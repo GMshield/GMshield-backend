@@ -1,0 +1,97 @@
+# The shared development setup of GMshield: the data services and every application whose sibling
+# clone has a Dockerfile. Start and stop it with ./start and ./stop (see README.md in this folder).
+#
+# - Nothing here starts by itself: no container has a restart policy.
+# - Every port is bound to 127.0.0.1 only.
+# - Every credential below is a throwaway for development on this machine. Never reuse one.
+# - Images are pinned by version and digest: the newest release at least two weeks old on 2026-11-12.
+name: gmshield-dev
+
+services:
+  postgres:
+    image: postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b
+    restart: "no"
+    environment:
+      POSTGRES_DB: gmshield
+      POSTGRES_USER: gmshield
+      POSTGRES_PASSWORD: gmshield-dev
+    ports: ["127.0.0.1:${GMSHIELD_DEV_POSTGRES_PORT:-5432}:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmshield -d gmshield"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  redis:
+    image: redis:8.10.3-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
+    restart: "no"
+    command: ["redis-server", "--requirepass", "gmshield-dev", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    environment:
+      REDISCLI_AUTH: gmshield-dev   # for the health check and for `docker compose exec redis redis-cli`
+    ports: ["127.0.0.1:${GMSHIELD_DEV_REDIS_PORT:-6379}:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    restart: "no"
+    environment:
+      QDRANT__SERVICE__API_KEY: gmshield-dev
+    ports: ["127.0.0.1:${GMSHIELD_DEV_QDRANT_PORT:-6333}:6333"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
+  backend:
+    build:
+      context: ..
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      GMSHIELD_DB_URL: jdbc:postgresql://postgres:5432/gmshield
+      GMSHIELD_DB_USER: gmshield
+      GMSHIELD_DB_PASSWORD: gmshield-dev
+      GMSHIELD_REDIS_HOST: redis
+      GMSHIELD_REDIS_PASSWORD: gmshield-dev
+    read_only: true
+    tmpfs: ["/tmp"]
+    ports: ["127.0.0.1:${GMSHIELD_DEV_BACKEND_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/actuator/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  # The two applications below start only when their sibling clone has a Dockerfile: ./start
+  # turns on the matching profile. Their stories (1.2 and 1.3) complete these entries.
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ../../GMshield-frontend
+    restart: "no"
+    depends_on:
+      backend: {condition: service_healthy}
+    environment:
+      GMSHIELD_BACKEND_URL: http://backend:8080
+    ports: ["127.0.0.1:${GMSHIELD_DEV_FRONTEND_PORT:-3000}:3000"]
+
+  worker:
+    profiles: ["worker"]
+    build:
+      context: ../../GMshield-worker
+    restart: "no"
+    depends_on:
+      backend: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      GMSHIELD_BACKEND_URL: http://backend:8080
+
+volumes:
+  postgres_data: {}
+  redis_data: {}
+  qdrant_data: {}

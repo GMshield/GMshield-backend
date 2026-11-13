@@ -1,5 +1,5 @@
 # GMshield pipeline contract (see GMshield-pipeline/templates/pipeline.toml for every option).
-# Inactive until a Dockerfile exists; until then only the source checks run.
+# Active: the Dockerfile has the stages `test`, `test-reports` and `production`.
 
 [service]
 name = "backend"
@@ -11,7 +11,7 @@ test_target = "test"         # Dockerfile stage that runs the unit tests
 
 [dast]
 path = "/"
-openapi = ""                 # set to the OpenAPI path once it exists, for a ZAP API scan
+openapi = "/v3/api-docs/public"   # ZAP API scan of the public contract (committed as openapi/public.json)
 
 [deploy]
 host_port = 8080               # 127.0.0.1:<host_port> on roberto-server (0 = not published)

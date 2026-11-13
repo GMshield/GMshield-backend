@@ -1,0 +1,13 @@
+# GMSHIELD_MODE=test: throwaway dependencies that the pipeline starts beside the application.
+# Every value is fixed here: test mode reads no GMSHIELD_* connection setting, so it cannot be
+# pointed at a real host. Nothing here is a secret, and nothing reaches the internet.
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/gmshield
+    username: gmshield
+    password: gmshield-test-mode
+  data:
+    redis:
+      host: redis
+      port: 6379
+      password: ""
