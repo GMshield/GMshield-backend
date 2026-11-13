@@ -1,0 +1,61 @@
+# Settings come from the environment (see README.md, "Settings"). GmshieldApplication checks
+# them before Spring starts, so a placeholder below never fails with a Spring stack trace.
+spring:
+  application:
+    name: gmshield-backend
+  main:
+    banner-mode: "off"
+    log-startup-info: false   # it names the user and the path; GmshieldApplication logs application.started
+  datasource:
+    url: ${GMSHIELD_DB_URL}
+    username: ${GMSHIELD_DB_USER}
+    password: ${GMSHIELD_DB_PASSWORD}
+  flyway:
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: ${GMSHIELD_REDIS_HOST}
+      port: ${GMSHIELD_REDIS_PORT:6379}
+      password: ${GMSHIELD_REDIS_PASSWORD}
+  web:
+    resources:
+      add-mappings: false   # an API only: an unknown path is a 404 problem detail, never a file lookup
+
+server:
+  port: 8080
+  shutdown: graceful
+  error:
+    whitelabel:
+      enabled: false
+
+# Only /actuator/health answers, with the status and nothing else
+# (shared.web.ActuatorScopeFilter refuses every other actuator path, whatever is set here).
+management:
+  endpoints:
+    access:
+      default: none
+    web:
+      exposure:
+        include: health
+      discovery:
+        enabled: false
+  endpoint:
+    health:
+      access: read-only
+      show-details: never
+      show-components: never
+      probes:
+        enabled: false
+
+# One JSON object per line (shared.service.JsonLineLogFormatter).
+logging:
+  structured:
+    format:
+      console: io.github.gmshield.shared.service.JsonLineLogFormatter
+
+# The two contract documents: /v3/api-docs/public and /v3/api-docs/internal
+# (groups defined in shared.web.OpenApiConfiguration).
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  writer-with-order-by-keys: true

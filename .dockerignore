@@ -1,0 +1,15 @@
+# Only what the build needs enters the build context.
+.git
+.github
+.gmshield
+.gmshield-reports
+.gradle
+.idea
+.vscode
+.scannerwork
+build
+out
+dev
+*.md
+sonar-project.properties
+.env

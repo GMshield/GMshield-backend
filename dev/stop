@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stops and removes every container of the GMshield development setup. Data volumes are kept;
+# `./stop --wipe` also deletes them (the development database, Redis file and Qdrant storage).
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Docker is not running: nothing to stop."
+    exit 0
+fi
+
+args=(down --remove-orphans)
+if [[ "${1:-}" == "--wipe" ]]; then
+    args+=(--volumes)
+fi
+docker compose --profile frontend --profile worker "${args[@]}"
+
+running="$(docker ps --quiet | wc -l)"
+echo "Containers still running on this machine: ${running}"

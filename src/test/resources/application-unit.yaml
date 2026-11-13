@@ -1,0 +1,8 @@
+# Unit tests run inside `docker build`, where no Postgres or Redis exists: the application starts
+# without its data connections. Start-up against real services is checked outside the test stage.
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration

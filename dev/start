@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Starts the GMshield development setup: Postgres, Redis, Qdrant, the backend, and the frontend
+# and the worker when their sibling clone has a Dockerfile. Waits until everything is healthy.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+if ! docker info >/dev/null 2>&1; then
+    echo "Docker is not answering. Start it with: sudo systemctl start docker" >&2
+    echo "(first use: see 'Install Docker in WSL' in dev/README.md)" >&2
+    exit 1
+fi
+
+profiles=()
+for app in frontend worker; do
+    if [[ -f "../../GMshield-${app}/Dockerfile" ]]; then
+        profiles+=(--profile "$app")
+    else
+        echo "GMshield-${app} has no Dockerfile yet: not started."
+    fi
+done
+
+docker compose "${profiles[@]}" up --build --detach --wait "$@"
+
+port="${GMSHIELD_DEV_BACKEND_PORT:-8080}"
+echo
+echo "Backend health: $(wget -q -O - "http://127.0.0.1:${port}/actuator/health" 2>/dev/null \
+    || curl -fsS "http://127.0.0.1:${port}/actuator/health" 2>/dev/null || echo 'no answer')"
+echo "Backend:  http://127.0.0.1:${port}/api/v1/version"
+echo "Stop everything with: $(pwd)/stop"

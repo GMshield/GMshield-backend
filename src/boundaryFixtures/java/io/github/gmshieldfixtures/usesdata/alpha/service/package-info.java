@@ -1,0 +1,2 @@
+@org.springframework.modulith.NamedInterface("service")
+package io.github.gmshieldfixtures.usesdata.alpha.service;

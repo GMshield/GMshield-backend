@@ -7,3 +7,7 @@ build/
 *.iml
 .vscode/
 .env
+!gradle/wrapper/gradle-wrapper.jar
+out/
+.gmshield-reports/
+.scannerwork/
