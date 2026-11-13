@@ -4,9 +4,20 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-if ! docker info >/dev/null 2>&1; then
-    echo "Docker is not answering. Start it with: sudo systemctl start docker" >&2
-    echo "(first use: see 'Install Docker in WSL' in dev/README.md)" >&2
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is not installed: see 'Install Docker in WSL' in dev/README.md." >&2
+    exit 1
+fi
+if ! docker_error="$(docker info 2>&1 >/dev/null)"; then
+    echo "Docker does not answer:" >&2
+    echo "${docker_error}" >&2
+    if grep -qi "permission denied" <<<"${docker_error}"; then
+        echo "Docker is running, but this session is not in the 'docker' group yet. Close every WSL" >&2
+        echo "window, run 'wsl --shutdown' in PowerShell and open WSL again (dev/README.md, 'Install" >&2
+        echo "Docker in WSL'). If the group was never added: sudo usermod -aG docker \"\$USER\"" >&2
+    elif grep -qiE "cannot connect to the docker daemon|is the docker daemon running" <<<"${docker_error}"; then
+        echo "The Docker daemon is not running. Start it with: sudo systemctl start docker" >&2
+    fi
     exit 1
 fi
 

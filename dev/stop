@@ -4,13 +4,37 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
-if ! docker info >/dev/null 2>&1; then
-    echo "Docker is not running: nothing to stop."
+wipe=false
+for argument in "$@"; do
+    case "${argument}" in
+        --wipe) wipe=true ;;
+        *)
+            echo "Unknown option: ${argument}" >&2
+            echo "Usage: dev/stop [--wipe]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is not installed: nothing to stop."
     exit 0
+fi
+if ! docker_error="$(docker info 2>&1 >/dev/null)"; then
+    # Only a daemon that is really not running means that nothing runs. Any other failure
+    # (for example permission denied) may hide containers that are still running.
+    if ! grep -qi "permission denied" <<<"${docker_error}" \
+        && grep -qiE "cannot connect to the docker daemon|is the docker daemon running" <<<"${docker_error}"; then
+        echo "The Docker daemon is not running: nothing to stop."
+        exit 0
+    fi
+    echo "Docker does not answer, so nothing was stopped and containers may still be running:" >&2
+    echo "${docker_error}" >&2
+    exit 1
 fi
 
 args=(down --remove-orphans)
-if [[ "${1:-}" == "--wipe" ]]; then
+if [[ "${wipe}" == true ]]; then
     args+=(--volumes)
 fi
 docker compose --profile frontend --profile worker "${args[@]}"

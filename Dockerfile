@@ -39,4 +39,4 @@ COPY --from=test /workspace/build/libs/gmshield-backend.jar /app/gmshield-backen
 USER 10001:10001
 VOLUME ["/tmp"]
 EXPOSE 8080
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-Djava.io.tmpdir=/tmp", "-jar", "/app/gmshield-backend.jar"]
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-XX:+ExitOnOutOfMemoryError", "-Djava.io.tmpdir=/tmp", "-jar", "/app/gmshield-backend.jar"]

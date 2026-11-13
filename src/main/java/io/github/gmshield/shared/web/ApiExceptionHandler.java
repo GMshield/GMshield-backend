@@ -43,10 +43,11 @@ public class ApiExceptionHandler {
             return ProblemResponses.of(
                     ApiProblem.forStatus(response.getStatusCode().value()), traceId, response.getHeaders());
         }
-        // The cause is logged by type only: an exception message may quote content or SQL.
+        // The log formatter writes the type and the place of the cause, never its message,
+        // which may quote content or SQL.
         log.atError()
+                .setCause(exception)
                 .addKeyValue("code", ApiProblem.unexpected().code())
-                .addKeyValue("errorType", exception.getClass().getName())
                 .log("request.failed");
         return ProblemResponses.of(ApiProblem.unexpected(), traceId, null);
     }

@@ -45,8 +45,13 @@ public class TraceIdFilter extends OncePerRequestFilter {
         request.setAttribute(REQUEST_ATTRIBUTE, traceId);
         TraceContext.set(traceId);
         long started = System.nanoTime();
+        boolean escaped = false;
         try {
             chain.doFilter(request, response);
+        } catch (IOException | ServletException | RuntimeException | Error failure) {
+            // The status is still the one set so far (usually 200); the server answers 500 after this.
+            escaped = true;
+            throw failure;
         } finally {
             // The matched route pattern, never the path or the query: those may carry content.
             Object route = request.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
@@ -55,7 +60,7 @@ public class TraceIdFilter extends OncePerRequestFilter {
             (routeName.startsWith("/actuator") ? log.atDebug() : log.atInfo())
                     .addKeyValue("method", request.getMethod())
                     .addKeyValue("route", routeName)
-                    .addKeyValue("status", response.getStatus())
+                    .addKeyValue("status", escaped ? HttpServletResponse.SC_INTERNAL_SERVER_ERROR : response.getStatus())
                     .addKeyValue("durationMs", (System.nanoTime() - started) / 1_000_000)
                     .log("request.completed");
             TraceContext.clear();

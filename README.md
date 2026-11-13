@@ -43,6 +43,8 @@ Only `shared` exists so far: the error model, trace ids, log lines, start-up che
 contract versions.
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
+- **No credential yet.** `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`,
+  `/v3/api-docs/internal`) answer without a credential until the service credential story.
 - **Contract.** `openapi/public.json` and `openapi/internal.json` are generated and committed, each
   with a version (`ContractVersions`). `GET /api/v1/version` and `GET /internal/v1/version` answer
   the version of their document. The build fails when a generated document differs from its file:
@@ -73,12 +75,14 @@ that names the settings, never a value, and exits with status 78.
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
 built-in throwaway settings and needs no internet: PostgreSQL at `postgres:5432`, database and
-user `gmshield`, password `gmshield-test-mode`; Redis at `redis:6379` without a password. Test mode
-refuses to start when a secret above is present. Any other value of `GMSHIELD_MODE` is refused.
+user `gmshield`, password `gmshield-test-mode`; Redis at `redis:6379` without a password. These
+values are fixed: in test mode the settings above are not read, so it cannot be pointed at another
+host. Test mode refuses to start when a secret above is present. Any other value of
+`GMSHIELD_MODE` is refused.
 
 ## Build and start
 
-Neither Java nor Gradle needs to be installed: everything builds in Docker.
+Neither Java nor Gradle needs to be installed: everything builds and runs in Docker.
 
 ```sh
 docker build --target test .                                               # tests and every build guard
@@ -86,6 +90,16 @@ docker build --target test-reports --output type=local,dest=out .          # tes
 docker build -t gmshield-backend .                                         # the production image
 dev/start                                                                  # data services and applications
 dev/stop
+```
+
+After an intended change of an API, regenerate `openapi/*.json` with the pinned build image on
+the mounted repository (it leaves `build/` and `.gradle/` behind, both ignored by git):
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GRADLE_USER_HOME=/tmp/gradle \
+  -v "$PWD":/workspace -w /workspace \
+  eclipse-temurin:27.0.1.0-jdk-alpine@sha256:a63e42ef2a577cdb0802b73bb6f8fa2c3b0ebf1b4f00f29eb22e7f4d83b234f7 \
+  ./gradlew --no-daemon test -PupdateOpenApi
 ```
 
 [`dev/README.md`](dev/README.md) describes the shared development setup, used by the frontend and

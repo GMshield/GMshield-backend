@@ -34,6 +34,7 @@ public class ProblemErrorReportValve extends ErrorReportValve {
                 + "\",\"status\":" + problem.status() + ",\"category\":\"" + problem.category() + "\",\"code\":\""
                 + problem.code() + "\",\"params\":{},\"traceId\":\"" + TraceContext.newTraceId() + "\"}";
         try {
+            response.setHeader("Cache-Control", "no-store");
             response.setContentType(ProblemBody.MEDIA_TYPE);
             response.setCharacterEncoding("utf-8");
             Writer writer = response.getReporter();

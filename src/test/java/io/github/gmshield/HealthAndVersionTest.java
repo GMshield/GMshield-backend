@@ -13,6 +13,12 @@ import tools.jackson.databind.JsonNode;
 /** Health and the two contract versions (I/O matrix of Story 1.1). */
 class HealthAndVersionTest extends HttpTestSupport {
 
+    static final List<String> OTHER_ACTUATOR_PATHS = List.of(
+            "/actuator", "/actuator/", "/actuator/info", "/actuator/env", "/actuator/beans", "/actuator/metrics",
+            "/actuator/loggers", "/actuator/heapdump", "/actuator/shutdown", "/actuator/modulith",
+            "/actuator/health/", "/actuator/health/db", "/actuator/health/ping", "/actuator/health/liveness",
+            "/actuator/health/readiness");
+
     @Test
     void healthAnswersTheStatusOnlyWithoutACredential() throws Exception {
         HttpResponse<String> response = get("/actuator/health");
@@ -25,10 +31,7 @@ class HealthAndVersionTest extends HttpTestSupport {
 
     @Test
     void noOtherActuatorPathAnswers() throws Exception {
-        for (String path : List.of(
-                "/actuator", "/actuator/", "/actuator/info", "/actuator/env", "/actuator/beans", "/actuator/metrics",
-                "/actuator/loggers", "/actuator/heapdump", "/actuator/shutdown", "/actuator/modulith",
-                "/actuator/health/db", "/actuator/health/liveness", "/actuator/health/readiness")) {
+        for (String path : OTHER_ACTUATOR_PATHS) {
             HttpResponse<String> response = get(path);
 
             assertThat(response.statusCode()).as(path).isEqualTo(404);
@@ -43,7 +46,7 @@ class HealthAndVersionTest extends HttpTestSupport {
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(json(response).path("version").asString())
                 .isEqualTo(ContractVersions.PUBLIC_API)
-                .isEqualTo(committedVersion("public"))
+                .isEqualTo(committedVersion("public", ContractVersions.PUBLIC_API))
                 .isEqualTo(json(get("/v3/api-docs/public")).path("info").path("version").asString());
     }
 
@@ -54,11 +57,15 @@ class HealthAndVersionTest extends HttpTestSupport {
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(json(response).path("version").asString())
                 .isEqualTo(ContractVersions.INTERNAL_API)
-                .isEqualTo(committedVersion("internal"))
+                .isEqualTo(committedVersion("internal", ContractVersions.INTERNAL_API))
                 .isEqualTo(json(get("/v3/api-docs/internal")).path("info").path("version").asString());
     }
 
-    private static String committedVersion(String api) throws Exception {
+    /** In update mode the committed file is about to be rewritten and may be stale: it is not compared. */
+    private static String committedVersion(String api, String whenUpdating) throws Exception {
+        if (Boolean.getBoolean("gmshield.openapi.update")) {
+            return whenUpdating;
+        }
         return JSON.readTree(Files.readString(Path.of("openapi", api + ".json"))).path("info").path("version").asString();
     }
 }

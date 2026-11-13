@@ -33,13 +33,15 @@ public class FallbackErrorController implements ErrorController {
         int status = request.getAttribute(RequestDispatcher.ERROR_STATUS_CODE) instanceof Integer code ? code : 404;
         ApiProblem problem = ApiProblem.forStatus(status);
         if (problem.status() >= 500) {
-            Object thrown = request.getAttribute(RequestDispatcher.ERROR_EXCEPTION);
+            // The log formatter writes the type and the place of the cause, never its message.
+            Throwable thrown = request.getAttribute(RequestDispatcher.ERROR_EXCEPTION) instanceof Throwable cause
+                    ? cause : null;
             // The trace id filter has already cleared the logging context: set it for this line.
             TraceContext.set(traceId);
             try {
                 log.atError()
+                        .setCause(thrown)
                         .addKeyValue("code", problem.code())
-                        .addKeyValue("errorType", thrown == null ? "none" : thrown.getClass().getName())
                         .log("request.failed");
             } finally {
                 TraceContext.clear();

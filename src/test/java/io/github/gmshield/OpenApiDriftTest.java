@@ -2,12 +2,17 @@ package io.github.gmshield;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.gmshield.shared.service.ProblemBody;
+import java.lang.reflect.RecordComponent;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.SerializationFeature;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -45,6 +50,19 @@ class OpenApiDriftTest extends HttpTestSupport {
                 .as("%s differs from the generated document (%s): run ./gradlew test -PupdateOpenApi and commit it",
                         committed, produced)
                 .isEqualTo(generated);
+    }
+
+    /** The schema is written by hand in OpenApiConfiguration: it must name exactly the fields of the answer. */
+    @ParameterizedTest
+    @ValueSource(strings = {"public", "internal"})
+    void problemSchemaHasExactlyTheFieldsOfTheProblemAnswer(String api) throws Exception {
+        List<String> fields = Arrays.stream(ProblemBody.class.getRecordComponents())
+                .map(RecordComponent::getName).toList();
+        JsonNode schema = json(get("/v3/api-docs/" + api)).path("components").path("schemas").path("Problem");
+
+        assertThat(schema.path("properties").propertyNames()).containsExactlyInAnyOrderElementsOf(fields);
+        assertThat(schema.path("required").valueStream().map(JsonNode::asString))
+                .containsExactlyInAnyOrderElementsOf(fields);
     }
 
     /** Sorted keys, fixed indentation, Unix line ends, one final line end. */

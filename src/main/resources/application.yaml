@@ -52,6 +52,10 @@ logging:
   structured:
     format:
       console: io.github.gmshield.shared.service.JsonLineLogFormatter
+  level:
+    # Spring's "No mapping for GET <path>" warning would put a request path in the log;
+    # request.completed already records the 404 with the route "unmatched".
+    org.springframework.web.servlet.PageNotFound: "OFF"
 
 # The two contract documents: /v3/api-docs/public and /v3/api-docs/internal
 # (groups defined in shared.web.OpenApiConfiguration).
