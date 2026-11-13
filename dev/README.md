@@ -20,7 +20,9 @@ agentic-RPG/
 ~/agentic-RPG/GMshield-backend/dev/stop      # stops and removes every container; data is kept
 ```
 
-`dev/start` ends by printing the backend's health. `dev/stop --wipe` also deletes the development
+`dev/start` ends by printing the backend's health and address, and the frontend's address when it
+started. The frontend starts only after the backend is healthy, and is itself healthy when its
+`/api/health` answers 200: the backend answers with a contract version the frontend accepts. `dev/stop --wipe` also deletes the development
 data (database, Redis file, Qdrant storage).
 
 | Service | Address on the workstation | Throwaway credential |
@@ -29,15 +31,16 @@ data (database, Redis file, Qdrant storage).
 | PostgreSQL | 127.0.0.1:5432, database `gmshield` | user `gmshield`, password `gmshield-dev` |
 | Redis | 127.0.0.1:6379 | password `gmshield-dev` |
 | Qdrant | http://127.0.0.1:6333 | API key `gmshield-dev` |
-| Frontend (once it has a Dockerfile) | http://127.0.0.1:3000 | |
+| Frontend | http://127.0.0.1:3000 (`/api/health`) | none |
 
 Every port is bound to 127.0.0.1: nothing is reachable from another machine. The credentials are
 for development on this machine only. A port that is taken can be moved for one start, for example
 `GMSHIELD_DEV_BACKEND_PORT=18080 dev/start` (also `GMSHIELD_DEV_POSTGRES_PORT`,
 `GMSHIELD_DEV_REDIS_PORT`, `GMSHIELD_DEV_QDRANT_PORT`, `GMSHIELD_DEV_FRONTEND_PORT`).
 
-The backend runs here as it does in production: outside test mode, with its settings given in
-`compose.yaml`, as a non-root user on a read-only root filesystem.
+The backend and the frontend run here as they do in production: outside test mode, with their
+settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with a tmpfs on
+`/tmp`.
 
 ## It never runs on its own
 
@@ -91,5 +94,6 @@ Docker Desktop: either would break the rule above.
 
 - The first `dev/start` downloads the images and builds the backend, which runs its tests: allow
   several minutes. Later starts reuse what did not change.
-- `docker compose -f dev/compose.yaml logs -f backend` follows the backend's log (JSON lines).
+- `docker compose -f dev/compose.yaml logs -f backend` follows the backend's log (JSON lines);
+  `logs -f frontend` follows the frontend's.
 - `docker compose -f dev/compose.yaml exec postgres psql -U gmshield` opens the development database.

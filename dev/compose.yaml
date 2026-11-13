@@ -68,7 +68,7 @@ services:
       retries: 60
 
   # The two applications below start only when their sibling clone has a Dockerfile: ./start
-  # turns on the matching profile. Their stories (1.2 and 1.3) complete these entries.
+  # turns on the matching profile. Story 1.3 completes the worker's entry.
   frontend:
     profiles: ["frontend"]
     build:
@@ -78,7 +78,15 @@ services:
       backend: {condition: service_healthy}
     environment:
       GMSHIELD_BACKEND_URL: http://backend:8080
+    read_only: true
+    tmpfs: ["/tmp"]
     ports: ["127.0.0.1:${GMSHIELD_DEV_FRONTEND_PORT:-3000}:3000"]
+    healthcheck:
+      # 200 only when the backend answers with a contract version the frontend accepts.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
 
   worker:
     profiles: ["worker"]
