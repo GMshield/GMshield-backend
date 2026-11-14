@@ -6,6 +6,7 @@ import io.github.gmshield.shared.service.StartupSettings;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
@@ -19,7 +20,7 @@ class GmshieldApplicationTest {
     private static final Map<String, String> PRODUCTION = Map.of(
             "GMSHIELD_DB_URL", "jdbc:postgresql://db.example:5432/gmshield", "GMSHIELD_DB_USER", "gmshield",
             "GMSHIELD_DB_PASSWORD", "value-never-printed", "GMSHIELD_REDIS_HOST", "redis.example",
-            "GMSHIELD_REDIS_PASSWORD", "value-never-printed");
+            "GMSHIELD_REDIS_USERNAME", "backend", "GMSHIELD_REDIS_PASSWORD", "value-never-printed");
 
     private final ByteArrayOutputStream printed = new ByteArrayOutputStream();
     private final PrintStream out = new PrintStream(printed, true, StandardCharsets.UTF_8);
@@ -64,11 +65,22 @@ class GmshieldApplicationTest {
     }
 
     @Test
-    void productionSettingsStartWithoutTheTestModeProfile() {
+    void productionSettingsStartWithRedisTlsAndWithoutTheTestModeProfile() {
         Optional<SpringApplication> application = GmshieldApplication.prepare(PRODUCTION, out);
 
         assertThat(application).isPresent();
-        assertThat(application.get().getAdditionalProfiles()).isEmpty();
+        assertThat(application.get().getAdditionalProfiles()).containsExactly("redis-tls");
         assertThat(printed.size()).isZero();
+    }
+
+    @Test
+    void theDevelopmentSetupCanSwitchRedisTlsOff() {
+        Map<String, String> development = new HashMap<>(PRODUCTION);
+        development.put("GMSHIELD_REDIS_TLS", "false");
+
+        Optional<SpringApplication> application = GmshieldApplication.prepare(development, out);
+
+        assertThat(application).isPresent();
+        assertThat(application.get().getAdditionalProfiles()).isEmpty();
     }
 }

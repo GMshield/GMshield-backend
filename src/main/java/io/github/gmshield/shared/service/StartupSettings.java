@@ -12,21 +12,26 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>{@code GMSHIELD_MODE=test} (set only by the pipeline): built-in throwaway connection
  *       settings. Refused when a production secret is present.</li>
- *   <li>No mode: every required setting must be present.</li>
+ *   <li>No mode: every required setting must be present. Redis is reached over TLS verified against
+ *       the private authority (the {@code redis-tls} profile) unless {@code GMSHIELD_REDIS_TLS=false},
+ *       which only the development setup sets.</li>
  * </ul>
  *
  * A refusal names settings and never prints a value.
  */
-public record StartupSettings(boolean testMode, String refusalReason, List<String> refusedSettings) {
+public record StartupSettings(boolean testMode, boolean redisTls, String refusalReason, List<String> refusedSettings) {
 
     public static final String MODE = "GMSHIELD_MODE";
     public static final String TEST_MODE = "test";
     public static final String TEST_MODE_PROFILE = "test-mode";
+    /** Outside test mode, unless switched off: Redis over TLS with the private authority's certificate. */
+    public static final String REDIS_TLS_PROFILE = "redis-tls";
+    public static final String REDIS_TLS = "GMSHIELD_REDIS_TLS";
 
     /** Required outside test mode. */
     public static final List<String> REQUIRED = List.of(
             "GMSHIELD_DB_URL", "GMSHIELD_DB_USER", "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_HOST",
-            "GMSHIELD_REDIS_PASSWORD");
+            "GMSHIELD_REDIS_USERNAME", "GMSHIELD_REDIS_PASSWORD");
 
     /** Production secrets: test mode refuses to start beside any of them. */
     public static final List<String> SECRETS = List.of("GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_PASSWORD");
@@ -34,6 +39,7 @@ public record StartupSettings(boolean testMode, String refusalReason, List<Strin
     public static final String REASON_UNKNOWN_MODE = "mode.unknown";
     public static final String REASON_MISSING = "setting.missing";
     public static final String REASON_SECRET_IN_TEST_MODE = "mode.test_with_production_secret";
+    public static final String REASON_INVALID = "setting.invalid";
 
     public StartupSettings {
         refusedSettings = List.copyOf(refusedSettings);
@@ -43,7 +49,14 @@ public record StartupSettings(boolean testMode, String refusalReason, List<Strin
         String mode = environment.get(MODE);
         if (isBlank(mode)) {
             List<String> missing = REQUIRED.stream().filter(name -> isBlank(environment.get(name))).toList();
-            return missing.isEmpty() ? allowed(false) : refuse(false, REASON_MISSING, missing);
+            if (!missing.isEmpty()) {
+                return refuse(false, REASON_MISSING, missing);
+            }
+            String tls = environment.get(REDIS_TLS);
+            if (isBlank(tls) || "true".equals(tls)) {
+                return allowed(false, true);
+            }
+            return "false".equals(tls) ? allowed(false, false) : refuse(false, REASON_INVALID, List.of(REDIS_TLS));
         }
         if (!TEST_MODE.equals(mode)) {
             return refuse(false, REASON_UNKNOWN_MODE, List.of(MODE));
@@ -55,7 +68,7 @@ public record StartupSettings(boolean testMode, String refusalReason, List<Strin
             conflict.addAll(secrets);
             return refuse(true, REASON_SECRET_IN_TEST_MODE, conflict);
         }
-        return allowed(true);
+        return allowed(true, false);
     }
 
     public boolean refused() {
@@ -70,12 +83,20 @@ public record StartupSettings(boolean testMode, String refusalReason, List<Strin
                 + "\",\"settings\":[" + names + "]}";
     }
 
-    private static StartupSettings allowed(boolean testMode) {
-        return new StartupSettings(testMode, null, List.of());
+    /** The Spring profiles this start adds: {@code test-mode} or {@code redis-tls}, or none. */
+    public List<String> profiles() {
+        if (testMode) {
+            return List.of(TEST_MODE_PROFILE);
+        }
+        return redisTls ? List.of(REDIS_TLS_PROFILE) : List.of();
+    }
+
+    private static StartupSettings allowed(boolean testMode, boolean redisTls) {
+        return new StartupSettings(testMode, redisTls, null, List.of());
     }
 
     private static StartupSettings refuse(boolean testMode, String reason, List<String> settings) {
-        return new StartupSettings(testMode, reason, settings);
+        return new StartupSettings(testMode, false, reason, settings);
     }
 
     private static boolean isBlank(String value) {

@@ -7,6 +7,8 @@ spring:
     banner-mode: "off"
     log-startup-info: false   # it names the user and the path; GmshieldApplication logs application.started
   datasource:
+    # Production: ...?sslmode=verify-full&sslrootcert=/run/gmshield/certs/ca.crt (TLS verified against
+    # the private authority, host name included); written by GMshield-pipeline deploy/data-credentials.sh.
     url: ${GMSHIELD_DB_URL}
     username: ${GMSHIELD_DB_USER}
     password: ${GMSHIELD_DB_PASSWORD}
@@ -16,7 +18,9 @@ spring:
     redis:
       host: ${GMSHIELD_REDIS_HOST}
       port: ${GMSHIELD_REDIS_PORT:6379}
+      username: ${GMSHIELD_REDIS_USERNAME}
       password: ${GMSHIELD_REDIS_PASSWORD}
+      # TLS comes from application-redis-tls.yaml, added by GmshieldApplication outside test mode.
   web:
     resources:
       add-mappings: false   # an API only: an unknown path is a 404 problem detail, never a file lookup

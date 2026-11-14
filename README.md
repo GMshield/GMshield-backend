@@ -65,19 +65,21 @@ that names the settings, never a value, and exits with status 78.
 
 | Setting | Meaning |
 |---|---|
-| `GMSHIELD_DB_URL` | JDBC address of PostgreSQL (required) |
-| `GMSHIELD_DB_USER` | database user (required) |
+| `GMSHIELD_DB_URL` | JDBC address of PostgreSQL (required); in production it ends in `?sslmode=verify-full&sslrootcert=/run/gmshield/certs/ca.crt` |
+| `GMSHIELD_DB_USER` | database user (required; `gmshield_backend` in production) |
 | `GMSHIELD_DB_PASSWORD` | database password (required, secret) |
 | `GMSHIELD_REDIS_HOST` | Redis host (required) |
 | `GMSHIELD_REDIS_PORT` | Redis port (default 6379) |
+| `GMSHIELD_REDIS_USERNAME` | Redis account (required; `backend` in production) |
 | `GMSHIELD_REDIS_PASSWORD` | Redis password (required, secret) |
+| `GMSHIELD_REDIS_TLS` | `true` (default): TLS verified, chain and host name, against `/run/gmshield/certs/ca.crt`; `false` only in the development setup |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
 built-in throwaway settings and needs no internet: PostgreSQL at `postgres:5432`, database and
 user `gmshield`, password `gmshield-test-mode`; Redis at `redis:6379` without a password. These
 values are fixed: in test mode the settings above are not read, so it cannot be pointed at another
-host. Test mode refuses to start when a secret above is present. Any other value of
+host. Test mode uses plain connections and needs no certificate. Test mode refuses to start when a secret above is present. Any other value of
 `GMSHIELD_MODE` is refused.
 
 ## Build and start
@@ -132,6 +134,14 @@ Work on feature branches, merge into `develop`, then open a pull request from `d
 Reports for every run are kept by the pipeline; see [GMshield-pipeline](https://github.com/GMshield/GMshield-pipeline).
 
 ## Pipeline contract
+
+In production (Story 1.6) the backend publishes no host port and joins `gmshield-app`,
+`gmshield-data` (PostgreSQL), `gmshield-work` (Redis) and `gmshield-outbound`, runs as 10001 with a
+read-only root filesystem and every capability dropped, and finds the private authority's
+certificate at `/run/gmshield/certs/ca.crt`. Its settings, written once by GMshield-pipeline's
+`deploy/data-credentials.sh`, live in `~/gmshield-ci/secrets/backend.env` on the server: its own
+PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`) and its own Redis
+account `backend` (keys `gmshield:*` only).
 
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 [`Dockerfile`](Dockerfile): the `test` stage runs the unit tests, `test-reports` exports the test

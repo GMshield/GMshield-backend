@@ -68,6 +68,40 @@ class StartupSettingsTest {
     }
 
     @Test
+    void outsideTestModeRedisTlsIsOnUnlessSwitchedOff() {
+        assertThat(StartupSettings.check(production()).redisTls()).isTrue();
+        assertThat(StartupSettings.check(production()).profiles()).containsExactly("redis-tls");
+
+        Map<String, String> environment = production();
+        environment.put("GMSHIELD_REDIS_TLS", "true");
+        assertThat(StartupSettings.check(environment).profiles()).containsExactly("redis-tls");
+
+        environment.put("GMSHIELD_REDIS_TLS", "false");
+        assertThat(StartupSettings.check(environment).redisTls()).isFalse();
+        assertThat(StartupSettings.check(environment).profiles()).isEmpty();
+    }
+
+    @Test
+    void anUnclearRedisTlsValueIsRefused() {
+        Map<String, String> environment = production();
+        environment.put("GMSHIELD_REDIS_TLS", "no");
+
+        StartupSettings settings = StartupSettings.check(environment);
+
+        assertThat(settings.refused()).isTrue();
+        assertThat(settings.refusedSettings()).containsExactly("GMSHIELD_REDIS_TLS");
+        assertRefusalLine(settings, "setting.invalid");
+    }
+
+    @Test
+    void testModeUsesPlainConnections() {
+        StartupSettings settings = StartupSettings.check(Map.of("GMSHIELD_MODE", "test"));
+
+        assertThat(settings.redisTls()).isFalse();
+        assertThat(settings.profiles()).containsExactly("test-mode");
+    }
+
+    @Test
     void anUnknownModeIsRefused() {
         Map<String, String> environment = production();
         environment.put("GMSHIELD_MODE", "Test");
@@ -97,6 +131,7 @@ class StartupSettingsTest {
         environment.put("GMSHIELD_DB_USER", "gmshield");
         environment.put("GMSHIELD_DB_PASSWORD", SECRET_VALUE);
         environment.put("GMSHIELD_REDIS_HOST", "redis.example");
+        environment.put("GMSHIELD_REDIS_USERNAME", "backend");
         environment.put("GMSHIELD_REDIS_PASSWORD", SECRET_VALUE);
         return environment;
     }

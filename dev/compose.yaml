@@ -57,7 +57,9 @@ services:
       GMSHIELD_DB_USER: gmshield
       GMSHIELD_DB_PASSWORD: gmshield-dev
       GMSHIELD_REDIS_HOST: redis
+      GMSHIELD_REDIS_USERNAME: default
       GMSHIELD_REDIS_PASSWORD: gmshield-dev
+      GMSHIELD_REDIS_TLS: "false"   # the development Redis has no TLS; production always verifies it
     read_only: true
     tmpfs: ["/tmp"]
     ports: ["127.0.0.1:${GMSHIELD_DEV_BACKEND_PORT:-8080}:8080"]

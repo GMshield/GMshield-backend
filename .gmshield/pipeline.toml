@@ -14,7 +14,15 @@ path = "/"
 openapi = "/v3/api-docs/public"   # ZAP API scan of the public contract (committed as openapi/public.json)
 
 [deploy]
-host_port = 8080               # 127.0.0.1:<host_port> on roberto-server (0 = not published)
+host_port = 0                  # no host port: the frontend and the worker reach it on gmshield-app and gmshield-work
+# Story 1.6 (AD-14): created on the first network (the health probe joins it), then connected to the rest.
+# Postgres is on gmshield-data, Redis on gmshield-work; gmshield-outbound alone reaches the internet.
+networks = ["gmshield-app", "gmshield-data", "gmshield-work", "gmshield-outbound"]
+certs = true                   # ~/gmshield-ci/certs/backend/ca.crt at /run/gmshield/certs: TLS to Postgres and Redis
+read_only = true
+user = "10001:10001"
+cap_drop = ["ALL"]
+tmpfs = ["/tmp"]
 
 [staging]
 # The develop pipeline's throwaway copy (active DAST) runs with GMSHIELD_MODE=test, which reads the

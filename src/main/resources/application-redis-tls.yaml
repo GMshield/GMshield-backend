@@ -1,0 +1,16 @@
+# Added by GmshieldApplication outside test mode, unless GMSHIELD_REDIS_TLS=false (development only).
+# Redis over TLS, verified (chain and host name) against the private authority's certificate, which
+# the pipeline mounts read-only at /run/gmshield/certs (GMshield-pipeline deploy/certs.sh). Spring
+# loads the bundle at start: a missing certificate stops the start instead of connecting unverified.
+spring:
+  data:
+    redis:
+      ssl:
+        enabled: true
+        bundle: gmshield-ca
+  ssl:
+    bundle:
+      pem:
+        gmshield-ca:
+          truststore:
+            certificate: file:/run/gmshield/certs/ca.crt
