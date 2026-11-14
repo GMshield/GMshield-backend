@@ -15,3 +15,8 @@ openapi = "/v3/api-docs/public"   # ZAP API scan of the public contract (committ
 
 [deploy]
 host_port = 8080               # 127.0.0.1:<host_port> on roberto-server (0 = not published)
+
+[staging]
+# The develop pipeline's throwaway copy (active DAST) runs with GMSHIELD_MODE=test, which reads the
+# fixed connections in application-test-mode.yaml: a throwaway Postgres and Redis on the run's network.
+services = ["postgres", "redis"]
