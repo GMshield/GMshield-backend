@@ -20,9 +20,11 @@ agentic-RPG/
 ~/agentic-RPG/GMshield-backend/dev/stop      # stops and removes every container; data is kept
 ```
 
-`dev/start` ends by printing the backend's health and address, and the frontend's address when it
-started. The frontend starts only after the backend is healthy, and is itself healthy when its
-`/api/health` answers 200: the backend answers with a contract version the frontend accepts. `dev/stop --wipe` also deletes the development
+`dev/start` ends by printing the backend's health and address, the frontend's address and the
+worker's state when they started. The frontend and the worker start only after the backend is
+healthy. The frontend is itself healthy when its `/api/health` answers 200, and the worker when
+its health check (`python -m gmshield_worker.health`) passes: in both cases the backend answered
+with a contract version the application accepts. `dev/stop --wipe` also deletes the development
 data (database, Redis file, Qdrant storage).
 
 | Service | Address on the workstation | Throwaway credential |
@@ -32,15 +34,22 @@ data (database, Redis file, Qdrant storage).
 | Redis | 127.0.0.1:6379 | password `gmshield-dev` |
 | Qdrant | http://127.0.0.1:6333 | API key `gmshield-dev` |
 | Frontend | http://127.0.0.1:3000 (`/api/health`) | none |
+| Worker | no port: it opens none | `GMSHIELD_ANTHROPIC_API_KEY` from your shell, or the placeholder `not-a-real-key` |
 
 Every port is bound to 127.0.0.1: nothing is reachable from another machine. The credentials are
 for development on this machine only. A port that is taken can be moved for one start, for example
 `GMSHIELD_DEV_BACKEND_PORT=18080 dev/start` (also `GMSHIELD_DEV_POSTGRES_PORT`,
 `GMSHIELD_DEV_REDIS_PORT`, `GMSHIELD_DEV_QDRANT_PORT`, `GMSHIELD_DEV_FRONTEND_PORT`).
 
-The backend and the frontend run here as they do in production: outside test mode, with their
-settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with a tmpfs on
-`/tmp`.
+The backend, the frontend and the worker run here as they do in production: outside test mode,
+with their settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with
+a tmpfs on `/tmp`.
+
+The worker refuses to start without `GMSHIELD_ANTHROPIC_API_KEY`. `compose.yaml` passes the value
+of that variable from the shell that runs `dev/start`, or the placeholder `not-a-real-key` when it
+is unset. Nothing calls the model yet, so the placeholder is enough; to try a real key for one
+start, `GMSHIELD_ANTHROPIC_API_KEY=... dev/start` (never write it into a file of this repository).
+The worker does not use Redis yet: Story 1.12 adds its Redis account and service credential.
 
 ## It never runs on its own
 
@@ -95,5 +104,7 @@ Docker Desktop: either would break the rule above.
 - The first `dev/start` downloads the images and builds the backend, which runs its tests: allow
   several minutes. Later starts reuse what did not change.
 - `docker compose -f dev/compose.yaml logs -f backend` follows the backend's log (JSON lines);
-  `logs -f frontend` follows the frontend's.
+  `logs -f frontend` follows the frontend's, `logs -f worker` the worker's.
+- The first start of the worker builds its image, which downloads Docling's models and runs the
+  worker's tests: allow several minutes.
 - `docker compose -f dev/compose.yaml exec postgres psql -U gmshield` opens the development database.

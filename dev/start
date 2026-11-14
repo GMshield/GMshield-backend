@@ -41,4 +41,8 @@ if [[ " ${profiles[*]} " == *" frontend "* ]]; then
     frontend_port="${GMSHIELD_DEV_FRONTEND_PORT:-3000}"
     echo "Frontend: http://127.0.0.1:${frontend_port}/ (health: http://127.0.0.1:${frontend_port}/api/health)"
 fi
+if [[ " ${profiles[*]} " == *" worker "* ]]; then
+    worker_state="$(docker compose ps worker --format '{{.State}} ({{.Health}})' 2>/dev/null || true)"
+    echo "Worker:   ${worker_state:-not running} (no port; logs: docker compose -f $(pwd)/compose.yaml logs -f worker)"
+fi
 echo "Stop everything with: $(pwd)/stop"
