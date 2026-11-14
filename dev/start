@@ -42,7 +42,8 @@ if [[ " ${profiles[*]} " == *" frontend "* ]]; then
     echo "Frontend: http://127.0.0.1:${frontend_port}/ (health: http://127.0.0.1:${frontend_port}/api/health)"
 fi
 if [[ " ${profiles[*]} " == *" worker "* ]]; then
-    worker_state="$(docker compose ps worker --format '{{.State}} ({{.Health}})' 2>/dev/null || true)"
-    echo "Worker:   ${worker_state:-not running} (no port; logs: docker compose -f $(pwd)/compose.yaml logs -f worker)"
+    # -a: an exited worker (exit 78 is a refused start) is listed too, with its exit code.
+    worker_state="$(docker compose ps -a worker --format '{{.State}} {{.Health}} (exit code {{.ExitCode}})' 2>/dev/null || true)"
+    echo "Worker:   ${worker_state:-not created} (no port; logs: docker compose -f $(pwd)/compose.yaml logs worker)"
 fi
 echo "Stop everything with: $(pwd)/stop"
