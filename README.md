@@ -39,8 +39,9 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Only `shared` exists so far: the error model, trace ids, log lines, start-up checks and the
-contract versions.
+Two modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+contract versions and `Ids`, which mints every id as a UUID v7) and `vault` (encryption at rest,
+below).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **No credential yet.** `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`,
@@ -57,6 +58,28 @@ contract versions.
   (`log.atInfo().addKeyValue("pages", 12).log("material.accepted")`): never content, never a secret.
   The trace id comes from a valid `traceparent` header, otherwise it is new.
 - **Health.** `GET /actuator/health` answers the status only; no other actuator path answers.
+- **Encryption at rest (`vault`, AD-19).** Every module stores content, personal data and file
+  pieces through `vault.service`:
+  - `Vault.encrypt(binding, bytes)` / `decrypt`: AES-256-GCM with a random 96-bit nonce under the
+    owner's data key. The `Binding` is entity, field, row id and owner id; they go, length-prefixed,
+    into the AAD, so a value read under another row, field, entity or owner fails. A stored value is
+    `format(1) ‖ dataKeyVersion(4) ‖ nonce(12) ‖ ciphertext ‖ tag(16)`.
+  - One data key per owner, created on first use, kept in `vault_data_key` wrapped by the master key
+    (AAD: owner and version); unwrapped keys live in a bounded in-memory map and are never logged.
+  - `Vault.fingerprint(entity, field, value)` for exact lookups (no SQL text search) and
+    `Vault.tokenHash(purpose, token)` for stored tokens: HMAC-SHA256 under subkeys derived by HKDF
+    from the index key, separated by purpose and by entity and field.
+  - `FileStore.writePiece` / `readPiece`: one encrypted file per piece under `GMSHIELD_FILES_DIR`,
+    `<owner>/<file>/<index>.piece`, bound to owner, file id and index, written under a temporary name
+    and renamed.
+  - Any failed check (changed byte, moved value, unknown version, wrong master key) throws
+    `IntegrityException`: the problem `integrity.failed` (500, no params), a `vault.integrity_failed`
+    log line with the ids only, and no content.
+  - `ModuleBoundaryTest` fails the build when a class outside `vault` uses `javax.crypto`,
+    `MessageDigest`, `Mac` or `Signature` (a fixture proves the rule fails).
+  - Test mode only: `POST /internal/v1/test-mode/nfr1-probe` and `GET .../{id}` (left out of the
+    OpenAPI documents) store and read back the pipeline's NFR-1 text as one `vault_probe` row and
+    one file piece. The table comes from `db/test-mode-migration`, a location only test mode adds.
 
 ## Settings
 
@@ -73,14 +96,19 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_REDIS_USERNAME` | Redis account (required; `backend` in production) |
 | `GMSHIELD_REDIS_PASSWORD` | Redis password (required, secret) |
 | `GMSHIELD_REDIS_TLS` | `true` (default): TLS verified, chain and host name, against `/run/gmshield/certs/ca.crt`; `false` only in the development setup |
+| `GMSHIELD_VAULT_MASTER_KEY` | 32 random bytes in Base64 (required, secret): wraps every data key. Losing or changing it loses every stored value; no off-server copy exists until Epic 10 |
+| `GMSHIELD_VAULT_INDEX_KEY` | 32 random bytes in Base64 (required, secret, different from the master key): source of the fingerprint and token-hash subkeys |
+| `GMSHIELD_FILES_DIR` | the encrypted file store (default `/var/lib/gmshield/files`, where the pipeline mounts the volume `gmshield-backend-files`) |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
 built-in throwaway settings and needs no internet: PostgreSQL at `postgres:5432`, database and
 user `gmshield`, password `gmshield-test-mode`; Redis at `redis:6379` without a password. These
 values are fixed: in test mode the settings above are not read, so it cannot be pointed at another
-host. Test mode uses plain connections and needs no certificate. Test mode refuses to start when a secret above is present. Any other value of
-`GMSHIELD_MODE` is refused.
+host. Test mode uses plain connections and needs no certificate. Its vault keys are random for each
+start and held only in memory, and its file store is `/var/lib/gmshield/files`. Test mode refuses
+to start when a secret above is present. Any other value of `GMSHIELD_MODE` is refused. A vault key
+that is not 32 bytes of Base64, or the same key twice, is refused with `setting.invalid`.
 
 ## Build and start
 
@@ -108,8 +136,9 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GRADLE_USER_HOME=/tmp/gra
 the worker as well. With a JDK 27 installed, `./gradlew check` runs the same tests without Docker
 (they need neither PostgreSQL nor Redis).
 
-The production image runs as user 10001, writes only to `/tmp`, and works with a read-only root
-filesystem (`docker run --read-only`).
+The production image runs as user 10001, writes only to `/tmp` and `/var/lib/gmshield/files` (created
+owned by 10001, mode 700, so that a new named volume mounted there gets that owner), and works with a
+read-only root filesystem (`docker run --read-only`).
 
 ## Rules for changes
 
@@ -140,8 +169,13 @@ In production (Story 1.6) the backend publishes no host port and joins `gmshield
 read-only root filesystem and every capability dropped, and finds the private authority's
 certificate at `/run/gmshield/certs/ca.crt`. Its settings, written once by GMshield-pipeline's
 `deploy/data-credentials.sh`, live in `~/gmshield-ci/secrets/backend.env` on the server: its own
-PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`) and its own Redis
-account `backend` (keys `gmshield:*` only).
+PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`), its own Redis
+account `backend` (keys `gmshield:*` only), and the two vault keys. The contract mounts the named
+volume `gmshield-backend-files` at `/var/lib/gmshield/files` (the encrypted file store).
+
+`[nfr1]` in the contract turns on the NFR-1 release gate on `develop`: inside the staging session the
+pipeline stores a random text through the test-mode probe route, reads it back, and searches
+`pg_dump`, the file-store volume, a Redis RDB and every log for it, plain and encoded.
 
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 [`Dockerfile`](Dockerfile): the `test` stage runs the unit tests, `test-reports` exports the test

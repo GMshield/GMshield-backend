@@ -25,6 +25,16 @@ spring:
     resources:
       add-mappings: false   # an API only: an unknown path is a 404 problem detail, never a file lookup
 
+# Encryption at rest (vault module, Story 1.7). Both keys are 32 random bytes in Base64, checked by
+# StartupSettings before Spring starts; written once by GMshield-pipeline deploy/data-credentials.sh.
+gmshield:
+  vault:
+    master-key: ${GMSHIELD_VAULT_MASTER_KEY}
+    index-key: ${GMSHIELD_VAULT_INDEX_KEY}
+  files:
+    # The encrypted file store; the pipeline contract mounts the named volume gmshield-files here.
+    dir: ${GMSHIELD_FILES_DIR:/var/lib/gmshield/files}
+
 server:
   port: 8080
   shutdown: graceful

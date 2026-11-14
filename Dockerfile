@@ -33,11 +33,14 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="gmshield-backend" \
       org.opencontainers.image.revision="${GIT_SHA}"
 RUN addgroup -S -g 10001 gmshield \
-    && adduser -S -D -H -u 10001 -G gmshield -s /sbin/nologin gmshield
+    && adduser -S -D -H -u 10001 -G gmshield -s /sbin/nologin gmshield \
+    && install -d -o 10001 -g 10001 -m 700 /var/lib/gmshield/files
 WORKDIR /app
 COPY --from=test /workspace/build/libs/gmshield-backend.jar /app/gmshield-backend.jar
-# Not root, and nothing written outside /tmp: the root filesystem can be read-only.
-# /tmp is a volume so that `--read-only` works without any other option; a tmpfs on /tmp replaces it.
+# Not root, and nothing written outside /tmp and the encrypted file store: the root filesystem can be
+# read-only. /tmp is a volume so that `--read-only` works without any other option; a tmpfs on /tmp
+# replaces it. /var/lib/gmshield/files (owner 10001, mode 700) is where the pipeline mounts the named
+# volume gmshield-files; Docker fills a new volume from this folder, owner included.
 USER 10001:10001
 VOLUME ["/tmp"]
 EXPOSE 8080

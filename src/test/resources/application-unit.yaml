@@ -6,3 +6,12 @@ spring:
       - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
       - org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration
       - org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration
+
+# Throwaway vault keys for the Spring tests (32 bytes of 1 and of 2; never used anywhere else), and a file store under the
+# temporary folder. The test-mode profile ignores the keys: it makes random ones at each start.
+gmshield:
+  vault:
+    master-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+    index-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+  files:
+    dir: ${java.io.tmpdir}/gmshield-unit-files
