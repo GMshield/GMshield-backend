@@ -68,7 +68,7 @@ services:
       retries: 60
 
   # The two applications below start only when their sibling clone has a Dockerfile: ./start
-  # turns on the matching profile. Story 1.3 completes the worker's entry.
+  # turns on the matching profile.
   frontend:
     profiles: ["frontend"]
     build:
@@ -95,9 +95,20 @@ services:
     restart: "no"
     depends_on:
       backend: {condition: service_healthy}
-      redis: {condition: service_healthy}
     environment:
       GMSHIELD_BACKEND_URL: http://backend:8080
+      # Taken from your shell when set; otherwise a placeholder that cannot call the model.
+      # Nothing calls the model yet, but the worker refuses to start without a key.
+      GMSHIELD_ANTHROPIC_API_KEY: ${GMSHIELD_ANTHROPIC_API_KEY:-not-a-real-key}
+    read_only: true
+    tmpfs: ["/tmp"]
+    # No port: the worker opens none. Healthy only when the backend answers with a contract
+    # version the worker accepts (python -m gmshield_worker.health reads the worker's health file).
+    healthcheck:
+      test: ["CMD", "python", "-m", "gmshield_worker.health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
 
 volumes:
   postgres_data: {}
