@@ -32,7 +32,8 @@ public class GmshieldApplication {
 
     /**
      * Decides from the environment whether to start. A refused start prints the refusal line and
-     * gives nothing back: Spring is never created. Test mode adds the {@code test-mode} profile.
+     * gives nothing back: Spring is never created. Test mode adds the {@code test-mode} profile;
+     * production adds {@code redis-tls} unless the development setup switched it off.
      */
     static Optional<SpringApplication> prepare(Map<String, String> environment, PrintStream out) {
         StartupSettings settings = StartupSettings.check(environment);
@@ -42,9 +43,7 @@ public class GmshieldApplication {
             return Optional.empty();
         }
         SpringApplication application = new SpringApplication(GmshieldApplication.class);
-        if (settings.testMode()) {
-            application.setAdditionalProfiles(StartupSettings.TEST_MODE_PROFILE);
-        }
+        application.setAdditionalProfiles(settings.profiles().toArray(String[]::new));
         return Optional.of(application);
     }
 }

@@ -29,5 +29,7 @@ class TestModeSettingsTest {
         assertThat(environment.getProperty("spring.data.redis.host")).isEqualTo("redis");
         assertThat(environment.getProperty("spring.data.redis.port")).isEqualTo("6379");
         assertThat(environment.getProperty("spring.data.redis.password")).isEmpty();
+        assertThat(environment.getProperty("spring.data.redis.username")).isEmpty();
+        assertThat(environment.getProperty("spring.data.redis.ssl.enabled")).isEqualTo("false");
     }
 }
