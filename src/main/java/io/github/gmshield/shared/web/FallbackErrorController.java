@@ -16,6 +16,15 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import static org.springframework.web.bind.annotation.RequestMethod.DELETE;
+import static org.springframework.web.bind.annotation.RequestMethod.GET;
+import static org.springframework.web.bind.annotation.RequestMethod.HEAD;
+import static org.springframework.web.bind.annotation.RequestMethod.OPTIONS;
+import static org.springframework.web.bind.annotation.RequestMethod.PATCH;
+import static org.springframework.web.bind.annotation.RequestMethod.POST;
+import static org.springframework.web.bind.annotation.RequestMethod.PUT;
+import static org.springframework.web.bind.annotation.RequestMethod.TRACE;
+
 /**
  * Answers the failures that never reach a controller (rejected by the server itself or thrown in
  * a filter) in the same error shape. Replaces Spring Boot's default error page.
@@ -26,7 +35,11 @@ public class FallbackErrorController implements ErrorController {
 
     private static final Logger log = LoggerFactory.getLogger(FallbackErrorController.class);
 
-    @RequestMapping("${server.error.path:${error.path:/error}}")
+    // The error dispatch keeps the failed request's method, so every method is mapped. The path is
+    // Spring Boot's default: application.yaml does not set server.error.path.
+    @RequestMapping(
+            path = "/error",
+            method = {GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS, TRACE})
     ResponseEntity<ProblemBody> error(HttpServletRequest request) {
         String traceId = TraceIdFilter.traceIdOf(request);
         // Without an error status the path was requested directly: it does not exist for a client.
