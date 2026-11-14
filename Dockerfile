@@ -1,6 +1,7 @@
 # GMshield backend. Stages the pipeline uses (GMshield-pipeline, "Repository contract"):
 #   test          runs the unit tests and every build guard; a failure fails the build
-#   test-reports  test results, coverage and compiled classes, exported for the artifacts and SonarQube
+#   test-reports  test results, coverage, compiled classes and dependency jars, exported for the
+#                 artifacts and SonarQube
 #   production    the image that runs (last stage)
 # Images are pinned by version and digest: the newest release at least two weeks old on 2026-11-12.
 
@@ -18,12 +19,13 @@ COPY openapi/ openapi/
 COPY src/ src/
 
 FROM build AS test
-RUN ./gradlew check bootJar
+RUN ./gradlew check bootJar sonarLibraries
 
 FROM scratch AS test-reports
 COPY --from=test /workspace/build/test-results/test/ /junit/
 COPY --from=test /workspace/build/reports/jacoco/test/jacocoTestReport.xml /jacoco.xml
 COPY --from=test /workspace/build/classes/java/main/ /classes/
+COPY --from=test /workspace/build/sonar-libraries/ /libraries/
 COPY --from=test /workspace/build/openapi/ /openapi/
 
 FROM eclipse-temurin:27.0.1.0-jre-alpine@sha256:a0f3b523fd89e242ce302715ce367f68e9073c59274e65746d0791c750f38de3 AS production

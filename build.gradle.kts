@@ -85,3 +85,11 @@ tasks.jacocoTestReport {
         html.required = false
     }
 }
+
+// The dependency jars, for SonarQube to resolve the types the code uses (GMshield-pipeline passes
+// sonar.java.libraries when the test-reports stage exports libraries/). The Dockerfile's test stage runs it.
+val sonarLibraries by tasks.registering(Sync::class) {
+    from(configurations.testRuntimeClasspath.map { classpath -> classpath.filter { it.name.endsWith(".jar") } })
+    into(layout.buildDirectory.dir("sonar-libraries"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
