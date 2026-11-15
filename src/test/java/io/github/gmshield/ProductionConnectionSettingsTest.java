@@ -45,6 +45,26 @@ class ProductionConnectionSettingsTest {
     }
 
     @Test
+    void vaultKeysAndFileStoreComeFromTheSettingsAndOnlyProductionMigrationsRun() throws IOException {
+        PropertySource<?> yaml = load("application.yaml");
+
+        assertThat(yaml.getProperty("gmshield.vault.master-key")).hasToString("${GMSHIELD_VAULT_MASTER_KEY}");
+        assertThat(yaml.getProperty("gmshield.vault.index-key")).hasToString("${GMSHIELD_VAULT_INDEX_KEY}");
+        assertThat(yaml.getProperty("gmshield.files.dir")).hasToString("${GMSHIELD_FILES_DIR:/var/lib/gmshield/files}");
+        assertThat(yaml.getProperty("spring.flyway.locations")).hasToString("classpath:db/migration");
+    }
+
+    @Test
+    void testModeAddsTheProbeMigrationsAndUsesTheMountedFileStore() throws IOException {
+        PropertySource<?> yaml = load("application-test-mode.yaml");
+
+        assertThat(yaml.getProperty("spring.flyway.locations"))
+                .hasToString("classpath:db/migration,classpath:db/test-mode-migration");
+        assertThat(yaml.getProperty("gmshield.files.dir")).hasToString("/var/lib/gmshield/files");
+        assertThat(yaml.getProperty("gmshield.vault.master-key")).isNull();   // random at each start instead
+    }
+
+    @Test
     void withoutTheAuthorityCertificateTheBackendDoesNotStart() {
         // Unit tests run where /run/gmshield/certs does not exist: the bundle must refuse, never fall back.
         assertThatThrownBy(() -> new SpringApplicationBuilder(GmshieldApplication.class)

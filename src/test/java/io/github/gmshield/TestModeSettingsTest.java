@@ -12,7 +12,7 @@ import org.springframework.test.context.ActiveProfiles;
  * Test mode's built-in connection settings, as documented in README.md ("Settings"). They resolve
  * with no GMSHIELD_* variable set, because test mode reads none.
  */
-@SpringBootTest
+@SpringBootTest(properties = "GMSHIELD_MODE=test")   // as the pipeline starts it (the vault checks it)
 @ActiveProfiles({"test-mode", "unit"})
 class TestModeSettingsTest {
 

@@ -60,8 +60,12 @@ services:
       GMSHIELD_REDIS_USERNAME: default
       GMSHIELD_REDIS_PASSWORD: gmshield-dev
       GMSHIELD_REDIS_TLS: "false"   # the development Redis has no TLS; production always verifies it
+      # Throwaway vault keys (32 bytes of 3 and of 4): data stored in development is not protected.
+      GMSHIELD_VAULT_MASTER_KEY: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
+      GMSHIELD_VAULT_INDEX_KEY: BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=
     read_only: true
     tmpfs: ["/tmp"]
+    volumes: ["backend_files:/var/lib/gmshield/files"]   # the encrypted file store
     ports: ["127.0.0.1:${GMSHIELD_DEV_BACKEND_PORT:-8080}:8080"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/actuator/health"]
@@ -116,3 +120,4 @@ volumes:
   postgres_data: {}
   redis_data: {}
   qdrant_data: {}
+  backend_files: {}
