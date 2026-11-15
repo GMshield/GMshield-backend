@@ -4,9 +4,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.belongToAnyOf;
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAnyPackage;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+
 import com.tngtech.archunit.core.domain.JavaClass;
+import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
+import com.tngtech.archunit.lang.ArchRule;
+import java.security.MessageDigest;
+import java.security.Signature;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -82,6 +90,48 @@ class ModuleBoundaryTest {
                     .as("%s must be in <module>.web, <module>.service or <module>.data", type.getName())
                     .matches(java.util.regex.Pattern.quote(base) + "\\.[a-z][a-z0-9]*\\.(web|service|data)(\\..+)?");
         }
+    }
+
+    /**
+     * AD-19: only {@code vault} encrypts, signs, hashes, computes a MAC or makes keys. Any other class
+     * that uses {@code javax.crypto}, {@code java.security.spec}, {@code MessageDigest}, {@code Signature},
+     * {@code KeyPairGenerator}, {@code KeyFactory}, {@code KeyStore}, Bouncy Castle, Tink or Spring
+     * Security's crypto fails the build.
+     */
+    static ArchRule cryptoOnlyInVault(String vaultPackage) {
+        return noClasses().that().resideOutsideOfPackage(vaultPackage + "..")
+                .should().dependOnClassesThat(resideInAnyPackage("javax.crypto..", "java.security.spec..",
+                                "org.bouncycastle..", "com.google.crypto.tink..", "org.springframework.security.crypto..")
+                        .or(belongToAnyOf(MessageDigest.class, Signature.class, javax.crypto.Mac.class,
+                                java.security.KeyPairGenerator.class, java.security.KeyFactory.class,
+                                java.security.KeyStore.class)))
+                .because("every cipher, MAC, digest and signature belongs to the vault module (AD-19)");
+    }
+
+    @Test
+    void onlyTheVaultUsesACipherADigestAMacOrASignature() {
+        JavaClasses application = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages(GmshieldApplication.class.getPackageName());
+
+        assertThat(application.contain(io.github.gmshield.vault.service.Vault.class)).isTrue();
+        cryptoOnlyInVault(GmshieldApplication.class.getPackageName() + ".vault").check(application);
+    }
+
+    @Test
+    void aCipherOutsideTheVaultFails() {
+        JavaClasses fixtures = new ClassFileImporter().importPackages(FIXTURES + "cipher");
+
+        assertThatThrownBy(() -> cryptoOnlyInVault(FIXTURES + "cipher.vault").check(fixtures))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("HomemadeHash").hasMessageContaining("HomemadeMac")
+                .hasMessageContaining("HomemadeSignature").hasMessageContaining("HomemadeCipher")
+                .hasMessageContaining("HomemadeKeyPair")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("AllowedCipher").doesNotContain("PlainNotes"));
+        JavaClasses allowed = new ClassFileImporter().importClasses(
+                io.github.gmshieldfixtures.cipher.vault.service.AllowedCipher.class,
+                io.github.gmshieldfixtures.cipher.notes.service.PlainNotes.class);
+        assertThatCode(() -> cryptoOnlyInVault(FIXTURES + "cipher.vault").check(allowed)).doesNotThrowAnyException();
     }
 
     @Test

@@ -20,7 +20,9 @@ class GmshieldApplicationTest {
     private static final Map<String, String> PRODUCTION = Map.of(
             "GMSHIELD_DB_URL", "jdbc:postgresql://db.example:5432/gmshield", "GMSHIELD_DB_USER", "gmshield",
             "GMSHIELD_DB_PASSWORD", "value-never-printed", "GMSHIELD_REDIS_HOST", "redis.example",
-            "GMSHIELD_REDIS_USERNAME", "backend", "GMSHIELD_REDIS_PASSWORD", "value-never-printed");
+            "GMSHIELD_REDIS_USERNAME", "backend", "GMSHIELD_REDIS_PASSWORD", "value-never-printed",
+            "GMSHIELD_VAULT_MASTER_KEY", "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+            "GMSHIELD_VAULT_INDEX_KEY", "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=");
 
     private final ByteArrayOutputStream printed = new ByteArrayOutputStream();
     private final PrintStream out = new PrintStream(printed, true, StandardCharsets.UTF_8);

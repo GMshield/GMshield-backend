@@ -23,8 +23,19 @@ read_only = true
 user = "10001:10001"
 cap_drop = ["ALL"]
 tmpfs = ["/tmp"]
+# Story 1.7: the encrypted file store (GMSHIELD_FILES_DIR). Production: the named volume
+# gmshield-backend-files on the encrypted volume; staging: a throwaway volume of the run.
+mounts = [{ name = "files", target = "/var/lib/gmshield/files" }]
 
 [staging]
 # The develop pipeline's throwaway copy (active DAST) runs with GMSHIELD_MODE=test, which reads the
 # fixed connections in application-test-mode.yaml: a throwaway Postgres and Redis on the run's network.
 services = ["postgres", "redis"]
+
+[nfr1]
+# Story 1.7 (NFR-1): inside the staging session, the develop pipeline stores a random text through
+# this test-mode-only route, reads it back, then searches pg_dump, the file-store volume, a Redis RDB
+# and every log for it: plain UTF-8; Base64 and Base64url at every alignment, also with "/" escaped as
+# "\/"; hex in lower and upper case. Found anywhere, or not read back: the release is blocked.
+seed_path = "/internal/v1/test-mode/nfr1-probe"
+readback_path = "/internal/v1/test-mode/nfr1-probe/{id}"

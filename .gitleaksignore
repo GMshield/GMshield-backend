@@ -1,0 +1,5 @@
+# Gitleaks false positives (fingerprints: commit:file:rule:line). Each is a fixed test placeholder, not a secret.
+# Story 1.7: a 15-byte Base64 string that must be refused as a vault key ("short-key-value").
+f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/shared/service/StartupSettingsTest.java:generic-api-key:135
+# Story 1.7: a fixed token whose keyed hash the test compares.
+f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/vault/service/VaultTest.java:generic-api-key:149

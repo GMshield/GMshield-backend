@@ -2,6 +2,9 @@
 # Every value is fixed here: test mode reads no GMSHIELD_* connection setting, so it cannot be
 # pointed at a real host. Nothing here is a secret, and nothing reaches the internet.
 spring:
+  flyway:
+    # The test-mode location adds vault_probe, the NFR-1 release gate's table; production never has it.
+    locations: classpath:db/migration,classpath:db/test-mode-migration
   datasource:
     url: jdbc:postgresql://postgres:5432/gmshield
     username: gmshield
@@ -14,3 +17,9 @@ spring:
       password: ""
       ssl:
         enabled: false   # plain connections to the throwaway services
+
+# The vault's keys are random for each start and held in memory only (vault.service.VaultConfiguration).
+# The file store is the run's throwaway volume, mounted by the pipeline at the production path.
+gmshield:
+  files:
+    dir: /var/lib/gmshield/files
