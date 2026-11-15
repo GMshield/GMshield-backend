@@ -27,11 +27,13 @@ public class Nfr1Probe {
     private final Vault vault;
     private final FileStore files;
     private final ProbeStore store;
+    private final DataKeys dataKeys;
 
-    Nfr1Probe(Vault vault, FileStore files, ProbeStore store) {
+    Nfr1Probe(Vault vault, FileStore files, ProbeStore store, DataKeys dataKeys) {
         this.vault = vault;
         this.files = files;
         this.store = store;
+        this.dataKeys = dataKeys;
     }
 
     public record ReadBack(String text, String fileText) {
@@ -43,22 +45,27 @@ public class Nfr1Probe {
             throw new ApiException(ApiProblem.forStatus(400));
         }
         byte[] plain = text.getBytes(StandardCharsets.UTF_8);
-        UUID owner = Ids.newId();
-        UUID id = Ids.newId();
-        UUID fileId = Ids.newId();
-        store.insert(new ProbeRow(id, owner, vault.encrypt(binding(id, owner), plain),
-                vault.fingerprint(ENTITY, FIELD, plain), fileId));
-        files.writePiece(owner, fileId, 0, plain);
-        ReadBack back = readBack(id);
-        if (!text.equals(back.text()) || !text.equals(back.fileText())) {
-            throw new IllegalStateException("the probe did not read back what it stored");
+        try {
+            UUID owner = Ids.newId();
+            UUID id = Ids.newId();
+            UUID fileId = Ids.newId();
+            store.insert(new ProbeRow(id, owner, vault.encrypt(binding(id, owner), plain),
+                    vault.fingerprint(ENTITY, FIELD, plain), fileId));
+            files.writePiece(owner, fileId, 0, plain);
+            ReadBack back = readBack(id);
+            if (!text.equals(back.text()) || !text.equals(back.fileText())) {
+                throw new IllegalStateException("the probe did not read back what it stored");
+            }
+            return id;
+        } finally {
+            Arrays.fill(plain, (byte) 0);
         }
-        Arrays.fill(plain, (byte) 0);
-        return id;
     }
 
+    /** Reads with a cold key cache for the probe's owner, so the wrapped data key comes from the store. */
     public ReadBack readBack(UUID id) {
         ProbeRow row = store.find(id).orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+        dataKeys.forget(row.ownerId());
         String text = vault.decryptText(binding(row.id(), row.ownerId()), row.text());
         String fileText = new String(files.readPiece(row.ownerId(), row.fileId(), 0), StandardCharsets.UTF_8);
         return new ReadBack(text, fileText);

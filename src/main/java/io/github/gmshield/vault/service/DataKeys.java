@@ -74,6 +74,14 @@ class DataKeys {
         return unwrapAndCache(stored);
     }
 
+    /** Drops the owner's keys from memory, so the next use reads them from the store again. */
+    void forget(UUID ownerId) {
+        current.remove(ownerId);
+        synchronized (unwrapped) {
+            unwrapped.keySet().removeIf(key -> key.ownerId().equals(ownerId));
+        }
+    }
+
     private SecretKey unwrapAndCache(WrappedDataKey stored) {
         byte[] wrapped = stored.wrapped();
         byte[] raw = wrapped.length > 0 && wrapped[0] == WRAP_FORMAT

@@ -30,7 +30,7 @@ final class VaultKeys {
     }
 
     byte[] index() {
-        return index;
+        return index.clone();
     }
 
     @Override

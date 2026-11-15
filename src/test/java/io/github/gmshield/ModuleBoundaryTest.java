@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.belongToAnyOf;
-import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAnyPackage;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
 import com.tngtech.archunit.core.domain.JavaClass;
@@ -93,13 +93,18 @@ class ModuleBoundaryTest {
     }
 
     /**
-     * AD-19: only {@code vault} encrypts, signs, hashes or computes a MAC. Any other class that uses
-     * {@code javax.crypto} or {@code java.security.MessageDigest} or {@code Signature} fails the build.
+     * AD-19: only {@code vault} encrypts, signs, hashes, computes a MAC or makes keys. Any other class
+     * that uses {@code javax.crypto}, {@code java.security.spec}, {@code MessageDigest}, {@code Signature},
+     * {@code KeyPairGenerator}, {@code KeyFactory}, {@code KeyStore}, Bouncy Castle, Tink or Spring
+     * Security's crypto fails the build.
      */
     static ArchRule cryptoOnlyInVault(String vaultPackage) {
         return noClasses().that().resideOutsideOfPackage(vaultPackage + "..")
-                .should().dependOnClassesThat(resideInAPackage("javax.crypto..")
-                        .or(belongToAnyOf(MessageDigest.class, Signature.class, javax.crypto.Mac.class)))
+                .should().dependOnClassesThat(resideInAnyPackage("javax.crypto..", "java.security.spec..",
+                                "org.bouncycastle..", "com.google.crypto.tink..", "org.springframework.security.crypto..")
+                        .or(belongToAnyOf(MessageDigest.class, Signature.class, javax.crypto.Mac.class,
+                                java.security.KeyPairGenerator.class, java.security.KeyFactory.class,
+                                java.security.KeyStore.class)))
                 .because("every cipher, MAC, digest and signature belongs to the vault module (AD-19)");
     }
 
@@ -121,6 +126,7 @@ class ModuleBoundaryTest {
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("HomemadeHash").hasMessageContaining("HomemadeMac")
                 .hasMessageContaining("HomemadeSignature").hasMessageContaining("HomemadeCipher")
+                .hasMessageContaining("HomemadeKeyPair")
                 .satisfies(e -> assertThat(e.getMessage()).doesNotContain("AllowedCipher").doesNotContain("PlainNotes"));
         JavaClasses allowed = new ClassFileImporter().importClasses(
                 io.github.gmshieldfixtures.cipher.vault.service.AllowedCipher.class,

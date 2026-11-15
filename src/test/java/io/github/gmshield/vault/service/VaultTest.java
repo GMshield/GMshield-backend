@@ -195,8 +195,24 @@ class VaultTest {
     }
 
     @Test
-    void keysNeverShowInText() {
+    void keysNeverShowInTextAndTheIndexKeyIsHandedOutAsACopy() {
         assertThat(keys.toString()).isEqualTo("VaultKeys[hidden]");
+        byte[] copy = keys.index();
+        Arrays.fill(copy, (byte) 0);
+        assertThat(keys.index()).isNotEqualTo(copy);
+    }
+
+    @Test
+    void forgettingAnOwnersKeysReloadsThemFromTheStore() {
+        DataKeys dataKeys = new DataKeys(store, keys);
+        Vault cold = new Vault(dataKeys, keys);
+        byte[] stored = cold.encryptText(binding, SECRET_TEXT);
+        int finds = store.finds.get();
+
+        dataKeys.forget(owner);
+
+        assertThat(cold.decryptText(binding, stored)).isEqualTo(SECRET_TEXT);
+        assertThat(store.finds.get()).isEqualTo(finds + 1);
     }
 
     @Test

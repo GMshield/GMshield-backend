@@ -35,6 +35,7 @@ services = ["postgres", "redis"]
 [nfr1]
 # Story 1.7 (NFR-1): inside the staging session, the develop pipeline stores a random text through
 # this test-mode-only route, reads it back, then searches pg_dump, the file-store volume, a Redis RDB
-# and every log for it (plain and Base64). Found anywhere, or not read back: the release is blocked.
+# and every log for it: plain UTF-8; Base64 and Base64url at every alignment, also with "/" escaped as
+# "\/"; hex in lower and upper case. Found anywhere, or not read back: the release is blocked.
 seed_path = "/internal/v1/test-mode/nfr1-probe"
 readback_path = "/internal/v1/test-mode/nfr1-probe/{id}"

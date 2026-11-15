@@ -22,7 +22,7 @@ class VaultConfiguration {
                                   @Value("${gmshield.vault.index-key}") String index) {
         byte[] masterKey = StartupSettings.vaultKey(master);
         byte[] indexKey = StartupSettings.vaultKey(index);
-        if (masterKey == null || indexKey == null) {
+        if (masterKey == null || indexKey == null || java.util.Arrays.equals(masterKey, indexKey)) {
             // Names only, never a value (StartupSettings refuses this before Spring starts).
             throw new IllegalStateException(StartupSettings.REASON_INVALID + ": " + StartupSettings.VAULT_MASTER_KEY
                     + " or " + StartupSettings.VAULT_INDEX_KEY);

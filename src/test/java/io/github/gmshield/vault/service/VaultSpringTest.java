@@ -105,6 +105,17 @@ class VaultSpringTest extends HttpTestSupport {
     }
 
     @Test
+    void theSameKeyTwiceStopsTheStartWithoutShowingIt() {
+        String same = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";   // 32 bytes of 7
+        assertThatThrownBy(() -> new SpringApplicationBuilder(GmshieldApplication.class)
+                        .profiles("unit")
+                        .run("--server.port=0", "--gmshield.vault.master-key=" + same, "--gmshield.vault.index-key=" + same)
+                        .close())
+                .hasStackTraceContaining("setting.invalid")
+                .satisfies(e -> assertThat(stackTrace(e)).doesNotContain(same));
+    }
+
+    @Test
     void theTestModeProfileWithoutTestModeGetsNoRandomKeys() {
         assertThatThrownBy(() -> new SpringApplicationBuilder(GmshieldApplication.class)
                         .profiles("test-mode", "unit")

@@ -5,7 +5,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -48,11 +47,8 @@ public class FileStore {
                 }
                 channel.force(true);
             }
-            try {
-                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException notAtomic) {
-                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
-            }
+            Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            syncDirectory(target.getParent());
         } catch (IOException e) {
             deleteQuietly(temporary);
             throw new UncheckedIOException("file piece not written", e);
@@ -99,6 +95,15 @@ public class FileStore {
             }
         } catch (FileAlreadyExistsException raced) {
             // Created meanwhile by another write: fine.
+        }
+    }
+
+    /** Makes the rename durable: fsync of the folder, where the platform lets a folder be opened. */
+    private static void syncDirectory(Path directory) throws IOException {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (UnsupportedOperationException | java.nio.file.AccessDeniedException notOnThisPlatform) {
+            // Windows cannot open a folder as a channel; Linux, where the backend runs, can.
         }
     }
 

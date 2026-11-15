@@ -40,7 +40,7 @@ COPY --from=test /workspace/build/libs/gmshield-backend.jar /app/gmshield-backen
 # Not root, and nothing written outside /tmp and the encrypted file store: the root filesystem can be
 # read-only. /tmp is a volume so that `--read-only` works without any other option; a tmpfs on /tmp
 # replaces it. /var/lib/gmshield/files (owner 10001, mode 700) is where the pipeline mounts the named
-# volume gmshield-files; Docker fills a new volume from this folder, owner included.
+# volume gmshield-backend-files; Docker fills a new volume from this folder, owner included.
 USER 10001:10001
 VOLUME ["/tmp"]
 EXPOSE 8080

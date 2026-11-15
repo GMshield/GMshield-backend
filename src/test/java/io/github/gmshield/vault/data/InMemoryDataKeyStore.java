@@ -12,6 +12,7 @@ public class InMemoryDataKeyStore implements DataKeyStore {
 
     public final Map<String, WrappedDataKey> rows = new ConcurrentHashMap<>();
     public final AtomicInteger reads = new AtomicInteger();
+    public final AtomicInteger finds = new AtomicInteger();
 
     @Override
     public Optional<WrappedDataKey> latest(UUID ownerId) {
@@ -23,6 +24,7 @@ public class InMemoryDataKeyStore implements DataKeyStore {
     @Override
     public Optional<WrappedDataKey> find(UUID ownerId, int version) {
         reads.incrementAndGet();
+        finds.incrementAndGet();
         return Optional.ofNullable(rows.get(ownerId + "/" + version));
     }
 

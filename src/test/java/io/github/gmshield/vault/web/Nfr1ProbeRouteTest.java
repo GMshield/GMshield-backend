@@ -67,6 +67,9 @@ class Nfr1ProbeRouteTest {
     @Autowired
     private ProbeStore probes;
 
+    @Autowired
+    private DataKeyStore dataKeys;
+
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
     private final Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
@@ -90,8 +93,12 @@ class Nfr1ProbeRouteTest {
         assertThat(seeded.statusCode()).isEqualTo(201);
         assertThat(seeded.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
         UUID id = UUID.fromString(JSON.readTree(seeded.body()).path("id").asString());
+        int findsAfterSeed = ((InMemoryDataKeyStore) dataKeys).finds.get();
+        assertThat(findsAfterSeed).isPositive();   // the seed's own read-back reloaded the wrapped key
 
         HttpResponse<String> read = get(Nfr1ProbeController.PATH + "/" + id);
+        // A cold cache for the probe's owner: the data key comes from the store (vault_data_key) again.
+        assertThat(((InMemoryDataKeyStore) dataKeys).finds.get()).isGreaterThan(findsAfterSeed);
         assertThat(read.statusCode()).isEqualTo(200);
         JsonNode body = JSON.readTree(read.body());
         assertThat(body.path("text").asString()).isEqualTo(TEXT);
