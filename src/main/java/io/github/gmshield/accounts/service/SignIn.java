@@ -58,11 +58,11 @@ public class SignIn {
         }
     }
 
-    /** A signed-in visitor's session token, or none when the username step comes next. */
-    public record Outcome(Optional<String> sessionToken) {
+    /** A signed-in visitor's session grant, or none when the username step comes next. */
+    public record Outcome(Optional<Sessions.Grant> session) {
         @Override
         public String toString() {
-            return "Outcome[signedIn=" + sessionToken.isPresent() + "]";
+            return "Outcome[signedIn=" + session.isPresent() + "]";
         }
     }
 
@@ -120,7 +120,7 @@ public class SignIn {
      * The attempt stays when the username is taken or invalid, or the terms are not accepted, so the
      * visitor can try again within the attempt's 10 minutes.
      */
-    public String complete(String attemptToken, String username, boolean termsAccepted) {
+    public Sessions.Grant complete(String attemptToken, String username, boolean termsAccepted) {
         if (!Tokens.wellFormed(attemptToken)) {
             throw expired("no_attempt");
         }

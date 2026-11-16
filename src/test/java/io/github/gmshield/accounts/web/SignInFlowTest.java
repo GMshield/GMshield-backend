@@ -12,6 +12,8 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.audit.data.AuditStore;
+import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.shared.service.JsonLineLogFormatter;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
@@ -61,6 +63,8 @@ import tools.jackson.databind.json.JsonMapper;
 class SignInFlowTest {
 
     private static final JsonMapper JSON = JsonMapper.builder().build();
+    /** Test mode's fixed service credential (application-test-mode.yaml), the same as the frontend's test mode. */
+    static final String CREDENTIAL = "gmshield-test-mode-frontend-credential-not-a-secret";
 
     /** A clock the tests move forward. */
     static final class MovableClock extends Clock {
@@ -108,8 +112,14 @@ class SignInFlowTest {
 
         @Bean
         @Primary
-        SessionStore inMemorySessions() {
-            return new InMemorySessionStore();
+        SessionStore inMemorySessions(MovableClock clock) {
+            return new InMemorySessionStore(clock);
+        }
+
+        @Bean
+        @Primary
+        AuditStore inMemoryAudit() {
+            return new InMemoryAuditStore();
         }
 
         @Bean
@@ -145,8 +155,7 @@ class SignInFlowTest {
     void captureLog() {
         // Accounts stay between tests (each uses its own identities); attempts and sessions start empty.
         attempts.values.clear();
-        sessions.values.clear();
-        sessions.accountSets.clear();
+        sessions.clear();
         logged.start();
         root.addAppender(logged);
     }
@@ -208,6 +217,7 @@ class SignInFlowTest {
         JsonNode grant = complete(attempt.token(), username, true, 200);
         String session = grant.path("sessionToken").asString();
         assertThat(grant.path("expiresInSeconds").asLong()).isEqualTo(604800);
+        assertThat(grant.path("renewAfterSeconds").asLong()).isEqualTo(900);
         assertThat(attempts.values).isEmpty();
         assertThat(me(session).path("username").asString()).isEqualTo(username);
         secrets.addAll(List.of(sub, "nova@example.test", username, session));
@@ -222,13 +232,21 @@ class SignInFlowTest {
             assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContain(sub)
                     .doesNotContain("nova@example.test").doesNotContain(username);
         }
-        // The session in Redis: the token's hash as the key, the account id and the seal version as the value.
+        // The session in Redis: its record under its id, holding the account id, the seal version and the
+        // token's hash; a pointer from the hash to the id; the id in the account's set. Never the token.
         String sessionKey = sessions.values.keySet().stream().filter(k -> sessions.values.get(k).contains(row.id().toString()))
                 .findFirst().orElseThrow();
-        assertThat(sessionKey).matches("gmshield:session:[0-9a-f]{64}");
-        assertThat(sessions.values.get(sessionKey)).doesNotContain(session).contains("\"sealVersion\":1");
-        assertThat(sessions.timesToLive.get(sessionKey)).isEqualTo(Duration.ofDays(7));
-        assertThat(sessions.accountSets.get("gmshield:session:account:" + row.id())).contains(sessionKey.substring(17));
+        String sessionId = sessionKey.substring("gmshield:session:".length());
+        assertThat(sessionKey).matches("gmshield:session:[0-9a-f-]{36}");
+        String tokenHash = HexFormat.of().formatHex(vault.tokenHash("session", session));
+        assertThat(sessions.values.get(sessionKey)).doesNotContain(session).contains("\"sealVersion\":1")
+                .contains("\"currentHash\":\"" + tokenHash + "\"");
+        assertThat(sessions.values.get("gmshield:session:token:" + tokenHash)).isEqualTo(sessionId);
+        // The shorter of the idle (24 h) and the absolute (7 days) timeouts; the account's set lasts 7 days.
+        assertThat(sessions.timesToLive.get(sessionKey)).isEqualTo(Duration.ofHours(24));
+        assertThat(sessions.timesToLive.get("gmshield:session:token:" + tokenHash)).isEqualTo(Duration.ofHours(24));
+        assertThat(sessions.accountSets.get("gmshield:session:account:" + row.id())).contains(sessionId);
+        assertThat(sessions.timesToLive.get("gmshield:session:account:" + row.id())).isEqualTo(Duration.ofDays(7));
 
         // Returning: the same Google id reaches the same account at once.
         JsonNode again = callback(start(), code(sub, "nova@example.test"), 200);
@@ -546,7 +564,8 @@ class SignInFlowTest {
     }
 
     private HttpResponse<String> post(String path, Map<String, Object> body) throws Exception {
-        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path));
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                .header("Authorization", "Bearer " + CREDENTIAL);
         if (body == null) {
             request.POST(HttpRequest.BodyPublishers.noBody());
         } else {
@@ -561,6 +580,7 @@ class SignInFlowTest {
 
     private HttpResponse<String> send(String method, String path, String session) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                .header("Authorization", "Bearer " + CREDENTIAL)
                 .method(method, HttpRequest.BodyPublishers.noBody());
         if (session != null && !session.isEmpty()) {
             request.header("X-Session-Token", session);

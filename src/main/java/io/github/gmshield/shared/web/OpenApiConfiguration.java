@@ -11,6 +11,8 @@ import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.media.StringSchema;
 import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.oas.models.servers.Server;
 import java.util.List;
 import org.springdoc.core.customizers.OpenApiCustomizer;
@@ -36,18 +38,28 @@ public class OpenApiConfiguration {
 
     @Bean
     GroupedOpenApi publicApi() {
-        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API);
+        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API, true);
     }
 
     @Bean
     GroupedOpenApi internalApi() {
-        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API);
+        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API, false);
     }
 
-    private static GroupedOpenApi group(String name, String paths, String title, String version) {
+    /** The frontend's service credential (Story 1.10), required on every public operation. */
+    static final String SERVICE_CREDENTIAL = "serviceCredential";
+
+    private static GroupedOpenApi group(String name, String paths, String title, String version, boolean credential) {
         OpenApiCustomizer contract = api -> {
             api.info(new Info().title(title).version(version));
             api.schema(PROBLEM_SCHEMA, problemSchema());
+            if (credential) {
+                api.getComponents().addSecuritySchemes(SERVICE_CREDENTIAL, new SecurityScheme()
+                        .type(SecurityScheme.Type.HTTP).scheme("bearer")
+                        .description("The frontend's service credential (GMSHIELD_FRONTEND_CREDENTIAL); without it every"
+                                + " path answers service.unauthenticated (401)"));
+                api.security(List.of(new SecurityRequirement().addList(SERVICE_CREDENTIAL)));
+            }
             if (api.getPaths() != null) {
                 api.getPaths().values().forEach(path -> path.readOperations().forEach(operation ->
                         operation.getResponses().addApiResponse("default", problemResponse())));

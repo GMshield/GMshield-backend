@@ -44,7 +44,8 @@ public class FallbackErrorController implements ErrorController {
         String traceId = TraceIdFilter.traceIdOf(request);
         // Without an error status the path was requested directly: it does not exist for a client.
         int status = request.getAttribute(RequestDispatcher.ERROR_STATUS_CODE) instanceof Integer code ? code : 404;
-        ApiProblem problem = ApiProblem.forStatus(status);
+        ApiProblem problem = request.getAttribute(ProblemResponses.PROBLEM_ATTRIBUTE) instanceof ApiProblem named
+                && named.status() == status ? named : ApiProblem.forStatus(status);
         if (problem.status() >= 500) {
             // The log formatter writes the type and the place of the cause, never its message.
             Throwable thrown = request.getAttribute(RequestDispatcher.ERROR_EXCEPTION) instanceof Throwable cause

@@ -29,7 +29,7 @@ data (database, Redis file, Qdrant storage).
 
 | Service | Address on the workstation | Throwaway credential |
 |---|---|---|
-| Backend | http://127.0.0.1:8080 (`/actuator/health`, `/api/v1/version`) | none yet |
+| Backend | http://127.0.0.1:8080 (`/actuator/health`; `/api/v1/*` only with `Authorization: Bearer gmshield-dev-frontend-credential-throwaway`) | the frontend's service credential, same value |
 | PostgreSQL | 127.0.0.1:5432, database `gmshield` | user `gmshield`, password `gmshield-dev` |
 | Redis | 127.0.0.1:6379 | password `gmshield-dev` |
 | Qdrant | http://127.0.0.1:6333 | API key `gmshield-dev` |
@@ -55,6 +55,13 @@ or placeholders: the backend then starts, and Google refuses a sign-in. To sign 
 Google OAuth client whose redirect URI is `http://localhost:3000/auth/google/callback` (or the port
 in `GMSHIELD_DEV_FRONTEND_PORT`) and pass both for one start, never writing them into a file of this
 repository. `GMSHIELD_PUBLIC_URL` is set to that frontend address.
+
+The backend answers `/api/v1/*` only with the frontend's service credential (Story 1.10):
+`compose.yaml` gives the backend and the frontend the same throwaway value. To call the backend by
+hand, `curl -H 'Authorization: Bearer gmshield-dev-frontend-credential-throwaway' http://127.0.0.1:8080/api/v1/version`.
+The session timings default to 15 minutes before renewal, 60 seconds of overlap, 24 hours idle and
+7 days in total; to watch a rotation, shorten them for one start, for example
+`GMSHIELD_SESSION_RENEW_AFTER=20s GMSHIELD_SESSION_OVERLAP=5s GMSHIELD_SESSION_IDLE_TIMEOUT=2m dev/start`.
 
 The worker does not use Redis yet: Story 1.12 adds its Redis account and service credential.
 

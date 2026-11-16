@@ -8,6 +8,7 @@ final class RedisKeys {
 
     static final String SIGN_IN = "gmshield:sign-in:";
     static final String SESSION = "gmshield:session:";
+    static final String SESSION_TOKEN = "gmshield:session:token:";
     static final String ACCOUNT_SESSIONS = "gmshield:session:account:";
 
     private RedisKeys() {
@@ -17,8 +18,16 @@ final class RedisKeys {
         return SIGN_IN + hex(tokenHash);
     }
 
-    static String session(byte[] tokenHash) {
-        return SESSION + hex(tokenHash);
+    static String session(UUID sessionId) {
+        return SESSION + sessionId;
+    }
+
+    static String sessionToken(byte[] tokenHash) {
+        return SESSION_TOKEN + hex(tokenHash);
+    }
+
+    static String sessionToken(String tokenHashHex) {
+        return SESSION_TOKEN + tokenHashHex;
     }
 
     static String accountSessions(UUID accountId) {

@@ -68,6 +68,14 @@ services:
       GMSHIELD_GOOGLE_CLIENT_ID: ${GMSHIELD_GOOGLE_CLIENT_ID:-not-a-real-client-id}
       GMSHIELD_GOOGLE_CLIENT_SECRET: ${GMSHIELD_GOOGLE_CLIENT_SECRET:-not-a-real-client-secret}
       GMSHIELD_PUBLIC_URL: http://localhost:${GMSHIELD_DEV_FRONTEND_PORT:-3000}
+      # The frontend's service credential (Story 1.10): the same throwaway value is given to the frontend below.
+      GMSHIELD_FRONTEND_CREDENTIAL: gmshield-dev-frontend-credential-throwaway
+      # Session timings (optional; defaults 15m, 60s, 24h, 7d), for example to watch a rotation:
+      # GMSHIELD_SESSION_RENEW_AFTER=20s GMSHIELD_SESSION_OVERLAP=5s GMSHIELD_SESSION_IDLE_TIMEOUT=2m ./start
+      GMSHIELD_SESSION_RENEW_AFTER: ${GMSHIELD_SESSION_RENEW_AFTER:-15m}
+      GMSHIELD_SESSION_OVERLAP: ${GMSHIELD_SESSION_OVERLAP:-60s}
+      GMSHIELD_SESSION_IDLE_TIMEOUT: ${GMSHIELD_SESSION_IDLE_TIMEOUT:-24h}
+      GMSHIELD_SESSION_ABSOLUTE_TIMEOUT: ${GMSHIELD_SESSION_ABSOLUTE_TIMEOUT:-7d}
     read_only: true
     tmpfs: ["/tmp"]
     volumes: ["backend_files:/var/lib/gmshield/files"]   # the encrypted file store
@@ -89,6 +97,7 @@ services:
       backend: {condition: service_healthy}
     environment:
       GMSHIELD_BACKEND_URL: http://backend:8080
+      GMSHIELD_FRONTEND_CREDENTIAL: gmshield-dev-frontend-credential-throwaway   # the backend's, above
     read_only: true
     tmpfs: ["/tmp"]
     ports: ["127.0.0.1:${GMSHIELD_DEV_FRONTEND_PORT:-3000}:3000"]
