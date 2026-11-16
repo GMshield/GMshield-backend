@@ -33,4 +33,18 @@ class TraceContextTest {
     void newTraceIdIs32LowercaseHexDigits() {
         assertThat(TraceContext.newTraceId()).matches("[0-9a-f]{32}").isNotEqualTo(TraceContext.newTraceId());
     }
+
+    @Test
+    void anOutgoingTraceparentCarriesTheTraceIdWithANewSpan() {
+        String traceId = TraceContext.newTraceId();
+        String first = TraceContext.traceparent(traceId);
+        String second = TraceContext.traceparent(traceId);
+
+        org.assertj.core.api.Assertions.assertThat(first).matches("00-" + traceId + "-[0-9a-f]{16}-01").isNotEqualTo(second);
+        org.assertj.core.api.Assertions.assertThat(TraceContext.fromTraceparent(first)).contains(traceId);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> TraceContext.traceparent(TraceContext.NONE))
+                .isInstanceOf(IllegalArgumentException.class);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> TraceContext.traceparent("not-a-trace"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

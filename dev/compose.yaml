@@ -70,6 +70,8 @@ services:
       GMSHIELD_PUBLIC_URL: http://localhost:${GMSHIELD_DEV_FRONTEND_PORT:-3000}
       # The frontend's service credential (Story 1.10): the same throwaway value is given to the frontend below.
       GMSHIELD_FRONTEND_CREDENTIAL: gmshield-dev-frontend-credential-throwaway
+      # The worker's credential (Story 1.12): the same throwaway value is given to the worker below.
+      GMSHIELD_WORKER_CREDENTIAL: gmshield-dev-worker-credential-throwaway
       # Session timings (optional; defaults 15m, 60s, 24h, 7d), for example to watch a rotation:
       # GMSHIELD_SESSION_RENEW_AFTER=20s GMSHIELD_SESSION_OVERLAP=5s GMSHIELD_SESSION_IDLE_TIMEOUT=2m ./start
       GMSHIELD_SESSION_RENEW_AFTER: ${GMSHIELD_SESSION_RENEW_AFTER:-15m}
@@ -115,8 +117,15 @@ services:
     restart: "no"
     depends_on:
       backend: {condition: service_healthy}
+      redis: {condition: service_healthy}
     environment:
       GMSHIELD_BACKEND_URL: http://backend:8080
+      # Story 1.12: the worker's credential (the backend's, above) and its Redis connection (the work streams).
+      GMSHIELD_WORKER_CREDENTIAL: gmshield-dev-worker-credential-throwaway
+      GMSHIELD_REDIS_HOST: redis
+      GMSHIELD_REDIS_USERNAME: default
+      GMSHIELD_REDIS_PASSWORD: gmshield-dev
+      GMSHIELD_REDIS_TLS: "false"   # the development Redis has no TLS; production always verifies it
       # Taken from your shell when set; otherwise a placeholder that cannot call the model.
       # Nothing calls the model yet, but the worker refuses to start without a key.
       GMSHIELD_ANTHROPIC_API_KEY: ${GMSHIELD_ANTHROPIC_API_KEY:-not-a-real-key}

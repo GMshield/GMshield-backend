@@ -58,7 +58,8 @@ class ServiceCredentialTest extends HttpTestSupport {
     @Test
     void theActuatorTheInternalApiAndTheContractsKeepTheirRules() throws Exception {
         assertThat(getWithout("/actuator/health").statusCode()).isEqualTo(200);
-        assertThat(getWithout("/internal/v1/version").statusCode()).isEqualTo(200);
+        assertThat(getWithout("/internal/v1/version", "Authorization", "Bearer " + WORKER_CREDENTIAL).statusCode())
+                .isEqualTo(200);
         assertThat(getWithout("/v3/api-docs/public").statusCode()).isEqualTo(200);
         assertThat(getWithout("/nope").statusCode()).isEqualTo(404);
     }
@@ -69,7 +70,11 @@ class ServiceCredentialTest extends HttpTestSupport {
         assertThat(document.path("components").path("securitySchemes").path("serviceCredential").path("scheme").asString())
                 .isEqualTo("bearer");
         assertThat(document.path("security").get(0).has("serviceCredential")).isTrue();
-        assertThat(json(getWithout("/v3/api-docs/internal")).has("security")).isFalse();
+        JsonNode internal = json(getWithout("/v3/api-docs/internal"));
+        assertThat(internal.path("components").path("securitySchemes").path("workerCredential").path("scheme").asString())
+                .isEqualTo("bearer");
+        assertThat(internal.path("security").get(0).has("workerCredential")).isTrue();
+        assertThat(internal.path("components").path("securitySchemes").has("serviceCredential")).isFalse();
     }
 
     @Test
@@ -86,6 +91,26 @@ class ServiceCredentialTest extends HttpTestSupport {
         assertThatThrownBy(() -> new ServiceCredentialFilter("short"))
                 .hasMessage("setting.invalid: GMSHIELD_FRONTEND_CREDENTIAL");
         assertThatThrownBy(() -> new ServiceCredentialFilter(null)).hasMessageNotContaining("null:");
+    }
+
+    @Test
+    void aWorkerCredentialThatCannotBeOneStopsTheStartNamingOnlyTheSetting() {
+        org.springframework.mock.env.MockEnvironment environment = new org.springframework.mock.env.MockEnvironment();
+        assertThatThrownBy(() -> new WorkerCredentialFilter("short", environment))
+                .hasMessage("setting.invalid: GMSHIELD_WORKER_CREDENTIAL");
+    }
+
+    @Test
+    void outsideTestModeTheInternalApiNeedsTheWorkersCredentialOnEveryPath() throws Exception {
+        for (String path : new String[] {"/internal/v1/version", "/internal/v1/jobs/x/claims", "/internal/v1",
+                "/internal/v1/test-mode/nfr1-probe"}) {
+            assertUnauthenticated(getWithout(path), path);
+            assertUnauthenticated(getWithout(path, "Authorization", "Bearer " + CREDENTIAL), path);
+        }
+        assertThat(getWithout("/internal/v1/version", "Authorization", "Bearer " + WORKER_CREDENTIAL).statusCode())
+                .isEqualTo(200);
+        // The worker's credential opens nothing of the public API.
+        assertUnauthenticated(getWithout("/api/v1/version", "Authorization", "Bearer " + WORKER_CREDENTIAL), "public");
     }
 
     private static void assertUnauthenticated(HttpResponse<String> response, String what) {
