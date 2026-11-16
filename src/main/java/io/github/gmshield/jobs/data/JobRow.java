@@ -1,6 +1,8 @@
 package io.github.gmshield.jobs.data;
 
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -43,6 +45,25 @@ public record JobRow(
     public JobRow released(String newState, String code, Instant now) {
         return new JobRow(id, ownerId, kind, lane, newState, attempt, traceId, offeredAt, claimId, null, null, null,
                 code, createdAt, now);
+    }
+
+    /** Compares the grant hash by its bytes, not by array identity (SonarQube S6218). */
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof JobRow that
+                && attempt == that.attempt && Objects.equals(id, that.id) && Objects.equals(ownerId, that.ownerId)
+                && Objects.equals(kind, that.kind) && Objects.equals(lane, that.lane) && Objects.equals(state, that.state)
+                && Objects.equals(traceId, that.traceId) && Objects.equals(offeredAt, that.offeredAt)
+                && Objects.equals(claimId, that.claimId) && Arrays.equals(grantHash, that.grantHash)
+                && Objects.equals(claimRenewAt, that.claimRenewAt) && Objects.equals(claimLapsesAt, that.claimLapsesAt)
+                && Objects.equals(outcomeCode, that.outcomeCode) && Objects.equals(createdAt, that.createdAt)
+                && Objects.equals(updatedAt, that.updatedAt);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id, ownerId, kind, lane, state, attempt, traceId, offeredAt, claimId, Arrays.hashCode(grantHash),
+                claimRenewAt, claimLapsesAt, outcomeCode, createdAt, updatedAt);
     }
 
     @Override
