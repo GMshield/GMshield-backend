@@ -13,7 +13,7 @@ import java.util.UUID;
  * {@link #callAs}: the request edge of the library routes ({@code accounts.web}), from the session, and
  * work that runs as one owner, such as a first sign-in creating the new account's starter library. It never
  * comes from a request parameter or body. Binding it again inside a bound piece of work is refused: one piece
- * of work has one owner.
+ * of work has one owner: that refusal is a plain {@link IllegalStateException}, never a {@link NoOwnerException}.
  */
 public final class OwnerContext {
 
@@ -43,7 +43,7 @@ public final class OwnerContext {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(work, "work");
         if (OWNER.isBound()) {
-            throw new NoOwnerException("owner.already_bound");
+            throw new IllegalStateException("owner.already_bound");
         }
         return ScopedValue.where(OWNER, owner).call(work::run);
     }

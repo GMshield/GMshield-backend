@@ -45,6 +45,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -285,11 +286,18 @@ class LibraryFlowTest {
         assertThatThrownBy(() -> libraryService.currentCampaign()).isInstanceOf(OwnerContext.NoOwnerException.class);
         assertThatThrownBy(() -> libraryService.system(UUID.randomUUID())).isInstanceOf(OwnerContext.NoOwnerException.class);
         assertThatThrownBy(() -> libraryService.campaign(UUID.randomUUID())).isInstanceOf(OwnerContext.NoOwnerException.class);
-        // A starter outside a transaction, or without an owner, is refused.
+        // A starter outside a transaction is refused by the library itself, before anything is encrypted.
         UUID owner = UUID.randomUUID();
         assertThatThrownBy(() -> OwnerContext.runAs(owner, () -> libraryService.createStarter(Language.EN)))
-                .isInstanceOf(IllegalStateException.class);
+                .isExactlyInstanceOf(IllegalStateException.class).hasMessage("library.transaction_required");
         assertThat(library.systems.values()).noneMatch(row -> row.ownerId().equals(owner));
+        assertThat(dataKeys.rows.values()).noneMatch(key -> key.ownerId().equals(owner));
+        // Inside a transaction but without an owner, it is refused too.
+        int systems = library.systems.size();
+        assertThatThrownBy(() -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> libraryService.createStarter(Language.EN)))
+                .isInstanceOf(OwnerContext.NoOwnerException.class).hasMessage("owner.missing");
+        assertThat(library.systems).hasSize(systems);
 
         // The request edge unbinds the owner once the request is over.
         Gm gm = signUp("en");

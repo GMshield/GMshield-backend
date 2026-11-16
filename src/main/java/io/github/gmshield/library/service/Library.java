@@ -112,7 +112,7 @@ public class Library {
     }
 
     /** The form whose fingerprint is unique per owner: trimmed, NFC, lower case in the root locale. */
-    static String uniqueForm(String name) {
+    public static String uniqueForm(String name) {
         return Normalizer.normalize(name.strip(), Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
     }
 

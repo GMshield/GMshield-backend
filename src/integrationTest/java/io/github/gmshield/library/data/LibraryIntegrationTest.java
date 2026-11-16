@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
@@ -263,23 +264,28 @@ class LibraryIntegrationTest {
                 em.close();
             }
         });
-        // A row of another owner is refused before it is written.
+        // A row of another owner is refused by Hibernate before it is written: its owner is not the current one.
         UUID refusedSystem = Ids.newId();
         assertThatThrownBy(() -> OwnerContext.runAs(b, () -> new TransactionTemplate(transactions).executeWithoutResult(
                 status -> store.insertSystem(new SystemRow(refusedSystem, a.id(), new byte[] {1}, new byte[] {2}, now)))))
-                .isInstanceOf(RuntimeException.class);
+                .satisfies(failure -> assertThat(messages(failure))
+                        .anyMatch(message -> message.contains("assigned tenant id differs from current tenant id")));
         assertThat(count("select count(*) from system where id = ?", refusedSystem)).isZero();
-        // A campaign of B can never name A's system.
+        // A campaign of B can never name A's system: the (owner, system) reference refuses it.
         UUID refusedCampaign = Ids.newId();
         assertThatThrownBy(() -> OwnerContext.runAs(b, () -> new TransactionTemplate(transactions).executeWithoutResult(
                 status -> store.insertCampaign(new CampaignRow(refusedCampaign, b, a.systemId(), new byte[] {1}, now)))))
-                .isInstanceOf(RuntimeException.class);
+                .satisfies(failure -> assertThat(messages(failure))
+                        .anyMatch(message -> message.contains("campaign_system_fkey")));
         assertThat(count("select count(*) from campaign where id = ?", refusedCampaign)).isZero();
-        // A second system with the same name, whatever its case, is refused within one owner.
+        // A second system with the same name, whatever its case and spacing, is refused within one owner.
+        UUID duplicate = Ids.newId();
         assertThatThrownBy(() -> OwnerContext.runAs(a.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(
-                status -> store.insertSystem(new SystemRow(Ids.newId(), a.id(), new byte[] {1},
-                        vault.fingerprint("system", "name", "untitled system"), now)))))
-                .isInstanceOf(RuntimeException.class);
+                status -> store.insertSystem(new SystemRow(duplicate, a.id(), new byte[] {1},
+                        vault.fingerprint("system", "name", Library.uniqueForm("  UNTITLED System ")), now)))))
+                .satisfies(failure -> assertThat(messages(failure))
+                        .anyMatch(message -> message.contains("system_owner_name_fingerprint_key")));
+        assertThat(count("select count(*) from system where id = ?", duplicate)).isZero();
     }
 
     // --- helpers ---
@@ -331,6 +337,11 @@ class LibraryIntegrationTest {
             statement = statement.param(param);
         }
         return statement.query(Long.class).single();
+    }
+
+    /** The messages of a failure and its causes (a test may read them; the application never logs them). */
+    private static List<String> messages(Throwable failure) {
+        return causes(failure).stream().map(cause -> String.valueOf(cause.getMessage())).toList();
     }
 
     private static List<Throwable> causes(Throwable failure) {

@@ -40,9 +40,9 @@ class OwnerContextTest {
     @Test
     void anOwnerIsNeverBoundInsideAnotherOwnersWork() {
         assertThatThrownBy(() -> OwnerContext.runAs(A, () -> OwnerContext.runAs(B, () -> { })))
-                .isInstanceOf(OwnerContext.NoOwnerException.class).hasMessage("owner.already_bound");
+                .isExactlyInstanceOf(IllegalStateException.class).hasMessage("owner.already_bound");
         assertThatThrownBy(() -> OwnerContext.runAs(A, () -> OwnerContext.runAs(A, () -> { })))
-                .isInstanceOf(OwnerContext.NoOwnerException.class);
+                .isExactlyInstanceOf(IllegalStateException.class).hasMessage("owner.already_bound");
         assertThat(OwnerContext.current()).isEmpty();
     }
 

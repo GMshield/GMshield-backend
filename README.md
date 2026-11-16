@@ -167,6 +167,13 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     owner (a first sign-in). Binding it inside bound work is refused. It never comes from a parameter or
     a body. `shared.data.OwnerTenantResolver` hands it to Hibernate; without an owner it throws, so no
     session opens and no query runs, and no tenant is ever a root.
+  - **Every JPA transaction needs an owner.** The JPA transaction manager is the application's only
+    `PlatformTransactionManager`, and each transaction it begins (`TransactionTemplate`,
+    `@Transactional`) opens a Hibernate session first, so without a bound owner it fails with
+    `OwnerContext.NoOwnerException` before it starts, whether or not it touches a library table. Work
+    with no owner (for example the backend's own job writes, Story 1.12) must bind an owner with
+    `OwnerContext.callAs` or run its JDBC writes under a separate JDBC transaction manager on its own
+    connection, as `vault.data.JdbcDataKeyStore` does.
   - Names are `bytea`, encrypted with `Binding("system"|"campaign", "name", id, owner)`. A system's
     `name_fingerprint` (NFC lower-case, trimmed) is unique per owner; a campaign names its system by
     `(owner_id, system_id)`, so it can never point at another owner's system.
@@ -328,7 +335,3 @@ results, the coverage report and the compiled classes (read by SonarQube through
 [`sonar-project.properties`](sonar-project.properties)), `integration` runs the integration tests
 (`[test]`: the pipeline's integration stage runs it on `develop` beside a throwaway PostgreSQL and
 Redis), and the production image is the last stage.
-
-Until Story 1.4 gives the pipeline a throwaway PostgreSQL and Redis, a run on `develop` fails at
-the staging start: the backend does not report healthy without them. That blocks promotion to
-`main` and nothing else.
