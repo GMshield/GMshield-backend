@@ -3,3 +3,5 @@
 f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/shared/service/StartupSettingsTest.java:generic-api-key:135
 # Story 1.7: a fixed token whose keyed hash the test compares.
 f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/vault/service/VaultTest.java:generic-api-key:149
+# Story 1.10: the development setup's throwaway frontend credential in a curl example (dev/compose.yaml), not a secret.
+4f1c855b7da6a0a9a7ffbe0e92cb730b551ee063:dev/README.md:curl-auth-header:61
