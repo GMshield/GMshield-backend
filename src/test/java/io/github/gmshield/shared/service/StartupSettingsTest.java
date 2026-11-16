@@ -256,6 +256,18 @@ class StartupSettingsTest {
     }
 
     @Test
+    void thePublicTestModeCredentialIsRefusedOutsideTestMode() {
+        Map<String, String> environment = production();
+        environment.put("GMSHIELD_FRONTEND_CREDENTIAL", StartupSettings.TEST_MODE_FRONTEND_CREDENTIAL);
+
+        StartupSettings settings = StartupSettings.check(environment);
+
+        assertThat(settings.refusedSettings()).containsExactly("GMSHIELD_FRONTEND_CREDENTIAL");
+        assertThat(settings.refusalLine()).doesNotContain(StartupSettings.TEST_MODE_FRONTEND_CREDENTIAL);
+        assertRefusalLine(settings, "setting.invalid");
+    }
+
+    @Test
     void theFrontendCredentialIsAProductionSecretThatTestModeRefuses() {
         assertThat(StartupSettings.SECRETS).contains("GMSHIELD_FRONTEND_CREDENTIAL");
         StartupSettings settings = StartupSettings.check(Map.of("GMSHIELD_MODE", "test",

@@ -97,9 +97,7 @@ public class Sessions {
             Session session = live(hash, now);
             Use use = useOf(session, hash, now);
             if (use != Use.CURRENT && use != Use.IN_OVERLAP) {
-                if (refuseOrRetry(session, use, attempt)) {
-                    continue;
-                }
+                refuseUse(session, use);
             }
             Account account = activeAccount(session);
             if (account.sealVersion() > session.sealVersion()) {
@@ -140,9 +138,7 @@ public class Sessions {
                 throw new ApiException(AccountProblems.ALREADY_RENEWED);
             }
             if (use != Use.CURRENT) {
-                if (refuseOrRetry(session, use, attempt)) {
-                    continue;
-                }
+                refuseUse(session, use);
             }
             Account account = activeAccount(session);
             String newToken = Tokens.newToken();
@@ -166,17 +162,10 @@ public class Sessions {
         if (!Tokens.wellFormed(token)) {
             return;
         }
-        byte[] hash = hash(token);
-        for (int attempt = 0; attempt < 3; attempt++) {
-            Optional<Session> session = store.findByToken(hash);
-            if (session.isEmpty()) {
-                return;
-            }
-            if (store.delete(session.get())) {
-                log.atInfo().addKeyValue("accountId", session.get().accountId()).addKeyValue("sessionId", session.get().id())
-                        .addKeyValue("reason", "sign_out").log("session.ended");
-                return;
-            }
+        Optional<Session> session = store.findByToken(hash(token));
+        if (session.isPresent() && store.delete(session.get())) {
+            log.atInfo().addKeyValue("accountId", session.get().accountId()).addKeyValue("sessionId", session.get().id())
+                    .addKeyValue("reason", "sign_out").log("session.ended");
         }
     }
 
@@ -218,27 +207,29 @@ public class Sessions {
     }
 
     /**
-     * Refuses a stale token, or ends the session of a reused one and audits it. True when the session changed
-     * meanwhile and this is the first attempt: the caller decides again on the session as it is now.
+     * Refuses a stale token, or ends the session of a reused one (whatever was written to it meanwhile) and
+     * audits it, once: only the call whose delete removed the session writes the audit entry.
      */
-    private boolean refuseOrRetry(Session session, Use use, int attempt) {
+    private void refuseUse(Session session, Use use) {
         if (use == Use.STALE) {
             refused(session, "stale_token");
             throw new ApiException(AccountProblems.SESSION_REQUIRED);
         }
         if (!store.delete(session)) {
-            retryOnce(session, attempt, "conflict");
-            return true;
+            refused(session, "already_ended");
+            throw new ApiException(AccountProblems.SESSION_REQUIRED);
         }
         log.atWarn().addKeyValue("accountId", session.accountId()).addKeyValue("sessionId", session.id())
                 .addKeyValue("reason", "token_reused").log("session.ended");
+        String reusedToken = use == Use.REUSED_PREVIOUS ? "previous" : "older";
         // The session is gone first; the audit entry second, and its failure never lets the token through.
         try {
             audit.append(AUDIT_TOKEN_REUSED, session.accountId(), Map.of("sessionId", session.id(),
-                    "reusedToken", use == Use.REUSED_PREVIOUS ? "previous" : "older"));
+                    "reusedToken", reusedToken));
         } catch (RuntimeException failed) {
             log.atError().setCause(failed).addKeyValue("accountId", session.accountId())
-                    .addKeyValue("action", AUDIT_TOKEN_REUSED).log("audit.append_failed");
+                    .addKeyValue("action", AUDIT_TOKEN_REUSED).addKeyValue("sessionId", session.id())
+                    .addKeyValue("reusedToken", reusedToken).log("audit.append_failed");
         }
         throw new ApiException(AccountProblems.SESSION_REQUIRED);
     }

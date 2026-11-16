@@ -52,6 +52,7 @@ public class ServiceCredentialFilter extends OncePerRequestFilter {
         if (publicApi && !presented(request)) {
             log.atInfo().addKeyValue("reason", "service.unauthenticated").log("request.refused");
             request.setAttribute(ProblemResponses.PROBLEM_ATTRIBUTE, UNAUTHENTICATED);
+            response.setHeader("WWW-Authenticate", "Bearer");
             response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
             return;
         }

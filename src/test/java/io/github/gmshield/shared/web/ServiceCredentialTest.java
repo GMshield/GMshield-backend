@@ -92,6 +92,7 @@ class ServiceCredentialTest extends HttpTestSupport {
         assertThat(response.statusCode()).as(what).isEqualTo(401);
         assertThat(response.headers().firstValue("Content-Type").orElseThrow()).as(what).startsWith("application/problem+json");
         assertThat(response.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(response.headers().allValues("WWW-Authenticate")).as(what).containsExactly("Bearer");
         JsonNode problem = json(response);
         assertThat(problem.path("code").asString()).as(what).isEqualTo("service.unauthenticated");
         assertThat(problem.path("category").asString()).isEqualTo("service");

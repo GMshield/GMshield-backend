@@ -45,8 +45,9 @@ below), `audit` (the append-only audit log, below; it may use `shared`) and `acc
 Google, accounts and sessions, below; it may use `shared`, `vault` and `audit`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
-- **No credential yet.** `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`,
-  `/v3/api-docs/internal`) answer without a credential until the service credential story.
+- **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below).
+  `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`, `/v3/api-docs/internal`) answer
+  without one; the `/internal/v1` credential comes with the worker (Story 1.12).
 - **Contract.** `openapi/public.json` and `openapi/internal.json` are generated and committed, each
   with a version (`ContractVersions`). `GET /api/v1/version` and `GET /internal/v1/version` answer
   the version of their document. The build fails when a generated document differs from its file:
@@ -135,9 +136,12 @@ Google, accounts and sessions, below; it may use `shared`, `vault` and `audit`).
     current token and for every token a renewal retired (those live until the absolute end, so the
     reuse of a token two renewals old is still recognised). `gmshield:session:account:<account id>`
     is the set of an account's session ids, so that all can end at once when Epic 8 or 9 needs it.
-  - Every key lives as long as the shorter of what is left of the idle and the absolute timeouts.
-    Each write is one Lua script that first compares the stored `version`, so two renewals of one
-    token can never both issue a token. `lastSeenAt` is written at most once a minute.
+  - The record and the current token's pointer live as long as the shorter of what is left of the
+    idle and the absolute timeouts; retired pointers live until the absolute end, and the account set
+    at least as long as the absolute timeout from its newest session.
+    Each replacement is one Lua script that first compares the stored `version`, so two renewals of
+    one token can never both issue a token; ending a session removes it whatever its version.
+    `lastSeenAt` is written at most once a minute.
   - Sign-in and `POST /api/v1/session/renewal` alone issue a token, as `SessionGrant
     {sessionToken, expiresInSeconds, renewAfterSeconds}`; `expiresInSeconds` is what is left of the
     absolute timeout. A renewal makes the presented token the previous one until now + overlap.

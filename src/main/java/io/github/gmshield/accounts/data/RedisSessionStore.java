@@ -19,7 +19,7 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * Sessions as one JSON string per session, a pointer per token and a set per account (see
  * {@link SessionStore}). Each write is one small Lua script, so that it happens whole or not at all, and a
- * change checks the stored {@code version} first. Java decides what changes; Redis only does the atomic step.
+ * replacement checks the stored {@code version} first. Java decides what changes; Redis only does the atomic step.
  * The template is looked up on first use, so the unit tests, which start without Redis, can still create
  * the application.
  */
@@ -53,18 +53,14 @@ class RedisSessionStore implements SessionStore {
             return 1
             """, Long.class);
 
-    /** KEYS: record, account set, then pointers. ARGV: expected version, session id. */
+    /** KEYS: record, account set, then pointers. ARGV: session id. Whatever the stored version; 1 if the record was there. */
     private static final RedisScript<Long> DELETE = RedisScript.of("""
-            local stored = redis.call('GET', KEYS[1])
-            if not stored then return 0 end
-            local ok, current = pcall(cjson.decode, stored)
-            if not ok or type(current) ~= 'table' or tonumber(current['version']) ~= tonumber(ARGV[1]) then return 0 end
-            redis.call('DEL', KEYS[1])
-            redis.call('SREM', KEYS[2], ARGV[2])
+            local existed = redis.call('DEL', KEYS[1])
+            redis.call('SREM', KEYS[2], ARGV[1])
             for i = 3, #KEYS do
               redis.call('DEL', KEYS[i])
             end
-            return 1
+            return existed
             """, Long.class);
 
     private final ObjectProvider<StringRedisTemplate> redis;
@@ -117,7 +113,7 @@ class RedisSessionStore implements SessionStore {
         if (session.previousHash() != null) {
             keys.add(RedisKeys.sessionToken(session.previousHash()));
         }
-        Long done = redis.getObject().execute(DELETE, keys, Long.toString(session.version()), session.id().toString());
+        Long done = redis.getObject().execute(DELETE, keys, session.id().toString());
         return done != null && done == 1L;
     }
 

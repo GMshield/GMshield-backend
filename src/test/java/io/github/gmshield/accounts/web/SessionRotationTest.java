@@ -337,7 +337,42 @@ class SessionRotationTest {
 
         assertRequired(get(SessionController.ME, second));
         assertThat(audit.rows).isEmpty();
-        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo("audit.append_failed"));
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getMessage()).isEqualTo("audit.append_failed");
+            assertThat(event.getKeyValuePairs()).extracting(pair -> pair.key)
+                    .contains("accountId", "action", "sessionId", "reusedToken");
+        });
+    }
+
+    @Test
+    void aReuseEndsTheSessionEvenWhenAConcurrentWriteCameJustBeforeTheEnding() throws Exception {
+        String first = signUp("reuserace");
+        clock.advance(Duration.ofMinutes(15));
+        String second = renewed(first);
+        String sessionId = recordOf(second).path("id").asString();
+        me(second, 200);
+        clock.advance(OVERLAP);
+        sessions.writesBeforeDelete = 1;
+
+        assertRequired(get(SessionController.ME, first));
+
+        assertThat(sessions.writesBeforeDelete).isZero();
+        assertThat(sessions.values.get("gmshield:session:" + sessionId)).isNull();
+        assertRequired(get(SessionController.ME, second));
+        assertThat(audit.rows).singleElement().satisfies(row -> assertThat(row.action()).isEqualTo("session.token_reused"));
+    }
+
+    @Test
+    void signingOutEndsTheSessionEvenWhenAConcurrentWriteCameJustBeforeIt() throws Exception {
+        String token = signUp("outrace");
+        sessions.writesBeforeDelete = 1;
+
+        assertThat(send("DELETE", SessionController.SESSION, token).statusCode()).isEqualTo(204);
+
+        assertThat(sessions.writesBeforeDelete).isZero();
+        assertRequired(get(SessionController.ME, token));
+        assertThat(sessions.values).isEmpty();
+        assertThat(audit.rows).isEmpty();
     }
 
     // --- Idle and absolute ---

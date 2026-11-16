@@ -17,8 +17,8 @@ import java.util.UUID;
  *       at once (a method here when Epic 8 or 9 needs it).</li>
  * </ul>
  *
- * Every change of an existing session is a compare-and-set on its {@code version}: two writers can never
- * both succeed from the same version. Every key has a time to live.
+ * Every replacement of an existing session is a compare-and-set on its {@code version}: two writers can never
+ * both succeed from the same version. Ending a session is unconditional. Every key has a time to live.
  */
 public interface SessionStore {
 
@@ -70,9 +70,10 @@ public interface SessionStore {
     boolean replace(long expectedVersion, Session next, List<Pointer> pointers, Duration timeToLive);
 
     /**
-     * Ends the session if its stored version is still {@code session.version()}: its record, the pointers of
-     * its current and previous tokens, and its entry in its account's set. False, with nothing removed,
-     * when the session is already gone or another write came first.
+     * Ends the session whatever its stored version (a concurrent write never keeps it alive): its record, the
+     * pointers of the current and previous tokens of {@code session}, and its entry in its account's set.
+     * True when this call removed the record, false when it was already gone. A pointer a concurrent
+     * renewal wrote may outlive it until its time to live, leading nowhere.
      */
     boolean delete(Session session);
 

@@ -14,7 +14,8 @@ import java.util.stream.Collectors;
  *   <li>{@code GMSHIELD_MODE=test} (set only by the pipeline): built-in throwaway connection
  *       settings. Refused when a production secret is present.</li>
  *   <li>No mode: every required setting must be present, each vault key must be 32 bytes in
- *       Base64, the frontend's service credential 32 to 512 header-safe characters, and the public URL an
+ *       Base64, the frontend's service credential 32 to 512 header-safe characters other than the public
+ *       test-mode value, and the public URL an
  *       https origin (http only on localhost). Redis is reached over TLS verified against the private authority (the
  *       {@code redis-tls} profile) unless {@code GMSHIELD_REDIS_TLS=false}, which only the
  *       development setup sets.</li>
@@ -106,7 +107,9 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
             if (publicUrl(environment.get(PUBLIC_URL)) == null) {
                 return refuse(false, REASON_INVALID, List.of(PUBLIC_URL));
             }
-            if (!frontendCredential(environment.get(FRONTEND_CREDENTIAL))) {
+            String credential = environment.get(FRONTEND_CREDENTIAL);
+            // The public test-mode value would let anyone call the backend: never a real credential.
+            if (!frontendCredential(credential) || TEST_MODE_FRONTEND_CREDENTIAL.equals(credential.strip())) {
                 return refuse(false, REASON_INVALID, List.of(FRONTEND_CREDENTIAL));
             }
             List<String> badTimings = invalidSessionTimings(environment);

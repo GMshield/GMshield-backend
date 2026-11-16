@@ -13,8 +13,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Sessions, token pointers and each account's set in memory, under the Redis key names and with the values
  * Redis would hold, for tests that run without Redis. It mirrors the Redis store: each write is atomic (the
- * methods are synchronized), a change compares the stored version first, and a key past its time to live,
- * measured on the injected clock, is gone.
+ * methods are synchronized), a replacement compares the stored version first (an ending does not), and a
+ * key past its time to live, measured on the injected clock, is gone.
  */
 public class InMemorySessionStore implements SessionStore {
 
@@ -31,6 +31,11 @@ public class InMemorySessionStore implements SessionStore {
      * the session (its version rises, the write is not applied).
      */
     public int replacesToLose;
+    /**
+     * How many of the next {@link #delete} calls meet a write that came just before them (the stored version
+     * rises first), as a concurrent call marking the session seen would.
+     */
+    public int writesBeforeDelete;
 
     public InMemorySessionStore(Clock clock) {
         this.clock = clock;
@@ -39,6 +44,7 @@ public class InMemorySessionStore implements SessionStore {
     /** Forgets everything, as a fresh Redis would. */
     public synchronized void clear() {
         replacesToLose = 0;
+        writesBeforeDelete = 0;
         values.clear();
         accountSets.clear();
         timesToLive.clear();
@@ -110,9 +116,13 @@ public class InMemorySessionStore implements SessionStore {
     @Override
     public synchronized boolean delete(Session session) {
         String key = RedisKeys.session(session.id());
-        if (storedVersion(key) != session.version()) {
-            return false;
+        expire(key);
+        if (writesBeforeDelete > 0 && values.containsKey(key)) {
+            writesBeforeDelete--;
+            Session other = RedisSessionStore.read(values.get(key)).orElseThrow().seen(clock.instant(), false);
+            values.put(key, RedisSessionStore.write(other));
         }
+        boolean existed = values.containsKey(key);
         remove(key);
         remove(RedisKeys.sessionToken(session.currentHash()));
         if (session.previousHash() != null) {
@@ -122,7 +132,7 @@ public class InMemorySessionStore implements SessionStore {
         if (members != null) {
             members.remove(session.id().toString());
         }
-        return true;
+        return existed;
     }
 
     /** The version of the stored session, or -1 when it is gone or unreadable. */
