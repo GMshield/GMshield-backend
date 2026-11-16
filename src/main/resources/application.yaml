@@ -56,6 +56,10 @@ gmshield:
   # (shared.web.ServiceCredentialFilter). A secret, written by GMshield-pipeline deploy/data-credentials.sh into
   # backend.env and frontend.env. Test mode uses the fixed value in application-test-mode.yaml.
   frontend-credential: ${GMSHIELD_FRONTEND_CREDENTIAL}
+  # The worker's credential (Story 1.12): every /internal/v1 call carries Authorization: Bearer <it>
+  # (shared.web.WorkerCredentialFilter). A secret, written by GMshield-pipeline deploy/data-credentials.sh into
+  # backend.env and worker.env. Test mode uses the fixed value in application-test-mode.yaml.
+  worker-credential: ${GMSHIELD_WORKER_CREDENTIAL}
   # Sessions (accounts module, Story 1.10), Spring durations. StartupSettings refuses a start unless
   # overlap < renew-after < idle-timeout <= absolute-timeout; its defaults are the same as these.
   session:
@@ -63,6 +67,15 @@ gmshield:
     overlap: ${GMSHIELD_SESSION_OVERLAP:60s}
     idle-timeout: ${GMSHIELD_SESSION_IDLE_TIMEOUT:24h}
     absolute-timeout: ${GMSHIELD_SESSION_ABSOLUTE_TIMEOUT:7d}
+  # Jobs (jobs module, Story 1.12), Spring durations: a claim lapses 90 s after its last renewal, the worker renews
+  # every 30 s, a job has 3 attempts, an offer nobody claimed is made again after 2 min, the sweep runs every 10 s.
+  # JobSettings refuses a start unless renew-every < claim-lapse, reoffer-after < 1 h and 1 <= max-attempts <= 100.
+  jobs:
+    claim-lapse: ${GMSHIELD_JOB_CLAIM_LAPSE:90s}
+    renew-every: ${GMSHIELD_JOB_RENEW_EVERY:30s}
+    max-attempts: ${GMSHIELD_JOB_MAX_ATTEMPTS:3}
+    reoffer-after: ${GMSHIELD_JOB_REOFFER_AFTER:2m}
+    sweep-every: ${GMSHIELD_JOB_SWEEP_EVERY:10s}
 
 server:
   port: 8080

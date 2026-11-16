@@ -14,8 +14,8 @@ import java.util.stream.Collectors;
  *   <li>{@code GMSHIELD_MODE=test} (set only by the pipeline): built-in throwaway connection
  *       settings. Refused when a production secret is present.</li>
  *   <li>No mode: every required setting must be present, each vault key must be 32 bytes in
- *       Base64, the frontend's service credential 32 to 512 header-safe characters other than the public
- *       test-mode value, and the public URL an
+ *       Base64, the frontend's and the worker's credentials 32 to 512 header-safe characters other than their
+ *       public test-mode values and other than each other, and the public URL an
  *       https origin (http only on localhost). Redis is reached over TLS verified against the private authority (the
  *       {@code redis-tls} profile) unless {@code GMSHIELD_REDIS_TLS=false}, which only the
  *       development setup sets.</li>
@@ -54,6 +54,15 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
     public static final String FRONTEND_CREDENTIAL = "GMSHIELD_FRONTEND_CREDENTIAL";
     /** The fixed, public credential of test mode, known to the frontend's test mode. Never a secret. */
     public static final String TEST_MODE_FRONTEND_CREDENTIAL = "gmshield-test-mode-frontend-credential-not-a-secret";
+    /**
+     * The worker's credential (Story 1.12): every {@code /internal/v1} call carries it as
+     * {@code Authorization: Bearer <it>}, except test mode's own {@code /internal/v1/test-mode/**} routes. Written by
+     * GMshield-pipeline's {@code deploy/data-credentials.sh} into both {@code backend.env} and {@code worker.env}.
+     * Test mode uses {@link #TEST_MODE_WORKER_CREDENTIAL}.
+     */
+    public static final String WORKER_CREDENTIAL = "GMSHIELD_WORKER_CREDENTIAL";
+    /** The fixed, public worker credential of test mode, known to the worker's test mode. Never a secret. */
+    public static final String TEST_MODE_WORKER_CREDENTIAL = "gmshield-test-mode-worker-credential-not-a-secret";
     /** 32 to 512 visible characters that a header can carry (the pipeline writes 64 hex characters). */
     private static final java.util.regex.Pattern CREDENTIAL = java.util.regex.Pattern.compile("[A-Za-z0-9._~+/=-]{32,512}");
 
@@ -77,12 +86,12 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
     public static final List<String> REQUIRED = List.of(
             "GMSHIELD_DB_URL", "GMSHIELD_DB_USER", "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_HOST",
             "GMSHIELD_REDIS_USERNAME", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY,
-            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, PUBLIC_URL, FRONTEND_CREDENTIAL);
+            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, PUBLIC_URL, FRONTEND_CREDENTIAL, WORKER_CREDENTIAL);
 
     /** Production secrets: test mode refuses to start beside any of them. */
     public static final List<String> SECRETS = List.of(
             "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY,
-            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FRONTEND_CREDENTIAL);
+            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, FRONTEND_CREDENTIAL, WORKER_CREDENTIAL);
 
     public static final String REASON_UNKNOWN_MODE = "mode.unknown";
     public static final String REASON_MISSING = "setting.missing";
@@ -111,6 +120,12 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
             // The public test-mode value would let anyone call the backend: never a real credential.
             if (!frontendCredential(credential) || TEST_MODE_FRONTEND_CREDENTIAL.equals(credential.strip())) {
                 return refuse(false, REASON_INVALID, List.of(FRONTEND_CREDENTIAL));
+            }
+            String workerCredential = environment.get(WORKER_CREDENTIAL);
+            // Likewise for the worker's; and the two must differ, so that neither caller can act as the other.
+            if (!credential(workerCredential) || TEST_MODE_WORKER_CREDENTIAL.equals(workerCredential.strip())
+                    || workerCredential.strip().equals(credential.strip())) {
+                return refuse(false, REASON_INVALID, List.of(WORKER_CREDENTIAL));
             }
             List<String> badTimings = invalidSessionTimings(environment);
             if (!badTimings.isEmpty()) {
@@ -230,6 +245,11 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
 
     /** Whether a value can be the frontend's service credential (see {@link #FRONTEND_CREDENTIAL}). */
     public static boolean frontendCredential(String value) {
+        return credential(value);
+    }
+
+    /** Whether a value can be a service credential: the frontend's or the worker's ({@link #WORKER_CREDENTIAL}). */
+    public static boolean credential(String value) {
         return value != null && CREDENTIAL.matcher(value.strip()).matches();
     }
 

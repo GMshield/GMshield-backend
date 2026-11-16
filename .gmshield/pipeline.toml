@@ -42,7 +42,7 @@ services = ["postgres", "redis"]
 
 [test]
 # Story 1.11: the integration tests (cross-owner tests of the library, the starter library's rollback with the
-# account) run from the Dockerfile's `integration` stage with GMSHIELD_MODE=test, beside a throwaway PostgreSQL
+# account; Story 1.12: the jobs, their streams, claims, lapses and a flushed Redis) run from the Dockerfile's `integration` stage with GMSHIELD_MODE=test, beside a throwaway PostgreSQL
 # and Redis at the test-mode hosts (application-test-mode.yaml); exit 0 passes.
 target = "integration"
 services = ["postgres", "redis"]

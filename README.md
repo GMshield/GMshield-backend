@@ -39,16 +39,17 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Five modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Six modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
-below), `audit` (the append-only audit log, below; it may use `shared`), `library` (systems and
+below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
+survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`) and `accounts` (sign-in with Google, accounts and
 sessions, below; it may use `shared`, `vault`, `audit` and `library`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
-- **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below).
-  `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`, `/v3/api-docs/internal`) answer
-  without one; the `/internal/v1` credential comes with the worker (Story 1.12).
+- **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below), and
+  `/internal/v1` the worker's (Story 1.12, below), `/internal/v1/version` included. Both OpenAPI
+  documents (`/v3/api-docs/public`, `/v3/api-docs/internal`) answer without one.
 - **Contract.** `openapi/public.json` and `openapi/internal.json` are generated and committed, each
   with a version (`ContractVersions`). `GET /api/v1/version` and `GET /internal/v1/version` answer
   the version of their document. The build fails when a generated document differs from its file:
@@ -197,6 +198,44 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   request through only with exactly one `Authorization: Bearer <GMSHIELD_FRONTEND_CREDENTIAL>`,
   compared in constant time; anything else is `service.unauthenticated` (401) before any controller.
   The actuator, `/internal` and the OpenAPI documents keep their own rules.
+- **Worker credential (Story 1.12).** `shared.web.WorkerCredentialFilter` does the same for every
+  `/internal/v1` request with `Authorization: Bearer <GMSHIELD_WORKER_CREDENTIAL>`. The one exception is
+  `/internal/v1/test-mode/**`, and only in test mode, where those routes exist. The frontend's credential
+  opens nothing of `/internal/v1`, and the worker's nothing of `/api/v1`.
+- **Jobs (`jobs`, Story 1.12).** Work that survives a restart of the backend, Redis or the worker.
+  - A job is a row of `job` (`V5__job.sql`, through `JdbcClient`; not a library table: no `@TenantId`, no
+    content, input or result): id, owner, kind, lane (`interactive` | `ingestion`), state (`waiting`,
+    `offered`, `running`, `done`, `failed`, `cancelled`), attempt, the trace id of the request that created
+    it, when it was offered, the live claim (id, the vault token hash of its grant, renew and lapse times)
+    and the outcome code.
+  - `Jobs.create(kind, input)` (or with a lane) writes the row in the caller's transaction, for the owner of
+    the work (`OwnerContext.require()`); `input` runs in that transaction with the new job, for the caller to
+    keep the job's input in its own tables. After the commit the job is marked `offered` and its id is added
+    to `gmshield:work:interactive` or `gmshield:work:ingestion` (`XADD <stream> * job <id>`), both in one
+    transaction of its own: when Redis fails, the job stays `waiting` for the sweep. A rollback leaves no
+    row and no message. Interactive jobs are offered at once; ingestion jobs one at a time (none while one is
+    `offered` or `running`), the next being the oldest job of the owner after the one offered last.
+  - The worker claims with `POST /internal/v1/jobs/{id}/claims` (201): `claimId`, `attempt`, `renewAt`,
+    `lapsesAt`, a random `grant` (32 bytes, Base64url; only `vault.tokenHash("grant", …)` is stored), the
+    `kind`, the handler's `input` and the job's `traceparent`. A live claim answers `409 job.claimed`; a job
+    that is waiting, done, failed or cancelled `409 job.not_offered`. It renews with `POST …/claims/{claimId}/renewals`
+    and reports with `POST …/claims/{claimId}/outcome` (`{outcome: done|failed, code?, result?}`, 204),
+    both with `X-Job-Grant`: a wrong, expired or replaced grant, or another job's, is `403 job.grant_refused`.
+  - Retries are the backend's alone: a lapsed claim or a `failed` outcome goes back to `waiting` while
+    `attempt < 3`, otherwise the job ends `failed` with `job.attempts_exhausted` or the reported code.
+  - Feature modules implement `jobs.service.JobHandler` (`kind()`, `lane()`, `input(JobRef)`,
+    `completed(JobRef, result)`, `failed(JobRef, code)`); `jobs` calls it inside a transaction of its own
+    with the job's owner bound (`OwnerContext.callAs`), together with the job's own change.
+  - `jobs.service.JobSweep`, the one `@Scheduled` task (every 10 s): creates the consumer group `workers`
+    (`XGROUP CREATE … 0 MKSTREAM`) where it is missing, takes back lapsed claims, offers again jobs offered
+    more than 2 minutes ago without a claim (Redis lost the message), offers waiting jobs, and trims each
+    stream to the last hour (`XTRIM MINID`). Its own writes run on a connection of their own
+    (`DataSourceTransactionManager` over a `DelegatingDataSource`), because a JPA transaction needs an owner.
+  - Every backend line about a job carries the trace id of the request that created it; the worker logs
+    under it and sends it back in `traceparent`.
+  - Test mode only: the `probe` kind and `POST /internal/v1/test-mode/probe-jobs` (`{lane, workMs, failTimes}`,
+    owned by a fixed test-mode owner; `GET …/{id}` shows its state), with the table `job_probe` from the
+    test-mode migration location. Left out of both OpenAPI documents.
 
 ## Settings
 
@@ -220,6 +259,12 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_GOOGLE_CLIENT_SECRET` | the Google OAuth client secret (required, secret): entered by hand in `backend.env` |
 | `GMSHIELD_PUBLIC_URL` | the frontend's origin as the browser sees it, `https` with no path, or `http` only on `localhost`, `127.0.0.1` or `[::1]` (required; `.gmshield/pipeline.toml`): Google redirects to `<it>/auth/google/callback`, which must be a redirect URI of the OAuth client |
 | `GMSHIELD_FRONTEND_CREDENTIAL` | the frontend's service credential (required, secret): 32 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`; written by GMshield-pipeline's `deploy/data-credentials.sh` into `backend.env` and `frontend.env` |
+| `GMSHIELD_WORKER_CREDENTIAL` | the worker's credential (required, secret): the same characters, different from the frontend's; written by `deploy/data-credentials.sh` into `backend.env` and `worker.env` |
+| `GMSHIELD_JOB_CLAIM_LAPSE` | a claim lapses this long after its last renewal (default `90s`) |
+| `GMSHIELD_JOB_RENEW_EVERY` | the worker renews a claim this often (default `30s`; less than the lapse) |
+| `GMSHIELD_JOB_MAX_ATTEMPTS` | claims per job (default `3`) |
+| `GMSHIELD_JOB_REOFFER_AFTER` | an offer nobody claimed is made again after this long (default `2m`; less than an hour) |
+| `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
 | `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
 | `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
 | `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |
@@ -239,7 +284,9 @@ where browsers still keep the `__Host-` cookies). Test mode ignores `GMSHIELD_PU
 pipeline's staging copy has it) and refuses the Google client id or secret like any other secret.
 Test mode's service credential is the fixed, public `gmshield-test-mode-frontend-credential-not-a-secret`,
 which the frontend's test mode also uses; a `GMSHIELD_FRONTEND_CREDENTIAL` beside test mode is refused
-like any other secret, and outside test mode a missing one is `setting.missing`. In both modes the
+like any other secret, and outside test mode a missing one is `setting.missing`. Likewise the worker's
+credential in test mode is the fixed, public `gmshield-test-mode-worker-credential-not-a-secret`, which the
+worker's test mode also uses. In both modes the
 session timings must be positive with overlap < renew-after < idle ≤ absolute, else `setting.invalid`
 names all four (or only the unreadable ones).
 
@@ -269,7 +316,8 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GRADLE_USER_HOME=/tmp/gra
 The integration tests (`src/integrationTest`, `./gradlew integrationTest`) run against a real
 PostgreSQL and Redis at the test-mode hosts `postgres:5432` and `redis:6379` (`GMSHIELD_MODE=test`):
 the cross-owner tests of every kind of library item, the starter library's rollback and the owner of
-every query. `check` compiles them but does not run them. To run the image by hand:
+every query, and the jobs (create and rollback, offer, claims, grants, lapses and attempts, a deleted message,
+a flushed Redis, trimming and the ingestion round robin). `check` compiles them but does not run them. To run the image by hand:
 
 ```sh
 docker network create gm-it
@@ -318,7 +366,8 @@ certificate at `/run/gmshield/certs/ca.crt`. Its settings, written once by GMshi
 `deploy/data-credentials.sh`, live in `~/gmshield-ci/secrets/backend.env` on the server: its own
 PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`), its own Redis
 account `backend` (keys `gmshield:*` only), the two vault keys, the frontend's service credential
-(the same value as in `frontend.env`), and the Google OAuth client id and secret, which Dalton enters by hand (the script writes empty placeholders and never replaces a value;
+(the same value as in `frontend.env`), the worker's credential (the same value as in `worker.env`;
+Dalton reruns `data-credentials.sh` at the first release that carries Story 1.12), and the Google OAuth client id and secret, which Dalton enters by hand (the script writes empty placeholders and never replaces a value;
 without them the backend refuses to start, `setting.missing`). `GMSHIELD_PUBLIC_URL` is a plain
 setting in the contract's `[deploy].env`: `http://localhost:3000`, the address of the frontend through
 Dalton's SSH tunnel, until the public domain exists. The contract mounts the named volume

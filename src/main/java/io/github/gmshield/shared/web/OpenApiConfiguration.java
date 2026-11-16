@@ -38,28 +38,31 @@ public class OpenApiConfiguration {
 
     @Bean
     GroupedOpenApi publicApi() {
-        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API, true);
+        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API, SERVICE_CREDENTIAL,
+                "The frontend's service credential (GMSHIELD_FRONTEND_CREDENTIAL); without it every"
+                        + " path answers service.unauthenticated (401)");
     }
 
     @Bean
     GroupedOpenApi internalApi() {
-        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API, false);
+        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API,
+                WORKER_CREDENTIAL, "The worker's credential (GMSHIELD_WORKER_CREDENTIAL); without it every path"
+                        + " answers service.unauthenticated (401)");
     }
 
     /** The frontend's service credential (Story 1.10), required on every public operation. */
     static final String SERVICE_CREDENTIAL = "serviceCredential";
+    /** The worker's credential (Story 1.12), required on every internal operation. */
+    static final String WORKER_CREDENTIAL = "workerCredential";
 
-    private static GroupedOpenApi group(String name, String paths, String title, String version, boolean credential) {
+    private static GroupedOpenApi group(String name, String paths, String title, String version, String credential,
+                                        String credentialDescription) {
         OpenApiCustomizer contract = api -> {
             api.info(new Info().title(title).version(version));
             api.schema(PROBLEM_SCHEMA, problemSchema());
-            if (credential) {
-                api.getComponents().addSecuritySchemes(SERVICE_CREDENTIAL, new SecurityScheme()
-                        .type(SecurityScheme.Type.HTTP).scheme("bearer")
-                        .description("The frontend's service credential (GMSHIELD_FRONTEND_CREDENTIAL); without it every"
-                                + " path answers service.unauthenticated (401)"));
-                api.security(List.of(new SecurityRequirement().addList(SERVICE_CREDENTIAL)));
-            }
+            api.getComponents().addSecuritySchemes(credential, new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP).scheme("bearer").description(credentialDescription));
+            api.security(List.of(new SecurityRequirement().addList(credential)));
             if (api.getPaths() != null) {
                 api.getPaths().values().forEach(path -> path.readOperations().forEach(operation ->
                         operation.getResponses().addApiResponse("default", problemResponse())));

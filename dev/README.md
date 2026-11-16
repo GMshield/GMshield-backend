@@ -63,7 +63,10 @@ The session timings default to 15 minutes before renewal, 60 seconds of overlap,
 7 days in total; to watch a rotation, shorten them for one start, for example
 `GMSHIELD_SESSION_RENEW_AFTER=20s GMSHIELD_SESSION_OVERLAP=5s GMSHIELD_SESSION_IDLE_TIMEOUT=2m dev/start`.
 
-The worker does not use Redis yet: Story 1.12 adds its Redis account and service credential.
+The worker reads the work streams in Redis (Story 1.12) as the `default` account with the same
+throwaway password, without TLS, and calls `/internal/v1` with the worker's credential:
+`compose.yaml` gives the backend and the worker the same throwaway value. To call the internal API by
+hand, `curl -H 'Authorization: Bearer gmshield-dev-worker-credential-throwaway' http://127.0.0.1:8080/internal/v1/version`.
 
 ## It never runs on its own
 

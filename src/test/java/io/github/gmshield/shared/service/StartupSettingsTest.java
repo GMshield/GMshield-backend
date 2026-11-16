@@ -17,6 +17,8 @@ class StartupSettingsTest {
     private static final String INDEX_KEY = "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=";
     /** 64 hex characters, as the pipeline writes the frontend's service credential. */
     private static final String CREDENTIAL_VALUE = "c0ffee".repeat(10) + "beef";
+    /** 64 hex characters, as the pipeline writes the worker's credential. */
+    private static final String WORKER_CREDENTIAL_VALUE = "facade".repeat(10) + "d00d";
 
     @Test
     void testModeNeedsNoSetting() {
@@ -278,6 +280,42 @@ class StartupSettingsTest {
     }
 
     @Test
+    void outsideTestModeTheWorkerCredentialIsRequiredAndNamed() {
+        Map<String, String> environment = production();
+        environment.remove("GMSHIELD_WORKER_CREDENTIAL");
+
+        StartupSettings settings = StartupSettings.check(environment);
+
+        assertThat(settings.refusedSettings()).containsExactly("GMSHIELD_WORKER_CREDENTIAL");
+        assertRefusalLine(settings, "setting.missing");
+    }
+
+    @Test
+    void aWorkerCredentialThatCannotBeOneIsTheTestModeValueOrTheFrontendsIsInvalidAndNeverPrinted() {
+        for (String bad : new String[] {"short", "a".repeat(31), "has space " + "a".repeat(32), "a".repeat(513),
+                StartupSettings.TEST_MODE_WORKER_CREDENTIAL, CREDENTIAL_VALUE}) {
+            Map<String, String> environment = production();
+            environment.put("GMSHIELD_WORKER_CREDENTIAL", bad);
+
+            StartupSettings settings = StartupSettings.check(environment);
+
+            assertThat(settings.refusedSettings()).as(bad).containsExactly("GMSHIELD_WORKER_CREDENTIAL");
+            assertThat(settings.refusalLine()).doesNotContain(bad);
+            assertRefusalLine(settings, "setting.invalid");
+        }
+    }
+
+    @Test
+    void theWorkerCredentialIsAProductionSecretThatTestModeRefuses() {
+        assertThat(StartupSettings.SECRETS).contains("GMSHIELD_WORKER_CREDENTIAL");
+        StartupSettings settings = StartupSettings.check(Map.of("GMSHIELD_MODE", "test",
+                "GMSHIELD_WORKER_CREDENTIAL", WORKER_CREDENTIAL_VALUE));
+
+        assertThat(settings.refusedSettings()).containsExactly("GMSHIELD_MODE", "GMSHIELD_WORKER_CREDENTIAL");
+        assertRefusalLine(settings, "mode.test_with_production_secret");
+    }
+
+    @Test
     void sessionTimingsDefaultTo15Minutes60Seconds24HoursAnd7Days() {
         StartupSettings.SessionTimings timings = StartupSettings.sessionTimings(Map.of()).orElseThrow();
 
@@ -372,6 +410,7 @@ class StartupSettingsTest {
         environment.put("GMSHIELD_GOOGLE_CLIENT_SECRET", SECRET_VALUE);
         environment.put("GMSHIELD_PUBLIC_URL", "http://localhost:3000");
         environment.put("GMSHIELD_FRONTEND_CREDENTIAL", CREDENTIAL_VALUE);
+        environment.put("GMSHIELD_WORKER_CREDENTIAL", WORKER_CREDENTIAL_VALUE);
         return environment;
     }
 }

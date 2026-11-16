@@ -14,7 +14,8 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * Starts the whole application on a random port, without Postgres or Redis (profile {@code unit}),
  * and talks to it over real HTTP, so that the server's own error handling is part of what is tested.
- * {@link #get} and {@link #send} carry the frontend's service credential, as the frontend does.
+ * {@link #get} and {@link #send} carry the frontend's service credential, as the frontend does;
+ * {@link #getAsWorker} and {@link #sendAsWorker} carry the worker's credential instead.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("unit")
@@ -23,6 +24,8 @@ public abstract class HttpTestSupport {
     protected static final JsonMapper JSON = JsonMapper.builder().build();
     /** The service credential of application-unit.yaml (test mode's fixed one). */
     protected static final String CREDENTIAL = "gmshield-test-mode-frontend-credential-not-a-secret";
+    /** The worker's credential of application-unit.yaml (test mode's fixed one). */
+    protected static final String WORKER_CREDENTIAL = "gmshield-test-mode-worker-credential-not-a-secret";
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -42,11 +45,36 @@ public abstract class HttpTestSupport {
         return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }
 
+    /** A GET with the worker's credential, as the worker calls {@code /internal/v1}. */
+    protected HttpResponse<String> getAsWorker(String path, String... headers) throws IOException, InterruptedException {
+        return getWithout(path, concat(headers, "Authorization", "Bearer " + WORKER_CREDENTIAL));
+    }
+
+    /** A request with the worker's credential and a JSON body (none when {@code json} is null). */
+    protected HttpResponse<String> sendAsWorker(String method, String path, String json, String... headers)
+            throws IOException, InterruptedException {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                .header("Authorization", "Bearer " + WORKER_CREDENTIAL)
+                .method(method, json == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(json));
+        if (json != null) {
+            request.header("Content-Type", "application/json");
+        }
+        if (headers.length > 0) {
+            request.headers(headers);
+        }
+        return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
     protected HttpResponse<String> send(String method, String path) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
                 .header("Authorization", "Bearer " + CREDENTIAL)
                 .method(method, HttpRequest.BodyPublishers.noBody()).build();
         return client.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** The address of a path on the running application. */
+    protected URI uri(String path) {
+        return URI.create("http://127.0.0.1:" + port + path);
     }
 
     private static String[] concat(String[] headers, String... more) {
