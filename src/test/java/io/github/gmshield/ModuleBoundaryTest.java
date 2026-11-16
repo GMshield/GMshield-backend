@@ -101,10 +101,12 @@ class ModuleBoundaryTest {
     static ArchRule cryptoOnlyInVault(String vaultPackage) {
         return noClasses().that().resideOutsideOfPackage(vaultPackage + "..")
                 .should().dependOnClassesThat(resideInAnyPackage("javax.crypto..", "java.security.spec..",
-                                "org.bouncycastle..", "com.google.crypto.tink..", "org.springframework.security.crypto..")
+                                "org.bouncycastle..", "com.google.crypto.tink..", "org.springframework.security.crypto..",
+                                // hashing helpers: a digest of content outside the vault would bypass its keyed fingerprints
+                                "com.google.common.hash..", "org.apache.commons.codec.digest..")
                         .or(belongToAnyOf(MessageDigest.class, Signature.class, javax.crypto.Mac.class,
                                 java.security.KeyPairGenerator.class, java.security.KeyFactory.class,
-                                java.security.KeyStore.class)))
+                                java.security.KeyStore.class, org.springframework.util.DigestUtils.class)))
                 .because("every cipher, MAC, digest and signature belongs to the vault module (AD-19)");
     }
 
@@ -126,7 +128,7 @@ class ModuleBoundaryTest {
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("HomemadeHash").hasMessageContaining("HomemadeMac")
                 .hasMessageContaining("HomemadeSignature").hasMessageContaining("HomemadeCipher")
-                .hasMessageContaining("HomemadeKeyPair")
+                .hasMessageContaining("HomemadeKeyPair").hasMessageContaining("HomemadeSpringDigest")
                 .satisfies(e -> assertThat(e.getMessage()).doesNotContain("AllowedCipher").doesNotContain("PlainNotes"));
         JavaClasses allowed = new ClassFileImporter().importClasses(
                 io.github.gmshieldfixtures.cipher.vault.service.AllowedCipher.class,

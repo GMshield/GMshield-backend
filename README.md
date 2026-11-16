@@ -73,10 +73,15 @@ below).
     `<owner>/<file>/<index>.piece`, bound to owner, file id and index, written under a temporary name
     and renamed.
   - Any failed check (changed byte, moved value, unknown version, wrong master key) throws
-    `IntegrityException`: the problem `integrity.failed` (500, no params), a `vault.integrity_failed`
-    log line with the ids only, and no content.
+    `IntegrityException`: the problem `integrity.failed` (500, no params) and no content. It logs ids
+    and the entity and field names only: `vault.integrity_failed` when a stored value fails, and
+    `vault.data_key_failed` when an owner's data key cannot be unwrapped (a wrong master key). When
+    writing, only the second line appears; when reading, both do.
   - `ModuleBoundaryTest` fails the build when a class outside `vault` uses `javax.crypto`,
-    `MessageDigest`, `Mac` or `Signature` (a fixture proves the rule fails).
+    `java.security.spec`, `MessageDigest`, `Mac`, `Signature`, `KeyPairGenerator`, `KeyFactory`,
+    `KeyStore`, BouncyCastle, Tink, Spring Security crypto, Spring's `DigestUtils`, Guava hashing or
+    commons-codec digests (fixtures prove the rule fails). A checksum, such as an upload's SHA-256,
+    goes through a `vault` method too.
   - Test mode only: `POST /internal/v1/test-mode/nfr1-probe` and `GET .../{id}` (left out of the
     OpenAPI documents) store and read back the pipeline's NFR-1 text as one `vault_probe` row and
     one file piece. The table comes from `db/test-mode-migration`, a location only test mode adds.
