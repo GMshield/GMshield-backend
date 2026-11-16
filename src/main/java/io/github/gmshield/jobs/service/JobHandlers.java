@@ -5,15 +5,16 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Pattern;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.stereotype.Component;
 
 /**
- * The registered handlers by kind. Looked up on first use rather than injected, so that a handler may itself use
- * {@link Jobs} without a cycle between the beans. Two handlers of one kind, or a kind that is not a short
- * lower-case word, stop the start.
+ * The registered handlers by kind. Looked up once every singleton exists rather than injected, so that a handler
+ * may itself use {@link Jobs} without a cycle between the beans. Two handlers of one kind, or a kind that is not a
+ * short lower-case word, stop the start.
  */
 @Component
-class JobHandlers {
+class JobHandlers implements SmartInitializingSingleton {
 
     static final Pattern KIND = Pattern.compile("[a-z][a-z0-9_.-]{0,63}");
 
@@ -22,6 +23,11 @@ class JobHandlers {
 
     JobHandlers(ObjectProvider<JobHandler> handlers) {
         this.handlers = handlers;
+    }
+
+    @Override
+    public void afterSingletonsInstantiated() {
+        byKind();
     }
 
     Optional<JobHandler> find(String kind) {

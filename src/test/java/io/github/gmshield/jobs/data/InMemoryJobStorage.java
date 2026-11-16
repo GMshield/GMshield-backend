@@ -22,6 +22,8 @@ import java.util.stream.Collectors;
 public class InMemoryJobStorage implements JobStorage {
 
     public final Map<UUID, JobRow> rows = new ConcurrentHashMap<>();
+    /** Runs once before the next locked read: what another transaction commits while the caller waits for the lock. */
+    public volatile Runnable beforeNextLockedRead;
     private final Store joined = new Store(true);
     private final Store separate = new Store(false);
 
@@ -73,6 +75,11 @@ public class InMemoryJobStorage implements JobStorage {
 
         @Override
         public Optional<JobRow> findForUpdate(UUID id) {
+            Runnable before = beforeNextLockedRead;
+            if (before != null) {
+                beforeNextLockedRead = null;
+                before.run();
+            }
             return find(id);
         }
 

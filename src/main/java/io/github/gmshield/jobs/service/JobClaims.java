@@ -43,6 +43,8 @@ public class JobClaims {
     static final Pattern GRANT = Pattern.compile("[A-Za-z0-9_-]{43}");
     /** An outcome code: {@code category.reason}, lower case. */
     static final Pattern CODE = Pattern.compile("[a-z][a-z0-9_]{0,30}+(?:\\.[a-z0-9_]{1,30}+){1,3}+");
+    /** The longest code {@code job.outcome_code} holds. */
+    static final int MAX_CODE_LENGTH = 64;
     static final String DONE = "done";
     static final String FAILED = "failed";
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -83,27 +85,50 @@ public class JobClaims {
     public Claim claim(UUID jobId) {
         Instant now = clock.now();
         JobRow seen = storage.joined().find(jobId).orElseThrow(JobProblems::notFound);
-        refuseUnlessOffered(seen, now);
+        // A waiting job may be in the middle of its offer (the message added, the commit not yet done): the locked
+        // read below waits for that commit and decides.
+        if (!JobState.WAITING.equals(seen.state())) {
+            refuseUnlessOffered(seen, now);
+        }
         Optional<JobHandler> handler = handlers.find(seen.kind());
         if (handler.isEmpty()) {
-            endWithoutHandler(seen, now);
+            if (JobState.OFFERED.equals(seen.state())) {
+                endWithoutHandler(seen, now);
+            }
             throw JobProblems.notOffered();
         }
         String grant = newGrant();
         byte[] grantHash = vault.tokenHash(GRANT_PURPOSE, grant);
-        Claim claim = JobTrace.call(seen.traceId(), () -> owners.call(seen.ownerId(), () -> {
-            JobRow current = storage.joined().findForUpdate(jobId).orElseThrow(JobProblems::notFound);
-            refuseUnlessOffered(current, now);
-            JobRow next = current.claimed(Ids.newId(), grantHash, now.plus(settings.renewEvery()),
-                    now.plus(settings.claimLapse()), now);
-            if (!storage.joined().replace(current, next)) {
-                throw JobProblems.claimed();
-            }
-            JsonNode input = handler.get().input(ref(next));
-            return new Claim(next.id(), next.claimId(), next.attempt(), next.claimRenewAt(), next.claimLapsesAt(), grant,
-                    next.kind(), input == null ? JsonNodeFactory.instance.objectNode() : input,
-                    TraceContext.traceparent(next.traceId()));
-        }));
+        JobRow[] offered = new JobRow[1];
+        Claim claim;
+        try {
+            claim = JobTrace.call(seen.traceId(), () -> owners.call(seen.ownerId(), () -> {
+                JobRow current = storage.joined().findForUpdate(jobId).orElseThrow(JobProblems::notFound);
+                refuseUnlessOffered(current, now);
+                JobRow next = current.claimed(Ids.newId(), grantHash, now.plus(settings.renewEvery()),
+                        now.plus(settings.claimLapse()), now);
+                if (!storage.joined().replace(current, next)) {
+                    throw JobProblems.claimed();
+                }
+                offered[0] = current;
+                JsonNode input;
+                try {
+                    input = handler.get().input(ref(next));
+                } catch (RuntimeException failure) {
+                    throw new InputFailed(failure);
+                }
+                if (input != null && !input.isObject()) {
+                    throw new InputFailed(null);
+                }
+                return new Claim(next.id(), next.claimId(), next.attempt(), next.claimRenewAt(), next.claimLapsesAt(),
+                        grant, next.kind(), input == null ? JsonNodeFactory.instance.objectNode() : input,
+                        TraceContext.traceparent(next.traceId()));
+            }));
+        } catch (InputFailed failed) {
+            // The claim rolled back; the job cannot run without its input: it ends failed instead of being offered forever.
+            endWithoutInput(offered[0], handler.get(), failed.getCause(), now);
+            throw JobProblems.notOffered();
+        }
         JobTrace.run(seen.traceId(), () -> log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claim.claimId())
                 .addKeyValue("attempt", claim.attempt()).addKeyValue("kind", claim.kind()).log("job.claimed"));
         return claim;
@@ -140,7 +165,8 @@ public class JobClaims {
      */
     public void report(UUID jobId, UUID claimId, String grant, String outcome, String code, JsonNode result) {
         boolean done = DONE.equals(outcome);
-        if (!done && !FAILED.equals(outcome) || code != null && (done || !CODE.matcher(code).matches())
+        if (!done && !FAILED.equals(outcome)
+                || code != null && (done || code.length() > MAX_CODE_LENGTH || !CODE.matcher(code).matches())
                 || result != null && !done) {
             throw JobProblems.invalid();
         }
@@ -185,6 +211,37 @@ public class JobClaims {
             offers.offerDue(lane, jobId);
         } else if (lane == Lane.INGESTION) {
             offers.offerNextIngestion();
+        }
+    }
+
+    /** The handler's input could not be had (it threw, or it is not a JSON object). Its message names nothing. */
+    static final class InputFailed extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        InputFailed(RuntimeException cause) {
+            super(JobProblems.INPUT_FAILED, cause);
+        }
+    }
+
+    /** Ends an offered job whose input failed, with the handler told as the owner, in one transaction. */
+    private void endWithoutInput(JobRow offered, JobHandler handler, Throwable cause, Instant now) {
+        JobRow failed = offered.released(JobState.FAILED, JobProblems.INPUT_FAILED, now);
+        boolean ended = JobTrace.call(offered.traceId(), () -> owners.call(offered.ownerId(), () -> {
+            if (storage.joined().findForUpdate(offered.id()).isEmpty() || !storage.joined().replace(offered, failed)) {
+                return false;
+            }
+            handler.failed(ref(offered), JobProblems.INPUT_FAILED);
+            return true;
+        }));
+        if (ended) {
+            JobTrace.run(offered.traceId(), () -> log.atWarn().addKeyValue("jobId", offered.id())
+                    .addKeyValue("kind", offered.kind()).addKeyValue("code", JobProblems.INPUT_FAILED)
+                    .addKeyValue("errorType", cause == null ? "not_an_object" : cause.getClass().getName())
+                    .log("job.failed"));
+            if (Lane.of(offered.lane()).orElseThrow() == Lane.INGESTION) {
+                offers.offerNextIngestion();
+            }
         }
     }
 

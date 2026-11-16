@@ -47,8 +47,44 @@ import tools.jackson.databind.JsonNode;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles(value = {"test-mode", "unit"}, inheritProfiles = false)
-@Import(JobTestStores.class)
+@Import({JobTestStores.class, JobFlowTest.Handlers.class})
 class JobFlowTest extends HttpTestSupport {
+
+    /** A kind whose handler gives a JSON array as its input: never a valid claim. */
+    static final String ARRAY_INPUT = "array-input";
+
+    @org.springframework.boot.test.context.TestConfiguration(proxyBeanMethods = false)
+    static class Handlers {
+        @org.springframework.context.annotation.Bean
+        io.github.gmshield.jobs.service.JobHandler arrayInputHandler() {
+            return new io.github.gmshield.jobs.service.JobHandler() {
+                @Override
+                public String kind() {
+                    return ARRAY_INPUT;
+                }
+
+                @Override
+                public Lane lane() {
+                    return Lane.INGESTION;
+                }
+
+                @Override
+                public JsonNode input(JobRef job) {
+                    return tools.jackson.databind.node.JsonNodeFactory.instance.arrayNode().add(1);
+                }
+
+                @Override
+                public void completed(JobRef job, JsonNode result) {
+                }
+
+                @Override
+                public void failed(JobRef job, String code) {
+                    LoggerFactory.getLogger(JobFlowTest.class).atInfo().addKeyValue("jobId", job.id())
+                            .addKeyValue("code", code).log("array-input.failed");
+                }
+            };
+        }
+    }
 
     static final String PROBES = "/internal/v1/test-mode/probe-jobs";
     static final String INTERACTIVE = "gmshield:work:interactive";
@@ -184,6 +220,58 @@ class JobFlowTest extends HttpTestSupport {
     }
 
     @Test
+    void aClaimThatSeesAJobStillBeingOfferedWaitsForTheOfferAndSucceeds() throws Exception {
+        stream.down.set(true);
+        UUID id = createProbe("interactive", 0, 0, null);
+        stream.down.set(false);
+        assertThat(storage.row(id).state()).isEqualTo("waiting");
+        // The offer commits while the claim waits for the row's lock.
+        storage.beforeNextLockedRead = () -> storage.rows.put(id, storage.row(id).offered(START));
+
+        HttpResponse<String> response = claim(id);
+
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+        assertThat(storage.row(id).state()).isEqualTo("running");
+        assertThat(storage.row(id).attempt()).isEqualTo(1);
+    }
+
+    @Test
+    void aHandlerWhoseInputFailsEndsTheJobFailedInsteadOfOfferingItForever() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        probes.rows.remove(id);   // the probe handler's input() now throws
+
+        assertProblem(claim(id), 409, "job.not_offered");
+
+        JobRow row = storage.row(id);
+        assertThat(row.state()).isEqualTo("failed");
+        assertThat(row.outcomeCode()).isEqualTo("job.input_failed");
+        assertThat(row.attempt()).isZero();
+        assertThat(row.grantHash()).isNull();
+        assertThat(logEvents()).contains("probe.failed");
+        clock.advance(Duration.ofMinutes(3));
+        sweep.sweep();
+        assertThat(stream.offered(INTERACTIVE)).containsExactly(id);
+    }
+
+    @Test
+    void anInputThatIsNotAJsonObjectEndsTheJobFailedAndTheIngestionLaneMovesOn() throws Exception {
+        UUID owner = UUID.randomUUID();
+        UUID broken = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                jobs.create(ARRAY_INPUT, job -> { }).id()));
+        clock.advance(Duration.ofSeconds(1));
+        UUID next = createAs(owner, Lane.INGESTION);
+        assertThat(storage.row(next).state()).isEqualTo("waiting");
+
+        assertProblem(claim(broken), 409, "job.not_offered");
+
+        assertThat(storage.row(broken).state()).isEqualTo("failed");
+        assertThat(storage.row(broken).outcomeCode()).isEqualTo("job.input_failed");
+        assertThat(logEvents()).contains("array-input.failed");
+        assertThat(storage.row(next).state()).isEqualTo("offered");
+        assertThat(claim(next).statusCode()).isEqualTo(201);
+    }
+
+    @Test
     void aJobOfAKindWithoutAHandlerEndsFailedAtItsClaim() throws Exception {
         UUID id = UUID.randomUUID();
         storage.rows.put(id, new JobRow(id, UUID.randomUUID(), "gone", "interactive", "offered", 0,
@@ -291,7 +379,8 @@ class JobFlowTest extends HttpTestSupport {
         JsonNode claim = json(claim(id));
         for (String body : new String[] {"{\"outcome\":\"maybe\"}", "{}", "{\"outcome\":\"done\",\"code\":\"probe.failed\"}",
                 "{\"outcome\":\"failed\",\"code\":\"Not A Code\"}", "{\"outcome\":\"failed\",\"code\":\"nodot\"}",
-                "{\"outcome\":\"failed\",\"result\":{}}", "not json"}) {
+                "{\"outcome\":\"failed\",\"result\":{}}", "not json",
+                "{\"outcome\":\"failed\",\"code\":\"probe." + "x".repeat(30) + ".y" + "y".repeat(28) + "\"}"}) {
             assertThat(outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(), body).statusCode())
                     .as(body).isEqualTo(400);
         }

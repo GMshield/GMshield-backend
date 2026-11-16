@@ -82,6 +82,11 @@ class JobRulesTest {
     }
 
     @Test
+    void anOutcomeCodeFitsTheColumn() {
+        assertThat(JobClaims.MAX_CODE_LENGTH).isEqualTo(64);
+    }
+
+    @Test
     void theGrantComparisonLooksAtEveryByte() {
         byte[] expected = {1, 2, 3};
         assertThat(JobClaims.sameBytes(expected, new byte[] {1, 2, 3})).isTrue();

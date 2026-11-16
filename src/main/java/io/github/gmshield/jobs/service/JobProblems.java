@@ -14,6 +14,8 @@ public final class JobProblems {
     public static final String ATTEMPTS_EXHAUSTED = "job.attempts_exhausted";
     /** The code of a failed outcome that named none. */
     public static final String FAILED = "job.failed";
+    /** The code of a job whose handler could not give its input (it failed, or it was not a JSON object). */
+    public static final String INPUT_FAILED = "job.input_failed";
     /** The code of a job whose kind no handler of this backend knows. */
     public static final String UNKNOWN_KIND = "job.unknown_kind";
 
