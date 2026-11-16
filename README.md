@@ -39,10 +39,11 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Four modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
-contract versions and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
-below), `audit` (the append-only audit log, below; it may use `shared`) and `accounts` (sign-in with
-Google, accounts and sessions, below; it may use `shared`, `vault` and `audit`).
+Five modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
+below), `audit` (the append-only audit log, below; it may use `shared`), `library` (systems and
+campaigns, below; it may use `shared` and `vault`) and `accounts` (sign-in with Google, accounts and
+sessions, below; it may use `shared`, `vault`, `audit` and `library`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below).
@@ -155,6 +156,38 @@ Google, accounts and sessions, below; it may use `shared`, `vault` and `audit`).
   - An account whose seal version rose above the session's answers `session.renewal_required` (401)
     on every call but a renewal, which issues the next token under the current seal version.
   - A cookie or a Redis record of Story 1.9 is no session (`session.required`), never an error.
+- **Library and its owner (`library`, Story 1.11, AD-11).** The library tables `system` and `campaign`
+  (`V4__library.sql`) each carry `owner_id`, mapped with Hibernate `@TenantId`: Hibernate fills it on insert
+  and filters every query by it, so another owner's row is never read. They are read and written only through
+  JPA entities and JPQL (also by id), never native SQL or `JdbcClient`.
+  - The owner comes from `shared.service.OwnerContext`, a `ScopedValue` bound for one piece of work and
+    gone afterwards. Two places bind it: `accounts.web.LibraryOwnerFilter`, for every request to
+    `/api/v1/systems/**` and `/api/v1/campaigns/**`, from the session's account (`X-Session-Token`; no
+    session: `session.required` before any controller), and `OwnerContext.callAs`, for work run as one
+    owner (a first sign-in). Binding it inside bound work is refused. It never comes from a parameter or
+    a body. `shared.data.OwnerTenantResolver` hands it to Hibernate; without an owner it throws, so no
+    session opens and no query runs, and no tenant is ever a root.
+  - **Every JPA transaction needs an owner.** The JPA transaction manager is the application's only
+    `PlatformTransactionManager`, and each transaction it begins (`TransactionTemplate`,
+    `@Transactional`) opens a Hibernate session first, so without a bound owner it fails with
+    `OwnerContext.NoOwnerException` before it starts, whether or not it touches a library table. Work
+    with no owner (for example the backend's own job writes, Story 1.12) must bind an owner with
+    `OwnerContext.callAs` or run its JDBC writes under a separate JDBC transaction manager on its own
+    connection, as `vault.data.JdbcDataKeyStore` does.
+  - Names are `bytea`, encrypted with `Binding("system"|"campaign", "name", id, owner)`. A system's
+    `name_fingerprint` (NFC lower-case, trimmed) is unique per owner; a campaign names its system by
+    `(owner_id, system_id)`, so it can never point at another owner's system.
+  - `POST /api/v1/sign-in/complete` takes an optional `language` (`pt-BR` | `en`, default `pt-BR`) and
+    creates the account, one system and one campaign in one transaction, run as the new account: "Sistema
+    sem nome" / "Primeira campanha", or "Untitled system" / "First campaign". A failure leaves neither and
+    keeps the attempt for a retry with the same account id. The vault's data-key insert commits in its own
+    transaction (`REQUIRES_NEW`, on its own connection), because a stored key is cached at once.
+  - `GET /api/v1/campaigns/current` (the owner's oldest campaign, with its system), `GET
+    /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
+    malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
+  - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
+    metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
+    start without a database and use in-memory stores (`@Primary`).
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -217,6 +250,7 @@ Neither Java nor Gradle needs to be installed: everything builds and runs in Doc
 ```sh
 docker build --target test .                                               # tests and every build guard
 docker build --target test-reports --output type=local,dest=out .          # test results, coverage, classes
+docker build --target integration -t gmshield-backend-it .                  # the integration tests (see below)
 docker build -t gmshield-backend .                                         # the production image
 dev/start                                                                  # data services and applications
 dev/stop
@@ -230,6 +264,19 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GRADLE_USER_HOME=/tmp/gra
   -v "$PWD":/workspace -w /workspace \
   eclipse-temurin:27.0.1.0-jdk-alpine@sha256:a63e42ef2a577cdb0802b73bb6f8fa2c3b0ebf1b4f00f29eb22e7f4d83b234f7 \
   ./gradlew --no-daemon test -PupdateOpenApi
+```
+
+The integration tests (`src/integrationTest`, `./gradlew integrationTest`) run against a real
+PostgreSQL and Redis at the test-mode hosts `postgres:5432` and `redis:6379` (`GMSHIELD_MODE=test`):
+the cross-owner tests of every kind of library item, the starter library's rollback and the owner of
+every query. `check` compiles them but does not run them. To run the image by hand:
+
+```sh
+docker network create gm-it
+docker run -d --name gm-it-pg --network gm-it --network-alias postgres -e POSTGRES_DB=gmshield \
+  -e POSTGRES_USER=gmshield -e POSTGRES_PASSWORD=gmshield-test-mode postgres:18.6-alpine
+docker run -d --name gm-it-redis --network gm-it --network-alias redis redis:8.10.3-alpine
+docker run --rm --network gm-it -e GMSHIELD_MODE=test gmshield-backend-it   # exit 0: passed
 ```
 
 [`dev/README.md`](dev/README.md) describes the shared development setup, used by the frontend and
@@ -285,8 +332,6 @@ RDB and every log for it, plain and encoded.
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 [`Dockerfile`](Dockerfile): the `test` stage runs the unit tests, `test-reports` exports the test
 results, the coverage report and the compiled classes (read by SonarQube through
-[`sonar-project.properties`](sonar-project.properties)), and the production image is the last stage.
-
-Until Story 1.4 gives the pipeline a throwaway PostgreSQL and Redis, a run on `develop` fails at
-the staging start: the backend does not report healthy without them. That blocks promotion to
-`main` and nothing else.
+[`sonar-project.properties`](sonar-project.properties)), `integration` runs the integration tests
+(`[test]`: the pipeline's integration stage runs it on `develop` beside a throwaway PostgreSQL and
+Redis), and the production image is the last stage.

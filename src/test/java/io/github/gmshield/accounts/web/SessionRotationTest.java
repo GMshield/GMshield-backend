@@ -15,6 +15,7 @@ import io.github.gmshield.accounts.web.SignInFlowTest.MovableClock;
 import io.github.gmshield.audit.data.AuditRow;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
+import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.shared.service.JsonLineLogFormatter;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
@@ -46,6 +47,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
 import tools.jackson.databind.JsonNode;
@@ -64,6 +66,7 @@ class SessionRotationTest {
     private static final Duration OVERLAP = Duration.ofSeconds(60);
 
     @TestConfiguration
+    @Import(LibraryTestStores.class)
     static class Stores {
         @Bean
         @Primary

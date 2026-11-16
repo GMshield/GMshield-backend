@@ -1,12 +1,16 @@
 package io.github.gmshield.accounts.data;
 
+import io.github.gmshield.shared.data.RollbackUndo;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** {@code account} in memory, with the same unique keys as the table, for tests that run without PostgreSQL. */
+/**
+ * {@code account} in memory, with the same unique keys as the table, for tests that run without PostgreSQL. An
+ * insert undoes itself when its transaction rolls back.
+ */
 public class InMemoryAccountStore implements AccountStore {
 
     public final Map<UUID, AccountRow> rows = new ConcurrentHashMap<>();
@@ -22,6 +26,7 @@ public class InMemoryAccountStore implements AccountStore {
             return Insert.USERNAME_TAKEN;
         }
         rows.put(row.id(), row);
+        RollbackUndo.onRollback(() -> rows.remove(row.id()));
         return Insert.INSERTED;
     }
 
