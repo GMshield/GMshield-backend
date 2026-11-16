@@ -25,8 +25,14 @@ RUN ./gradlew check bootJar sonarLibraries
 
 # The pipeline runs this image with GMSHIELD_MODE=test on an internal network (no internet) where the
 # services answer as postgres:5432 and redis:6379: everything it needs is compiled and fetched here.
+# The tests run as an unprivileged user that owns only the workspace and the Gradle home (never root).
 FROM build AS integration
-RUN ./gradlew integrationTestClasses integrationTestDependencies
+RUN ./gradlew integrationTestClasses integrationTestDependencies \
+    && addgroup -S -g 10001 gmshield \
+    && adduser -S -D -H -u 10001 -G gmshield -s /sbin/nologin gmshield \
+    && chown -R 10001:10001 /workspace /gradle-home
+ENV HOME=/tmp
+USER 10001:10001
 CMD ["./gradlew", "--offline", "integrationTest"]
 
 FROM scratch AS test-reports
