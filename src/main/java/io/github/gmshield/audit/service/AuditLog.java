@@ -28,7 +28,8 @@ import tools.jackson.databind.json.JsonMapper;
 @Service
 public class AuditLog {
 
-    static final Pattern ACTION = Pattern.compile("[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+");
+    // Possessive quantifiers: the segments never overlap, so no backtracking (and no deep recursion on long input).
+    static final Pattern ACTION = Pattern.compile("[a-z][a-z0-9_]*+(?:\\.[a-z][a-z0-9_]*+)++");
     static final Pattern DETAIL_NAME = Pattern.compile("[a-z][A-Za-z0-9]{0,39}");
     static final Pattern CODE = Pattern.compile("[a-z0-9_.-]{1,40}");
     static final int MAX_DETAILS = 16;
