@@ -39,9 +39,10 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Two modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
-contract versions and `Ids`, which mints every id as a UUID v7) and `vault` (encryption at rest,
-below).
+Three modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+contract versions and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
+below) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared` and
+`vault`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **No credential yet.** `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`,
@@ -82,9 +83,53 @@ below).
     `KeyStore`, BouncyCastle, Tink, Spring Security crypto, Spring's `DigestUtils`, Guava hashing or
     commons-codec digests (fixtures prove the rule fails). A checksum, such as an upload's SHA-256,
     goes through a `vault` method too.
+  - `Vault.seal(entity, rowId, values...)` / `verifySeal`: the keyed signature (HMAC-SHA256 under a
+    subkey of the entity) over the row id and the sealed values, compared in constant time; a mismatch
+    logs `vault.seal_failed` (entity and row id) and throws `IntegrityException`.
+    `Vault.pkceChallenge(verifier)` gives the PKCE S256 challenge.
   - Test mode only: `POST /internal/v1/test-mode/nfr1-probe` and `GET .../{id}` (left out of the
     OpenAPI documents) store and read back the pipeline's NFR-1 text as one `vault_probe` row and
-    one file piece. The table comes from `db/test-mode-migration`, a location only test mode adds.
+    one file piece, then announce `Nfr1ProbeSeeded`: `accounts` also stores the text as a real
+    account's Google id and email address, and reads it back. The table comes from
+    `db/test-mode-migration`, a location only test mode adds.
+- **Sign-in with Google (`accounts`, AD-8, AD-20).** The backend alone calls Google, with the OIDC
+  code flow (scopes `openid email`, PKCE S256, state and nonce). Routes, all `no-store`:
+  - `POST /api/v1/sign-in/google` issues an attempt token (10 minutes) and the authorization URL.
+    Redis keeps the attempt under `gmshield:sign-in:<hex of vault.tokenHash("sign-in", token)>`,
+    600 s. The state, the nonce and the PKCE verifier are `tokenHash` of the token under the
+    purposes `sign-in-state`, `sign-in-nonce` and `sign-in-pkce`, so Redis holds nothing that
+    completes a sign-in.
+  - `POST /api/v1/sign-in/google/callback` (`attemptToken`, `state`, `code`, `error`, relayed by the
+    frontend) takes the attempt out of Redis in one step (`GETDEL`). No attempt, a wrong state, an
+    expired or reused attempt: `request.sign_in_expired` (400). Google's `error`, a failed exchange
+    or an unacceptable ID token: `request.sign_in_refused` (400). Nothing is created either way. The
+    ID token comes straight from Google's token endpoint over TLS, so its signature is not checked
+    (OIDC Core 3.1.3.7, item 6); `iss`, `aud` (and `azp`), `exp`, `nonce` and `email_verified=true`
+    are. A known Google id gets a session (`signed_in`); a changed email address is updated, the
+    seal version rises and the account is sealed again. An unknown one is encrypted for a newly
+    minted account id and kept in the attempt (`username_required`).
+  - `POST /api/v1/sign-in/complete` (`attemptToken`, `username`, `termsAccepted`) creates the
+    account and a session. Usernames: 3 to 24 of `A-Z a-z 0-9 _ . -`, unique whatever the case
+    (`request.username_invalid` 400 with `min` and `max`, `request.username_taken` 409, kept by a
+    unique index on the fingerprint of the NFC lower-case form), shown as typed. Unticked terms:
+    `request.terms_required` (400). The attempt stays for another try.
+  - `GET /api/v1/me` and `DELETE /api/v1/session` read the session token from `X-Session-Token`
+    (never a cookie). No session, an ended one or an account that is not active:
+    `session.required` (401). Sign-out deletes the session and its entry in the account's set; it
+    answers 204 whether or not the session existed.
+  - The table `account` (`V2__account.sql`) stores only the username, the email address and the
+    Google id, each encrypted with `Binding("account", field, id, id)` and fingerprinted, plus tier
+    (`ordinary`), state (`active`), `confirmed`, `terms_version`, `terms_accepted_at`,
+    `seal_version` and `seal`. The seal covers the id, tier, state, the Google-id, username and email
+    fingerprints, `confirmed` and `seal_version`, and is checked on every load: a mismatch is
+    `integrity.failed` (500) and grants nothing.
+  - Sessions: `gmshield:session:<hex of vault.tokenHash("session", token)>` holds the account id,
+    the seal version and the creation time for 7 days; `gmshield:session:account:<account id>` is
+    the set of an account's session hashes. Rotation, the idle timeout and the seal-version check
+    come with Story 1.10.
+  - Test mode: a stand-in replaces Google. Its authorization URL is the frontend's own callback,
+    relative (`/auth/google/callback?state=<real state>&code=stand-in.1.gm@example.test`); any code
+    `stand-in.<sub>.<email>` gives that identity, any other is refused.
 
 ## Settings
 
@@ -104,6 +149,9 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_VAULT_MASTER_KEY` | 32 random bytes in Base64 (required, secret): wraps every data key. Losing or changing it loses every stored value; no off-server copy exists until Epic 10 |
 | `GMSHIELD_VAULT_INDEX_KEY` | 32 random bytes in Base64 (required, secret, different from the master key): source of the fingerprint and token-hash subkeys |
 | `GMSHIELD_FILES_DIR` | the encrypted file store (default `/var/lib/gmshield/files`, where the pipeline mounts the volume `gmshield-backend-files`) |
+| `GMSHIELD_GOOGLE_CLIENT_ID` | the Google OAuth client id (required, secret): entered by hand in `backend.env` |
+| `GMSHIELD_GOOGLE_CLIENT_SECRET` | the Google OAuth client secret (required, secret): entered by hand in `backend.env` |
+| `GMSHIELD_PUBLIC_URL` | the frontend's origin as the browser sees it, `http` or `https` with no path (required; `.gmshield/pipeline.toml`): Google redirects to `<it>/auth/google/callback`, which must be a redirect URI of the OAuth client |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
@@ -113,7 +161,9 @@ values are fixed: in test mode the settings above are not read, so it cannot be 
 host. Test mode uses plain connections and needs no certificate. Its vault keys are random for each
 start and held only in memory, and its file store is `/var/lib/gmshield/files`. Test mode refuses
 to start when a secret above is present. Any other value of `GMSHIELD_MODE` is refused. A vault key
-that is not 32 bytes of Base64, or the same key twice, is refused with `setting.invalid`.
+that is not 32 bytes of Base64, or the same key twice, is refused with `setting.invalid`, as is a
+public URL that is not an `http` or `https` origin. Test mode ignores `GMSHIELD_PUBLIC_URL` (the
+pipeline's staging copy has it) and refuses the Google client id or secret like any other secret.
 
 ## Build and start
 
@@ -175,12 +225,17 @@ read-only root filesystem and every capability dropped, and finds the private au
 certificate at `/run/gmshield/certs/ca.crt`. Its settings, written once by GMshield-pipeline's
 `deploy/data-credentials.sh`, live in `~/gmshield-ci/secrets/backend.env` on the server: its own
 PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`), its own Redis
-account `backend` (keys `gmshield:*` only), and the two vault keys. The contract mounts the named
-volume `gmshield-backend-files` at `/var/lib/gmshield/files` (the encrypted file store).
+account `backend` (keys `gmshield:*` only), the two vault keys, and the Google OAuth client id and
+secret, which Dalton enters by hand (the script writes empty placeholders and never replaces a value;
+without them the backend refuses to start, `setting.missing`). `GMSHIELD_PUBLIC_URL` is a plain
+setting in the contract's `[deploy].env`: `http://localhost:3000`, the address of the frontend through
+Dalton's SSH tunnel, until the public domain exists. The contract mounts the named volume
+`gmshield-backend-files` at `/var/lib/gmshield/files` (the encrypted file store).
 
 `[nfr1]` in the contract turns on the NFR-1 release gate on `develop`: inside the staging session the
-pipeline stores a random text through the test-mode probe route, reads it back, and searches
-`pg_dump`, the file-store volume, a Redis RDB and every log for it, plain and encoded.
+pipeline stores a random text through the test-mode probe route (which also stores it as an account's
+Google id and email address), reads it back, and searches `pg_dump`, the file-store volume, a Redis
+RDB and every log for it, plain and encoded.
 
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 [`Dockerfile`](Dockerfile): the `test` stage runs the unit tests, `test-reports` exports the test

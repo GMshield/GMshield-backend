@@ -5,6 +5,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import io.github.gmshield.accounts.data.AccountRow;
+import io.github.gmshield.accounts.data.AccountStore;
+import io.github.gmshield.accounts.data.InMemoryAccountStore;
 import io.github.gmshield.shared.service.JsonLineLogFormatter;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
@@ -56,6 +59,12 @@ class Nfr1ProbeRouteTest {
         ProbeStore inMemoryProbes() {
             return new InMemoryProbeStore();
         }
+
+        @Bean
+        @Primary
+        AccountStore inMemoryAccounts() {
+            return new InMemoryAccountStore();
+        }
     }
 
     @Value("${local.server.port}")
@@ -69,6 +78,9 @@ class Nfr1ProbeRouteTest {
 
     @Autowired
     private DataKeyStore dataKeys;
+
+    @Autowired
+    private AccountStore accounts;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -110,6 +122,13 @@ class Nfr1ProbeRouteTest {
         byte[] stored = Files.readAllBytes(piece);
         assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContain(TEXT)
                 .doesNotContain(Base64.getEncoder().encodeToString(TEXT.getBytes(StandardCharsets.UTF_8)));
+
+        // Story 1.9: the text is also a real account row's Google id and email address, stored encrypted.
+        AccountRow account = ((InMemoryAccountStore) accounts).rows.values().stream()
+                .filter(candidate -> candidate.termsVersion().endsWith("draft")).findFirst().orElseThrow();
+        for (byte[] value : new byte[][] {account.googleId(), account.email(), account.username()}) {
+            assertThat(new String(value, StandardCharsets.ISO_8859_1)).doesNotContain(TEXT);
+        }
 
         JsonLineLogFormatter formatter = new JsonLineLogFormatter();
         assertThat(String.join("", logged.list.stream().map(formatter::format).toList())).doesNotContain(TEXT);

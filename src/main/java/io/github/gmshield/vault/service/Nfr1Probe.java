@@ -9,12 +9,14 @@ import io.github.gmshield.vault.data.ProbeStore;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.UUID;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 
 /**
  * Test mode only: stores the NFR-1 gate's known text through the vault, as one {@code vault_probe}
- * row and one file piece, and reads both back. Later stories add their real routes to the seed.
+ * row and one file piece, and reads both back. Then it announces {@link Nfr1ProbeSeeded}, so that other
+ * modules store the same text through their real paths (Story 1.9: an account's Google id and email).
  */
 @Service
 @Profile(StartupSettings.TEST_MODE_PROFILE)
@@ -28,12 +30,14 @@ public class Nfr1Probe {
     private final FileStore files;
     private final ProbeStore store;
     private final DataKeys dataKeys;
+    private final ApplicationEventPublisher events;
 
-    Nfr1Probe(Vault vault, FileStore files, ProbeStore store, DataKeys dataKeys) {
+    Nfr1Probe(Vault vault, FileStore files, ProbeStore store, DataKeys dataKeys, ApplicationEventPublisher events) {
         this.vault = vault;
         this.files = files;
         this.store = store;
         this.dataKeys = dataKeys;
+        this.events = events;
     }
 
     public record ReadBack(String text, String fileText) {
@@ -56,6 +60,7 @@ public class Nfr1Probe {
             if (!text.equals(back.text()) || !text.equals(back.fileText())) {
                 throw new IllegalStateException("the probe did not read back what it stored");
             }
+            events.publishEvent(new Nfr1ProbeSeeded(id, text));
             return id;
         } finally {
             Arrays.fill(plain, (byte) 0);

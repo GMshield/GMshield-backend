@@ -63,6 +63,11 @@ services:
       # Throwaway vault keys (32 bytes of 3 and of 4): data stored in development is not protected.
       GMSHIELD_VAULT_MASTER_KEY: AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=
       GMSHIELD_VAULT_INDEX_KEY: BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=
+      # Sign-in with Google: your own OAuth client from the shell that runs ./start, or placeholders with
+      # which the backend starts but Google refuses the sign-in. Never write a real one into this file.
+      GMSHIELD_GOOGLE_CLIENT_ID: ${GMSHIELD_GOOGLE_CLIENT_ID:-not-a-real-client-id}
+      GMSHIELD_GOOGLE_CLIENT_SECRET: ${GMSHIELD_GOOGLE_CLIENT_SECRET:-not-a-real-client-secret}
+      GMSHIELD_PUBLIC_URL: http://localhost:${GMSHIELD_DEV_FRONTEND_PORT:-3000}
     read_only: true
     tmpfs: ["/tmp"]
     volumes: ["backend_files:/var/lib/gmshield/files"]   # the encrypted file store

@@ -175,6 +175,55 @@ class StartupSettingsTest {
         assertThat(StartupSettings.vaultKey("")).isNull();
     }
 
+    @Test
+    void outsideTestModeTheGoogleSettingsAreRequiredAndNamed() {
+        Map<String, String> environment = production();
+        environment.remove("GMSHIELD_GOOGLE_CLIENT_ID");
+        environment.remove("GMSHIELD_GOOGLE_CLIENT_SECRET");
+        environment.remove("GMSHIELD_PUBLIC_URL");
+
+        StartupSettings settings = StartupSettings.check(environment);
+
+        assertThat(settings.refused()).isTrue();
+        assertThat(settings.refusedSettings())
+                .containsExactly("GMSHIELD_GOOGLE_CLIENT_ID", "GMSHIELD_GOOGLE_CLIENT_SECRET", "GMSHIELD_PUBLIC_URL");
+        assertRefusalLine(settings, "setting.missing");
+    }
+
+    @Test
+    void theGoogleClientIsAProductionSecretThatTestModeRefuses() {
+        for (String secret : new String[] {"GMSHIELD_GOOGLE_CLIENT_ID", "GMSHIELD_GOOGLE_CLIENT_SECRET"}) {
+            assertThat(StartupSettings.SECRETS).contains(secret);
+            StartupSettings settings = StartupSettings.check(Map.of("GMSHIELD_MODE", "test", secret, SECRET_VALUE));
+
+            assertThat(settings.refusedSettings()).containsExactly("GMSHIELD_MODE", secret);
+            assertRefusalLine(settings, "mode.test_with_production_secret");
+        }
+        // The public URL is a plain setting: the pipeline's staging copy has it, and test mode ignores it.
+        assertThat(StartupSettings.check(Map.of("GMSHIELD_MODE", "test", "GMSHIELD_PUBLIC_URL", "http://localhost:3000"))
+                .refused()).isFalse();
+    }
+
+    @Test
+    void thePublicUrlMustBeAnHttpOrigin() {
+        for (String good : new String[] {"http://localhost:3000", "https://app.example", "https://app.example/"}) {
+            Map<String, String> environment = production();
+            environment.put("GMSHIELD_PUBLIC_URL", good);
+            assertThat(StartupSettings.check(environment).refused()).as(good).isFalse();
+        }
+        assertThat(StartupSettings.publicUrl(" https://app.example/ ")).isEqualTo("https://app.example");
+        for (String bad : new String[] {"localhost:3000", "ftp://app.example", "https://app.example/path",
+                "https://user@app.example", "https://app.example?x=1", "https://app.example#x", "https://", "not a url"}) {
+            Map<String, String> environment = production();
+            environment.put("GMSHIELD_PUBLIC_URL", bad);
+
+            StartupSettings settings = StartupSettings.check(environment);
+
+            assertThat(settings.refusedSettings()).as(bad).containsExactly("GMSHIELD_PUBLIC_URL");
+            assertRefusalLine(settings, "setting.invalid");
+        }
+    }
+
     private static void assertRefusalLine(StartupSettings settings, String reason) {
         String line = settings.refusalLine();
         assertThat(line).doesNotContain(SECRET_VALUE).doesNotContain("\n");
@@ -197,6 +246,9 @@ class StartupSettingsTest {
         environment.put("GMSHIELD_REDIS_PASSWORD", SECRET_VALUE);
         environment.put("GMSHIELD_VAULT_MASTER_KEY", MASTER_KEY);
         environment.put("GMSHIELD_VAULT_INDEX_KEY", INDEX_KEY);
+        environment.put("GMSHIELD_GOOGLE_CLIENT_ID", "client-id.apps.example");
+        environment.put("GMSHIELD_GOOGLE_CLIENT_SECRET", SECRET_VALUE);
+        environment.put("GMSHIELD_PUBLIC_URL", "http://localhost:3000");
         return environment;
     }
 }
