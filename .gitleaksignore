@@ -5,3 +5,5 @@ f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/shared
 f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/vault/service/VaultTest.java:generic-api-key:149
 # Story 1.10: the development setup's throwaway frontend credential in a curl example (dev/compose.yaml), not a secret.
 4f1c855b7da6a0a9a7ffbe0e92cb730b551ee063:dev/README.md:curl-auth-header:61
+# Story 1.12: the development setup's throwaway worker credential in a curl example (dev/compose.yaml), not a secret.
+897af0f5de12b7b93e8a13ed513afcef92140248:dev/README.md:curl-auth-header:69
