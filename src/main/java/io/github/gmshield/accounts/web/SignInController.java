@@ -68,8 +68,8 @@ class SignInController {
     @Schema(name = "CompleteSignIn", requiredProperties = {"attemptToken", "username", "termsAccepted"})
     record CompleteSignIn(
             @Schema(description = "The attempt token of the visitor's cookie") String attemptToken,
-            @Schema(description = "3 to 24 characters: letters a to z, digits, \"_\", \".\" and \"-\"; unique whatever"
-                    + " the case", example = "mestre_ana") String username,
+            @Schema(description = "3 to 24 characters: letters a to z in upper or lower case, digits, \"_\", \".\" and"
+                    + " \"-\"; unique whatever the case, shown as typed", example = "mestre_ana") String username,
             @Schema(description = "The visitor accepted the terms of use and the privacy notice") Boolean termsAccepted) {
     }
 

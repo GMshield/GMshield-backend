@@ -14,7 +14,7 @@ import java.util.stream.Collectors;
  *   <li>{@code GMSHIELD_MODE=test} (set only by the pipeline): built-in throwaway connection
  *       settings. Refused when a production secret is present.</li>
  *   <li>No mode: every required setting must be present, each vault key must be 32 bytes in
- *       Base64, and the public URL an http or https origin. Redis is reached over TLS verified against the private authority (the
+ *       Base64, and the public URL an https origin (http only on localhost). Redis is reached over TLS verified against the private authority (the
  *       {@code redis-tls} profile) unless {@code GMSHIELD_REDIS_TLS=false}, which only the
  *       development setup sets.</li>
  * </ul>
@@ -41,6 +41,8 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
     public static final String GOOGLE_CLIENT_SECRET = "GMSHIELD_GOOGLE_CLIENT_SECRET";
     /** The origin the browser sees for the frontend; Google's redirect goes to {@code <it>/auth/google/callback}. */
     public static final String PUBLIC_URL = "GMSHIELD_PUBLIC_URL";
+    /** The only hosts a plain-http public URL may name: the browser treats them as secure for cookies. */
+    private static final java.util.Set<String> LOOPBACK_HOSTS = java.util.Set.of("localhost", "127.0.0.1", "[::1]");
 
     /** Required outside test mode. */
     public static final List<String> REQUIRED = List.of(
@@ -158,8 +160,10 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
 
     /**
      * The public URL as an origin without a trailing slash ({@code https://app.example} or
-     * {@code http://localhost:3000}), or null when it is not an http or https URL with a host and
-     * nothing else: no user, path, query or fragment.
+     * {@code http://localhost:3000}), or null when it is not an https URL with a host and nothing else
+     * (no user, path, query or fragment). Plain http is accepted only for {@code localhost},
+     * {@code 127.0.0.1} and {@code [::1]}: elsewhere browsers drop the {@code __Host-} cookies and every
+     * sign-in would silently expire.
      */
     public static String publicUrl(String value) {
         if (value == null) {
@@ -171,7 +175,8 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
         }
         try {
             java.net.URI uri = new java.net.URI(stripped);
-            boolean web = "http".equals(uri.getScheme()) || "https".equals(uri.getScheme());
+            boolean web = "https".equals(uri.getScheme())
+                    || ("http".equals(uri.getScheme()) && LOOPBACK_HOSTS.contains(uri.getHost()));
             boolean originOnly = uri.getHost() != null && uri.getRawUserInfo() == null
                     && (uri.getRawPath() == null || uri.getRawPath().isEmpty())
                     && uri.getRawQuery() == null && uri.getRawFragment() == null;

@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -378,6 +379,30 @@ class SignInFlowTest {
         assertThat(get(SessionController.ME, session).statusCode()).isEqualTo(500);
         accounts.put(row);
         assertThat(get(SessionController.ME, session).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void aBlockedAccountIsRefusedAndLeftUnchanged() throws Exception {
+        String sub = "blocked-" + UUID.randomUUID();
+        signUp(sub, "before@example.test", "blocked_" + sub.substring(8, 14));
+        AccountRow row = onlyAccountOf(sub);
+        // Blocked the way accounts would do it: the state changed and the row sealed again.
+        HexFormat hex = HexFormat.of();
+        AccountRow blocked = new AccountRow(row.id(), row.tier(), "blocked", row.confirmed(), row.googleId(),
+                row.googleIdFingerprint(), row.email(), row.emailFingerprint(), row.username(), row.usernameFingerprint(),
+                row.termsVersion(), row.termsAcceptedAt(), row.sealVersion(),
+                vault.seal("account", row.id(), row.tier(), "blocked", hex.formatHex(row.googleIdFingerprint()),
+                        hex.formatHex(row.usernameFingerprint()), hex.formatHex(row.emailFingerprint()),
+                        Boolean.toString(row.confirmed()), Integer.toString(row.sealVersion())));
+        accounts.put(blocked);
+        int sessionsBefore = sessions.values.size();
+
+        // Google now asserts another email: the account is refused before anything changes.
+        JsonNode problem = callback(start(), code(sub, "after@example.test"), 400);
+
+        assertThat(problem.path("code").asString()).isEqualTo("request.sign_in_refused");
+        assertThat(onlyAccountOf(sub)).isEqualTo(blocked);
+        assertThat(sessions.values).hasSize(sessionsBefore);
     }
 
     @Test

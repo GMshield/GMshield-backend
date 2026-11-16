@@ -151,7 +151,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_FILES_DIR` | the encrypted file store (default `/var/lib/gmshield/files`, where the pipeline mounts the volume `gmshield-backend-files`) |
 | `GMSHIELD_GOOGLE_CLIENT_ID` | the Google OAuth client id (required, secret): entered by hand in `backend.env` |
 | `GMSHIELD_GOOGLE_CLIENT_SECRET` | the Google OAuth client secret (required, secret): entered by hand in `backend.env` |
-| `GMSHIELD_PUBLIC_URL` | the frontend's origin as the browser sees it, `http` or `https` with no path (required; `.gmshield/pipeline.toml`): Google redirects to `<it>/auth/google/callback`, which must be a redirect URI of the OAuth client |
+| `GMSHIELD_PUBLIC_URL` | the frontend's origin as the browser sees it, `https` with no path, or `http` only on `localhost`, `127.0.0.1` or `[::1]` (required; `.gmshield/pipeline.toml`): Google redirects to `<it>/auth/google/callback`, which must be a redirect URI of the OAuth client |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
@@ -162,7 +162,8 @@ host. Test mode uses plain connections and needs no certificate. Its vault keys 
 start and held only in memory, and its file store is `/var/lib/gmshield/files`. Test mode refuses
 to start when a secret above is present. Any other value of `GMSHIELD_MODE` is refused. A vault key
 that is not 32 bytes of Base64, or the same key twice, is refused with `setting.invalid`, as is a
-public URL that is not an `http` or `https` origin. Test mode ignores `GMSHIELD_PUBLIC_URL` (the
+public URL that is not an `https` origin (plain `http` only on `localhost`, `127.0.0.1` or `[::1]`,
+where browsers still keep the `__Host-` cookies). Test mode ignores `GMSHIELD_PUBLIC_URL` (the
 pipeline's staging copy has it) and refuses the Google client id or secret like any other secret.
 
 ## Build and start

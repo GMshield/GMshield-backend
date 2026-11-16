@@ -205,14 +205,15 @@ class StartupSettingsTest {
     }
 
     @Test
-    void thePublicUrlMustBeAnHttpOrigin() {
-        for (String good : new String[] {"http://localhost:3000", "https://app.example", "https://app.example/"}) {
+    void thePublicUrlMustBeAnHttpsOriginOrLocalhost() {
+        for (String good : new String[] {"http://localhost:3000", "http://127.0.0.1:3000", "http://[::1]:3000",
+                "https://app.example", "https://app.example/"}) {
             Map<String, String> environment = production();
             environment.put("GMSHIELD_PUBLIC_URL", good);
             assertThat(StartupSettings.check(environment).refused()).as(good).isFalse();
         }
         assertThat(StartupSettings.publicUrl(" https://app.example/ ")).isEqualTo("https://app.example");
-        for (String bad : new String[] {"localhost:3000", "ftp://app.example", "https://app.example/path",
+        for (String bad : new String[] {"http://app.example", "http://192.168.15.8:3000", "localhost:3000", "ftp://app.example", "https://app.example/path",
                 "https://user@app.example", "https://app.example?x=1", "https://app.example#x", "https://", "not a url"}) {
             Map<String, String> environment = production();
             environment.put("GMSHIELD_PUBLIC_URL", bad);

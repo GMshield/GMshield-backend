@@ -97,12 +97,13 @@ public class SignIn {
         GoogleIdentity identity = google.exchange(code, verifier(attemptToken), nonce(attemptToken));
         Optional<Account> known = accounts.byGoogleId(identity.subject());
         if (known.isPresent()) {
-            Account account = accounts.withEmail(known.get(), identity.email());
-            if (!account.active()) {
-                log.atInfo().addKeyValue("reason", "account_" + account.state()).addKeyValue("accountId", account.id())
+            if (!known.get().active()) {
+                // Refused before any change: a blocked or deleting account is left exactly as it is.
+                log.atInfo().addKeyValue("reason", "account_" + known.get().state()).addKeyValue("accountId", known.get().id())
                         .log("sign_in.refused");
                 throw new ApiException(AccountProblems.SIGN_IN_REFUSED);
             }
+            Account account = accounts.withEmail(known.get(), identity.email());
             log.atInfo().addKeyValue("accountId", account.id()).log("sign_in.returning");
             return new Outcome(Optional.of(sessions.start(account)));
         }
