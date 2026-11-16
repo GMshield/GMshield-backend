@@ -2,6 +2,8 @@
 #   test          runs the unit tests and every build guard; a failure fails the build
 #   test-reports  test results, coverage, compiled classes and dependency jars, exported for the
 #                 artifacts and SonarQube
+#   integration   the integration tests, run as a container beside a throwaway PostgreSQL and Redis
+#                 (.gmshield/pipeline.toml [test]); built here, run offline
 #   production    the image that runs (last stage)
 # Images are pinned by version and digest: the newest release at least two weeks old on 2026-11-12.
 
@@ -20,6 +22,12 @@ COPY src/ src/
 
 FROM build AS test
 RUN ./gradlew check bootJar sonarLibraries
+
+# The pipeline runs this image with GMSHIELD_MODE=test on an internal network (no internet) where the
+# services answer as postgres:5432 and redis:6379: everything it needs is compiled and fetched here.
+FROM build AS integration
+RUN ./gradlew integrationTestClasses integrationTestDependencies
+CMD ["./gradlew", "--offline", "integrationTest"]
 
 FROM scratch AS test-reports
 COPY --from=test /workspace/build/test-results/test/ /junit/

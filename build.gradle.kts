@@ -28,6 +28,16 @@ repositories {
 // never sees them and the boundary test can prove that the verification really fails.
 val boundaryFixtures: SourceSet by sourceSets.creating
 
+// Integration tests (Story 1.11): run against a real PostgreSQL and Redis at the test-mode hosts
+// (postgres:5432, redis:6379), never by `check`. The pipeline's integration stage runs them in the
+// Dockerfile's `integration` stage beside throwaway services.
+val integrationTest: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+configurations[integrationTest.implementationConfigurationName].extendsFrom(configurations.testImplementation.get())
+configurations[integrationTest.runtimeOnlyConfigurationName].extendsFrom(configurations.testRuntimeOnly.get())
+
 dependencies {
     implementation(platform(SpringBootPlugin.BOM_COORDINATES))
     implementation(platform("org.springframework.modulith:spring-modulith-bom:$springModulithVersion"))
@@ -35,6 +45,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-webmvc")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("org.springframework.boot:spring-boot-starter-jdbc")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("org.springframework.boot:spring-boot-starter-flyway")
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
     implementation("org.springframework.modulith:spring-modulith-starter-core")
@@ -76,6 +87,37 @@ tasks.test {
     // `./gradlew test -PupdateOpenApi` rewrites openapi/*.json instead of failing on a difference.
     systemProperty("gmshield.openapi.update", providers.gradleProperty("updateOpenApi").isPresent)
     finalizedBy(tasks.jacocoTestReport)
+}
+
+val integrationTestTask = tasks.register<Test>("integrationTest") {
+    description = "Runs the integration tests against the test-mode PostgreSQL and Redis."
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    testClassesDirs = integrationTest.output.classesDirs
+    classpath = integrationTest.runtimeClasspath
+    useJUnitPlatform()
+    // Every run talks to the services: never up to date, never taken from the build cache.
+    outputs.upToDateWhen { false }
+    testLogging {
+        events("passed", "skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+    // No coverage agent: the container that runs them is offline, and the unit tests measure coverage.
+    extensions.configure<JacocoTaskExtension> { isEnabled = false }
+}
+
+// Downloads every jar the integration tests run with: the Dockerfile's `integration` stage runs them offline.
+val integrationTestDependencies by tasks.registering {
+    description = "Resolves the integration tests' runtime classpath."
+    val runtime = configurations.named(integrationTest.runtimeClasspathConfigurationName)
+    inputs.files(runtime)
+    doLast {
+        logger.lifecycle("integration test classpath: {} files", runtime.get().files.size)
+    }
+}
+
+// `check` compiles the integration tests (it does not run them: they need the services).
+tasks.check {
+    dependsOn(integrationTest.classesTaskName)
 }
 
 tasks.jacocoTestReport {

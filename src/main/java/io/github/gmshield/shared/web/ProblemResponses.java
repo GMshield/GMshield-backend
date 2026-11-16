@@ -13,7 +13,7 @@ final class ProblemResponses {
      * A request attribute a filter sets before {@code sendError}, so that the error answer names the problem
      * itself rather than one guessed from the status.
      */
-    static final String PROBLEM_ATTRIBUTE = ProblemResponses.class.getName() + ".problem";
+    static final String PROBLEM_ATTRIBUTE = ApiProblem.REQUEST_ATTRIBUTE;
 
     private ProblemResponses() {
     }

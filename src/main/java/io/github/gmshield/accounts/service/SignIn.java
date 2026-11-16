@@ -2,8 +2,11 @@ package io.github.gmshield.accounts.service;
 
 import io.github.gmshield.accounts.data.SignInAttempt;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.library.service.Language;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
+import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Vault;
 import java.time.Clock;
 import java.time.Duration;
@@ -14,6 +17,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Sign-in with Google, run by the backend (AD-8). Starting issues an attempt token valid for 10 minutes;
@@ -25,6 +30,10 @@ import org.springframework.stereotype.Service;
  * wrong state or an expired attempt is {@code request.sign_in_expired}, and nothing is created. A known
  * Google identity gets a session; an unknown one is kept, encrypted for a newly minted account id, in the
  * attempt until the visitor chooses a username and accepts the terms.
+ *
+ * <p>The username step creates the account and its starter library (one system and one campaign, named in
+ * the visitor's language; Story 1.11) in one transaction, run as the new account: both exist or neither does.
+ * A failure leaves the attempt, and its account id, for another try.
  */
 @Service
 public class SignIn {
@@ -39,15 +48,19 @@ public class SignIn {
     private final Sessions sessions;
     private final GoogleSignIn google;
     private final Vault vault;
+    private final Library library;
+    private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
     SignIn(SignInAttemptStore attempts, Accounts accounts, Sessions sessions, GoogleSignIn google, Vault vault,
-           ObjectProvider<Clock> clock) {
+           Library library, ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.attempts = attempts;
         this.accounts = accounts;
         this.sessions = sessions;
         this.google = google;
         this.vault = vault;
+        this.library = library;
+        this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
@@ -116,11 +129,12 @@ public class SignIn {
     }
 
     /**
-     * The username step of a first sign-in: creates the account, ends the attempt and starts a session.
-     * The attempt stays when the username is taken or invalid, or the terms are not accepted, so the
-     * visitor can try again within the attempt's 10 minutes.
+     * The username step of a first sign-in: creates the account and its starter library named in
+     * {@code language}, ends the attempt and starts a session. The attempt stays when the username is taken
+     * or invalid, the terms are not accepted or the creation fails, so the visitor can try again within the
+     * attempt's 10 minutes, with the same account id.
      */
-    public Sessions.Grant complete(String attemptToken, String username, boolean termsAccepted) {
+    public Sessions.Grant complete(String attemptToken, String username, boolean termsAccepted, Language language) {
         if (!Tokens.wellFormed(attemptToken)) {
             throw expired("no_attempt");
         }
@@ -138,8 +152,13 @@ public class SignIn {
         }
         Account account;
         try {
-            account = accounts.create(attempt.accountId(), attempt.googleId(), attempt.email(), username,
-                    TERMS_VERSION, now);
+            account = OwnerContext.callAs(attempt.accountId(), () -> new TransactionTemplate(transactions.getObject())
+                    .execute(status -> {
+                        Account created = accounts.create(attempt.accountId(), attempt.googleId(), attempt.email(),
+                                username, TERMS_VERSION, now);
+                        library.createStarter(language);
+                        return created;
+                    }));
         } catch (ApiException failed) {
             if (failed.problem().equals(AccountProblems.SIGN_IN_EXPIRED)) {
                 // The identity has an account already (another attempt finished first): this one is over.

@@ -3,6 +3,9 @@ package io.github.gmshield.accounts.web;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.accounts.service.Sessions;
 import io.github.gmshield.accounts.service.SignIn;
+import io.github.gmshield.library.service.Language;
+import io.github.gmshield.shared.service.ApiException;
+import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -82,7 +85,10 @@ class SignInController {
             @Schema(description = "The attempt token of the visitor's cookie") String attemptToken,
             @Schema(description = "3 to 24 characters: letters a to z in upper or lower case, digits, \"_\", \".\" and"
                     + " \"-\"; unique whatever the case, shown as typed", example = "mestre_ana") String username,
-            @Schema(description = "The visitor accepted the terms of use and the privacy notice") Boolean termsAccepted) {
+            @Schema(description = "The visitor accepted the terms of use and the privacy notice") Boolean termsAccepted,
+            @Schema(description = "The interface's language: the new account's first system and campaign are named in"
+                    + " it. Optional, pt-BR when absent", allowableValues = {"pt-BR", "en"}, defaultValue = "pt-BR",
+                    example = "pt-BR") String language) {
     }
 
     @PostMapping(path = START, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -108,8 +114,10 @@ class SignInController {
     @Operation(operationId = "completeSignIn",
             summary = "The username step of a first sign-in: creates the account and starts a session")
     ResponseEntity<SessionGrant> complete(@RequestBody CompleteSignIn request) {
+        Language language = request.language() == null ? Language.DEFAULT : Language.fromTag(request.language())
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(400)));
         Sessions.Grant grant = signIn.complete(request.attemptToken(), request.username(),
-                Boolean.TRUE.equals(request.termsAccepted()));
+                Boolean.TRUE.equals(request.termsAccepted()), language);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(SessionGrant.of(grant));
     }
 }
