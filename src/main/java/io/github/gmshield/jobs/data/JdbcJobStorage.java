@@ -172,7 +172,7 @@ class JdbcJobStorage implements JobStorage {
         @Override
         public boolean busy(String lane) {
             return jdbc.get().sql("select exists (select 1 from job where lane = :lane and state in ('offered', 'running'))")
-                    .param("lane", lane).query(Boolean.class).single();
+                    .param("lane", lane).query(Boolean.class).optional().orElse(Boolean.FALSE);
         }
 
         @Override
