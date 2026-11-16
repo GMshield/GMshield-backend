@@ -53,11 +53,12 @@ class JdbcAccountStore implements AccountStore {
         if (inserted == 1) {
             return Insert.INSERTED;
         }
-        boolean identityExists = jdbc.getObject()
+        // `exists` always answers true or false; TRUE.equals also covers the nullable result type (Sonar S2259).
+        boolean identityExists = Boolean.TRUE.equals(jdbc.getObject()
                 .sql("select exists (select 1 from account where id = :id or google_id_fingerprint = :googleIdFingerprint)")
                 .param("id", row.id())
                 .param("googleIdFingerprint", row.googleIdFingerprint())
-                .query(Boolean.class).single();
+                .query(Boolean.class).single());
         return identityExists ? Insert.IDENTITY_EXISTS : Insert.USERNAME_TAKEN;
     }
 
