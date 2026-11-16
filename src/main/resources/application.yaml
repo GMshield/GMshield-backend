@@ -41,6 +41,17 @@ gmshield:
     client-id: ${GMSHIELD_GOOGLE_CLIENT_ID}
     client-secret: ${GMSHIELD_GOOGLE_CLIENT_SECRET}
   public-url: ${GMSHIELD_PUBLIC_URL}
+  # The frontend's service credential (Story 1.10): every /api/v1 call carries Authorization: Bearer <it>
+  # (shared.web.ServiceCredentialFilter). A secret, written by GMshield-pipeline deploy/data-credentials.sh into
+  # backend.env and frontend.env. Test mode uses the fixed value in application-test-mode.yaml.
+  frontend-credential: ${GMSHIELD_FRONTEND_CREDENTIAL}
+  # Sessions (accounts module, Story 1.10), Spring durations. StartupSettings refuses a start unless
+  # overlap < renew-after < idle-timeout <= absolute-timeout; its defaults are the same as these.
+  session:
+    renew-after: ${GMSHIELD_SESSION_RENEW_AFTER:15m}
+    overlap: ${GMSHIELD_SESSION_OVERLAP:60s}
+    idle-timeout: ${GMSHIELD_SESSION_IDLE_TIMEOUT:24h}
+    absolute-timeout: ${GMSHIELD_SESSION_ABSOLUTE_TIMEOUT:7d}
 
 server:
   port: 8080

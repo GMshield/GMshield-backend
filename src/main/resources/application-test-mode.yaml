@@ -23,3 +23,7 @@ spring:
 gmshield:
   files:
     dir: /var/lib/gmshield/files
+  # The fixed service credential of test mode, the same as the frontend's test mode (src/server/settings.ts).
+  # Public on purpose: test mode refuses to start beside a real GMSHIELD_FRONTEND_CREDENTIAL. The session
+  # timings still come from GMSHIELD_SESSION_* (application.yaml), so a run can shorten them.
+  frontend-credential: gmshield-test-mode-frontend-credential-not-a-secret

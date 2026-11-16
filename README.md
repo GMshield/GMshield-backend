@@ -39,10 +39,10 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Three modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Four modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
-below) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared` and
-`vault`).
+below), `audit` (the append-only audit log, below; it may use `shared`) and `accounts` (sign-in with
+Google, accounts and sessions, below; it may use `shared`, `vault` and `audit`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **No credential yet.** `/internal/v1` and both OpenAPI documents (`/v3/api-docs/public`,
@@ -113,23 +113,53 @@ below) and `accounts` (sign-in with Google, accounts and sessions, below; it may
     (`request.username_invalid` 400 with `min` and `max`, `request.username_taken` 409, kept by a
     unique index on the fingerprint of the NFC lower-case form), shown as typed. Unticked terms:
     `request.terms_required` (400). The attempt stays for another try.
-  - `GET /api/v1/me` and `DELETE /api/v1/session` read the session token from `X-Session-Token`
-    (never a cookie). No session, an ended one or an account that is not active:
-    `session.required` (401). Sign-out deletes the session and its entry in the account's set; it
-    answers 204 whether or not the session existed.
+  - `GET /api/v1/me`, `POST /api/v1/session/renewal` and `DELETE /api/v1/session` read the session
+    token from `X-Session-Token` (never a cookie). No session, an ended one or an account that is not
+    active: `session.required` (401). Sign-out deletes the session and its entry in the account's set;
+    it answers 204 whether or not the session existed.
   - The table `account` (`V2__account.sql`) stores only the username, the email address and the
     Google id, each encrypted with `Binding("account", field, id, id)` and fingerprinted, plus tier
     (`ordinary`), state (`active`), `confirmed`, `terms_version`, `terms_accepted_at`,
     `seal_version` and `seal`. The seal covers the id, tier, state, the Google-id, username and email
     fingerprints, `confirmed` and `seal_version`, and is checked on every load: a mismatch is
     `integrity.failed` (500) and grants nothing.
-  - Sessions: `gmshield:session:<hex of vault.tokenHash("session", token)>` holds the account id,
-    the seal version and the creation time for 7 days; `gmshield:session:account:<account id>` is
-    the set of an account's session hashes. Rotation, the idle timeout and the seal-version check
-    come with Story 1.10.
   - Test mode: a stand-in replaces Google. Its authorization URL is the frontend's own callback,
     relative (`/auth/google/callback?state=<real state>&code=stand-in.1.gm@example.test`); any code
     `stand-in.<sub>.<email>` gives that identity, any other is refused.
+- **Sessions that rotate and end (`accounts`, Story 1.10).** The accounts module's own Redis store;
+  Spring Session is not used. Redis holds only ids, times, flags and token hashes:
+  - `gmshield:session:<session id>`: the account id, the seal version the current token was issued
+    under, `createdAt`, `lastSeenAt`, a rising `version`, the current token's hash with a `used`
+    flag, and after a renewal the previous token's hash with its `overlapUntil`.
+  - `gmshield:session:token:<hex of vault.tokenHash("session", token)>`: the session id, for the
+    current token and for every token a renewal retired (those live until the absolute end, so the
+    reuse of a token two renewals old is still recognised). `gmshield:session:account:<account id>`
+    is the set of an account's session ids, so that all can end at once when Epic 8 or 9 needs it.
+  - Every key lives as long as the shorter of what is left of the idle and the absolute timeouts.
+    Each write is one Lua script that first compares the stored `version`, so two renewals of one
+    token can never both issue a token. `lastSeenAt` is written at most once a minute.
+  - Sign-in and `POST /api/v1/session/renewal` alone issue a token, as `SessionGrant
+    {sessionToken, expiresInSeconds, renewAfterSeconds}`; `expiresInSeconds` is what is left of the
+    absolute timeout. A renewal makes the presented token the previous one until now + overlap.
+  - The previous token within the overlap serves ordinary calls; a renewal with it is
+    `session.already_renewed` (409) and the session continues. After the overlap, once the newer
+    token has served a call (or for any older token), it is reuse: the session ends, then
+    `session.token_reused` is appended to the audit log (a failed append logs `audit.append_failed`
+    and still refuses). The previous token after the overlap while the newer one was never used is
+    `session.required` and the session is kept.
+  - `lastSeenAt` + idle or `createdAt` + absolute passed: the session ends, `session.required`.
+  - An account whose seal version rose above the session's answers `session.renewal_required` (401)
+    on every call but a renewal, which issues the next token under the current seal version.
+  - A cookie or a Redis record of Story 1.9 is no session (`session.required`), never an error.
+- **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
+  `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
+  that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
+  email address, a username or text is refused before any write. There is no update, delete or read
+  path; the refusal in the database comes with Story 9.1 and the reader with Epic 9.
+- **Service credential (Story 1.10).** `shared.web.ServiceCredentialFilter` lets an `/api/v1`
+  request through only with exactly one `Authorization: Bearer <GMSHIELD_FRONTEND_CREDENTIAL>`,
+  compared in constant time; anything else is `service.unauthenticated` (401) before any controller.
+  The actuator, `/internal` and the OpenAPI documents keep their own rules.
 
 ## Settings
 
@@ -152,6 +182,11 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_GOOGLE_CLIENT_ID` | the Google OAuth client id (required, secret): entered by hand in `backend.env` |
 | `GMSHIELD_GOOGLE_CLIENT_SECRET` | the Google OAuth client secret (required, secret): entered by hand in `backend.env` |
 | `GMSHIELD_PUBLIC_URL` | the frontend's origin as the browser sees it, `https` with no path, or `http` only on `localhost`, `127.0.0.1` or `[::1]` (required; `.gmshield/pipeline.toml`): Google redirects to `<it>/auth/google/callback`, which must be a redirect URI of the OAuth client |
+| `GMSHIELD_FRONTEND_CREDENTIAL` | the frontend's service credential (required, secret): 32 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`; written by GMshield-pipeline's `deploy/data-credentials.sh` into `backend.env` and `frontend.env` |
+| `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
+| `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
+| `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |
+| `GMSHIELD_SESSION_ABSOLUTE_TIMEOUT` | a session ends this long after sign-in (default `7d`) |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 `GMSHIELD_MODE=test` is set only by the pipeline, never in `.gmshield/pipeline.toml`. It uses
@@ -165,6 +200,11 @@ that is not 32 bytes of Base64, or the same key twice, is refused with `setting.
 public URL that is not an `https` origin (plain `http` only on `localhost`, `127.0.0.1` or `[::1]`,
 where browsers still keep the `__Host-` cookies). Test mode ignores `GMSHIELD_PUBLIC_URL` (the
 pipeline's staging copy has it) and refuses the Google client id or secret like any other secret.
+Test mode's service credential is the fixed, public `gmshield-test-mode-frontend-credential-not-a-secret`,
+which the frontend's test mode also uses; a `GMSHIELD_FRONTEND_CREDENTIAL` beside test mode is refused
+like any other secret, and outside test mode a missing one is `setting.missing`. In both modes the
+session timings must be positive with overlap < renew-after < idle ≤ absolute, else `setting.invalid`
+names all four (or only the unreadable ones).
 
 ## Build and start
 
@@ -226,8 +266,8 @@ read-only root filesystem and every capability dropped, and finds the private au
 certificate at `/run/gmshield/certs/ca.crt`. Its settings, written once by GMshield-pipeline's
 `deploy/data-credentials.sh`, live in `~/gmshield-ci/secrets/backend.env` on the server: its own
 PostgreSQL role `gmshield_backend` (database `gmshield`, `sslmode=verify-full`), its own Redis
-account `backend` (keys `gmshield:*` only), the two vault keys, and the Google OAuth client id and
-secret, which Dalton enters by hand (the script writes empty placeholders and never replaces a value;
+account `backend` (keys `gmshield:*` only), the two vault keys, the frontend's service credential
+(the same value as in `frontend.env`), and the Google OAuth client id and secret, which Dalton enters by hand (the script writes empty placeholders and never replaces a value;
 without them the backend refuses to start, `setting.missing`). `GMSHIELD_PUBLIC_URL` is a plain
 setting in the contract's `[deploy].env`: `http://localhost:3000`, the address of the frontend through
 Dalton's SSH tunnel, until the public domain exists. The contract mounts the named volume

@@ -12,6 +12,10 @@ test_target = "test"         # Dockerfile stage that runs the unit tests
 [dast]
 path = "/"
 openapi = "/v3/api-docs/public"   # ZAP API scan of the public contract (committed as openapi/public.json)
+# Story 1.10: every /api/v1 request needs the frontend's service credential, else 401 service.unauthenticated
+# before any controller. The staging backend runs in test mode, whose credential is this fixed public value
+# (application-test-mode.yaml), so ZAP sends it on every request and scans the controllers themselves.
+auth_header = "Authorization: Bearer gmshield-test-mode-frontend-credential-not-a-secret"
 
 [deploy]
 host_port = 0                  # no host port: the frontend and the worker reach it on gmshield-app and gmshield-work

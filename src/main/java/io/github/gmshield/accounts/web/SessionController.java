@@ -11,10 +11,14 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
-/** The signed-in account and sign-out. The session token arrives in {@code X-Session-Token}, never a cookie. */
+/**
+ * The signed-in account, renewal and sign-out. The session token arrives in {@code X-Session-Token}, never a
+ * cookie. Only sign-in and renewal issue a token: an ordinary call never replaces one.
+ */
 @RestController
 @Tag(name = "session")
 class SessionController {
@@ -22,6 +26,7 @@ class SessionController {
     static final String HEADER = "X-Session-Token";
     static final String ME = "/api/v1/me";
     static final String SESSION = "/api/v1/session";
+    static final String RENEWAL = "/api/v1/session/renewal";
 
     private final Sessions sessions;
 
@@ -34,10 +39,20 @@ class SessionController {
     }
 
     @GetMapping(path = ME, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getMe", summary = "The signed-in account; session.required (401) without a session")
+    @Operation(operationId = "getMe", summary = "The signed-in account; session.required (401) without a session,"
+            + " session.renewal_required (401) when the token must be renewed first")
     ResponseEntity<Me> me(@RequestHeader(name = HEADER, required = false) String sessionToken) {
         Account account = sessions.account(sessionToken);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new Me(account.username()));
+    }
+
+    @PostMapping(path = RENEWAL, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "renewSession", summary = "Renew the session: a new token, the presented one kept for"
+            + " the overlap. session.already_renewed (409) with the previous token within the overlap; session.required"
+            + " (401) when the session is over")
+    ResponseEntity<SignInController.SessionGrant> renew(@RequestHeader(name = HEADER, required = false) String sessionToken) {
+        Sessions.Grant grant = sessions.renew(sessionToken);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(SignInController.SessionGrant.of(grant));
     }
 
     @DeleteMapping(path = SESSION)

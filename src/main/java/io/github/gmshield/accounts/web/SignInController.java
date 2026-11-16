@@ -49,11 +49,23 @@ class SignInController {
             @Schema(description = "The error parameter of Google's redirect, when Google refused") String error) {
     }
 
-    @Schema(name = "SessionGrant", requiredProperties = {"sessionToken", "expiresInSeconds"})
+    @Schema(name = "SessionGrant", requiredProperties = {"sessionToken", "expiresInSeconds", "renewAfterSeconds"})
     record SessionGrant(
             @Schema(description = "The session token: the frontend keeps it in a cookie and sends it as X-Session-Token",
                     example = "example-session-token") String sessionToken,
-            @Schema(description = "Lifetime of the session", example = "604800") long expiresInSeconds) {
+            @Schema(description = "What is left of the session's absolute lifetime", example = "604800")
+            long expiresInSeconds,
+            @Schema(description = "After this many seconds the frontend renews the token (POST /api/v1/session/renewal)",
+                    example = "900") long renewAfterSeconds) {
+
+        static SessionGrant of(Sessions.Grant grant) {
+            return new SessionGrant(grant.token(), grant.expiresIn().toSeconds(), grant.renewAfter().toSeconds());
+        }
+
+        @Override
+        public String toString() {
+            return "SessionGrant[expiresInSeconds=" + expiresInSeconds + ", renewAfterSeconds=" + renewAfterSeconds + "]";
+        }
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -86,8 +98,8 @@ class SignInController {
             summary = "Google's redirect, relayed with the attempt token: a session, or the username step next")
     ResponseEntity<SignInOutcome> callback(@RequestBody GoogleCallback request) {
         SignIn.Outcome outcome = signIn.callback(request.attemptToken(), request.state(), request.code(), request.error());
-        SignInOutcome body = outcome.sessionToken()
-                .map(token -> new SignInOutcome("signed_in", grant(token)))
+        SignInOutcome body = outcome.session()
+                .map(grant -> new SignInOutcome("signed_in", SessionGrant.of(grant)))
                 .orElseGet(() -> new SignInOutcome("username_required", null));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
     }
@@ -96,11 +108,8 @@ class SignInController {
     @Operation(operationId = "completeSignIn",
             summary = "The username step of a first sign-in: creates the account and starts a session")
     ResponseEntity<SessionGrant> complete(@RequestBody CompleteSignIn request) {
-        String token = signIn.complete(request.attemptToken(), request.username(), Boolean.TRUE.equals(request.termsAccepted()));
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(grant(token));
-    }
-
-    private static SessionGrant grant(String token) {
-        return new SessionGrant(token, Sessions.LIFETIME.toSeconds());
+        Sessions.Grant grant = signIn.complete(request.attemptToken(), request.username(),
+                Boolean.TRUE.equals(request.termsAccepted()));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(SessionGrant.of(grant));
     }
 }

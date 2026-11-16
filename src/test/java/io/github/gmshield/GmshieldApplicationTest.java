@@ -28,7 +28,8 @@ class GmshieldApplicationTest {
             Map.entry("GMSHIELD_VAULT_INDEX_KEY", "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY="),
             Map.entry("GMSHIELD_GOOGLE_CLIENT_ID", "client-id.apps.example"),
             Map.entry("GMSHIELD_GOOGLE_CLIENT_SECRET", "value-never-printed"),
-            Map.entry("GMSHIELD_PUBLIC_URL", "http://localhost:3000"));
+            Map.entry("GMSHIELD_PUBLIC_URL", "http://localhost:3000"),
+            Map.entry("GMSHIELD_FRONTEND_CREDENTIAL", "f".repeat(64)));
 
     private final ByteArrayOutputStream printed = new ByteArrayOutputStream();
     private final PrintStream out = new PrintStream(printed, true, StandardCharsets.UTF_8);

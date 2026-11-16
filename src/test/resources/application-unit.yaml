@@ -20,3 +20,5 @@ gmshield:
     client-id: unit-client.apps.example
     client-secret: unit-client-secret
   public-url: http://localhost:3000
+  # The service credential the Spring tests send (HttpTestSupport), the same as test mode's.
+  frontend-credential: gmshield-test-mode-frontend-credential-not-a-secret

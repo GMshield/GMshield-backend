@@ -36,7 +36,7 @@ port="${GMSHIELD_DEV_BACKEND_PORT:-8080}"
 echo
 echo "Backend health: $(wget -q -O - "http://127.0.0.1:${port}/actuator/health" 2>/dev/null \
     || curl -fsS "http://127.0.0.1:${port}/actuator/health" 2>/dev/null || echo 'no answer')"
-echo "Backend:  http://127.0.0.1:${port}/api/v1/version"
+echo "Backend:  http://127.0.0.1:${port}/api/v1/version (with Authorization: Bearer gmshield-dev-frontend-credential-throwaway)"
 if [[ " ${profiles[*]} " == *" frontend "* ]]; then
     frontend_port="${GMSHIELD_DEV_FRONTEND_PORT:-3000}"
     echo "Frontend: http://127.0.0.1:${frontend_port}/ (health: http://127.0.0.1:${frontend_port}/api/health)"
