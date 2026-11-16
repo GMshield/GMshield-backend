@@ -49,6 +49,13 @@ The worker refuses to start without `GMSHIELD_ANTHROPIC_API_KEY`. `compose.yaml`
 of that variable from the shell that runs `dev/start`, or the placeholder `not-a-real-key` when it
 is unset. Nothing calls the model yet, so the placeholder is enough; to try a real key for one
 start, `GMSHIELD_ANTHROPIC_API_KEY=... dev/start` (never write it into a file of this repository).
+The backend refuses to start without a Google OAuth client. `compose.yaml` passes
+`GMSHIELD_GOOGLE_CLIENT_ID` and `GMSHIELD_GOOGLE_CLIENT_SECRET` from the shell that runs `dev/start`,
+or placeholders: the backend then starts, and Google refuses a sign-in. To sign in for real, create a
+Google OAuth client whose redirect URI is `http://localhost:3000/auth/google/callback` (or the port
+in `GMSHIELD_DEV_FRONTEND_PORT`) and pass both for one start, never writing them into a file of this
+repository. `GMSHIELD_PUBLIC_URL` is set to that frontend address.
+
 The worker does not use Redis yet: Story 1.12 adds its Redis account and service credential.
 
 ## It never runs on its own

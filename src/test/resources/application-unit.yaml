@@ -15,3 +15,8 @@ gmshield:
     index-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
   files:
     dir: ${java.io.tmpdir}/gmshield-unit-files
+  # A Google client that exists nowhere: outside test mode the unit tests never reach Google.
+  google:
+    client-id: unit-client.apps.example
+    client-secret: unit-client-secret
+  public-url: http://localhost:3000

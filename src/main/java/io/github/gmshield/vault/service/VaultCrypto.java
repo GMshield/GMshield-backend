@@ -14,7 +14,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * The JDK primitives the vault uses, and nothing else: AES-256-GCM with a random 96-bit nonce,
- * HMAC-SHA256, and HKDF-SHA256 (RFC 5869) for subkeys. A failed check returns null; callers turn
+ * HMAC-SHA256, SHA-256, and HKDF-SHA256 (RFC 5869) for subkeys. A failed check returns null; callers turn
  * it into one {@link IntegrityException}.
  */
 final class VaultCrypto {
@@ -84,6 +84,14 @@ final class VaultCrypto {
             return mac.doFinal(message);
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("HMAC-SHA256 is not available", e);
+        }
+    }
+
+    static byte[] sha256(byte[] message) {
+        try {
+            return java.security.MessageDigest.getInstance("SHA-256").digest(message);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
         }
     }
 

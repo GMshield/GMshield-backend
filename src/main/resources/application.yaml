@@ -34,6 +34,13 @@ gmshield:
   files:
     # The encrypted file store; the pipeline contract mounts the named volume gmshield-backend-files here.
     dir: ${GMSHIELD_FILES_DIR:/var/lib/gmshield/files}
+  # Sign-in with Google (accounts module, Story 1.9). The client id and secret are entered by hand in the
+  # server's backend.env; the public URL is the frontend's origin, set in .gmshield/pipeline.toml. Google
+  # redirects to <public URL>/auth/google/callback. Test mode reads none of them: a stand-in replaces Google.
+  google:
+    client-id: ${GMSHIELD_GOOGLE_CLIENT_ID}
+    client-secret: ${GMSHIELD_GOOGLE_CLIENT_SECRET}
+  public-url: ${GMSHIELD_PUBLIC_URL}
 
 server:
   port: 8080

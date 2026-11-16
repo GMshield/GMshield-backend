@@ -15,6 +15,10 @@ openapi = "/v3/api-docs/public"   # ZAP API scan of the public contract (committ
 
 [deploy]
 host_port = 0                  # no host port: the frontend and the worker reach it on gmshield-app and gmshield-work
+# Story 1.9: the frontend's origin as the browser sees it; Google redirects to <it>/auth/google/callback.
+# Through Dalton's SSH tunnel until the public domain (Cloudflare Tunnel) replaces it. The Google client id
+# and secret are secrets: ~/gmshield-ci/secrets/backend.env, entered by hand.
+env = { GMSHIELD_PUBLIC_URL = "http://localhost:3000" }
 # Story 1.6 (AD-14): created on the first network (the health probe joins it), then connected to the rest.
 # Postgres is on gmshield-data, Redis on gmshield-work; gmshield-outbound alone reaches the internet.
 networks = ["gmshield-app", "gmshield-data", "gmshield-work", "gmshield-outbound"]

@@ -55,6 +55,15 @@ class ProductionConnectionSettingsTest {
     }
 
     @Test
+    void theGoogleClientAndThePublicUrlComeFromTheSettings() throws IOException {
+        PropertySource<?> yaml = load("application.yaml");
+
+        assertThat(yaml.getProperty("gmshield.google.client-id")).hasToString("${GMSHIELD_GOOGLE_CLIENT_ID}");
+        assertThat(yaml.getProperty("gmshield.google.client-secret")).hasToString("${GMSHIELD_GOOGLE_CLIENT_SECRET}");
+        assertThat(yaml.getProperty("gmshield.public-url")).hasToString("${GMSHIELD_PUBLIC_URL}");
+    }
+
+    @Test
     void testModeAddsTheProbeMigrationsAndUsesTheMountedFileStore() throws IOException {
         PropertySource<?> yaml = load("application-test-mode.yaml");
 

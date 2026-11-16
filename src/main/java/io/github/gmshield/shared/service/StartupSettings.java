@@ -13,8 +13,8 @@ import java.util.stream.Collectors;
  * <ul>
  *   <li>{@code GMSHIELD_MODE=test} (set only by the pipeline): built-in throwaway connection
  *       settings. Refused when a production secret is present.</li>
- *   <li>No mode: every required setting must be present, and each vault key must be 32 bytes in
- *       Base64. Redis is reached over TLS verified against the private authority (the
+ *   <li>No mode: every required setting must be present, each vault key must be 32 bytes in
+ *       Base64, and the public URL an https origin (http only on localhost). Redis is reached over TLS verified against the private authority (the
  *       {@code redis-tls} profile) unless {@code GMSHIELD_REDIS_TLS=false}, which only the
  *       development setup sets.</li>
  * </ul>
@@ -36,15 +36,24 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
     public static final String VAULT_INDEX_KEY = "GMSHIELD_VAULT_INDEX_KEY";
     /** Length of each vault key once decoded from Base64. */
     public static final int VAULT_KEY_BYTES = 32;
+    /** The Google OAuth client of the sign-in (Story 1.9), entered by hand in the server's secrets. */
+    public static final String GOOGLE_CLIENT_ID = "GMSHIELD_GOOGLE_CLIENT_ID";
+    public static final String GOOGLE_CLIENT_SECRET = "GMSHIELD_GOOGLE_CLIENT_SECRET";
+    /** The origin the browser sees for the frontend; Google's redirect goes to {@code <it>/auth/google/callback}. */
+    public static final String PUBLIC_URL = "GMSHIELD_PUBLIC_URL";
+    /** The only hosts a plain-http public URL may name: the browser treats them as secure for cookies. */
+    private static final java.util.Set<String> LOOPBACK_HOSTS = java.util.Set.of("localhost", "127.0.0.1", "[::1]");
 
     /** Required outside test mode. */
     public static final List<String> REQUIRED = List.of(
             "GMSHIELD_DB_URL", "GMSHIELD_DB_USER", "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_HOST",
-            "GMSHIELD_REDIS_USERNAME", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY);
+            "GMSHIELD_REDIS_USERNAME", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY,
+            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, PUBLIC_URL);
 
     /** Production secrets: test mode refuses to start beside any of them. */
     public static final List<String> SECRETS = List.of(
-            "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY);
+            "GMSHIELD_DB_PASSWORD", "GMSHIELD_REDIS_PASSWORD", VAULT_MASTER_KEY, VAULT_INDEX_KEY,
+            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
 
     public static final String REASON_UNKNOWN_MODE = "mode.unknown";
     public static final String REASON_MISSING = "setting.missing";
@@ -65,6 +74,9 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
             List<String> badKeys = invalidVaultKeys(environment);
             if (!badKeys.isEmpty()) {
                 return refuse(false, REASON_INVALID, badKeys);
+            }
+            if (publicUrl(environment.get(PUBLIC_URL)) == null) {
+                return refuse(false, REASON_INVALID, List.of(PUBLIC_URL));
             }
             String tls = environment.get(REDIS_TLS);
             if (isBlank(tls) || "true".equals(tls)) {
@@ -142,6 +154,34 @@ public record StartupSettings(boolean testMode, boolean redisTls, String refusal
             byte[] key = Base64.getDecoder().decode(value.strip());
             return key.length == VAULT_KEY_BYTES ? key : null;
         } catch (IllegalArgumentException notBase64) {
+            return null;
+        }
+    }
+
+    /**
+     * The public URL as an origin without a trailing slash ({@code https://app.example} or
+     * {@code http://localhost:3000}), or null when it is not an https URL with a host and nothing else
+     * (no user, path, query or fragment). Plain http is accepted only for {@code localhost},
+     * {@code 127.0.0.1} and {@code [::1]}: elsewhere browsers drop the {@code __Host-} cookies and every
+     * sign-in would silently expire.
+     */
+    public static String publicUrl(String value) {
+        if (value == null) {
+            return null;
+        }
+        String stripped = value.strip();
+        while (stripped.endsWith("/")) {
+            stripped = stripped.substring(0, stripped.length() - 1);
+        }
+        try {
+            java.net.URI uri = new java.net.URI(stripped);
+            boolean web = "https".equals(uri.getScheme())
+                    || ("http".equals(uri.getScheme()) && LOOPBACK_HOSTS.contains(uri.getHost()));
+            boolean originOnly = uri.getHost() != null && uri.getRawUserInfo() == null
+                    && (uri.getRawPath() == null || uri.getRawPath().isEmpty())
+                    && uri.getRawQuery() == null && uri.getRawFragment() == null;
+            return web && originOnly ? stripped : null;
+        } catch (java.net.URISyntaxException notAUrl) {
             return null;
         }
     }

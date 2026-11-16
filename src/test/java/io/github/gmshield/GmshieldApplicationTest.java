@@ -17,12 +17,18 @@ import tools.jackson.databind.json.JsonMapper;
 /** The decision taken before Spring exists: refuse and name the settings, or start in the right mode. */
 class GmshieldApplicationTest {
 
-    private static final Map<String, String> PRODUCTION = Map.of(
-            "GMSHIELD_DB_URL", "jdbc:postgresql://db.example:5432/gmshield", "GMSHIELD_DB_USER", "gmshield",
-            "GMSHIELD_DB_PASSWORD", "value-never-printed", "GMSHIELD_REDIS_HOST", "redis.example",
-            "GMSHIELD_REDIS_USERNAME", "backend", "GMSHIELD_REDIS_PASSWORD", "value-never-printed",
-            "GMSHIELD_VAULT_MASTER_KEY", "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
-            "GMSHIELD_VAULT_INDEX_KEY", "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=");
+    private static final Map<String, String> PRODUCTION = Map.ofEntries(
+            Map.entry("GMSHIELD_DB_URL", "jdbc:postgresql://db.example:5432/gmshield"),
+            Map.entry("GMSHIELD_DB_USER", "gmshield"),
+            Map.entry("GMSHIELD_DB_PASSWORD", "value-never-printed"),
+            Map.entry("GMSHIELD_REDIS_HOST", "redis.example"),
+            Map.entry("GMSHIELD_REDIS_USERNAME", "backend"),
+            Map.entry("GMSHIELD_REDIS_PASSWORD", "value-never-printed"),
+            Map.entry("GMSHIELD_VAULT_MASTER_KEY", "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="),
+            Map.entry("GMSHIELD_VAULT_INDEX_KEY", "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY="),
+            Map.entry("GMSHIELD_GOOGLE_CLIENT_ID", "client-id.apps.example"),
+            Map.entry("GMSHIELD_GOOGLE_CLIENT_SECRET", "value-never-printed"),
+            Map.entry("GMSHIELD_PUBLIC_URL", "http://localhost:3000"));
 
     private final ByteArrayOutputStream printed = new ByteArrayOutputStream();
     private final PrintStream out = new PrintStream(printed, true, StandardCharsets.UTF_8);
