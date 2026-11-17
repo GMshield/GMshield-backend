@@ -94,6 +94,12 @@ public interface MaterialStore {
     /** The current owner's files of a version, by role and first page. */
     List<VersionFileRow> versionFiles(UUID versionId);
 
+    /** {@link #versionFiles(UUID)} of these roles only (Story 1.19: a version may have a picture per page). */
+    List<VersionFileRow> versionFiles(UUID versionId, Collection<String> roles);
+
+    /** The current owner's file of a version with this file id; empty when there is none. */
+    Optional<VersionFileRow> versionFile(UUID versionId, UUID fileId);
+
     /** Deletes the current owner's files of a version and answers them, so the caller removes them from the store. */
     List<VersionFileRow> deleteVersionFiles(UUID versionId);
 
@@ -154,6 +160,29 @@ public interface MaterialStore {
 
     /** Deletes the current owner's outline of a version; false when it had none. */
     boolean deleteOutline(UUID versionId);
+
+    // --- page_view (Story 1.19)
+
+    /** Records the page view of a page of the current owner's version, which must have none. */
+    void insertPageView(PageViewRow row);
+
+    /** The current owner's page view of a page of a version; empty when there is none or for another owner's. */
+    Optional<PageViewRow> findPageView(UUID versionId, int page);
+
+    /**
+     * Deletes the current owner's page views of the pages {@code firstPage} to {@code lastPage} of a version and
+     * answers them, so the caller removes their pictures.
+     */
+    List<PageViewRow> deletePageViews(UUID versionId, int firstPage, int lastPage);
+
+    /** Deletes every page view of the current owner's version; answers how many went. */
+    int deletePageViews(UUID versionId);
+
+    /** Deletes the current owner's file of a version with this file id and answers it; empty when there is none. */
+    Optional<VersionFileRow> deleteVersionFile(UUID versionId, UUID fileId);
+
+    /** The current owner's passages on a page of a version, in reading order (Story 1.19). */
+    List<PassageRow> passagesOnPage(UUID versionId, int page);
 
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);

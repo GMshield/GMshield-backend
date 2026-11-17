@@ -322,6 +322,29 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `Materials.passage(id)` gives the material's id and name, the version id, the section path, the page and the
     text; `Materials.outline(versionId)` the sections (level, title, page); both empty for an unknown id or another
     owner's. No public route reads them yet (Story 1.20).
+- **Page pictures with a text layer (`materials`, Story 1.19, internal contract 1.5.0, public contract 1.8.0).** A
+  reading report may add `pageViews`: for a PDF page `{page, picture: {fileId, width, height}, lines: [{text,
+  box}]}`, for a text page `{page, text}`. It is refused with `job.result_invalid` (detail code
+  `ingestion.page_view_invalid`) unless each page is one this report gives an outcome and appears once, the picture
+  is an output of this job (adopted here as a `version_file` with role `picture`, `first_page = last_page = page`),
+  width and height are 1 to 10,000, there are at most 10,000 lines, each of 1 to 4,096 code points with a box of
+  four fractions (`[left, top, right, bottom]` of the picture from its top-left corner), and the text has at most
+  16,384 code points. A report replaces the views of the pages it carries (their earlier pictures are removed after
+  the commit), so a retry leaves one view per page; a restart removes the page views and the pictures with the
+  passages. The backend never reads a picture: it stores and serves the worker's bytes. Deploy this release before a
+  worker of pipeline "5" (its floor is internal contract 1.5.0).
+  - `V12__page_views.sql`: `version_file.role` gains `picture`; the library table `page_view` (owner, id, version,
+    page, `picture_file_id` with `width` and `height`, all three null for a text page, and `content`, the lines or
+    the text as JSON encrypted under `page_view`, `content`, the row and the owner), unique on (owner, version,
+    page), its picture a file of the same owner; an index on `passage (owner_id, version_id, page)`.
+  - `GET /api/v1/materials/{id}/pages/{page}?ground=review` answers `{page, pageTotal, picture: {width, height} |
+    null, lines, text | null, passages: [{id, boxes | range}]}` (the page's passages in reading order, through the
+    new index), and `GET …/pages/{page}/picture?ground=review` streams the WebP piece by piece (`image/webp`,
+    `nosniff`); both `no-store`. The ground `review` (the owner reviewing a version) serves the material's current
+    version only while it is `needs_review` or `ready`. Another owner's material, an unknown or malformed id, a
+    version in any other state, a page outside 1 to the page total, a page with no view, and a picture of a page
+    with none are the same `request.not_found` (404); a missing or other ground is `page.ground_unknown` (400).
+    Grounds are a parameter (`Materials.Ground`) so that Epics 2 and 3 add theirs without a new path.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

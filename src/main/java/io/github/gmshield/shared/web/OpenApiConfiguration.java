@@ -6,6 +6,7 @@ import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.info.Info;
 import io.swagger.v3.oas.models.media.Content;
 import io.swagger.v3.oas.models.media.IntegerSchema;
+import io.swagger.v3.oas.models.media.JsonSchema;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
@@ -15,6 +16,8 @@ import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.oas.models.servers.Server;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.springdoc.core.customizers.OpenApiCustomizer;
 import org.springdoc.core.models.GroupedOpenApi;
 import org.springframework.context.annotation.Bean;
@@ -60,6 +63,7 @@ public class OpenApiConfiguration {
         OpenApiCustomizer contract = api -> {
             api.info(new Info().title(title).version(version));
             api.schema(PROBLEM_SCHEMA, problemSchema());
+            nullableReferences(api);
             api.getComponents().addSecuritySchemes(credential, new SecurityScheme()
                     .type(SecurityScheme.Type.HTTP).scheme("bearer").description(credentialDescription));
             api.security(List.of(new SecurityRequirement().addList(credential)));
@@ -69,6 +73,28 @@ public class OpenApiConfiguration {
             }
         };
         return GroupedOpenApi.builder().group(name).pathsToMatch(paths).addOpenApiCustomizer(contract).build();
+    }
+
+    /**
+     * A property that is a reference to another schema or null (Story 1.19: a page's picture) is written by the
+     * annotations as {@code $ref} beside the type null, which code generators read as never null: it becomes
+     * {@code anyOf} the reference and null, with its description.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void nullableReferences(OpenAPI api) {
+        if (api.getComponents() == null || api.getComponents().getSchemas() == null) {
+            return;
+        }
+        for (Schema schema : api.getComponents().getSchemas().values()) {
+            Map<String, Schema> properties = schema.getProperties();
+            if (properties == null) {
+                continue;
+            }
+            properties.replaceAll((name, property) -> property.get$ref() == null || property.getTypes() == null
+                    || !property.getTypes().contains("null") ? property
+                    : new JsonSchema().anyOf(List.of(new JsonSchema().$ref(property.get$ref()),
+                            new JsonSchema().types(Set.of("null")))).description(property.getDescription()));
+        }
     }
 
     private static Schema<Object> problemSchema() {

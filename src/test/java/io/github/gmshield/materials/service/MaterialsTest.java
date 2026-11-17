@@ -67,9 +67,11 @@ class MaterialsTest {
     /** The jobs offered or running, as the jobs module would answer (Story 1.17). */
     private final java.util.Set<UUID> running = new java.util.HashSet<>();
 
+    private FileStore files;
+
     @BeforeEach
     void wire() {
-        FileStore files = TestVaults.files(vault, root);
+        files = TestVaults.files(vault, root);
         StaticListableBeanFactory beans = new StaticListableBeanFactory();
         beans.addBean("transactions", transactions);
         beans.addBean("clock", clock);
@@ -78,7 +80,7 @@ class MaterialsTest {
         service = new Uploads(materials, uploads, vault, files, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
-        reads = new Materials(materials, uploads, vault, ids -> ids.stream().filter(running::contains)
+        reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
                 .collect(java.util.stream.Collectors.toSet()), beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
@@ -374,7 +376,7 @@ class MaterialsTest {
         UUID layout = step(version, 9, 30);
         running.add(layout);
         List<java.util.Collection<UUID>> asked = new ArrayList<>();
-        Materials watched = new Materials(materials, uploads, vault, ids -> {
+        Materials watched = new Materials(materials, uploads, vault, files, ids -> {
             asked.add(List.copyOf(ids));
             return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
         }, beansFor(transactions));
@@ -461,6 +463,106 @@ class MaterialsTest {
                         21)));
         assertThat(as(other, () -> reads.outline(version))).isEmpty();
         assertThat(as(owner, () -> reads.outline(Ids.newId()))).isEmpty();
+    }
+
+    // --- Story 1.19: pages on the review ground
+
+    @Test
+    void aPageIsServedOnTheReviewGroundOnlyFromTheCurrentVersionWhileItNeedsReviewOrIsReady() throws Exception {
+        UUID material = create(owner, "livro.pdf", Uploads.Details.NONE);
+        UUID version = versionOf(material).id();
+        write(() -> materials.recordIngestion(version, "5", 3, clock.instant()));
+        byte[] webp = "RIFF\0\0\0\0WEBPVP8 picture".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        UUID picture = pageView(version, 2, webp, List.of(new PageViews.Line("Plate | 1,500 gp | 18",
+                List.of(0.1, 0.2, 0.9, 0.25))));
+        UUID first = passage(version, 0, 2, List.of("Armor"), "Plate");
+        passage(version, 1, 3, List.of("Armor"), "Shield");
+
+        for (String state : List.of("waiting", "processing", "failed", "superseded", "discarded")) {
+            setState(material, state);
+            assertThat(as(owner, () -> reads.page(material, 2, Materials.Ground.REVIEW))).as(state).isEmpty();
+            assertThat(as(owner, () -> reads.picture(material, 2, Materials.Ground.REVIEW))).as(state).isEmpty();
+        }
+        for (String state : List.of("needs_review", "ready")) {
+            setState(material, state);
+            Materials.VersionPage page = as(owner, () -> reads.page(material, 2, Materials.Ground.REVIEW))
+                    .orElseThrow();
+            assertThat(page.page()).isEqualTo(2);
+            assertThat(page.pageTotal()).isEqualTo(3);
+            assertThat(page.picture()).isEqualTo(new Materials.PictureSize(1545, 2000));
+            assertThat(page.lines()).containsExactly(new Materials.Line("Plate | 1,500 gp | 18",
+                    List.of(0.1, 0.2, 0.9, 0.25)));
+            assertThat(page.text()).isNull();
+            assertThat(page.passages()).containsExactly(new Materials.PagePassage(first,
+                    List.of(List.of(0.1, 0.2, 0.9, 0.3)), null));
+            assertThat(page.toString()).doesNotContain("Plate");
+            Materials.Picture found = as(owner, () -> reads.picture(material, 2, Materials.Ground.REVIEW)).orElseThrow();
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            found.writeTo(out);
+            assertThat(out.toByteArray()).isEqualTo(webp);
+            assertThat(found.size()).isEqualTo(webp.length);
+        }
+        // A page with no view, a page outside 1..3, another owner, an unknown material.
+        assertThat(as(owner, () -> reads.page(material, 1, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(as(owner, () -> reads.page(material, 4, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(as(owner, () -> reads.page(material, 0, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(as(other, () -> reads.page(material, 2, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(as(other, () -> reads.picture(material, 2, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(as(owner, () -> reads.page(Ids.newId(), 2, Materials.Ground.REVIEW))).isEmpty();
+        // Only the material's current version is served: a newer one that is processing hides the page.
+        addVersion(material, "processing");
+        assertThat(as(owner, () -> reads.page(material, 2, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(picture).isNotNull();
+        // Grounds are words: review only, in this release.
+        assertThat(Materials.Ground.of("review")).hasValue(Materials.Ground.REVIEW);
+        assertThat(Materials.Ground.of(null)).isEmpty();
+        assertThat(Materials.Ground.of("scope")).isEmpty();
+        assertThat(Materials.Ground.of("Review")).isEmpty();
+    }
+
+    @Test
+    void aTextPagesViewIsItsTextAndItsContentIsStoredOnlyEncrypted() {
+        UUID material = create(owner, "regras.md", Uploads.Details.NONE);
+        UUID version = versionOf(material).id();
+        write(() -> materials.recordIngestion(version, "5", 1, clock.instant()));
+        setState(material, "needs_review");
+        UUID id = Ids.newId();
+        write(() -> {
+            materials.insertPageView(new io.github.gmshield.materials.data.PageViewRow(id, owner, version, 1, null,
+                    null, null, vault.encrypt(PageViews.content(id, owner), PageViews.contentJson(
+                            new PageViews.Content(null, "# Regras da Casa\n"))), clock.instant()));
+            return true;
+        });
+
+        Materials.VersionPage page = as(owner, () -> reads.page(material, 1, Materials.Ground.REVIEW)).orElseThrow();
+        assertThat(page.picture()).isNull();
+        assertThat(page.lines()).isEmpty();
+        assertThat(page.text()).isEqualTo("# Regras da Casa\n");
+        assertThat(as(owner, () -> reads.picture(material, 1, Materials.Ground.REVIEW))).isEmpty();
+        assertThat(new String(materials.pageViews.get(id).content(), java.nio.charset.StandardCharsets.ISO_8859_1))
+                .doesNotContain("Regras");
+        // Moved to another row, the ciphertext fails its integrity check.
+        UUID moved = Ids.newId();
+        materials.pageViews.put(moved, new io.github.gmshield.materials.data.PageViewRow(moved, owner, version, 1,
+                null, null, null, materials.pageViews.remove(id).content(), clock.instant()));
+        assertThatThrownBy(() -> as(owner, () -> reads.page(material, 1, Materials.Ground.REVIEW)))
+                .isInstanceOf(io.github.gmshield.vault.service.IntegrityException.class);
+    }
+
+    /** A picture page's view of the owner's version, its picture stored as a file of the version; answers the file. */
+    private UUID pageView(UUID version, int page, byte[] picture, List<PageViews.Line> lines) throws Exception {
+        UUID fileId = Ids.newId();
+        files.writePiece(owner, fileId, 0, picture);
+        UUID id = Ids.newId();
+        write(() -> {
+            materials.insertVersionFile(new io.github.gmshield.materials.data.VersionFileRow(Ids.newId(), owner,
+                    version, fileId, "picture", page, page, picture.length, 1, clock.instant()));
+            materials.insertPageView(new io.github.gmshield.materials.data.PageViewRow(id, owner, version, page,
+                    fileId, 1545, 2000, vault.encrypt(PageViews.content(id, owner), PageViews.contentJson(
+                            new PageViews.Content(lines, null))), clock.instant()));
+            return true;
+        });
+        return fileId;
     }
 
     /** A passage of the owner's version, stored as the report stores it; answers its id. */

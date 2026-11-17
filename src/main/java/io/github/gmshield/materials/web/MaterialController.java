@@ -2,19 +2,27 @@ package io.github.gmshield.materials.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.materials.service.Materials;
+import io.github.gmshield.materials.service.PageProblems;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -26,7 +34,9 @@ import org.springframework.web.bind.annotation.RestController;
  * The owner's materials (Story 1.14): a list by the state of each material's newest version, and one material. The
  * owner is the session's account, set by the request edge ({@code accounts.web}) before any of these runs; nothing
  * here takes an owner from the request. Another owner's id, an unknown id and a malformed id are the same
- * {@code request.not_found} (404). Every answer is {@code no-store}.
+ * {@code request.not_found} (404). Every answer is {@code no-store}. From Story 1.19, one page of a material on a
+ * ground ({@code ?ground=review}: the owner reviewing its current version), as JSON, and its picture, streamed as
+ * WebP; a missing or unknown ground is {@code page.ground_unknown} (400).
  */
 @RestController
 @Tag(name = "materials")
@@ -34,6 +44,11 @@ class MaterialController {
 
     static final String MATERIALS = "/api/v1/materials";
     static final String MATERIAL = "/api/v1/materials/{id}";
+    static final String PAGE = "/api/v1/materials/{id}/pages/{page}";
+    static final String PICTURE = "/api/v1/materials/{id}/pages/{page}/picture";
+    static final String WEBP = "image/webp";
+    /** A page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is a page nowhere. */
+    private static final Pattern PAGE_NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
@@ -182,6 +197,141 @@ class MaterialController {
         return parse(id).flatMap(materials::find).map(MaterialView::of)
                 .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
                 .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    @Schema(name = "PagePicture", requiredProperties = {"width", "height"})
+    record PictureView(
+            @Schema(description = "The picture's width in pixels", format = "int32", example = "1545") int width,
+            @Schema(description = "The picture's height in pixels", format = "int32", example = "2000") int height) {
+    }
+
+    @Schema(name = "PageLine", requiredProperties = {"text", "box"})
+    record LineView(
+            @Schema(description = "The line's text, as read", example = "Plate | 1,500 gp | 18") String text,
+            @ArraySchema(minItems = 4, maxItems = 4, arraySchema = @Schema(description = "The line's box, [left, top,"
+                    + " right, bottom] as fractions of the picture from its top-left corner"),
+                    schema = @Schema(type = "number", format = "double", minimum = "0", maximum = "1"))
+            List<Double> box) {
+
+        static LineView of(Materials.Line line) {
+            return new LineView(line.text(), line.box());
+        }
+
+        @Override
+        public String toString() {
+            return "LineView[box=" + box + "]";
+        }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "PagePassage", requiredProperties = "id", description = "A passage on the page: its boxes on a"
+            + " picture page, or its range in a text page's text")
+    record PassageView(
+            @Schema(description = "The passage's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000009")
+            String id,
+            @ArraySchema(arraySchema = @Schema(description = "The passage's boxes, each [left, top, right, bottom] as"
+                    + " fractions of the picture from its top-left corner"),
+                    schema = @Schema(type = "array", description = "[left, top, right, bottom]"))
+            List<List<Double>> boxes,
+            @ArraySchema(minItems = 2, maxItems = 2, arraySchema = @Schema(description = "The passage's range in the"
+                    + " page's text, [start, end) in code points"), schema = @Schema(type = "integer", format = "int32"))
+            List<Integer> range) {
+
+        static PassageView of(Materials.PagePassage passage) {
+            return new PassageView(passage.id().toString(), passage.boxes(), passage.range());
+        }
+    }
+
+    @Schema(name = "MaterialPageView", requiredProperties = {"page", "pageTotal", "picture", "lines", "text",
+        "passages"})
+    record PageContentView(
+            @Schema(description = "The page's number", format = "int32", example = "13") int page,
+            @Schema(description = "The version's page total", format = "int32", example = "364") int pageTotal,
+            @Schema(description = "The page's picture size (a PDF page); null for a text page, which has no picture",
+                    types = {"object", "null"}, implementation = PictureView.class) PictureView picture,
+            @ArraySchema(arraySchema = @Schema(description = "The picture's text lines in reading order; empty for a"
+                    + " text page"), schema = @Schema(implementation = LineView.class)) List<LineView> lines,
+            @Schema(description = "A text page's text; null for a picture page", types = {"string", "null"})
+            String text,
+            @ArraySchema(arraySchema = @Schema(description = "The page's passages, in reading order"),
+                    schema = @Schema(implementation = PassageView.class)) List<PassageView> passages) {
+
+        static PageContentView of(Materials.VersionPage page) {
+            return new PageContentView(page.page(), page.pageTotal(), page.picture() == null ? null
+                    : new PictureView(page.picture().width(), page.picture().height()),
+                    page.lines().stream().map(LineView::of).toList(), page.text(),
+                    page.passages().stream().map(PassageView::of).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "PageContentView[page=" + page + ", pageTotal=" + pageTotal + "]";
+        }
+    }
+
+    private static final String PAGE_SUMMARY = " page.ground_unknown (400) without a ground or for another one;"
+            + " request.not_found (404) for another owner's material or an unknown one, a version the ground does not"
+            + " serve, a page outside 1 to the page total or a page with no view;" + SESSION_SUMMARY;
+
+    @GetMapping(path = PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getMaterialPage", summary = "One page of one of the account's materials on a ground:"
+            + " review serves its current version while it needs review or is ready. The page's picture size and"
+            + " text lines (a PDF page) or its text (a text page), and its passages' places." + PAGE_SUMMARY,
+            parameters = {
+                @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "ground", in = ParameterIn.QUERY, required = true,
+                        description = "Why the page is read: review (the owner reviewing a version)",
+                        schema = @Schema(type = "string", allowableValues = "review"))})
+    ResponseEntity<PageContentView> page(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer", format = "int32",
+                    minimum = "1")) @PathVariable("page") String page,
+            @Parameter(hidden = true) @RequestParam(value = "ground", required = false) String ground) {
+        Materials.Ground served = Materials.Ground.of(ground).orElseThrow(PageProblems::groundUnknown);
+        return parse(id).flatMap(material -> pageNumber(page).flatMap(number -> materials.page(material, number,
+                        served))).map(PageContentView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    // No `produces`: a refusal is problem JSON, which an image's Accept would otherwise turn into a 406.
+    @GetMapping(path = PICTURE)
+    @Operation(operationId = "getMaterialPagePicture", summary = "The picture of one page of one of the account's"
+            + " materials on a ground, as WebP, streamed. request.not_found (404) also for a page with no picture (a"
+            + " text page)." + PAGE_SUMMARY,
+            parameters = {
+                @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "ground", in = ParameterIn.QUERY, required = true,
+                        description = "Why the page is read: review (the owner reviewing a version)",
+                        schema = @Schema(type = "string", allowableValues = "review"))},
+            responses = @ApiResponse(responseCode = "200", description = "The page's picture",
+                    content = @Content(mediaType = WEBP, schema = @Schema(type = "string", format = "binary"))))
+    void picture(@Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+                 @PathVariable("id") String id,
+                 @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer",
+                         format = "int32", minimum = "1")) @PathVariable("page") String page,
+                 @Parameter(hidden = true) @RequestParam(value = "ground", required = false) String ground,
+                 @Parameter(hidden = true) HttpServletResponse response) throws IOException {
+        Materials.Ground served = Materials.Ground.of(ground).orElseThrow(PageProblems::groundUnknown);
+        Materials.Picture picture = parse(id).flatMap(material -> pageNumber(page)
+                        .flatMap(number -> materials.picture(material, number, served)))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+        response.setStatus(HttpStatus.OK.value());
+        response.setContentType(WEBP);
+        response.setContentLengthLong(picture.size());
+        response.setHeader(HttpHeaders.CACHE_CONTROL, CacheControl.noStore().getHeaderValue());
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        try (OutputStream out = response.getOutputStream()) {
+            picture.writeTo(out);
+        }
+    }
+
+    private static Optional<Integer> pageNumber(String page) {
+        return page != null && PAGE_NUMBER.matcher(page).matches() ? Optional.of(Integer.parseInt(page))
+                : Optional.empty();
     }
 
     /** A malformed id is no different from an unknown one. */

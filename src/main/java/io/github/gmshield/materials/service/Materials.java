@@ -5,13 +5,19 @@ import io.github.gmshield.materials.data.NewestVersion;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.UploadStorage;
+import io.github.gmshield.materials.data.VersionFileRow;
+import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
+import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
@@ -39,7 +45,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * layer of the pages of the step whose job is offered or running, from its page range and the layer ranges (a held step,
  * or one over every text file of its version, reads no page: Story 1.18). The backend never reads a stage name and
  * names no phase: the frontend chooses the words. From Story 1.18, a passage with its material, section path, page
- * and text ({@link #passage}), and a version's outline ({@link #outline}), decrypted, for their owner only.
+ * and text ({@link #passage}), and a version's outline ({@link #outline}), decrypted, for their owner only. From Story
+ * 1.19, one page of a material on a {@link Ground} ({@link #page}): its picture's size, its lines or text, and its
+ * passages' places, and the picture itself ({@link #picture}), streamed piece by piece.
  * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
  * Nothing here logs a name.
  */
@@ -58,6 +66,7 @@ public class Materials {
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final JobsInProgress inProgress;
+    private final FileStore files;
 
     /** Those of these jobs of the bound owner that are offered or running ({@link Jobs#inProgress}). */
     @FunctionalInterface
@@ -66,16 +75,17 @@ public class Materials {
     }
 
     @Autowired
-    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, Jobs jobs,
+    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs,
               ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, jobs::inProgress, transactions);
+        this(materials, uploads, vault, files, jobs::inProgress, transactions);
     }
 
-    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, JobsInProgress inProgress,
+    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
               ObjectProvider<PlatformTransactionManager> transactions) {
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
+        this.files = files;
         this.inProgress = inProgress;
         this.transactions = transactions;
     }
@@ -141,6 +151,95 @@ public class Materials {
         }
     }
 
+    /**
+     * The ground a page is served on (Story 1.19, AD-11): {@link #REVIEW}, the owner reviewing a version, serves the
+     * material's current version while it is {@code needs_review} or {@code ready}. Epics 2 and 3 add their grounds.
+     */
+    public enum Ground {
+        REVIEW("review", Set.of(IngestionSteps.NEEDS_REVIEW, "ready"));
+
+        private final String word;
+        private final Set<String> states;
+
+        Ground(String word, Set<String> states) {
+            this.word = word;
+            this.states = states;
+        }
+
+        /** The ground of this word; empty for a missing or unknown one. */
+        public static Optional<Ground> of(String word) {
+            for (Ground ground : values()) {
+                if (ground.word.equals(word)) {
+                    return Optional.of(ground);
+                }
+            }
+            return Optional.empty();
+        }
+
+        boolean serves(VersionRow version) {
+            return states.contains(version.state());
+        }
+    }
+
+    /** A picture's size in pixels. */
+    public record PictureSize(int width, int height) {
+    }
+
+    /** A text line of a picture page and its box, {@code [left, top, right, bottom]} as fractions of the picture. */
+    public record Line(String text, List<Double> box) {
+        @Override
+        public String toString() {
+            return "Line[box=" + box + "]";
+        }
+    }
+
+    /** A passage's place on its page: its boxes (a picture page), or its range in the page's text (a text page). */
+    public record PagePassage(UUID id, List<List<Double>> boxes, List<Integer> range) {
+    }
+
+    /**
+     * One page of a version (Story 1.19): its number and the version's page total, its picture's size and its lines
+     * (a PDF page), or its text (a text page: {@code picture} and {@code text} null otherwise, {@code lines} empty),
+     * and the places of the passages on it, in reading order. {@code toString} names numbers only.
+     */
+    public record VersionPage(int page, int pageTotal, PictureSize picture, List<Line> lines, String text,
+                              List<PagePassage> passages) {
+        @Override
+        public String toString() {
+            return "VersionPage[page=" + page + ", pageTotal=" + pageTotal + "]";
+        }
+    }
+
+    /** A page's picture as the file store holds it: WebP, streamed one decrypted piece at a time. */
+    public final class Picture {
+        private final UUID owner;
+        private final UUID fileId;
+        private final long size;
+        private final int pieces;
+
+        Picture(VersionFileRow file) {
+            this.owner = file.ownerId();
+            this.fileId = file.fileId();
+            this.size = file.sizeBytes();
+            this.pieces = file.pieceCount();
+        }
+
+        public long size() {
+            return size;
+        }
+
+        public void writeTo(OutputStream out) throws IOException {
+            for (int index = 0; index < pieces; index++) {
+                out.write(files.readPiece(owner, fileId, index));
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "Picture[fileId=" + fileId + ", size=" + size + "]";
+        }
+    }
+
     /** One page of materials, and the cursor of the next one (null when this is the last). */
     public record Page(List<Material> items, UUID nextCursor) {
     }
@@ -190,6 +289,42 @@ public class Materials {
         return reading(() -> materials.findOutline(versionId).map(row -> Passages.outline(
                         vault.decrypt(Passages.outline(row.id(), row.ownerId()), row.outline())).stream()
                 .map(entry -> new Section(entry.level(), entry.title(), entry.page())).toList()));
+    }
+
+    /**
+     * Page {@code page} of the owner's material on {@code ground}: empty for an unknown material or another owner's,
+     * a current version the ground does not serve, a page outside 1 to the page total, or a page with no page view.
+     */
+    public Optional<VersionPage> page(UUID materialId, int page, Ground ground) {
+        return reading(() -> served(materialId, page, ground).flatMap(version -> materials
+                .findPageView(version.id(), page).map(view -> versionPage(version, view))));
+    }
+
+    /** The picture of that page, as {@link #page} finds it; empty also for a page with no picture. */
+    public Optional<Picture> picture(UUID materialId, int page, Ground ground) {
+        return reading(() -> served(materialId, page, ground).flatMap(version -> materials
+                .findPageView(version.id(), page).filter(PageViewRow::hasPicture)
+                .flatMap(view -> materials.versionFile(version.id(), view.pictureFileId()))
+                .filter(file -> VersionFileRow.PICTURE.equals(file.role())).map(Picture::new)));
+    }
+
+    /** The material's current version when the ground serves it and the page is one of its pages. */
+    private Optional<VersionRow> served(UUID materialId, int page, Ground ground) {
+        return materials.newest(materialId).map(NewestVersion::version).filter(ground::serves)
+                .filter(version -> version.pageTotal() != null && page >= 1 && page <= version.pageTotal());
+    }
+
+    private VersionPage versionPage(VersionRow version, PageViewRow view) {
+        PageViews.Content content = PageViews.content(vault.decrypt(PageViews.content(view.id(), view.ownerId()),
+                view.content()));
+        List<PagePassage> passages = materials.passagesOnPage(version.id(), view.page()).stream().map(row -> {
+            Passages.Place place = Passages.place(vault.decrypt(Passages.place(row.id(), row.ownerId()), row.place()));
+            return new PagePassage(row.id(), place.boxes(), place.range());
+        }).toList();
+        List<Line> lines = content.lines().stream().map(line -> new Line(line.text(), line.box())).toList();
+        return new VersionPage(view.page(), version.pageTotal(),
+                view.hasPicture() ? new PictureSize(view.width(), view.height()) : null, lines, content.text(),
+                passages);
     }
 
     private List<Material> views(List<NewestVersion> rows) {

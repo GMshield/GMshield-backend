@@ -244,6 +244,38 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionFileRow> versionFiles(UUID versionId, Collection<String> roles) {
+        if (roles.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select f from VersionFile f where f.versionId = :version and f.role in :roles"
+                        + " order by f.role desc, f.firstPage, f.id", VersionFileEntity.class)
+                .setParameter("version", versionId).setParameter("roles", roles).getResultList().stream()
+                .map(VersionFileEntity::row).toList();
+    }
+
+    @Override
+    public Optional<VersionFileRow> versionFile(UUID versionId, UUID fileId) {
+        return versionFileEntity(versionId, fileId).map(VersionFileEntity::row);
+    }
+
+    private Optional<VersionFileEntity> versionFileEntity(UUID versionId, UUID fileId) {
+        return em().createQuery("select f from VersionFile f where f.versionId = :version and f.fileId = :file",
+                        VersionFileEntity.class).setParameter("version", versionId).setParameter("file", fileId)
+                .getResultList().stream().findFirst();
+    }
+
+    @Override
+    public Optional<VersionFileRow> deleteVersionFile(UUID versionId, UUID fileId) {
+        Optional<VersionFileEntity> found = versionFileEntity(versionId, fileId);
+        found.ifPresent(entity -> {
+            em().remove(entity);
+            em().flush();
+        });
+        return found.map(VersionFileEntity::row);
+    }
+
+    @Override
     public List<VersionFileRow> deleteVersionFiles(UUID versionId) {
         List<VersionFileEntity> found = versionFileEntities(versionId);
         found.forEach(em()::remove);
@@ -422,6 +454,50 @@ class JpaMaterialStore implements MaterialStore {
     private Optional<VersionOutlineEntity> outlineEntity(UUID versionId) {
         return em().createQuery("select o from VersionOutline o where o.versionId = :version",
                 VersionOutlineEntity.class).setParameter("version", versionId).getResultList().stream().findFirst();
+    }
+
+    @Override
+    public void insertPageView(PageViewRow row) {
+        EntityManager em = em();
+        em.persist(new PageViewEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public Optional<PageViewRow> findPageView(UUID versionId, int page) {
+        return pageViewEntities(versionId, page, page).stream().findFirst().map(PageViewEntity::row);
+    }
+
+    @Override
+    public List<PageViewRow> deletePageViews(UUID versionId, int firstPage, int lastPage) {
+        List<PageViewEntity> found = pageViewEntities(versionId, firstPage, lastPage);
+        found.forEach(em()::remove);
+        em().flush();
+        return found.stream().map(PageViewEntity::row).toList();
+    }
+
+    @Override
+    public int deletePageViews(UUID versionId) {
+        List<PageViewEntity> found = em().createQuery("select p from PageView p where p.versionId = :version",
+                PageViewEntity.class).setParameter("version", versionId).getResultList();
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
+    }
+
+    private List<PageViewEntity> pageViewEntities(UUID versionId, int firstPage, int lastPage) {
+        return em().createQuery("select p from PageView p where p.versionId = :version"
+                        + " and p.page between :first and :last order by p.page", PageViewEntity.class)
+                .setParameter("version", versionId).setParameter("first", firstPage).setParameter("last", lastPage)
+                .getResultList();
+    }
+
+    @Override
+    public List<PassageRow> passagesOnPage(UUID versionId, int page) {
+        return em().createQuery("select p from Passage p where p.versionId = :version and p.page = :page"
+                        + " order by p.ordinal", PassageEntity.class)
+                .setParameter("version", versionId).setParameter("page", page).getResultList().stream()
+                .map(PassageEntity::row).toList();
     }
 
     @Override

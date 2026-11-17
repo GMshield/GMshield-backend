@@ -27,6 +27,7 @@ import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialTestStores;
 import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
@@ -84,8 +85,10 @@ import tools.jackson.databind.json.JsonMapper;
  * steps over a scanned and a mixed PDF, the page counts by layer and outcome the GM reads, and two owners' scans
  * offered in turn. Story 1.18: the held step over every text file, its job once every page has an outcome, its claim
  * input and text inputs, the passages and outline it reports (refused when invalid, replaced when reported again), a
- * failure or a restart ending it, and the cross-owner test of passages and outlines. The same tables against
- * PostgreSQL are in {@code IngestionIntegrationTest}.
+ * failure or a restart ending it, and the cross-owner test of passages and outlines. Story 1.19: the page views a
+ * reading report carries (refused when invalid, removed by a restart), each page served on the review ground with its
+ * passages and its picture, and the cross-owner test of pages and pictures. The same tables against PostgreSQL are in
+ * {@code IngestionIntegrationTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -1498,6 +1501,369 @@ class IngestionFlowTest {
     /** A stored passage's place, decrypted as the owner. */
     private JsonNode place(Gm gm, PassageRow row) {
         return JSON.readTree(vault.decrypt(new Binding("passage", "place", row.id(), gm.id()), row.place()));
+    }
+
+    // --- Story 1.19: page views
+
+    @Test
+    void aDigitalPagesViewIsServedOnTheReviewGroundWithItsLinesItsPassagesAndItsWebpPicture() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 13, "2", true);
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 13, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode layoutClaim = claim(layout.jobId());
+        List<String> views = new ArrayList<>();
+        byte[] page13 = webp(3000);
+        for (int page = 1; page <= 13; page++) {
+            views.add(pictureView(layout, layoutClaim, page, page == 13 ? page13 : webp(1000 + page),
+                    "Plate | 1,500 gp | " + page));
+        }
+        report(layout, layoutClaim, withViews(layout(layout, layoutClaim, 1, 13, List.of()), views));
+
+        // Matrix row "Not reviewable": the version is still processing (its passages step runs).
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        assertThat(pageOf(gm, uploaded, 13, "review").statusCode()).isEqualTo(404);
+        assertThat(pictureOf(gm, uploaded, 13, "review").statusCode()).isEqualTo(404);
+        StepRow passages = offeredStep(uploaded.versionId());
+        report(passages, claim(passages.jobId()), passagesReport(passage(12, "Doze", "Armor"),
+                passage(13, "Armor\nArmor | Cost | AC", "Equipment", "Armor"), passage(13, "Plate", "Armor")));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+
+        // Matrix row "Digital page": page 13's picture size, its lines with boxes and its own passages, in order.
+        HttpResponse<String> read = pageOf(gm, uploaded, 13, "review");
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode page = json(read);
+        assertThat(page.path("page").asInt()).isEqualTo(13);
+        assertThat(page.path("pageTotal").asInt()).isEqualTo(13);
+        assertThat(page.path("picture").toString()).isEqualTo("{\"width\":1545,\"height\":2000}");
+        assertThat(page.path("lines").toString())
+                .isEqualTo("[{\"text\":\"Plate | 1,500 gp | 13\",\"box\":[0.1,0.2,0.9,0.25]}]");
+        assertThat(page.path("text").isNull()).isTrue();
+        List<PassageRow> stored = passages(uploaded.versionId());
+        assertThat(page.path("passages").toString()).isEqualTo("[{\"id\":\"" + stored.get(1).id()
+                + "\",\"boxes\":[[0.1,0.2,0.9,0.3]]},{\"id\":\"" + stored.get(2).id() + "\",\"boxes\":[[0.1,0.2,0.9,0.3]]}]");
+        HttpResponse<byte[]> picture = pictureOf(gm, uploaded, 13, "review");
+        assertThat(picture.statusCode()).isEqualTo(200);
+        assertThat(picture.body()).isEqualTo(page13);
+        assertThat(picture.headers().firstValue("Content-Type").orElseThrow()).isEqualTo("image/webp");
+        assertThat(picture.headers().firstValue("Content-Length").orElseThrow()).isEqualTo("3000");
+        assertThat(picture.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(picture.headers().firstValue("X-Content-Type-Options").orElseThrow()).isEqualTo("nosniff");
+        assertThat(json(pageOf(gm, uploaded, 1, "review")).path("passages").size()).isZero();
+
+        // Each picture is a file of its page; each view's lines are stored only encrypted.
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .filteredOn(file -> file.role().equals("picture")).hasSize(13)
+                .allSatisfy(file -> assertThat(file.firstPage()).isEqualTo(file.lastPage()));
+        assertThat(pageViews(uploaded.versionId())).hasSize(13).allSatisfy(view -> {
+            assertThat(new String(view.content(), StandardCharsets.UTF_8)).doesNotContain("Plate");
+            assertThat(view.width()).isEqualTo(1545);
+        });
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Plate")
+                || String.valueOf(event.getKeyValuePairs()).contains("Plate"));
+
+        // Matrix row "Ground": none or another one is page.ground_unknown; a page outside 1..13 is not found.
+        for (String ground : new String[] {null, "scope", "reference", "REVIEW", ""}) {
+            HttpResponse<String> refused = pageOf(gm, uploaded, 13, ground);
+            assertThat(refused.statusCode()).as(ground).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("page.ground_unknown");
+            assertThat(pictureOf(gm, uploaded, 13, ground).statusCode()).as(ground).isEqualTo(400);
+        }
+        for (String number : List.of("0", "14", "-1", "013", "1.0", "x", "99999999")) {
+            HttpResponse<String> missing = get(gm, "/api/v1/materials/" + uploaded.materialId() + "/pages/" + number
+                    + "?ground=review");
+            assertThat(missing.statusCode()).as(number).isEqualTo(404);
+            assertThat(json(missing).path("code").asString()).isEqualTo("request.not_found");
+        }
+    }
+
+    @Test
+    void aBlankScanHasAPictureWithNoLinesAndACrashedPageHasNoViewAtAll() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Scan.pdf", null);
+        clean(uploaded, 10, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 10, List.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)));
+        StepRow ocr = offeredStep(uploaded.versionId());
+        assertThat(outcome(ocr.jobId(), claim(ocr.jobId()), "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\"}")
+                .statusCode()).isEqualTo(204);
+        // The retried step reads page by page: page 9's child crashed (unreadable, no view), page 7 is a blank scan.
+        JsonNode second = claim(ocr.jobId());
+        List<String> views = new ArrayList<>();
+        for (int page = 1; page <= 10; page++) {
+            if (page == 7) {
+                UUID blank = output(ocr.jobId(), second, webp(900));
+                views.add("{\"page\":7,\"picture\":{\"fileId\":\"" + blank + "\",\"width\":1545,\"height\":2000},"
+                        + "\"lines\":[]}");
+            } else if (page != 9) {
+                views.add(pictureView(ocr, second, page, webp(1200), "Capítulo " + page));
+            }
+        }
+        report(ocr, second, withViews(ocr(ocr, second, 1, 10, List.of(7, 9)), views));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+
+        // Matrix row "Blank scan": its picture, no lines.
+        JsonNode blank = json(pageOf(gm, uploaded, 7, "review"));
+        assertThat(blank.path("picture").path("width").asInt()).isEqualTo(1545);
+        assertThat(blank.path("lines").size()).isZero();
+        assertThat(pictureOf(gm, uploaded, 7, "review").statusCode()).isEqualTo(200);
+        // Matrix row "Crashed page": no view, so neither the page nor its picture.
+        assertThat(pageOf(gm, uploaded, 9, "review").statusCode()).isEqualTo(404);
+        assertThat(pictureOf(gm, uploaded, 9, "review").statusCode()).isEqualTo(404);
+        // Matrix row "Retried batch": one view per page, the retry's.
+        assertThat(pageViews(uploaded.versionId())).extracting(PageViewRow::page)
+                .containsExactlyInAnyOrder(1, 2, 3, 4, 5, 6, 7, 8, 10);
+        assertThat(json(pageOf(gm, uploaded, 10, "review")).path("lines").get(0).path("text").asString())
+                .isEqualTo("Capítulo 10");
+    }
+
+    @Test
+    void aTextPageIsServedAsItsTextWithNoPictureAndItsPassagesRanges() throws Exception {
+        Gm gm = signUp();
+        byte[] text = "# A\n\nUnder A.\n\n## B\n\nUnder B.\n".getBytes(StandardCharsets.UTF_8);
+        Uploaded uploaded = upload(gm, text, "regras.md", null);
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, text);
+        UUID pages = output(uploaded.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        report(steps(uploaded.versionId()).getFirst(), claim, "{\"pipelineVersion\":\"2\",\"pageTotal\":2,"
+                + "\"original\":{\"fileId\":\"" + original + "\"},\"pages\":[" + range(1, 2, "outcome", "read_directly")
+                + "],\"texts\":[{\"fileId\":\"" + pages + "\",\"firstPage\":1,\"lastPage\":2}],"
+                + "\"pageViews\":[{\"page\":1,\"text\":\"# A\\n\\nUnder A.\\n\\n\"},"
+                + "{\"page\":2,\"text\":\"## B\\n\\nUnder B.\\n\"}],\"next\":[" + passagesStep(2) + "]}");
+        StepRow passages = offeredStep(uploaded.versionId());
+        report(passages, claim(passages.jobId()), passagesReport(
+                "{\"page\":2,\"sectionPath\":[\"A\",\"B\"],\"text\":\"## B\\n\\nUnder B.\",\"range\":[0,14]}"));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+
+        // Matrix row "Text page": no picture, its text, and its passage's range.
+        JsonNode page = json(pageOf(gm, uploaded, 2, "review"));
+        assertThat(page.path("picture").isNull()).isTrue();
+        assertThat(page.path("text").asString()).isEqualTo("## B\n\nUnder B.\n");
+        assertThat(page.path("lines").size()).isZero();
+        assertThat(page.path("pageTotal").asInt()).isEqualTo(2);
+        assertThat(page.path("passages").toString()).isEqualTo("[{\"id\":\""
+                + passages(uploaded.versionId()).getFirst().id() + "\",\"range\":[0,14]}]");
+        HttpResponse<byte[]> picture = pictureOf(gm, uploaded, 2, "review");
+        assertThat(picture.statusCode()).isEqualTo(404);
+        assertThat(new String(picture.body(), StandardCharsets.UTF_8)).contains("request.not_found");
+        assertThat(pageViews(uploaded.versionId())).allSatisfy(view -> assertThat(view.pictureFileId()).isNull());
+    }
+
+    @Test
+    void aReportWithAnInvalidPageViewIsRefusedAndKeepsNothing() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 4, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 4, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        UUID picture = output(layout.jobId(), claim, webp(1000));
+        String layoutReport = layout(layout, claim, 1, 4, List.of());
+        // A picture another job sent back (the triage step's), never this claim's.
+        UUID otherJobs = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())).stream()
+                .filter(file -> file.role().equals("batch")).findFirst().orElseThrow().fileId();
+        String good = "\"picture\":{\"fileId\":\"" + picture + "\",\"width\":10,\"height\":10}";
+        String line = "{\"text\":\"a\",\"box\":[0,0,1,1]}";
+        List<String> refused = List.of(
+                // Matrix row "Bad report": a box outside 0..1, and a picture file not this claim's.
+                "{\"page\":1," + good + ",\"lines\":[{\"text\":\"a\",\"box\":[0,0,1.2,1]}]}",
+                "{\"page\":1,\"picture\":{\"fileId\":\"" + otherJobs + "\",\"width\":10,\"height\":10},\"lines\":[]}",
+                "{\"page\":1,\"picture\":{\"fileId\":\"" + UUID.randomUUID() + "\",\"width\":10,\"height\":10},"
+                        + "\"lines\":[]}",
+                "{\"page\":5," + good + ",\"lines\":[]}",
+                "{\"page\":0," + good + ",\"lines\":[]}",
+                "{\"page\":1," + good + ",\"lines\":[]},{\"page\":1,\"text\":\"b\"}",
+                "{\"page\":1,\"picture\":{\"fileId\":\"" + picture + "\",\"width\":0,\"height\":10},\"lines\":[]}",
+                "{\"page\":1,\"picture\":{\"fileId\":\"" + picture + "\",\"width\":10,\"height\":10001},\"lines\":[]}",
+                "{\"page\":1," + good + "}",
+                "{\"page\":1," + good + ",\"lines\":[{\"text\":\"\",\"box\":[0,0,1,1]}]}",
+                "{\"page\":1," + good + ",\"lines\":[{\"text\":\"" + "a".repeat(4097) + "\",\"box\":[0,0,1,1]}]}",
+                "{\"page\":1," + good + ",\"lines\":[{\"text\":\"a\",\"box\":[0,0,1]}]}",
+                "{\"page\":1," + good + ",\"lines\":[" + String.join(",", java.util.Collections.nCopies(10_001, line))
+                        + "]}",
+                "{\"page\":1," + good + ",\"lines\":[],\"text\":\"a\"}",
+                "{\"page\":1}",
+                "{\"page\":1,\"text\":\"" + "a".repeat(16_385) + "\"}",
+                "{\"page\":1,\"text\":3}",
+                "\"page\"");
+        for (String views : refused) {
+            HttpResponse<String> answer = outcome(layout.jobId(), claim, "{\"outcome\":\"done\",\"result\":"
+                    + layoutReport.replace("\"next\":[]", "\"pageViews\":[" + views + "],\"next\":[]") + "}");
+            assertThat(answer.statusCode()).as(views.length() > 200 ? views.substring(0, 200) : views).isEqualTo(400);
+            assertThat(json(answer).path("code").asString()).isEqualTo("job.result_invalid");
+        }
+        assertThat(pageViews(uploaded.versionId())).isEmpty();
+        assertThat(outcomes(uploaded.versionId())).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .noneMatch(file -> file.role().equals("picture") || file.role().equals("text"));
+        assertThat(logged.list).anyMatch(event -> String.valueOf(event.getKeyValuePairs())
+                .contains("ingestion.page_view_invalid"));
+
+        // The same report with valid views is recorded: page 4 a text page is fine, at the limits.
+        report(layout, claim, layoutReport.replace("\"next\":[]", "\"pageViews\":[{\"page\":1," + good
+                + ",\"lines\":[" + line + "]},{\"page\":4,\"text\":\"" + "a".repeat(16_384) + "\"}],\"next\":[]"));
+        assertThat(pageViews(uploaded.versionId())).extracting(PageViewRow::page).containsExactlyInAnyOrder(1, 4);
+    }
+
+    @Test
+    void aRestartRemovesThePageViewsAndTheirPictures() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 25, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        report(layout, claim, withViews(layout(layout, claim, 1, 20, List.of()),
+                List.of(pictureView(layout, claim, 3, webp(1500), "Três"))));
+        assertThat(pageViews(uploaded.versionId())).hasSize(1);
+        UUID picture = pageViews(uploaded.versionId()).getFirst().pictureFileId();
+        StepRow second = offeredStep(uploaded.versionId());
+
+        assertThat(outcome(second.jobId(), claim(second.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+
+        assertThat(pageViews(uploaded.versionId())).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::fileId).containsExactly(cleaned.original());
+        assertThat(materials.files.values()).noneMatch(file -> file.fileId().equals(picture));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.restarted")
+                && event.getKeyValuePairs().stream().anyMatch(pair -> pair.key.equals("pageViews")
+                        && Integer.valueOf(1).equals(pair.value)));
+    }
+
+    @Test
+    void aPictureIsNeverTheInputOfANextStep() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 25, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        report(layout, claim, withViews(layout(layout, claim, 1, 20, List.of()),
+                List.of(pictureView(layout, claim, 3, webp(1500), "Três"))));
+        UUID picture = pageViews(uploaded.versionId()).getFirst().pictureFileId();
+        StepRow second = offeredStep(uploaded.versionId());
+        int steps = steps(uploaded.versionId()).size();
+
+        HttpResponse<String> refused = outcome(second.jobId(), claim(second.jobId()), "{\"outcome\":\"done\",\"result\":"
+                + "{\"pipelineVersion\":\"2\",\"next\":[{\"stage\":\"layout\",\"firstPage\":21,\"lastPage\":25,"
+                + "\"input\":\"" + picture + "\"}]}}");
+
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
+        assertThat(json(refused).path("code").asString()).isEqualTo("job.result_invalid");
+        assertThat(steps(uploaded.versionId())).hasSize(steps);
+    }
+
+    @Test
+    void anotherOwnersPageAndPictureAreNotFoundAndLeakNoId() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        Uploaded uploaded = upload(a, pdf(MIB), "Segredo.pdf", null);
+        clean(uploaded, 2, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 2, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        report(layout, claim, withViews(layout(layout, claim, 1, 2, List.of()),
+                List.of(pictureView(layout, claim, 1, webp(1000), "Segredo"))));
+        assertThat(state(a, uploaded)).isEqualTo("needs_review");
+        assertThat(pageOf(a, uploaded, 1, "review").statusCode()).isEqualTo(200);
+        PageViewRow theirs = pageViews(uploaded.versionId()).getFirst();
+
+        // Matrix row "Two owners": B asks A's page and picture: the same not found as an unknown or malformed id.
+        JsonNode expected = json(get(b, "/api/v1/materials/" + UUID.randomUUID() + "/pages/1?ground=review"));
+        for (String material : List.of(uploaded.materialId(), UUID.randomUUID().toString(), "not-a-uuid")) {
+            for (String path : List.of("/api/v1/materials/" + material + "/pages/1?ground=review",
+                    "/api/v1/materials/" + material + "/pages/1/picture?ground=review")) {
+                HttpResponse<String> answer = get(b, path);
+                assertThat(answer.statusCode()).as(path).isEqualTo(404);
+                assertThat(json(answer).path("code").asString()).isEqualTo(expected.path("code").asString());
+                assertThat(answer.body()).doesNotContain(uploaded.materialId()).doesNotContain("Segredo")
+                        .doesNotContain(theirs.id().toString()).doesNotContain(uploaded.versionId().toString());
+            }
+        }
+        OwnerContext.runAs(b.id(), () -> {
+            assertThat(materials.findPageView(uploaded.versionId(), 1)).isEmpty();
+            assertThat(reads.page(UUID.fromString(uploaded.materialId()), 1, Materials.Ground.REVIEW)).isEmpty();
+            assertThat(reads.picture(UUID.fromString(uploaded.materialId()), 1, Materials.Ground.REVIEW)).isEmpty();
+        });
+        // B cannot write a page view naming A's version, nor remove A's.
+        assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> materials.insertPageView(new PageViewRow(UUID.randomUUID(), b.id(),
+                        uploaded.versionId(), 2, null, null, null, new byte[] {1}, Instant.now())))))
+                .isInstanceOf(IllegalStateException.class);
+        OwnerContext.runAs(b.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                assertThat(materials.deletePageViews(uploaded.versionId())).isZero()));
+        assertThat(pageViews(uploaded.versionId())).hasSize(1);
+    }
+
+    @Test
+    void aFailedVersionServesNoPage() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 25, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        report(layout, claim, withViews(layout(layout, claim, 1, 20, List.of()),
+                List.of(pictureView(layout, claim, 1, webp(1000), "Um"))));
+        StepRow next = offeredStep(uploaded.versionId());
+        assertThat(outcome(next.jobId(), claim(next.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+
+        assertThat(state(gm, uploaded)).isEqualTo("failed");
+        assertThat(pageViews(uploaded.versionId())).hasSize(1);
+        assertThat(pageOf(gm, uploaded, 1, "review").statusCode()).isEqualTo(404);
+        assertThat(pictureOf(gm, uploaded, 1, "review").statusCode()).isEqualTo(404);
+    }
+
+    // --- Story 1.19 helpers
+
+    /** A WebP file's first bytes, then zeros: the backend never parses a picture. */
+    private static byte[] webp(int size) {
+        byte[] content = new byte[size];
+        byte[] head = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' '};
+        System.arraycopy(head, 0, content, 0, head.length);
+        return content;
+    }
+
+    /** A picture page's view: a picture sent back on this claim, 1545 by 2000 pixels, and one line. */
+    private String pictureView(StepRow step, JsonNode claim, int page, byte[] picture, String line) throws Exception {
+        UUID file = output(step.jobId(), claim, picture);
+        return "{\"page\":" + page + ",\"picture\":{\"fileId\":\"" + file + "\",\"width\":1545,\"height\":2000},"
+                + "\"lines\":[{\"text\":\"" + line + "\",\"box\":[0.1,0.2,0.9,0.25]}]}";
+    }
+
+    /** A reading report (which ends with an empty {@code next}) with these page views. */
+    private static String withViews(String report, List<String> views) {
+        return report.replace("\"next\":[]", "\"pageViews\":[" + String.join(",", views) + "],\"next\":[]");
+    }
+
+    private HttpResponse<String> pageOf(Gm gm, Uploaded uploaded, int page, String ground) throws Exception {
+        return get(gm, "/api/v1/materials/" + uploaded.materialId() + "/pages/" + page
+                + (ground == null ? "" : "?ground=" + ground));
+    }
+
+    private HttpResponse<byte[]> pictureOf(Gm gm, Uploaded uploaded, int page, String ground) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(uri("/api/v1/materials/" + uploaded.materialId() + "/pages/" + page
+                        + "/picture" + (ground == null ? "" : "?ground=" + ground)))
+                .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
+                .header("Accept", "image/avif,image/webp,*/*").GET().build();
+        return client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private List<PageViewRow> pageViews(UUID versionId) {
+        return materials.pageViews.values().stream().filter(row -> row.versionId().equals(versionId))
+                .sorted(Comparator.comparingInt(PageViewRow::page)).toList();
     }
 
     // --- owners

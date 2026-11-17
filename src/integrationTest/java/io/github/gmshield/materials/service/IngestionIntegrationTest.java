@@ -10,6 +10,7 @@ import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
@@ -17,6 +18,7 @@ import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.FileStore;
+import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -50,7 +52,9 @@ import tools.jackson.databind.json.JsonMapper;
  * chain), the restart transaction on a pipeline change, and the cross-owner tests of {@code ingestion_step},
  * {@code version_file}, {@code page_layer} and {@code page_outcome}. Story 1.18: V11, the held passages step and its
  * job, its text inputs, passages and the outline stored encrypted and replaced by a second report, a failure ending
- * the held step, and the cross-owner tests of {@code passage} and {@code version_outline}.
+ * the held step, and the cross-owner tests of {@code passage} and {@code version_outline}. Story 1.19: V12, page views
+ * stored encrypted with their pictures and served on the review ground, a restart removing them before their pictures,
+ * and the cross-owner tests of {@code page_view}.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads the library tables with
  * native SQL.
@@ -83,6 +87,8 @@ class IngestionIntegrationTest {
     private PlatformTransactionManager transactions;
     @Autowired
     private Jobs jobs;
+    @Autowired
+    private Vault vault;
     @Value("${gmshield.files.dir}")
     private Path filesDir;
 
@@ -640,6 +646,198 @@ class IngestionIntegrationTest {
                 b.owner(), b.versionId(), 0, 1, new byte[] {1}, new byte[] {2}, now))))).isInstanceOf(RuntimeException.class);
         assertThat(jdbc.sql("select count(*) from passage where version_id in (?, ?)").params(a.versionId(),
                 b.versionId()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    // --- Story 1.19: page views
+
+    @Test
+    void pageViewsAreStoredEncryptedWithTheirPicturesAndServedOnTheReviewGroundOnPostgres() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
+                        + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + "]}"));
+        JobClaims.Claim layout = claimOffered(chain);
+        JobFiles.Stored text = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8)));
+        List<byte[]> pictures = new ArrayList<>();
+        StringBuilder views = new StringBuilder();
+        for (int page = 1; page <= 3; page++) {
+            byte[] picture = webp(2 * MIB + page);
+            pictures.add(picture);
+            UUID file = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                    new ByteArrayInputStream(picture)).fileId();
+            views.append(page == 1 ? "" : ",").append("{\"page\":").append(page).append(",\"picture\":{\"fileId\":\"")
+                    .append(file).append("\",\"width\":1545,\"height\":2000},\"lines\":[{\"text\":\"Plate | 1,500 gp | ")
+                    .append(page).append("\",\"box\":[0.1,0.2,0.9,0.25]}]}");
+        }
+        claims.report(layout.jobId(), layout.claimId(), layout.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pages\":[" + range(1, 3, "outcome", "read_directly") + "],\"texts\":"
+                        + "[{\"fileId\":\"" + text.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],\"pageViews\":["
+                        + views + "],\"next\":[]}"));
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+
+        List<Map<String, Object>> rows = jdbc.sql("select id, owner_id, page, picture_file_id, width, height, content"
+                + " from page_view where version_id = ? order by page").param(chain.versionId()).query().listOfRows();
+        assertThat(rows).extracting(row -> row.get("page")).containsExactly(1, 2, 3);
+        for (Map<String, Object> row : rows) {
+            assertThat(row).containsEntry("owner_id", chain.owner()).containsEntry("width", 1545)
+                    .containsEntry("height", 2000);
+            assertThat(new String((byte[]) row.get("content"), StandardCharsets.ISO_8859_1)).doesNotContain("Plate")
+                    .doesNotContain("1,500");
+            assertThat(jdbc.sql("select role, first_page, last_page, piece_count from version_file where file_id = ?")
+                    .param(row.get("picture_file_id")).query().singleRow()).containsEntry("role", "picture")
+                    .containsEntry("first_page", row.get("page")).containsEntry("last_page", row.get("page"))
+                    .containsEntry("piece_count", 1);
+        }
+        Materials.VersionPage page = as(chain.owner(), () -> materials.page(chain.materialId(), 2,
+                Materials.Ground.REVIEW)).orElseThrow();
+        assertThat(page.lines()).extracting(Materials.Line::text).containsExactly("Plate | 1,500 gp | 2");
+        assertThat(page.picture()).isEqualTo(new Materials.PictureSize(1545, 2000));
+        // The page's passages, read through the page index: page 2's only, in reading order (inserted out of it,
+        // their ids minted in the reverse order).
+        UUID third = Ids.newId();
+        UUID first = Ids.newId();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(chain.owner(), () -> store.insertPassages(List.of(passageRow(chain, third, 3, 2, now),
+                passageRow(chain, Ids.newId(), 0, 1, now), passageRow(chain, Ids.newId(), 2, 3, now),
+                passageRow(chain, first, 1, 2, now))));
+        assertThat(as(chain.owner(), () -> materials.page(chain.materialId(), 2, Materials.Ground.REVIEW))
+                .orElseThrow().passages()).extracting(Materials.PagePassage::id).containsExactly(first, third);
+        assertThat(as(chain.owner(), () -> materials.page(chain.materialId(), 3, Materials.Ground.REVIEW))
+                .orElseThrow().passages()).hasSize(1).allSatisfy(passage ->
+                        assertThat(passage.boxes()).containsExactly(List.of(0.1, 0.2, 0.9, 0.3)));
+        Materials.Picture picture = as(chain.owner(), () -> materials.picture(chain.materialId(), 2,
+                Materials.Ground.REVIEW)).orElseThrow();
+        ByteArrayOutputStream read = new ByteArrayOutputStream();
+        picture.writeTo(read);
+        assertThat(read.toByteArray()).isEqualTo(pictures.get(1));
+        assertThat(as(chain.owner(), () -> materials.page(chain.materialId(), 4, Materials.Ground.REVIEW))).isEmpty();
+
+        // A picture a view shows cannot go before its view; the views of a range go together, answered for removal.
+        UUID shown = (UUID) rows.get(0).get("picture_file_id");
+        assertThatThrownBy(() -> jdbc.sql("delete from version_file where file_id = ?").param(shown).update())
+                .satisfies(failure -> assertThat(messages(failure)).anyMatch(m -> m.contains("page_view_picture_fkey")));
+        write(chain.owner(), () -> {
+            assertThat(store.deletePageViews(chain.versionId(), 2, 3)).extracting(row -> row.page())
+                    .containsExactly(2, 3);
+            assertThat(store.deleteVersionFile(chain.versionId(), (UUID) rows.get(1).get("picture_file_id")))
+                    .isPresent();
+        });
+        assertThat(jdbc.sql("select count(*) from page_view where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(1);
+        // A ciphertext moved to another row fails its integrity check rather than being shown.
+        jdbc.sql("insert into page_view (id, owner_id, version_id, page, content, created_at) values (?, ?, ?, 3, ?,"
+                + " now())").params(Ids.newId(), chain.owner(), chain.versionId(), rows.get(0).get("content")).update();
+        assertThatThrownBy(() -> as(chain.owner(), () -> materials.page(chain.materialId(), 3,
+                Materials.Ground.REVIEW))).isInstanceOf(ApiException.class);
+    }
+
+    @Test
+    void aRestartRemovesThePageViewsBeforeTheirPicturesOnPostgres() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
+                        + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 2, batch.fileId()) + "," + layoutStep(3, 3, batch.fileId())
+                        + "]}"));
+        JobClaims.Claim first = claimOffered(chain);
+        UUID picture = jobFiles.store(first.jobId(), first.claimId(), first.grant(), -1,
+                new ByteArrayInputStream(webp(5000))).fileId();
+        claims.report(first.jobId(), first.claimId(), first.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pages\":[" + range(1, 2, "outcome", "unreadable") + "],\"pageViews\":"
+                        + "[{\"page\":1,\"picture\":{\"fileId\":\"" + picture + "\",\"width\":10,\"height\":10},"
+                        + "\"lines\":[]}],\"next\":[]}"));
+        assertThat(jdbc.sql("select count(*) from page_view where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(1);
+        JobClaims.Claim second = claimOffered(chain);
+
+        claims.report(second.jobId(), second.claimId(), second.grant(), "failed", "ingestion.pipeline_changed", false,
+                null);
+
+        assertThat(state(chain.versionId())).isEqualTo("processing");
+        assertThat(jdbc.sql("select count(*) from page_view where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select role from version_file where version_id = ?").param(chain.versionId())
+                .query(String.class).list()).containsExactly("original");
+    }
+
+    @Test
+    void theStory119TableChecksItsValuesAndKeepsItsVersionAndPictureWithinTheOwner() throws Exception {
+        Chain a = completed(pdf(MIB));
+        Chain b = completed(pdf(MIB));
+        UUID pictureA = Ids.newId();
+        UUID pictureB = Ids.newId();
+        jdbc.sql("insert into version_file (id, owner_id, version_id, file_id, role, first_page, last_page, size_bytes,"
+                + " piece_count, created_at) values (?, ?, ?, ?, 'picture', 1, 1, 10, 1, now())")
+                .params(Ids.newId(), a.owner(), a.versionId(), pictureA).update();
+        jdbc.sql("insert into version_file (id, owner_id, version_id, file_id, role, first_page, last_page, size_bytes,"
+                + " piece_count, created_at) values (?, ?, ?, ?, 'picture', 1, 1, 10, 1, now())")
+                .params(Ids.newId(), b.owner(), b.versionId(), pictureB).update();
+        UUID view = Ids.newId();
+        jdbc.sql("insert into page_view (id, owner_id, version_id, page, picture_file_id, width, height, content,"
+                + " created_at) values (?, ?, ?, 1, ?, 10, 20, ?, now())").params(view, a.owner(), a.versionId(),
+                pictureA, new byte[] {1}).update();
+        Map<String, String> violations = Map.of(
+                "update page_view set page = 0 where id = '" + view + "'", "page_view_page_check",
+                "update page_view set width = 0 where id = '" + view + "'", "page_view_width_check",
+                "update page_view set height = 10001 where id = '" + view + "'", "page_view_height_check",
+                "update page_view set width = null where id = '" + view + "'", "page_view_picture_check",
+                "update page_view set picture_file_id = '" + pictureB + "' where id = '" + view + "'",
+                "page_view_picture_fkey",
+                "update page_view set version_id = '" + b.versionId() + "' where id = '" + view + "'",
+                "page_view_version_fkey",
+                "insert into page_view (id, owner_id, version_id, page, content, created_at) values ('" + Ids.newId()
+                        + "', '" + a.owner() + "', '" + a.versionId() + "', 1, '\\x01', now())",
+                "page_view_owner_version_page_key",
+                "update version_file set role = 'thumbnail' where file_id = '" + pictureA + "'",
+                "version_file_role_check");
+        violations.forEach((sql, constraint) -> assertThatThrownBy(() -> jdbc.sql(sql).update())
+                .as(sql).satisfies(failure -> assertThat(messages(failure)).anyMatch(text -> text.contains(constraint))));
+        assertThat(jdbc.sql("select count(*) from pg_indexes where indexname = 'passage_owner_version_page'")
+                .query(Long.class).single()).isEqualTo(1);
+
+        // Matrix row "Two owners": B sees and removes none of A's page views, and cannot write one naming A's version.
+        as(b.owner(), () -> {
+            assertThat(store.findPageView(a.versionId(), 1)).isEmpty();
+            assertThat(materials.page(a.materialId(), 1, Materials.Ground.REVIEW)).isEmpty();
+            assertThat(materials.picture(a.materialId(), 1, Materials.Ground.REVIEW)).isEmpty();
+            return null;
+        });
+        write(b.owner(), () -> assertThat(store.deletePageViews(a.versionId())).isZero());
+        assertThatThrownBy(() -> write(b.owner(), () -> store.insertPageView(new PageViewRow(Ids.newId(), b.owner(),
+                a.versionId(), 2, null, null, null, new byte[] {1}, Instant.now().truncatedTo(ChronoUnit.MICROS)))))
+                .isInstanceOf(RuntimeException.class);
+        as(a.owner(), () -> {
+            assertThat(store.findPageView(a.versionId(), 1)).hasValueSatisfying(row ->
+                    assertThat(row.pictureFileId()).isEqualTo(pictureA));
+            return null;
+        });
+    }
+
+    /** A passage of the chain's version, encrypted as a report stores it. */
+    private PassageRow passageRow(Chain chain, UUID id, int ordinal, int page, Instant now) {
+        return new PassageRow(id, chain.owner(), chain.versionId(), ordinal, page,
+                vault.encryptText(Passages.text(id, chain.owner()), "Passagem " + ordinal),
+                vault.encrypt(Passages.place(id, chain.owner()), Passages.placeJson(new Passages.Place(List.of("A"),
+                        List.of(List.of(0.1, 0.2, 0.9, 0.3)), null))), now);
+    }
+
+    /** A WebP file's first bytes, then a pattern: the backend never parses a picture. */
+    private static byte[] webp(int size) {
+        byte[] content = new byte[size];
+        byte[] head = "RIFF\0\0\0\0WEBPVP8 ".getBytes(StandardCharsets.ISO_8859_1);
+        System.arraycopy(head, 0, content, 0, head.length);
+        for (int i = head.length; i < size; i++) {
+            content[i] = (byte) (i * 13 + (i >>> 7));
+        }
+        return content;
     }
 
     /** A passages report: page 1 under the first title, page 3 under both, and the outline of the two. */
