@@ -1,6 +1,7 @@
 -- Story 1.18 (AD-11, AD-17, AD-19): the passages of a material version and its outline of sections, and the held
--- final step that reads every text file of the version. The previous backend release writes none of it and keeps
--- working: the steps it writes still have a job and an input file.
+-- final step that reads every text file of the version. The previous backend release writes none of it, but it does
+-- not understand a held step (it would cancel a job that does not exist and never end the chain): rolling back past
+-- V11 is safe only while no held step exists, which holds until the first release with V11 ships.
 -- A held step is an ingestion_step with no job yet (job_id null): its input is every text file of the version
 -- (input_texts, with no input_file_id), which do not exist until every page has an outcome. The report that leaves
 -- every page with an outcome and only held steps unended gives each its job, in that transaction.

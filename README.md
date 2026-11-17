@@ -308,10 +308,12 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     lastPage}]`, the version's text files in page order; `GET …/inputs/text-<fileId>` streams one of them to that step
     only (404 for anything else, `source` included).
   - A report may add `passages: [{page, sectionPath, text, boxes | range}]` in reading order and `outline: [{level,
-    title, page}]`. It is refused with `job.result_invalid` when a page is outside 1 to the page total, a text has
-    not 1 to 16,384 code points, a path is deeper than 32, a title (in a path or the outline) has not 1 to 1,000
-    code points, or a passage has both or neither of `boxes` (`[left, top, right, bottom]` fractions) and `range`
-    (`[start, end)` code points, not empty). A report carrying either replaces the version's passages and outline in
+    title, page}]`. It is refused with `job.result_invalid` (detail codes `ingestion.passage_invalid`,
+    `ingestion.outline_invalid`, or `ingestion.pages_invalid` for a page) when a page is outside 1 to the page total,
+    a text has not 1 to 16,384 code points, `sectionPath` is not an array (it is required, possibly empty) or is
+    deeper than 32, a title (in a path or the outline) has not 1 to 1,000 code points, an outline level is outside 0
+    to 1,000, or a passage has both or neither of `boxes` (at most 16,384, each `[left, top, right, bottom]`
+    fractions) and `range` (`[start, end)` integer code points, `0 <= start < end`). A report carrying either replaces the version's passages and outline in
     its transaction, so a retried report leaves one set. Each passage gets its id (UUID v7) and its ordinal here.
   - `V11__passages.sql`: `ingestion_step.job_id` and `input_file_id` nullable, `input_texts`, and their checks; the
     library tables `passage` (owner, id, version, ordinal, page, `text` and `place` encrypted, each bound to

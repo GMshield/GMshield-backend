@@ -415,8 +415,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         }
         int cancelled = cancelUnended(version.id(), now);
         int ranges = materials.deletePageRanges(version.id());
-        materials.deletePassages(version.id());
-        materials.deleteOutline(version.id());
+        int passages = materials.deletePassages(version.id());
+        boolean outline = materials.deleteOutline(version.id());
         removeFilesAfterCommit(materials.deleteVersionFiles(version.id(),
                 Set.of(VersionFileRow.BATCH, VersionFileRow.TEXT)));
         materials.clearPipelineVersion(version.id(), now);
@@ -425,7 +425,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 version.id(), created.id(), stage, null, null, input, now)));
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("jobId", job.id())
                 .addKeyValue("newJobId", first.id()).addKeyValue("stage", stage).addKeyValue("cancelled", cancelled)
-                .addKeyValue("ranges", ranges).log("ingestion.restarted");
+                .addKeyValue("ranges", ranges).addKeyValue("passages", passages).addKeyValue("outline", outline)
+                .log("ingestion.restarted");
     }
 
     /**

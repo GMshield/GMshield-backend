@@ -1251,6 +1251,10 @@ class IngestionFlowTest {
                         + "]"),
                 passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(-1, "A", 1)
                         + "]"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(1001, "A", 1)
+                        + "]"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"range\":[-1,2]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"range\":[0,1.5]}"),
                 passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":{}"))) {
             HttpResponse<String> refused = outcome(passages.jobId(), claim, "{\"outcome\":\"done\",\"result\":" + result
                     + "}");
@@ -1272,6 +1276,33 @@ class IngestionFlowTest {
                 .satisfies(row -> assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
                         .orElseThrow().text()).isEqualTo(limit));
         assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    @Test
+    void aPassagesStepIsRefusedATextFileOfAnotherVersionOfTheSameOwner() throws Exception {
+        Gm gm = signUp();
+        Uploaded other = upload(gm, pdf(MIB), "Outro.pdf", null);
+        cleanReport(other.jobId(), claim(other.jobId()), 3, "2");
+        StepRow otherTriage = offeredStep(other.versionId());
+        report(otherTriage, claim(otherTriage.jobId()), triage(otherTriage, 1, 3, List.of()));
+        StepRow otherLayout = offeredStep(other.versionId());
+        JsonNode otherClaim = claim(otherLayout.jobId());
+        report(otherLayout, otherClaim, layout(otherLayout, otherClaim, 1, 3, List.of()));
+        assertThat(state(gm, other)).isEqualTo("needs_review");
+        UUID theirs = textFileOf(gm, other);
+
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 3);
+        JsonNode claim = claim(passages.jobId());
+
+        assertThat(input(passages.jobId(), claim, "text-" + textFileOf(gm, uploaded)).statusCode()).isEqualTo(200);
+        // A text file of the same owner's other version is not this step's input.
+        assertThat(input(passages.jobId(), claim, "text-" + theirs).statusCode()).isEqualTo(404);
+    }
+
+    private UUID textFileOf(Gm gm, Uploaded uploaded) {
+        return OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())).stream()
+                .filter(file -> file.role().equals("text")).findFirst().orElseThrow().fileId();
     }
 
     @Test
