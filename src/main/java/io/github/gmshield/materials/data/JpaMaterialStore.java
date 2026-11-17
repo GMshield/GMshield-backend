@@ -53,20 +53,23 @@ class JpaMaterialStore implements MaterialStore {
         return systemEntitiesOf(materialId).stream().map(MaterialSystemEntity::row).toList();
     }
 
+    /**
+     * The newest version of a material is the one no other version of it follows (later, or as late with a greater id).
+     * Two constant query texts rather than a null parameter, whose type PostgreSQL could not tell.
+     */
+    private static final String NEWEST = "select m, v from Material m join MaterialVersion v on v.materialId = m.id"
+            + " where v.state in :states"
+            + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
+            + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))";
+    private static final String NEWEST_IN = NEWEST + " order by m.id desc";
+    private static final String NEWEST_IN_BEFORE = NEWEST + " and m.id < :before order by m.id desc";
+
     @Override
     public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
         if (states.isEmpty() || limit < 1) {
             return List.of();
         }
-        // The newest version of a material is the one no other version of it follows (later, or as late with a
-        // greater id). Two query texts rather than a null parameter, whose type PostgreSQL could not tell.
-        String jpql = "select m, v from Material m join MaterialVersion v on v.materialId = m.id"
-                + " where v.state in :states"
-                + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
-                + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))"
-                + (before == null ? "" : " and m.id < :before")
-                + " order by m.id desc";
-        var query = em().createQuery(jpql, Object[].class).setParameter("states", states).setMaxResults(limit);
+        var query = em().createQuery(before == null ? NEWEST_IN : NEWEST_IN_BEFORE, Object[].class).setParameter("states", states).setMaxResults(limit);
         if (before != null) {
             query.setParameter("before", before);
         }
