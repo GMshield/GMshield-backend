@@ -4,13 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.jobs.service.JobClaims;
-import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.jobs.service.JobFiles;
 import io.github.gmshield.jobs.service.JobSweep;
+import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
+import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.FileStore;
@@ -22,6 +23,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -76,7 +78,7 @@ class IngestionIntegrationTest {
     @Autowired
     private PlatformTransactionManager transactions;
     @Autowired
-    private io.github.gmshield.jobs.service.Jobs jobs;
+    private Jobs jobs;
     @Value("${gmshield.files.dir}")
     private Path filesDir;
 
@@ -281,7 +283,7 @@ class IngestionIntegrationTest {
                 .extracting(row -> row.get("layer") + " " + row.get("first_page") + "-" + row.get("last_page"))
                 .containsExactly("text 1-20", "text 21-22", "image 23-23", "text 24-25");
 
-        // The three layout steps; one reports a page triage gave no outcome to twice in a row, which is refused.
+        // The three layout steps. The first one's report gives its last page two outcomes: it is refused.
         for (int i = 0; i < 3; i++) {
             JobClaims.Claim layout = claimOffered(chain);
             int first = layout.input().path("firstPage").asInt();
@@ -436,7 +438,7 @@ class IngestionIntegrationTest {
     private List<UUID> cleanReport(Chain chain, int total, String pipeline) throws Exception {
         JobClaims.Claim claim = claims.claim(chain.jobId());
         JobFiles.Stored original = store(chain, claim, pdf(4000));
-        List<UUID> batches = new java.util.ArrayList<>();
+        List<UUID> batches = new ArrayList<>();
         StringBuilder batchJson = new StringBuilder();
         StringBuilder next = new StringBuilder();
         for (int first = 1; first <= total; first += 20) {
@@ -543,7 +545,7 @@ class IngestionIntegrationTest {
     }
 
     private static List<String> messages(Throwable failure) {
-        List<String> messages = new java.util.ArrayList<>();
+        List<String> messages = new ArrayList<>();
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
             messages.add(String.valueOf(cause.getMessage()));
         }

@@ -251,10 +251,15 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             restart(job, version, now);
             return;
         }
-        if (version.pageTotal() != null && report.pageTotal() != null && !version.pageTotal().equals(report.pageTotal())) {
+        // A chain's first report (a new chain, or a restarted one) sets the page total, even over the kept one: another
+        // pipeline may split the same file into other pages. Every later report must keep it.
+        boolean first = version.pipelineVersion() == null;
+        if (!first && version.pageTotal() != null && report.pageTotal() != null
+                && !version.pageTotal().equals(report.pageTotal())) {
             throw new JobResultInvalid("ingestion.page_total_changed");
         }
-        Integer total = version.pageTotal() != null ? version.pageTotal() : report.pageTotal();
+        Integer total = (first || version.pageTotal() == null) && report.pageTotal() != null ? report.pageTotal()
+                : version.pageTotal();
         if (total == null && report.namesPages()) {
             throw new JobResultInvalid("ingestion.page_total_missing");
         }

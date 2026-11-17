@@ -1,6 +1,8 @@
 package io.github.gmshield.materials.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -23,6 +25,7 @@ import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialTestStores;
+import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionFileRow;
@@ -41,8 +44,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -60,6 +65,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -134,7 +141,7 @@ class IngestionFlowTest {
     @Autowired
     private Vault vault;
     @Autowired
-    private org.springframework.transaction.PlatformTransactionManager transactions;
+    private PlatformTransactionManager transactions;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -270,9 +277,9 @@ class IngestionFlowTest {
         List<VersionFileRow> stored = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()));
         assertThat(stored).extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::firstPage,
                         VersionFileRow::lastPage)
-                .containsExactly(org.assertj.core.groups.Tuple.tuple("original", original, 1, 25),
-                        org.assertj.core.groups.Tuple.tuple("batch", batch1, 1, 20),
-                        org.assertj.core.groups.Tuple.tuple("batch", batch2, 21, 25));
+                .containsExactly(tuple("original", original, 1, 25),
+                        tuple("batch", batch1, 1, 20),
+                        tuple("batch", batch2, 21, 25));
         assertThat(stored.getFirst().sizeBytes()).isEqualTo(cleaned.length);
         assertThat(stored.getFirst().pieceCount()).isEqualTo(2);
         assertThat(readBack(gm.id(), original, 2)).isEqualTo(cleaned);
@@ -516,9 +523,9 @@ class IngestionFlowTest {
 
         assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("triage"))
                 .extracting(StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
-                .containsExactlyInAnyOrder(org.assertj.core.groups.Tuple.tuple(1, 20, cleaned.batches().get(0)),
-                        org.assertj.core.groups.Tuple.tuple(21, 40, cleaned.batches().get(1)),
-                        org.assertj.core.groups.Tuple.tuple(41, 45, cleaned.batches().get(2)));
+                .containsExactlyInAnyOrder(tuple(1, 20, cleaned.batches().get(0)),
+                        tuple(21, 40, cleaned.batches().get(1)),
+                        tuple(41, 45, cleaned.batches().get(2)));
         List<Integer> done = new ArrayList<>();
         List<String> stages = new ArrayList<>();
         for (int i = 0; i < 6; i++) {
@@ -576,9 +583,9 @@ class IngestionFlowTest {
 
         assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("layout"))
                 .extracting(StepRow::firstPage, StepRow::lastPage)
-                .containsExactlyInAnyOrder(org.assertj.core.groups.Tuple.tuple(1, 5),
-                        org.assertj.core.groups.Tuple.tuple(8, 20), org.assertj.core.groups.Tuple.tuple(21, 40),
-                        org.assertj.core.groups.Tuple.tuple(41, 45));
+                .containsExactlyInAnyOrder(tuple(1, 5),
+                        tuple(8, 20), tuple(21, 40),
+                        tuple(41, 45));
         assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
         JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
         assertThat(read.path("state").asString()).isEqualTo("processing");
@@ -586,7 +593,7 @@ class IngestionFlowTest {
         assertThat(read.path("pages").path("total").asInt()).isEqualTo(45);
         assertThat(layers(uploaded.versionId())).filteredOn(row -> row.value().equals("image"))
                 .extracting(row -> row.firstPage(), row -> row.lastPage())
-                .containsExactly(org.assertj.core.groups.Tuple.tuple(6, 7));
+                .containsExactly(tuple(6, 7));
     }
 
     @Test
@@ -608,9 +615,9 @@ class IngestionFlowTest {
 
         assertThat(outcomes(uploaded.versionId())).extracting(row -> row.firstPage(), row -> row.lastPage(),
                         row -> row.value())
-                .containsExactly(org.assertj.core.groups.Tuple.tuple(1, 8, "read_directly"),
-                        org.assertj.core.groups.Tuple.tuple(9, 9, "unreadable"),
-                        org.assertj.core.groups.Tuple.tuple(10, 20, "read_directly"));
+                .containsExactly(tuple(1, 8, "read_directly"),
+                        tuple(9, 9, "unreadable"),
+                        tuple(10, 20, "read_directly"));
         JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
         assertThat(read.path("state").asString()).isEqualTo("needs_review");
         assertThat(read.path("pages").path("done").asInt()).isEqualTo(20);
@@ -629,7 +636,7 @@ class IngestionFlowTest {
         // The worker is killed mid-layout: its claim lapses, and the sweep offers the step again.
         jobs.rows.computeIfPresent(layout.jobId(), (id, row) -> new JobRow(row.id(), row.ownerId(), row.kind(),
                 row.lane(), row.state(), row.attempt(), row.traceId(), row.offeredAt(), row.claimId(), row.grantHash(),
-                row.claimRenewAt(), java.time.Instant.now().minusSeconds(1), row.outcomeCode(), row.createdAt(),
+                row.claimRenewAt(), Instant.now().minusSeconds(1), row.outcomeCode(), row.createdAt(),
                 row.updatedAt()));
         sweep.sweep();
         assertThat(jobs.row(layout.jobId()).state()).isEqualTo("offered");
@@ -673,7 +680,7 @@ class IngestionFlowTest {
         assertThat(outcomes(uploaded.versionId())).isEmpty();
         assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
                 .extracting(VersionFileRow::role, VersionFileRow::fileId)
-                .containsExactly(org.assertj.core.groups.Tuple.tuple("original", cleaned.original()));
+                .containsExactly(tuple("original", cleaned.original()));
         assertThat(cleaned.batches()).allSatisfy(batch -> assertThat(files.fileExists(gm.id(), batch)).isFalse());
         // The old steps ended; the first layout step's job, which was waiting, is cancelled.
         List<StepRow> steps = steps(uploaded.versionId());
@@ -809,12 +816,77 @@ class IngestionFlowTest {
         assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
                 .extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::firstPage,
                         VersionFileRow::lastPage)
-                .containsExactlyInAnyOrder(org.assertj.core.groups.Tuple.tuple("original", original, 1, 600),
-                        org.assertj.core.groups.Tuple.tuple("text", pages1, 1, 500),
-                        org.assertj.core.groups.Tuple.tuple("text", pages2, 501, 600));
+                .containsExactlyInAnyOrder(tuple("original", original, 1, 600),
+                        tuple("text", pages1, 1, 500),
+                        tuple("text", pages2, 501, 600));
         assertThat(readBack(gm.id(), original, 1)).isEqualTo(text);
         assertThat(uploads.rows).doesNotContainKey(uploaded.uploadId());
         assertThat(layers(uploaded.versionId())).isEmpty();
+    }
+
+    @Test
+    void aFinalFailureOfOneStepFailsTheVersionAndCancelsItsOtherSteps() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 45, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode()).isEqualTo(204);
+
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("failed");
+        assertThat(version.failureCode()).isEqualTo("ingestion.step_failed");
+        List<StepRow> siblings = steps(uploaded.versionId()).stream()
+                .filter(step -> step.stage().equals("triage") && !step.jobId().equals(triage.jobId())).toList();
+        assertThat(siblings).hasSize(2)
+                .allSatisfy(step -> assertThat(jobs.row(step.jobId()).state()).isEqualTo("cancelled"));
+        assertThat(steps(uploaded.versionId())).hasSize(4).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+    }
+
+    @Test
+    void aRestartedTextUploadsFirstReportMayGiveAnotherPageTotalAndEndsInNeedsReview() throws Exception {
+        Gm gm = signUp();
+        byte[] text = "# Regras\n\nTexto da casa.\n".repeat(50).getBytes(StandardCharsets.UTF_8);
+        Uploaded uploaded = upload(gm, text, "regras.md", null);
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, text);
+        UUID pages = output(uploaded.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        // Pipeline "1" reads pages 1 and 2 of 3, and leaves page 3 to a later step over the original.
+        assertThat(outcome(uploaded.jobId(), claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"1\","
+                + "\"pageTotal\":3,\"original\":{\"fileId\":\"" + original + "\"},\"pages\":["
+                + range(1, 2, "outcome", "read_directly") + "],\"texts\":[{\"fileId\":\"" + pages
+                + "\",\"firstPage\":1,\"lastPage\":2}],\"next\":[{\"stage\":\"text\",\"firstPage\":3,\"lastPage\":3,"
+                + "\"input\":\"" + original + "\"}]}}").statusCode()).isEqualTo(204);
+        StepRow later = offeredStep(uploaded.versionId());
+        assertThat(outcome(later.jobId(), claim(later.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(materials.versions.get(uploaded.versionId()).pageTotal()).isEqualTo(3);
+
+        // Pipeline "2" splits the same file into 5 pages: its first report sets the new page total.
+        StepRow restart = offeredStep(uploaded.versionId());
+        assertThat(restart.stage()).isEqualTo("text");
+        assertThat(restart.inputFileId()).isEqualTo(original);
+        JsonNode again = claim(restart.jobId());
+        assertThat(again.path("input").has("pipelineVersion")).isFalse();
+        UUID newOriginal = output(restart.jobId(), again, text);
+        UUID newPages = output(restart.jobId(), again, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        report(restart, again, "{\"pipelineVersion\":\"2\",\"pageTotal\":5,\"original\":{\"fileId\":\"" + newOriginal
+                + "\"},\"pages\":[" + range(1, 5, "outcome", "read_directly") + "],\"texts\":[{\"fileId\":\""
+                + newPages + "\",\"firstPage\":1,\"lastPage\":5}],\"next\":[]}");
+
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("needs_review");
+        assertThat(version.pageTotal()).isEqualTo(5);
+        assertThat(version.pipelineVersion()).isEqualTo("2");
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(5);
+        assertThat(read.path("pages").path("total").asInt()).isEqualTo(5);
+        // Only the new original and the new text file remain.
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::lastPage)
+                .containsExactlyInAnyOrder(tuple("original", newOriginal, 5), tuple("text", newPages, 5));
     }
 
     @Test
@@ -833,11 +905,11 @@ class IngestionFlowTest {
             assertThat(materials.pagesDone(List.of(uploaded.versionId()))).isEmpty();
         });
         OwnerContext.runAs(a.id(), () -> assertThat(materials.pageLayers(uploaded.versionId())).hasSize(3));
-        org.assertj.core.api.Assertions.assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () ->
-                new org.springframework.transaction.support.TransactionTemplate(transactions).executeWithoutResult(
-                        status -> materials.insertPageOutcome(new io.github.gmshield.materials.data.PageRangeRow(
+        assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () ->
+                new TransactionTemplate(transactions).executeWithoutResult(
+                        status -> materials.insertPageOutcome(new PageRangeRow(
                                 UUID.randomUUID(), b.id(), uploaded.versionId(), 1, 1, "unreadable",
-                                java.time.Instant.now())))))
+                                Instant.now())))))
                 .isInstanceOf(IllegalStateException.class);
         assertThat(materials.outcomes.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
     }
@@ -968,14 +1040,14 @@ class IngestionFlowTest {
                 .filter(file -> file.fileId().equals(fileId)).findFirst().orElseThrow();
     }
 
-    private List<io.github.gmshield.materials.data.PageRangeRow> layers(UUID versionId) {
+    private List<PageRangeRow> layers(UUID versionId) {
         return materials.layers.values().stream().filter(row -> row.versionId().equals(versionId))
-                .sorted(java.util.Comparator.comparing(io.github.gmshield.materials.data.PageRangeRow::firstPage)).toList();
+                .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
     }
 
-    private List<io.github.gmshield.materials.data.PageRangeRow> outcomes(UUID versionId) {
+    private List<PageRangeRow> outcomes(UUID versionId) {
         return materials.outcomes.values().stream().filter(row -> row.versionId().equals(versionId))
-                .sorted(java.util.Comparator.comparing(io.github.gmshield.materials.data.PageRangeRow::firstPage)).toList();
+                .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
     }
 
     // --- helpers
