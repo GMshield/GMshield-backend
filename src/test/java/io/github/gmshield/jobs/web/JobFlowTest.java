@@ -591,7 +591,9 @@ class JobFlowTest extends HttpTestSupport {
         int mib = 1024 * 1024;
         java.util.Set<String> before = fileFolders();
 
-        assertProblem(postOutput(id, claim, bytes(6 * mib + 1), true), 413, "job.output_too_large");
+        // A declared length past the limit is refused before the body is read: only the headers are sent, since a
+        // client still writing a body the server never reads may see the connection reset before the answer.
+        assertDeclaredLengthRefused(id, claim, 6L * mib + 1);
         // Without a length the first 4 MiB piece is written before the limit is passed: it is removed again.
         assertProblem(postOutput(id, claim, bytes(6 * mib + 1), false), 413, "job.output_too_large");
         assertProblem(postOutput(id, claim, new byte[0], true), 400, "request.invalid");
@@ -820,6 +822,34 @@ class JobFlowTest extends HttpTestSupport {
                 .header("Authorization", "Bearer " + WORKER_CREDENTIAL).header("Content-Type", "application/octet-stream")
                 .header("X-Job-Grant", claim.path("grant").asString()).POST(body).build();
         return java.net.http.HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /**
+     * Sends an output's headers with {@code Content-Length: length} and no body, half-closes the connection, and
+     * expects 413 {@code job.output_too_large}: the refusal must come from the declared length alone.
+     */
+    private void assertDeclaredLengthRefused(UUID id, JsonNode claim, long length) throws Exception {
+        java.net.URI target = uri("/internal/v1/jobs/" + id + "/claims/" + claim.path("claimId").asString()
+                + "/outputs");
+        String head = "POST " + target.getRawPath() + " HTTP/1.1\r\n"
+                + "Host: " + target.getHost() + ":" + target.getPort() + "\r\n"
+                + "Authorization: Bearer " + WORKER_CREDENTIAL + "\r\n"
+                + "X-Job-Grant: " + claim.path("grant").asString() + "\r\n"
+                + "Content-Type: application/octet-stream\r\n"
+                + "Content-Length: " + length + "\r\n"
+                + "Connection: close\r\n\r\n";
+        String answer;
+        try (java.net.Socket socket = new java.net.Socket(target.getHost(), target.getPort())) {
+            socket.setSoTimeout(30_000);
+            socket.getOutputStream().write(head.getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+            socket.shutdownOutput();
+            answer = new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        }
+        assertThat(answer).as(answer).startsWith("HTTP/1.1 413 ");
+        String body = answer.substring(answer.indexOf('{'), answer.lastIndexOf('}') + 1);
+        assertThat(tools.jackson.databind.json.JsonMapper.builder().build().readTree(body).path("code").asString())
+                .isEqualTo("job.output_too_large");
     }
 
     private HttpResponse<String> sendBytesAsWorker(String path, byte[] content, String... headers) throws Exception {
