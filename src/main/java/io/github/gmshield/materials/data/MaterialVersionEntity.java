@@ -93,6 +93,12 @@ class MaterialVersionEntity {
         this.updatedAt = now;
     }
 
+    /** A restarted chain (Story 1.16): its pipeline version goes, its page total stays. */
+    void clearPipelineVersion(Instant now) {
+        this.pipelineVersion = null;
+        this.updatedAt = now;
+    }
+
     /** The version ended {@code failed} with a code. */
     void fail(String code, Instant now) {
         this.state = "failed";
