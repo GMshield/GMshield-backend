@@ -317,8 +317,13 @@ class IngestionIntegrationTest {
         // Once page 23 is read by OCR (Story 1.17), a report that leaves no step unended ends the chain.
         UUID last = as(chain.owner(), () -> new TransactionTemplate(transactions).execute(status ->
                 jobsCreate(chain, "ocr", 23)));
+        // Offered, then running, the version is reading its image page: the job's state and the step's pages, on
+        // Postgres.
+        assertThat(jdbc.sql("select state from job where id = ?").param(last).query(String.class).single())
+                .isEqualTo("offered");
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
+                .isEqualTo("image");
         JobClaims.Claim ocr = claims.claim(last);
-        // While it runs, the version is reading its image page: the job's state and the step's pages, on Postgres.
         assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
                 .isEqualTo("image");
         JobFiles.Stored scanned = jobFiles.store(last, ocr.claimId(), ocr.grant(), -1,

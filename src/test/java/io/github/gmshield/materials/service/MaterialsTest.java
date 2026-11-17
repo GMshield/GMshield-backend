@@ -336,7 +336,7 @@ class MaterialsTest {
         assertThat(pages.reading()).isEqualTo("image");
         assertThat(pages.text()).isEqualTo(new Materials.Count(8, 18));
         assertThat(pages.image()).isEqualTo(new Materials.Count(0, 12));
-        // No step in progress: null. Another owner's view of the same job ids never counts.
+        // No step in progress: null.
         running.clear();
         assertThat(as(owner, () -> reads.find(mixed)).orElseThrow().pages().reading()).isNull();
         running.add(waitingOcr);

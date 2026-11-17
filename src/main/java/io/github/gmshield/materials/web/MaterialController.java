@@ -83,9 +83,9 @@ class MaterialController {
             int readDirectly,
             @Schema(description = "Pages read by OCR", format = "int32", example = "0") int readByOcr,
             @Schema(description = "Pages that could not be read", format = "int32", example = "0") int unreadable,
-            @Schema(description = "The layer of the pages being read now, by the step whose job is offered or running;"
-                    + " null when none is, when those pages have no layer yet, or when their layers differ",
-                    types = {"string", "null"}, allowableValues = {"text", "image"}, example = "text") String reading) {
+            @Schema(description = "The layer of the pages being read now, by the step whose job is offered or running:"
+                    + " \"text\" or \"image\"; null when none is, when those pages have no layer yet, or when their"
+                    + " layers differ", types = {"string", "null"}, example = "text") String reading) {
 
         static PagesView of(Materials.Pages pages) {
             return new PagesView(pages.done(), pages.total(), CountView.of(pages.text()), CountView.of(pages.image()),
