@@ -1,6 +1,7 @@
 package io.github.gmshield.jobs.data;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -30,6 +31,9 @@ public interface JobStore {
 
     /** The owner of the job of the lane offered last, if any job of the lane was ever offered. */
     Optional<UUID> lastOfferedOwner(String lane);
+
+    /** Those of {@code ids} that are jobs of {@code owner} now {@code offered} or {@code running} (Story 1.17). */
+    List<UUID> inProgress(Collection<UUID> ids, UUID owner);
 
     /** Whether a job of the lane is {@code offered} or {@code running}. */
     boolean busy(String lane);

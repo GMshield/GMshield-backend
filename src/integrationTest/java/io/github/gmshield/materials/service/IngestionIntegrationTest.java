@@ -318,6 +318,9 @@ class IngestionIntegrationTest {
         UUID last = as(chain.owner(), () -> new TransactionTemplate(transactions).execute(status ->
                 jobsCreate(chain, "ocr", 23)));
         JobClaims.Claim ocr = claims.claim(last);
+        // While it runs, the version is reading its image page: the job's state and the step's pages, on Postgres.
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
+                .isEqualTo("image");
         JobFiles.Stored scanned = jobFiles.store(last, ocr.claimId(), ocr.grant(), -1,
                 new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8)));
         claims.report(last, ocr.claimId(), ocr.grant(), "done", null, null, JSON.readTree(

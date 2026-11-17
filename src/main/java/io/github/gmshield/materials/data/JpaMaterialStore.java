@@ -196,6 +196,16 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<StepRow> unendedSteps(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select s from IngestionStep s where s.versionId in :versions and s.endedAt is null"
+                        + " order by s.createdAt, s.id", IngestionStepEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(IngestionStepEntity::row).toList();
+    }
+
+    @Override
     public void insertVersionFile(VersionFileRow row) {
         EntityManager em = em();
         em.persist(new VersionFileEntity(row));

@@ -664,6 +664,41 @@ class IngestionFlowTest {
     }
 
     @Test
+    void anOcrStepInProgressBetweenTextBatchesIsReadingImageWhileLaterTextPagesWait() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Misto.pdf", null);
+        clean(uploaded, 30, "2");
+        String path = "/api/v1/materials/" + uploaded.materialId();
+        // Before any layer is recorded, the triage in progress reads nothing yet.
+        assertThat(json(get(gm, path)).path("pages").path("reading").isNull()).isTrue();
+        for (int i = 0; i < 2; i++) {
+            StepRow triage = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(triage.jobId());
+            List<Integer> images = triage.firstPage() == 1 ? IntStream.rangeClosed(9, 20).boxed().toList() : List.of();
+            report(triage, claim, triage(triage, triage.firstPage(), triage.lastPage(), images));
+        }
+        StepRow layout = offeredStep(uploaded.versionId());
+        assertThat(layout.stage()).isEqualTo("layout");
+        assertThat(json(get(gm, path)).path("pages").path("reading").asString()).isEqualTo("text");
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 1, 8, List.of()));
+
+        // Batch 1's OCR 9-18 is offered, then running, while batch 2's text pages 21-30 still wait.
+        StepRow ocr = offeredStep(uploaded.versionId());
+        assertThat(ocr.stage()).isEqualTo("ocr");
+        assertThat(json(get(gm, path)).path("pages").path("reading").asString()).isEqualTo("image");
+        claim(ocr.jobId());
+        JsonNode pages = json(get(gm, path)).path("pages");
+        assertThat(pages.path("reading").asString()).isEqualTo("image");
+        assertThat(pages.path("text").path("done").asInt()).isEqualTo(8);
+        assertThat(pages.path("text").path("total").asInt()).isEqualTo(18);
+        assertThat(pages.path("image").path("done").asInt()).isZero();
+        assertThat(pages.path("image").path("total").asInt()).isEqualTo(12);
+        assertThat(json(get(gm, "/api/v1/materials?state=processing")).path("items").get(0).path("pages")
+                .path("reading").asString()).isEqualTo("image");
+    }
+
+    @Test
     void twoOwnersScansAreOfferedInTurnOneStepAtATime() throws Exception {
         Gm a = signUp();
         Gm b = signUp();

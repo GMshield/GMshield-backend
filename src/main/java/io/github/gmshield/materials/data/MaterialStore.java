@@ -79,6 +79,9 @@ public interface MaterialStore {
     /** The current owner's steps of a version that have not ended, oldest first (Story 1.16). */
     List<StepRow> unendedSteps(UUID versionId);
 
+    /** The current owner's unended steps of all these versions, in one read (Story 1.17). */
+    List<StepRow> unendedSteps(Collection<UUID> versionIds);
+
     /** Records a file of the current owner's version (Story 1.15). */
     void insertVersionFile(VersionFileRow row);
 

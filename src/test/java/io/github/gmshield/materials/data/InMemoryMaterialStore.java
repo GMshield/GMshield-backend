@@ -212,6 +212,15 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<StepRow> unendedSteps(Collection<UUID> versionIds) {
+        rangeReads.incrementAndGet();
+        UUID owner = OwnerContext.require();
+        return steps.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && versionIds.contains(row.versionId()) && row.endedAt() == null)
+                .sorted(Comparator.comparing(StepRow::createdAt).thenComparing(StepRow::id)).toList();
+    }
+
+    @Override
     public synchronized void insertVersionFile(VersionFileRow row) {
         UUID owner = ownerFor(row.ownerId());
         VersionRow version = versions.get(row.versionId());

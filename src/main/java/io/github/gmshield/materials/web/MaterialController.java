@@ -70,7 +70,7 @@ class MaterialController {
     }
 
     @Schema(name = "MaterialPages", requiredProperties = {"done", "total", "text", "image", "readDirectly", "readByOcr",
-        "unreadable"})
+        "unreadable", "reading"})
     record PagesView(
             @Schema(description = "Pages read so far (0 until the reading stages run)", format = "int32", example = "0")
             int done,
@@ -82,11 +82,14 @@ class MaterialController {
             @Schema(description = "Pages read from their text layer", format = "int32", example = "40")
             int readDirectly,
             @Schema(description = "Pages read by OCR", format = "int32", example = "0") int readByOcr,
-            @Schema(description = "Pages that could not be read", format = "int32", example = "0") int unreadable) {
+            @Schema(description = "Pages that could not be read", format = "int32", example = "0") int unreadable,
+            @Schema(description = "The layer of the pages being read now, by the step whose job is offered or running;"
+                    + " null when none is, when those pages have no layer yet, or when their layers differ",
+                    types = {"string", "null"}, allowableValues = {"text", "image"}, example = "text") String reading) {
 
         static PagesView of(Materials.Pages pages) {
             return new PagesView(pages.done(), pages.total(), CountView.of(pages.text()), CountView.of(pages.image()),
-                    pages.readDirectly(), pages.readByOcr(), pages.unreadable());
+                    pages.readDirectly(), pages.readByOcr(), pages.unreadable(), pages.reading());
         }
     }
 

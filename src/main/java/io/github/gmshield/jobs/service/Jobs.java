@@ -7,6 +7,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -115,6 +116,15 @@ public class Jobs {
         JobOutputRow row = found.get();
         log.atDebug().addKeyValue("jobId", job.id()).addKeyValue("fileId", fileId).log("job.output_adopted");
         return Optional.of(new JobOutput(row.id(), row.sizeBytes(), row.pieceCount()));
+    }
+
+    /**
+     * Those of {@code jobIds} that are jobs of the bound owner now {@code offered} or {@code running} (Story 1.17), in
+     * one read joined to the caller's transaction: another owner's job, an unknown one or an ended one is left out.
+     */
+    public Set<UUID> inProgress(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().inProgress(Set.copyOf(jobIds), owner));
     }
 
     /**

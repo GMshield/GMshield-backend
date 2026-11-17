@@ -14,6 +14,7 @@ import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.data.InMemoryTransactionManager;
@@ -63,6 +64,8 @@ class MaterialsTest {
     private Uploads service;
     private Materials reads;
     private final List<VersionRow> started = new java.util.ArrayList<>();
+    /** The jobs offered or running, as the jobs module would answer (Story 1.17). */
+    private final java.util.Set<UUID> running = new java.util.HashSet<>();
 
     @BeforeEach
     void wire() {
@@ -75,7 +78,8 @@ class MaterialsTest {
         service = new Uploads(materials, uploads, vault, files, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
-        reads = new Materials(materials, uploads, vault, beans.getBeanProvider(PlatformTransactionManager.class));
+        reads = new Materials(materials, uploads, vault, ids -> ids.stream().filter(running::contains)
+                .collect(java.util.stream.Collectors.toSet()), beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
                 library.createStarter(Language.EN);
@@ -306,8 +310,67 @@ class MaterialsTest {
 
         List<Materials.Material> items = as(owner, () -> reads.list(List.of("processing"), null, 20)).items();
 
-        assertThat(materials.rangeReads.get()).isEqualTo(2);
+        // Layers, outcomes and unended steps: one read each for the whole list.
+        assertThat(materials.rangeReads.get()).isEqualTo(3);
         assertThat(items).extracting(item -> item.pages().image().done()).containsExactlyInAnyOrder(1, 2, 3);
+    }
+
+    @Test
+    void readingIsTheLayerOfThePagesOfTheStepInProgressEvenWhileTextPagesOfALaterBatchWait() {
+        // Matrix row "OCR between text batches": batch 1's OCR 9-18 runs while batch 2's text pages 21-30 wait.
+        UUID mixed = create(owner, "misto.pdf", Uploads.Details.NONE);
+        setState(mixed, "processing");
+        UUID version = versionOf(mixed).id();
+        write(() -> materials.recordIngestion(version, "3", 30, clock.instant()));
+        layer(version, 1, 8, PageRangeRow.TEXT);
+        layer(version, 9, 20, PageRangeRow.IMAGE);
+        layer(version, 21, 30, PageRangeRow.TEXT);
+        outcome(version, 1, 8, PageRangeRow.READ_DIRECTLY);
+        UUID ocr = step(version, 9, 18);
+        UUID waitingOcr = step(version, 19, 20);
+        step(version, 21, 30);
+        running.add(ocr);
+
+        Materials.Pages pages = as(owner, () -> reads.find(mixed)).orElseThrow().pages();
+
+        assertThat(pages.reading()).isEqualTo("image");
+        assertThat(pages.text()).isEqualTo(new Materials.Count(8, 18));
+        assertThat(pages.image()).isEqualTo(new Materials.Count(0, 12));
+        // No step in progress: null. Another owner's view of the same job ids never counts.
+        running.clear();
+        assertThat(as(owner, () -> reads.find(mixed)).orElseThrow().pages().reading()).isNull();
+        running.add(waitingOcr);
+        assertThat(as(owner, () -> reads.find(mixed)).orElseThrow().pages().reading()).isEqualTo("image");
+    }
+
+    @Test
+    void readingIsNullWithoutPagesWithoutALayerYetOrAcrossLayers() {
+        List<PageRangeRow> layers = List.of(range(1, 5, PageRangeRow.TEXT), range(6, 10, PageRangeRow.IMAGE));
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 5)))).isEqualTo("text");
+        assertThat(Materials.reading(layers, List.of(stepRow(6, 7)))).isEqualTo("image");
+        assertThat(Materials.reading(layers, List.of())).isNull();
+        assertThat(Materials.reading(layers, List.of(stepRow(null, null)))).isNull();     // clean
+        assertThat(Materials.reading(layers, List.of(stepRow(11, 20)))).isNull();         // triage, no layer yet
+        assertThat(Materials.reading(layers, List.of(stepRow(9, 12)))).isNull();          // partly sorted
+        assertThat(Materials.reading(layers, List.of(stepRow(4, 7)))).isNull();           // two layers
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 2), stepRow(6, 6)))).isNull();
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 2), stepRow(4, 5)))).isEqualTo("text");
+    }
+
+    private StepRow stepRow(Integer first, Integer last) {
+        return new StepRow(Ids.newId(), owner, Ids.newId(), Ids.newId(), "any", first, last, null, clock.instant(), null);
+    }
+
+    /** An unended step over pages of the version, with a job id of its own; answers that job id. */
+    private UUID step(UUID version, int first, int last) {
+        UUID job = Ids.newId();
+        clock.advance(Duration.ofSeconds(1));
+        write(() -> {
+            materials.insertStep(new StepRow(Ids.newId(), owner, version, job, "any", first, last, null, clock.instant(),
+                    null));
+            return true;
+        });
+        return job;
     }
 
     private void layer(UUID version, int first, int last, String value) {
