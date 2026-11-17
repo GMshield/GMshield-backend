@@ -76,6 +76,12 @@ public interface MaterialStore {
     /** The current owner's step of this job ends at {@code now} unless it ended already (Story 1.16); false when none. */
     boolean endStep(UUID jobId, Instant now);
 
+    /** The current owner's held step with this id ends at {@code now} with no job (Story 1.18); false when none. */
+    boolean endHeldStep(UUID stepId, Instant now);
+
+    /** The current owner's held step with this id gets its job (Story 1.18); false when there is no such held step. */
+    boolean startHeldStep(UUID stepId, UUID jobId);
+
     /** The current owner's steps of a version that have not ended, oldest first (Story 1.16). */
     List<StepRow> unendedSteps(UUID versionId);
 
@@ -125,6 +131,29 @@ public interface MaterialStore {
 
     /** Deletes the version's layers and outcomes (a restarted chain); answers how many ranges went. */
     int deletePageRanges(UUID versionId);
+
+    // --- passage and version_outline (Story 1.18)
+
+    /** Records passages of the current owner's versions. */
+    void insertPassages(List<PassageRow> rows);
+
+    /** The current owner's passage with this id; empty for an unknown id or another owner's. */
+    Optional<PassageRow> findPassage(UUID id);
+
+    /** The current owner's passages of a version, in reading order. */
+    List<PassageRow> passages(UUID versionId);
+
+    /** Deletes the current owner's passages of a version; answers how many went. */
+    int deletePassages(UUID versionId);
+
+    /** Records the outline of the current owner's version, which must have none. */
+    void insertOutline(OutlineRow row);
+
+    /** The current owner's outline of a version; empty when it has none, for an unknown version or another owner's. */
+    Optional<OutlineRow> findOutline(UUID versionId);
+
+    /** Deletes the current owner's outline of a version; false when it had none. */
+    boolean deleteOutline(UUID versionId);
 
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);

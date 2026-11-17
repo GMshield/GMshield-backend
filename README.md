@@ -297,6 +297,29 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     replaces it. A final failure with another code fails the version and cancels its other steps.
   - `V10__page_ranges.sql`: the library tables `page_layer` and `page_outcome` (owner, id, version, first, last,
     value), owner-scoped as in V9; `ingestion_step.ended_at`; `version_file.role` gains `text`.
+- **Passages (`materials`, Story 1.18, internal contract 1.4.0).** A `next` item whose `input` is the word `texts`
+  (not a file id) is a step over every text file of the version: it is recorded **held**, an `ingestion_step` with no
+  job (`job_id` null, `input_texts` true, no `input_file_id`). The report that leaves every page with an outcome and
+  only held steps unended creates their jobs in its transaction; with nothing unended the version becomes
+  `needs_review` as before. A failure or a restart ends held steps as well as cancelling jobs; a restart also removes
+  the version's passages and outline. Held and `texts` steps never count toward `pages.reading`. The backend never
+  reads the stage name (the worker's `passages`).
+  - The claim input of a `texts` step has `input: "texts"` and `texts: [{name: "text-<fileId>", firstPage,
+    lastPage}]`, the version's text files in page order; `GET …/inputs/text-<fileId>` streams one of them to that step
+    only (404 for anything else, `source` included).
+  - A report may add `passages: [{page, sectionPath, text, boxes | range}]` in reading order and `outline: [{level,
+    title, page}]`. It is refused with `job.result_invalid` when a page is outside 1 to the page total, a text has
+    not 1 to 16,384 code points, a path is deeper than 32, a title (in a path or the outline) has not 1 to 1,000
+    code points, or a passage has both or neither of `boxes` (`[left, top, right, bottom]` fractions) and `range`
+    (`[start, end)` code points, not empty). A report carrying either replaces the version's passages and outline in
+    its transaction, so a retried report leaves one set. Each passage gets its id (UUID v7) and its ordinal here.
+  - `V11__passages.sql`: `ingestion_step.job_id` and `input_file_id` nullable, `input_texts`, and their checks; the
+    library tables `passage` (owner, id, version, ordinal, page, `text` and `place` encrypted, each bound to
+    `passage`, its field, the row and the owner; `place` is the section path with boxes or range, as JSON) and
+    `version_outline` (one encrypted JSON outline per version), owner-scoped as in V10.
+  - `Materials.passage(id)` gives the material's id and name, the version id, the section path, the page and the
+    text; `Materials.outline(versionId)` the sections (level, title, page); both empty for an unknown id or another
+    owner's. No public route reads them yet (Story 1.20).
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

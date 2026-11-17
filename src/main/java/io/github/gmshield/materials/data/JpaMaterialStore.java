@@ -189,6 +189,32 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public boolean endHeldStep(UUID stepId, Instant now) {
+        Optional<IngestionStepEntity> step = heldStep(stepId);
+        step.ifPresent(entity -> {
+            entity.end(now);
+            em().flush();
+        });
+        return step.isPresent();
+    }
+
+    @Override
+    public boolean startHeldStep(UUID stepId, UUID jobId) {
+        Optional<IngestionStepEntity> step = heldStep(stepId);
+        boolean started = step.isPresent() && step.get().start(jobId);
+        if (started) {
+            em().flush();
+        }
+        return started;
+    }
+
+    private Optional<IngestionStepEntity> heldStep(UUID stepId) {
+        return em().createQuery("select s from IngestionStep s where s.id = :id and s.jobId is null and s.endedAt is null",
+                        IngestionStepEntity.class)
+                .setParameter("id", stepId).getResultList().stream().findFirst();
+    }
+
+    @Override
     public List<StepRow> unendedSteps(UUID versionId) {
         return em().createQuery("select s from IngestionStep s where s.versionId = :version and s.endedAt is null"
                         + " order by s.createdAt, s.id", IngestionStepEntity.class)
@@ -335,6 +361,67 @@ class JpaMaterialStore implements MaterialStore {
         return em().createQuery("select f from VersionFile f where f.versionId = :version"
                         + " order by f.role desc, f.firstPage, f.id", VersionFileEntity.class)
                 .setParameter("version", versionId).getResultList();
+    }
+
+    @Override
+    public void insertPassages(List<PassageRow> rows) {
+        if (rows.isEmpty()) {
+            return;
+        }
+        EntityManager em = em();
+        rows.forEach(row -> em.persist(new PassageEntity(row)));
+        em.flush();
+    }
+
+    @Override
+    public Optional<PassageRow> findPassage(UUID id) {
+        return em().createQuery("select p from Passage p where p.id = :id", PassageEntity.class)
+                .setParameter("id", id).getResultList().stream().findFirst().map(PassageEntity::row);
+    }
+
+    @Override
+    public List<PassageRow> passages(UUID versionId) {
+        return passageEntities(versionId).stream().map(PassageEntity::row).toList();
+    }
+
+    @Override
+    public int deletePassages(UUID versionId) {
+        List<PassageEntity> found = passageEntities(versionId);
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
+    }
+
+    private List<PassageEntity> passageEntities(UUID versionId) {
+        return em().createQuery("select p from Passage p where p.versionId = :version order by p.ordinal",
+                PassageEntity.class).setParameter("version", versionId).getResultList();
+    }
+
+    @Override
+    public void insertOutline(OutlineRow row) {
+        EntityManager em = em();
+        em.persist(new VersionOutlineEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public Optional<OutlineRow> findOutline(UUID versionId) {
+        return outlineEntity(versionId).map(VersionOutlineEntity::row);
+    }
+
+    @Override
+    public boolean deleteOutline(UUID versionId) {
+        Optional<VersionOutlineEntity> found = outlineEntity(versionId);
+        found.ifPresent(entity -> {
+            em().remove(entity);
+            em().flush();
+        });
+        return found.isPresent();
+    }
+
+    private Optional<VersionOutlineEntity> outlineEntity(UUID versionId) {
+        return em().createQuery("select o from VersionOutline o where o.versionId = :version",
+                VersionOutlineEntity.class).setParameter("version", versionId).getResultList().stream().findFirst();
     }
 
     @Override

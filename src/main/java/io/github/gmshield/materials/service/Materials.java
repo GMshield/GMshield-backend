@@ -3,7 +3,9 @@ package io.github.gmshield.materials.service;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.NewestVersion;
 import io.github.gmshield.jobs.service.Jobs;
+import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.UploadStorage;
@@ -34,8 +36,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * from Story 1.15, its pages once the page total is known and the failure code of a failed version; from Story 1.16,
  * the pages done are the pages its chain gave an outcome; from Story 1.17, the pages of each layer and how many of them
  * have an outcome, and the pages of each outcome, all derived here from the recorded ranges; and {@code reading}, the
- * layer of the pages of the step whose job is offered or running, from its page range and the layer ranges. The backend
- * never reads a stage name and names no phase: the frontend chooses the words.
+ * layer of the pages of the step whose job is offered or running, from its page range and the layer ranges (a held step,
+ * or one over every text file of its version, reads no page: Story 1.18). The backend never reads a stage name and
+ * names no phase: the frontend chooses the words. From Story 1.18, a passage with its material, section path, page
+ * and text ({@link #passage}), and a version's outline ({@link #outline}), decrypted, for their owner only.
  * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
  * Nothing here logs a name.
  */
@@ -117,6 +121,26 @@ public class Materials {
         }
     }
 
+    /**
+     * A passage of a material's version (Story 1.18): its material (id and name), version, section path (outermost
+     * first), page and text. {@code toString} names ids and the page only.
+     */
+    public record Passage(UUID id, UUID materialId, String materialName, UUID versionId, List<String> sectionPath,
+                          int page, String text) {
+        @Override
+        public String toString() {
+            return "Passage[id=" + id + ", versionId=" + versionId + ", page=" + page + "]";
+        }
+    }
+
+    /** One section of a version's outline (Story 1.18): its heading's level and title, and the page it starts on. */
+    public record Section(int level, String title, int page) {
+        @Override
+        public String toString() {
+            return "Section[level=" + level + ", page=" + page + "]";
+        }
+    }
+
     /** One page of materials, and the cursor of the next one (null when this is the last). */
     public record Page(List<Material> items, UUID nextCursor) {
     }
@@ -142,6 +166,32 @@ public class Materials {
         return reading(() -> materials.newest(id).map(found -> views(List.of(found)).getFirst()));
     }
 
+    /** The owner's passage with this id; empty for an unknown id or another owner's. */
+    public Optional<Passage> passage(UUID id) {
+        return reading(() -> materials.findPassage(id).flatMap(row -> materials.findVersion(row.versionId())
+                .flatMap(version -> materials.findMaterial(version.materialId()))
+                .map(material -> passage(row, material))));
+    }
+
+    private Passage passage(PassageRow row, MaterialRow material) {
+        Passages.Place place = Passages.place(vault.decrypt(Passages.place(row.id(), row.ownerId()), row.place()));
+        return new Passage(row.id(), material.id(),
+                vault.decryptText(new Binding(Uploads.MATERIAL, Uploads.FIELD_NAME, material.id(), material.ownerId()),
+                        material.name()),
+                row.versionId(), place.sectionPath(), row.page(),
+                vault.decryptText(Passages.text(row.id(), row.ownerId()), row.text()));
+    }
+
+    /**
+     * The outline of the owner's version with this id, its sections in reading order; empty for an unknown version,
+     * another owner's, or one whose passages are not recorded yet.
+     */
+    public Optional<List<Section>> outline(UUID versionId) {
+        return reading(() -> materials.findOutline(versionId).map(row -> Passages.outline(
+                        vault.decrypt(Passages.outline(row.id(), row.ownerId()), row.outline())).stream()
+                .map(entry -> new Section(entry.level(), entry.title(), entry.page())).toList()));
+    }
+
     private List<Material> views(List<NewestVersion> rows) {
         UUID owner = OwnerContext.require();
         List<UUID> uploading = rows.stream().map(NewestVersion::version)
@@ -154,7 +204,9 @@ public class Materials {
         Map<UUID, List<PageRangeRow>> layers = byVersion(materials.pageLayers(counted));
         Map<UUID, List<PageRangeRow>> outcomes = byVersion(materials.pageOutcomes(counted));
         // The step in progress: the version's unended steps, then which of their jobs are offered or running.
-        List<StepRow> unended = counted.isEmpty() ? List.of() : materials.unendedSteps(counted);
+        // A held step has no job, and one over every text file reads no page: neither is ever in progress here.
+        List<StepRow> unended = counted.isEmpty() ? List.of() : materials.unendedSteps(counted).stream()
+                .filter(step -> step.jobId() != null && !step.inputTexts()).toList();
         Set<UUID> running = unended.isEmpty() ? Set.of()
                 : inProgress.of(unended.stream().map(StepRow::jobId).toList());
         Map<UUID, List<StepRow>> current = unended.stream().filter(step -> running.contains(step.jobId()))
