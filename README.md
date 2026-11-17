@@ -39,11 +39,12 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Six modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Seven modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
-campaigns, below; it may use `shared` and `vault`) and `accounts` (sign-in with Google, accounts and
+campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
+files, below; it may use `shared` and `vault`) and `accounts` (sign-in with Google, accounts and
 sessions, below; it may use `shared`, `vault`, `audit` and `library`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
@@ -75,7 +76,10 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     from the index key, separated by purpose and by entity and field.
   - `FileStore.writePiece` / `readPiece`: one encrypted file per piece under `GMSHIELD_FILES_DIR`,
     `<owner>/<file>/<index>.piece`, bound to owner, file id and index, written under a temporary name
-    and renamed.
+    and renamed; writing an index again replaces the piece. `FileStore.deleteFile(owner, file)` removes
+    every piece and the file's folder, and is safe to repeat.
+  - `Vault.sha256()`: an incremental SHA-256 (`update`, `digest`, `matches` in constant time) for content
+    that streams through, such as an upload's part and whole file (Story 1.13).
   - Any failed check (changed byte, moved value, unknown version, wrong master key) throws
     `IntegrityException`: the problem `integrity.failed` (500, no params) and no content. It logs ids
     and the entity and field names only: `vault.integrity_failed` when a stored value fails, and
@@ -189,6 +193,41 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
     start without a database and use in-memory stores (`@Primary`).
+- **Materials and the resumable upload (`materials`, Story 1.13, AD-16).** The backend's own tus 1.0.0
+  server (no tus library): four requests under `/api/v1/uploads`, behind the session's owner
+  (`LibraryOwnerFilter`) and `materials.web.UploadProtocolFilter`, which puts `Tus-Resumable: 1.0.0` and
+  `Cache-Control: no-store` on every answer and refuses a request without `Tus-Resumable: 1.0.0` with
+  `upload.tus_version` (412, `Tus-Version: 1.0.0`).
+  - `POST /api/v1/uploads` (`Upload-Length` 1 to 2 GiB, else `upload.too_large` 413; `Upload-Metadata` with
+    `filename`, else `upload.metadata_invalid` 400) creates, in one transaction, a `material` (its name
+    encrypted with `Binding("material", "name", id, owner)`), a `material_version` in `uploading` and an
+    `upload`, and answers 201 with a relative `Location` and `Upload-Expires` (creation + 6 h, fixed).
+  - `HEAD /api/v1/uploads/{id}` answers `Upload-Offset`, `Upload-Length` and `Upload-Expires`.
+  - `PATCH /api/v1/uploads/{id}` (`application/offset+octet-stream`, `Upload-Offset`, `Upload-Checksum:
+    sha256 <Base64>`, at most 90 MiB and never past the length, else 413 before anything is written). One
+    part at a time: a conditional update takes a 2-minute lease (`busy_token`, `busy_until`), renewed before
+    each piece; a second part answers `upload.busy` (423). The first part's first 4 KiB (the whole file
+    when it is shorter) decide the format from content alone; a first part shorter than that is
+    `request.invalid` and changes nothing (PDF, JPEG, PNG, WebP, TIFF, HEIC by signature, then UTF-8 text without control
+    characters, Markdown when the name ends in `.md` or `.markdown`, then BMP); anything else is
+    `upload.format_refused` (415, `params.accepted`) and the same transaction deletes the upload, version and
+    material rows. The body streams through `Vault.sha256()` into 4 MiB pieces, each encrypted into the file
+    store (index `piece_count + n`); a matching checksum moves `upload_offset` and `piece_count` in one
+    conditional update, a mismatch is `upload.part_checksum_mismatch` (460), a cut body `request.invalid`;
+    either way the offset stays and the next attempt overwrites the pieces. `Upload-Offset` other than the
+    stored one: `upload.offset_conflict` (409).
+  - `POST /api/v1/uploads/{id}/completion` (`{"sha256": "<64 hex>"}`) needs the whole file
+    (`upload.incomplete` 409), decrypts the pieces one at a time through `Vault.sha256()`: a match makes the
+    version `waiting` with its format and size and the upload `complete` (its pieces stay as the raw upload
+    for the first ingestion step) and answers 201 `{materialId, versionId, state}`; a mismatch is
+    `upload.file_checksum_mismatch` (422), the version `discarded` and the pieces removed.
+  - An open upload past its expiry answers `upload.expired` (410). `materials.service.UploadSweep` (every
+    `GMSHIELD_UPLOAD_SWEEP_EVERY`, 10 min) removes it in three resumable steps: as the owner, the version
+    `discarded` and the upload `removing`; then `FileStore.deleteFile`; then the row. It finishes every
+    `removing` row first, and runs on a connection of its own.
+  - `material` and `material_version` (`V6__materials.sql`) are library tables (`@TenantId`, JPA only);
+    `upload` is a working table through `JdbcClient` with no content, no name and no hash. Another owner's
+    id, an unknown id and a malformed id all answer `request.not_found` (404).
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -267,6 +306,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_MAX_ATTEMPTS` | claims per job (default `3`) |
 | `GMSHIELD_JOB_REOFFER_AFTER` | an offer nobody claimed is made again after this long (default `2m`; less than an hour) |
 | `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
+| `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
 | `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
 | `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |
@@ -319,7 +359,8 @@ The integration tests (`src/integrationTest`, `./gradlew integrationTest`) run a
 PostgreSQL and Redis at the test-mode hosts `postgres:5432` and `redis:6379` (`GMSHIELD_MODE=test`):
 the cross-owner tests of every kind of library item, the starter library's rollback and the owner of
 every query, and the jobs (create and rollback, offer, claims, grants, lapses and attempts, a deleted message,
-a flushed Redis, trimming and the ingestion round robin). `check` compiles them but does not run them. To run the image by hand:
+a flushed Redis, trimming and the ingestion round robin), and the uploads (the stored rows, a multi-part upload
+read back and decrypted, the lease, completion, a refused format and the sweep resumed after each step). `check` compiles them but does not run them. To run the image by hand:
 
 ```sh
 docker network create gm-it

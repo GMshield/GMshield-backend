@@ -48,9 +48,11 @@ import tools.jackson.databind.json.JsonMapper;
  * <p>The raw rows are read here with SQL to prove what is stored; the application itself never reads a library
  * table with native SQL.
  */
-// The job sweep is off: JobIntegrationTest drives it itself, and a second context's sweep must not touch its jobs.
+// The job sweep is off: JobIntegrationTest drives it itself, and a second context's sweep must not touch its jobs;
+// likewise the upload sweep (UploadIntegrationTest drives it).
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false"})
+        properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
+            "gmshield.materials.upload-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class LibraryIntegrationTest {
 

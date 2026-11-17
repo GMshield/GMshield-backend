@@ -28,3 +28,7 @@ gmshield:
   jobs:
     sweep:
       enabled: false
+  # Nor does the upload sweep (Story 1.13): the tests call it.
+  materials:
+    upload-sweep:
+      enabled: false

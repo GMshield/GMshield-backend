@@ -68,6 +68,34 @@ public class FileStore {
         return vault.decrypt(binding(ownerId, fileId, index), sealed);
     }
 
+    /**
+     * Removes a file with all its pieces, and any temporary name a cut write left behind. Idempotent: a file that
+     * is already gone, or never existed, is fine. Afterwards the file's folder is gone.
+     */
+    public void deleteFile(UUID ownerId, UUID fileId) {
+        Path folder = root.resolve(ownerId.toString()).resolve(fileId.toString());
+        try (java.util.stream.Stream<Path> entries = Files.list(folder)) {
+            for (Path entry : (Iterable<Path>) entries::iterator) {
+                Files.deleteIfExists(entry);
+            }
+        } catch (NoSuchFileException gone) {
+            return;
+        } catch (IOException e) {
+            throw new UncheckedIOException("file not removed", e);
+        }
+        try {
+            Files.deleteIfExists(folder);
+            syncDirectory(folder.getParent());
+        } catch (IOException e) {
+            throw new UncheckedIOException("file not removed", e);
+        }
+    }
+
+    /** Whether the file has a folder, that is, at least one piece was written and it is not removed. */
+    public boolean fileExists(UUID ownerId, UUID fileId) {
+        return Files.isDirectory(root.resolve(ownerId.toString()).resolve(fileId.toString()));
+    }
+
     Path piece(UUID ownerId, UUID fileId, int index) {
         if (index < 0) {
             throw new IllegalArgumentException("a piece index is 0 or more");

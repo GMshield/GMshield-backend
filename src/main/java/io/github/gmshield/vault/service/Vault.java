@@ -46,7 +46,7 @@ public class Vault {
     public byte[] encrypt(Binding binding, byte[] plaintext) {
         DataKeys.Current key = dataKeys.current(binding.ownerId());
         byte[] header = ByteBuffer.allocate(HEADER_BYTES).put(FORMAT).putInt(key.version()).array();
-        return VaultCrypto.concat(header, VaultCrypto.seal(key.key(), aad(binding, header), plaintext));
+        return VaultCrypto.seal(key.key(), aad(binding, header), header, plaintext);
     }
 
     public byte[] encryptText(Binding binding, String plaintext) {
@@ -118,6 +118,15 @@ public class Vault {
     public String pkceChallenge(String verifier) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(
                 VaultCrypto.sha256(verifier.getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    /**
+     * An incremental SHA-256 of content that streams through in parts (Story 1.13: a tus part and a whole upload),
+     * never held whole. The digest is the content's, unkeyed: it is compared with a checksum the browser sent, and
+     * is never stored or logged.
+     */
+    public Sha256 sha256() {
+        return new Sha256(VaultCrypto.newSha256());
     }
 
     private static byte[] sealed(String entity, UUID rowId, String... values) {
