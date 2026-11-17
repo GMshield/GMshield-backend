@@ -171,7 +171,7 @@ public class JobFiles {
     private JobRow live(UUID jobId, UUID claimId, String grant) {
         byte[] presented = JobClaims.hashOf(vault, grant);
         JobRow row = storage.joined().find(jobId).orElse(null);
-        if (!JobClaims.grantMatches(row, claimId, presented, clock.now())) {
+        if (row == null || !JobClaims.grantMatches(row, claimId, presented, clock.now())) {
             JobClaims.refusedGrant(jobId);
             throw JobProblems.grantRefused();
         }
