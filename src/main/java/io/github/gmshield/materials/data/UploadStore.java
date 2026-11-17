@@ -1,6 +1,7 @@
 package io.github.gmshield.materials.data;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -14,6 +15,9 @@ public interface UploadStore {
     void insert(UploadRow row);
 
     Optional<UploadRow> find(UUID id);
+
+    /** The open uploads of {@code owner} for these versions (Story 1.14), by the (owner, version) index. */
+    List<UploadRow> openForVersions(UUID owner, Collection<UUID> versionIds);
 
     /**
      * Takes the lease of an open, unexpired upload of {@code owner} whose verified offset is {@code offset} and whose

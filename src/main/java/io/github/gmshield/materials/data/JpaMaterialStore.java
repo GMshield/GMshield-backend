@@ -3,6 +3,8 @@ package io.github.gmshield.materials.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -40,6 +42,49 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public void insertMaterialSystem(MaterialSystemRow row) {
+        EntityManager em = em();
+        em.persist(new MaterialSystemEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public List<MaterialSystemRow> systemsOf(UUID materialId) {
+        return systemEntitiesOf(materialId).stream().map(MaterialSystemEntity::row).toList();
+    }
+
+    @Override
+    public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
+        if (states.isEmpty() || limit < 1) {
+            return List.of();
+        }
+        // The newest version of a material is the one no other version of it follows (later, or as late with a
+        // greater id). Two query texts rather than a null parameter, whose type PostgreSQL could not tell.
+        String jpql = "select m, v from Material m join MaterialVersion v on v.materialId = m.id"
+                + " where v.state in :states"
+                + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
+                + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))"
+                + (before == null ? "" : " and m.id < :before")
+                + " order by m.id desc";
+        var query = em().createQuery(jpql, Object[].class).setParameter("states", states).setMaxResults(limit);
+        if (before != null) {
+            query.setParameter("before", before);
+        }
+        return query.getResultList().stream()
+                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    @Override
+    public Optional<NewestVersion> newest(UUID materialId) {
+        return material(materialId).flatMap(material -> em()
+                .createQuery("select v from MaterialVersion v where v.materialId = :id order by v.createdAt desc, v.id desc",
+                        MaterialVersionEntity.class)
+                .setParameter("id", materialId).setMaxResults(1).getResultList().stream().findFirst()
+                .map(version -> new NewestVersion(material.row(), version.row())));
+    }
+
+    @Override
     public Optional<MaterialRow> findMaterial(UUID id) {
         return material(id).map(MaterialEntity::row);
     }
@@ -73,6 +118,7 @@ class JpaMaterialStore implements MaterialStore {
     public boolean deleteMaterial(UUID id) {
         Optional<MaterialEntity> material = material(id);
         material.ifPresent(entity -> {
+            systemEntitiesOf(id).forEach(em()::remove);
             em().remove(entity);
             em().flush();
         });
@@ -82,6 +128,11 @@ class JpaMaterialStore implements MaterialStore {
     private Optional<MaterialEntity> material(UUID id) {
         return em().createQuery("select m from Material m where m.id = :id", MaterialEntity.class)
                 .setParameter("id", id).getResultList().stream().findFirst();
+    }
+
+    private List<MaterialSystemEntity> systemEntitiesOf(UUID materialId) {
+        return em().createQuery("select s from MaterialSystem s where s.materialId = :id order by s.createdAt, s.id",
+                MaterialSystemEntity.class).setParameter("id", materialId).getResultList();
     }
 
     private Optional<MaterialVersionEntity> version(UUID id) {

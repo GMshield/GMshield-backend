@@ -273,11 +273,120 @@ class UploadFlowTest {
         assertThat(OwnerContext.current()).isEmpty();
     }
 
+    // --- Story 1.14: the details, the list and the read ---
+
+    @Test
+    void theDetailsAreStoredAndTheMaterialIsListedAndReadWithItsUploadWhileUploading() throws Exception {
+        Gm gm = signUp();
+        String campaign = json(get(gm, "/api/v1/campaigns/current")).path("id").asString();
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", metadata("Livro do Jogador.pdf") + ",kind " + b64("rulebook")
+                        + ",language " + b64("detect") + ",campaign " + b64(campaign));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        String location = created.headers().firstValue("Location").orElseThrow();
+        String uploadId = location.substring(location.lastIndexOf('/') + 1);
+
+        HttpResponse<String> listed = get(gm, "/api/v1/materials?state=uploading&state=waiting&state=processing");
+        assertThat(listed.statusCode()).as(listed.body()).isEqualTo(200);
+        assertThat(listed.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode item = json(listed).path("items").get(0);
+        assertThat(json(listed).path("items").size()).isEqualTo(1);
+        assertThat(json(listed).has("nextCursor")).isFalse();
+        assertThat(item.path("name").asString()).isEqualTo("Livro do Jogador.pdf");
+        assertThat(item.path("state").asString()).isEqualTo("uploading");
+        assertThat(item.path("kind").asString()).isEqualTo("rulebook");
+        assertThat(item.path("upload").path("id").asString()).isEqualTo(uploadId);
+        assertThat(item.path("upload").path("offset").asLong()).isZero();
+        assertThat(item.path("upload").path("length").asLong()).isEqualTo(1000);
+        assertThat(Instant.parse(item.path("upload").path("expiresAt").asString())).isAfter(Instant.now());
+
+        byte[] content = pdf(1000);
+        assertThat(patch(gm, location, 0, content).statusCode()).isEqualTo(204);
+        String materialId = json(complete(gm, location, sha256Hex(content))).path("materialId").asString();
+        HttpResponse<String> read = get(gm, "/api/v1/materials/" + materialId);
+        assertThat(read.statusCode()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(read).path("id").asString()).isEqualTo(materialId);
+        assertThat(json(read).path("state").asString()).isEqualTo("waiting");
+        assertThat(json(read).has("upload")).isFalse();
+        assertThat(json(get(gm, "/api/v1/materials?state=uploading")).path("items").size()).isZero();
+        assertThat(json(get(gm, "/api/v1/materials?state=waiting&limit=1")).path("items").get(0).path("id").asString())
+                .isEqualTo(materialId);
+    }
+
+    @Test
+    void anotherOwnersMaterialIsNotFoundAndNotListedAndAnotherOwnersBelongingIsInvalidMetadata() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String aCampaign = json(get(a, "/api/v1/campaigns/current")).path("id").asString();
+        String aSystem = json(get(a, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        byte[] content = pdf(1000);
+        String location = create(a, content.length, "secret.pdf").headers().firstValue("Location").orElseThrow();
+        patch(a, location, 0, content);
+        String materialId = json(complete(a, location, sha256Hex(content))).path("materialId").asString();
+
+        JsonNode expected = json(get(b, "/api/v1/materials/" + UUID.randomUUID()));
+        assertThat(expected.path("code").asString()).isEqualTo("request.not_found");
+        for (String path : List.of("/api/v1/materials/" + materialId, "/api/v1/materials/not-a-uuid",
+                "/api/v1/materials/" + materialId.toUpperCase() + "0")) {
+            HttpResponse<String> response = get(b, path);
+            assertThat(response.statusCode()).as(path).isEqualTo(404);
+            assertThat(withoutTraceId(json(response))).as(path).isEqualTo(withoutTraceId(expected));
+            assertThat(response.body()).doesNotContain(materialId).doesNotContain("secret");
+        }
+        HttpResponse<String> theirs = get(b, "/api/v1/materials?state=waiting&state=uploading");
+        assertThat(json(theirs).path("items").size()).isZero();
+        assertThat(theirs.body()).doesNotContain(materialId);
+        assertThat(json(get(a, "/api/v1/materials?state=waiting")).path("items").size()).isEqualTo(1);
+
+        int before = materials.materials.size();
+        List<String> refused = List.of(",campaign " + b64(aCampaign), ",system " + b64(aSystem),
+                ",campaign " + b64(json(get(b, "/api/v1/campaigns/current")).path("id").asString()) + ",system " + b64(
+                        json(get(b, "/api/v1/campaigns/current")).path("system").path("id").asString()),
+                ",kind " + b64("novel"), ",language " + b64("fr"), ",kind");
+        JsonNode first = null;
+        for (String details : refused) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session(b), "Tus-Resumable", TUS,
+                    "Upload-Length", "10", "Upload-Metadata", metadata("a.txt") + details);
+            assertProblem(response, 400, "upload.metadata_invalid");
+            assertThat(response.body()).doesNotContain(aCampaign).doesNotContain(aSystem);
+            first = first == null ? json(response) : first;
+            assertThat(withoutTraceId(json(response))).as(details).isEqualTo(withoutTraceId(first));
+        }
+        assertThat(materials.materials).hasSize(before);
+    }
+
+    @Test
+    void theListNeedsAKnownStateALimitFromOneToFiftyAndAWellFormedCursorAndASession() throws Exception {
+        Gm gm = signUp();
+        for (String query : List.of("", "?limit=5", "?state=", "?state=lost", "?state=waiting&state=lost",
+                "?state=waiting&limit=0", "?state=waiting&limit=51", "?state=waiting&limit=x", "?state=waiting&limit=01",
+                "?state=waiting&cursor=nope")) {
+            HttpResponse<String> response = get(gm, "/api/v1/materials" + query);
+            assertThat(response.statusCode()).as(query).isEqualTo(400);
+            assertThat(json(response).path("code").asString()).as(query).isEqualTo("request.invalid");
+        }
+        assertThat(get(gm, "/api/v1/materials?state=waiting&limit=50&cursor=" + UUID.randomUUID()).statusCode())
+                .isEqualTo(200);
+        HttpResponse<String> noSession = send("GET", "/api/v1/materials?state=waiting", null);
+        assertThat(noSession.statusCode()).isEqualTo(401);
+        assertThat(json(noSession).path("code").asString()).isEqualTo("session.required");
+        assertThat(send("GET", "/api/v1/materials/" + UUID.randomUUID(), null).statusCode()).isEqualTo(401);
+    }
+
+    private HttpResponse<String> get(Gm gm, String path) throws Exception {
+        return send("GET", path, null, session(gm));
+    }
+
+    private static String b64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
     // --- helpers ---
 
     private HttpResponse<String> create(Gm gm, long length, String name) throws Exception {
         return send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS, "Upload-Length",
-                Long.toString(length), "Upload-Metadata", metadata(name) + ",kind,language cHQtQlI=");
+                Long.toString(length), "Upload-Metadata", metadata(name) + ",future,note cHQtQlI=");
     }
 
     private HttpResponse<String> head(Gm gm, String location) throws Exception {

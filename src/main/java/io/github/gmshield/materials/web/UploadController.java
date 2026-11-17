@@ -19,9 +19,11 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -87,7 +89,9 @@ class UploadController {
     @PostMapping(path = UPLOADS)
     @Operation(operationId = "createUpload", summary = "tus 1.0.0 creation: a material, its version in uploading and an"
             + " upload that expires after 6 hours. upload.too_large (413) outside 1 byte to 2 GiB;"
-            + " upload.metadata_invalid (400) without a valid filename; request.invalid (400) for a missing or"
+            + " upload.metadata_invalid (400) without a valid filename, for a kind, language, campaign or system that is"
+            + " not valid, for a campaign or system that is not the account's, or for both at once (it never says"
+            + " which); request.invalid (400) for a missing or"
             + " malformed Upload-Length; upload.tus_version (412) without"
             + " Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
             parameters = {
@@ -99,8 +103,10 @@ class UploadController {
                         description = "The file's size in bytes, 1 to 2147483648",
                         schema = @Schema(type = "integer", format = "int64", minimum = "1", maximum = "2147483648")),
                 @Parameter(name = "Upload-Metadata", in = ParameterIn.HEADER, required = true,
-                        description = "tus metadata: comma-separated keys, each with its value in Base64; filename"
-                                + " is required", schema = @Schema(type = "string", example = "filename cnVsZXMucGRm"))},
+                        description = "tus metadata: comma-separated keys, each with its value in Base64. filename"
+                                + " is required. Optional: kind (rulebook, supplement, homebrew, campaign_notes, other),"
+                                + " language (pt-BR, en, detect), and campaign or system (the id of one of the"
+                                + " account's, never both)", schema = @Schema(type = "string", example = "filename cnVsZXMucGRm"))},
             responses = @ApiResponse(responseCode = "201", description = "Created",
                     headers = {
                         @Header(name = "Location", required = true, description = "The upload's path, relative",
@@ -111,8 +117,8 @@ class UploadController {
     ResponseEntity<Void> create(@Parameter(hidden = true) @RequestHeader(value = "Upload-Length", required = false) String length,
                                 @Parameter(hidden = true) @RequestHeader(value = "Upload-Metadata", required = false) String metadata) {
         long size = number(length);
-        String name = filename(metadata);
-        Uploads.Created created = uploads.create(size, name);
+        Metadata parsed = metadata(metadata);
+        Uploads.Created created = uploads.create(size, parsed.filename(), parsed.details());
         return ResponseEntity.status(201)
                 .header(HttpHeaders.LOCATION, UPLOADS + "/" + created.uploadId())
                 .header("Upload-Expires", HTTP_DATE.format(created.expiresAt()))
@@ -265,16 +271,30 @@ class UploadController {
         }
     }
 
+    /** The parsed {@code Upload-Metadata}: the file's name and what the GM said about it. */
+    record Metadata(String filename, Uploads.Details details) {
+        @Override
+        public String toString() {
+            return "Metadata[]";
+        }
+    }
+
+    /** The keys of what the GM said about a file (Story 1.14). */
+    private static final Set<String> DETAIL_KEYS = Set.of("kind", "language", "campaign", "system");
+
     /**
-     * The {@code filename} of tus's {@code Upload-Metadata}: comma-separated pairs of a key and its value in Base64
-     * (a key may stand alone). Keys are unique. Other keys are ignored here (Story 1.14 adds them).
+     * tus's {@code Upload-Metadata}: comma-separated pairs of a key and its value in Base64 (a key may stand alone).
+     * Keys are unique. {@code filename} is required; {@code kind}, {@code language}, {@code campaign} and
+     * {@code system} (Story 1.14) are optional, and a known key standing alone has an empty value, which the service
+     * refuses. Other keys are ignored.
      */
-    static String filename(String metadata) {
+    static Metadata metadata(String metadata) {
         if (metadata == null || metadata.isBlank()) {
             throw UploadProblems.metadataInvalid();
         }
         Set<String> keys = new HashSet<>();
         String filename = null;
+        Map<String, String> details = new HashMap<>();
         for (String pair : metadata.split(",", -1)) {
             String[] parts = pair.strip().split(" ", -1);
             if (parts.length > 2 || !METADATA_KEY.matcher(parts[0]).matches() || !keys.add(parts[0])) {
@@ -285,12 +305,15 @@ class UploadController {
                     throw UploadProblems.metadataInvalid();
                 }
                 filename = utf8(parts[1]);
+            } else if (DETAIL_KEYS.contains(parts[0])) {
+                details.put(parts[0], parts.length == 2 ? utf8(parts[1]) : "");
             }
         }
         if (filename == null) {
             throw UploadProblems.metadataInvalid();
         }
-        return filename;
+        return new Metadata(filename, new Uploads.Details(details.get("kind"), details.get("language"),
+                details.get("campaign"), details.get("system")));
     }
 
     private static String utf8(String base64) {

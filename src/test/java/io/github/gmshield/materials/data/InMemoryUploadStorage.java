@@ -2,6 +2,7 @@ package io.github.gmshield.materials.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -63,6 +64,12 @@ public class InMemoryUploadStorage implements UploadStorage {
         @Override
         public Optional<UploadRow> find(UUID id) {
             return Optional.ofNullable(rows.get(id));
+        }
+
+        @Override
+        public List<UploadRow> openForVersions(UUID owner, Collection<UUID> versionIds) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner)
+                    && versionIds.contains(row.versionId()) && row.state().equals(UploadRow.OPEN)).toList();
         }
 
         @Override

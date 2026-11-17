@@ -1,7 +1,9 @@
 package io.github.gmshield.materials.service;
 
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.UploadStorage;
 import io.github.gmshield.materials.data.VersionRow;
@@ -20,8 +22,10 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -34,8 +38,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * the work ({@link OwnerContext}).
  *
  * <ul>
- *   <li>{@link #create}: a material (its name encrypted), a version in {@code uploading} and an upload, in one
- *       transaction. The upload expires 6 hours after its creation, whatever happens meanwhile.</li>
+ *   <li>{@link #create}: a material (its name encrypted, with what the GM said about it: {@link Details}), a version in
+ *       {@code uploading} and an upload, in one transaction. The upload expires 6 hours after its creation, whatever
+ *       happens meanwhile.</li>
  *   <li>{@link #patch}: one part at a time, under a lease. The first part's first 4 KiB (the whole file when it is
  *       shorter) decide the format before anything is written: a first part shorter than that is refused as invalid,
  *       and a refused format leaves no row and no piece. The part streams through a SHA-256 into
@@ -44,8 +49,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       {@code waiting}, a mismatch discards it and removes the pieces.</li>
  * </ul>
  *
- * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name or a
- * hash; the file is never held whole in memory.
+ * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name, a
+ * hash, a kind or where a material belongs; the file is never held whole in memory.
  */
 @Service
 public class Uploads {
@@ -65,23 +70,50 @@ public class Uploads {
     static final String DISCARDED = "discarded";
     /** The longest name a material may have, in characters. */
     static final int MAX_NAME = 255;
+    /** What a material may be (Story 1.14). */
+    public static final Set<String> KINDS = Set.of("rulebook", "supplement", "homebrew", "campaign_notes", "other");
+    /** The languages a GM may name; {@value #DETECT} leaves it to a later read stage and is stored as null. */
+    public static final Set<String> LANGUAGES = Set.of("pt-BR", "en");
+    public static final String DETECT = "detect";
+    private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Logger log = LoggerFactory.getLogger(Uploads.class);
 
     private final MaterialStore materials;
     private final UploadStorage uploads;
     private final Vault vault;
     private final FileStore files;
+    private final Library library;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
-    Uploads(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files,
+    Uploads(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Library library,
             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
         this.files = files;
+        this.library = library;
         this.transactions = transactions;
         this.clock = clock;
+    }
+
+    /**
+     * What the GM said about a file (Story 1.14), as the tus metadata gave it: each may be null (an older frontend sends
+     * none). {@code kind} is one of {@link #KINDS}; {@code language} one of {@link #LANGUAGES} or {@value #DETECT};
+     * {@code campaign} or {@code system} the id of one of the owner's, never both. {@code toString} shows nothing.
+     */
+    public record Details(String kind, String language, String campaign, String system) {
+
+        public static final Details NONE = new Details(null, null, null, null);
+
+        @Override
+        public String toString() {
+            return "Details[]";
+        }
+    }
+
+    /** The details once checked: the language null when left to detection. */
+    private record Checked(String kind, String language, UUID campaign, UUID system) {
     }
 
     /** A new upload: its id and when it expires. */
@@ -96,13 +128,23 @@ public class Uploads {
     public record Completed(UUID materialId, UUID versionId, String state) {
     }
 
-    /** Creates the material, its version and the upload of {@code length} bytes named {@code name}. */
+    /** Creates the material, its version and the upload of {@code length} bytes named {@code name}, with no details. */
     public Created create(long length, String name) {
+        return create(length, name, Details.NONE);
+    }
+
+    /**
+     * Creates the material with its details, its version and the upload of {@code length} bytes named {@code name}. A
+     * detail that is not valid, or a campaign or system that is not the owner's, is {@code upload.metadata_invalid},
+     * which never says which, and nothing is stored.
+     */
+    public Created create(long length, String name, Details details) {
         UUID owner = OwnerContext.require();
         if (length < 1 || length > MAX_LENGTH) {
             throw UploadProblems.tooLarge(MAX_LENGTH);
         }
         String material = validName(name);
+        Checked checked = checked(details == null ? Details.NONE : details);
         Instant now = now();
         UUID materialId = Ids.newId();
         UUID versionId = Ids.newId();
@@ -110,7 +152,11 @@ public class Uploads {
         Instant expiresAt = now.plus(LIFETIME);
         inTransaction(() -> {
             materials.insertMaterial(new MaterialRow(materialId, owner,
-                    vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), material), now));
+                    vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), material), now,
+                    checked.kind(), checked.language(), checked.campaign()));
+            if (checked.system() != null) {
+                materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, checked.system(), now));
+            }
             materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
             uploads.joined().insert(new UploadRow(uploadId, owner, versionId, length, 0, 0, null, expiresAt, null, null,
                     UploadRow.OPEN, now, now));
@@ -408,6 +454,43 @@ public class Uploads {
 
     private Instant now() {
         return clock.getIfAvailable(Clock::systemUTC).instant().truncatedTo(ChronoUnit.MICROS);
+    }
+
+    /**
+     * The details checked against the owner's library: a campaign or a system must be the owner's (another owner's id
+     * reads like an unknown one). The check comes before the transaction; the database's owner-scoped keys still hold
+     * should the item go meanwhile.
+     */
+    private Checked checked(Details details) {
+        if (details.kind() != null && !KINDS.contains(details.kind())) {
+            throw UploadProblems.metadataInvalid();
+        }
+        String language = details.language();
+        if (language != null && !language.equals(DETECT) && !LANGUAGES.contains(language)) {
+            throw UploadProblems.metadataInvalid();
+        }
+        if (details.campaign() != null && details.system() != null) {
+            throw UploadProblems.metadataInvalid();
+        }
+        UUID campaign = id(details.campaign());
+        UUID system = id(details.system());
+        if (campaign != null && library.campaign(campaign).isEmpty()) {
+            throw UploadProblems.metadataInvalid();
+        }
+        if (system != null && library.system(system).isEmpty()) {
+            throw UploadProblems.metadataInvalid();
+        }
+        return new Checked(details.kind(), DETECT.equals(language) ? null : language, campaign, system);
+    }
+
+    private static UUID id(String text) {
+        if (text == null) {
+            return null;
+        }
+        if (!UUID_TEXT.matcher(text).matches()) {
+            throw UploadProblems.metadataInvalid();
+        }
+        return UUID.fromString(text);
     }
 
     /** A material's name: trimmed, 1 to {@value #MAX_NAME} characters, with no control character. */
