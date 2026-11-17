@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.jobs.data.MutableClock;
+import io.github.gmshield.library.data.InMemoryLibraryStore;
+import io.github.gmshield.library.service.TestLibraries;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialRow;
@@ -67,8 +69,10 @@ class UploadsTest {
         StaticListableBeanFactory beans = new StaticListableBeanFactory();
         beans.addBean("transactions", transactions);
         beans.addBean("clock", clock);
-        service = new Uploads(materials, uploads, vault, files, beans.getBeanProvider(PlatformTransactionManager.class),
-                beans.getBeanProvider(Clock.class));
+        service = new Uploads(materials, uploads, vault, files,
+                TestLibraries.library(new InMemoryLibraryStore(), vault,
+                        beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class)),
+                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         sweep = new UploadSweep(uploads, materials, service, beans.getBeanProvider(PlatformTransactionManager.class),
                 beans.getBeanProvider(Clock.class));
     }

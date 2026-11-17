@@ -6,6 +6,7 @@ import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -112,6 +113,15 @@ class JdbcUploadStorage implements UploadStorage {
         @Override
         public Optional<UploadRow> find(UUID id) {
             return jdbc.get().sql(COLUMNS + "where id = :id").param("id", id).query(Sql::row).optional();
+        }
+
+        @Override
+        public List<UploadRow> openForVersions(UUID owner, Collection<UUID> versionIds) {
+            if (versionIds.isEmpty()) {
+                return List.of();
+            }
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id in (:versions) and state = 'open'")
+                    .param("owner", owner).param("versions", List.copyOf(versionIds)).query(Sql::row).list();
         }
 
         @Override

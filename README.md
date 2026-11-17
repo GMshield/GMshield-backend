@@ -44,7 +44,7 @@ contract versions, the owner context and `Ids`, which mints every id as a UUID v
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
-files, below; it may use `shared` and `vault`) and `accounts` (sign-in with Google, accounts and
+files, below; it may use `shared`, `vault` and `library`) and `accounts` (sign-in with Google, accounts and
 sessions, below; it may use `shared`, `vault`, `audit` and `library`).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
@@ -167,7 +167,7 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   JPA entities and JPQL (also by id), never native SQL or `JdbcClient`.
   - The owner comes from `shared.service.OwnerContext`, a `ScopedValue` bound for one piece of work and
     gone afterwards. Two places bind it: `accounts.web.LibraryOwnerFilter`, for every request to
-    `/api/v1/systems/**` and `/api/v1/campaigns/**`, from the session's account (`X-Session-Token`; no
+    `/api/v1/systems/**`, `/api/v1/campaigns/**`, `/api/v1/uploads/**` and `/api/v1/materials/**`, from the session's account (`X-Session-Token`; no
     session: `session.required` before any controller), and `OwnerContext.callAs`, for work run as one
     owner (a first sign-in). Binding it inside bound work is refused. It never comes from a parameter or
     a body. `shared.data.OwnerTenantResolver` hands it to Hibernate; without an owner it throws, so no
@@ -228,6 +228,27 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `material` and `material_version` (`V6__materials.sql`) are library tables (`@TenantId`, JPA only);
     `upload` is a working table through `JdbcClient` with no content, no name and no hash. Another owner's
     id, an unknown id and a malformed id all answer `request.not_found` (404).
+- **The guided upload's details and the materials list (`materials`, Story 1.14).** `Upload-Metadata` at creation
+  may also carry `kind` (`rulebook`, `supplement`, `homebrew`, `campaign_notes`, `other`), `language` (`pt-BR`,
+  `en`, or `detect`, stored as null for a later read stage), and `campaign` or `system` (the id of one of the
+  owner's, checked through `library.service.Library`). All are optional (an older frontend sends none). A bad
+  value, an unknown or another owner's id, or both `campaign` and `system` answer `upload.metadata_invalid` (400),
+  which never says which, and nothing is stored. Other keys are still ignored.
+  - `V7__material_details.sql`: `material.kind` and `material.language` (nullable, each with a CHECK of every
+    value) and `material.campaign_id` (nullable, FK `(owner_id, campaign_id)` to `campaign`); the library table
+    `material_system (id, owner_id, material_id, system_id)`, unique per `(owner_id, material_id, system_id)`, with
+    owner-scoped FKs to `material` (on delete cascade, so a previous release that removes a refused upload's
+    material is not stopped) and `system`. One row per material in this release; several systems come with
+    Epic 3. Everything is written in creation's transaction; a refused format removes the row with the material.
+  - `GET /api/v1/materials?state=…&limit=&cursor=`: the owner's materials whose newest version (latest
+    `created_at`, then greatest id) is in one of the given states, newest material first (descending id),
+    `{items, nextCursor}`. `state` is repeatable and required, `limit` 1 to 50 (default 20), `cursor` the previous
+    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`).
+  - `GET /api/v1/materials/{id}`: one material. Another owner's id, an unknown id and a malformed id all answer
+    `request.not_found` (404).
+  - Each item is `{id, name, state, kind?, upload?}`; `upload` (`{id, offset, length, expiresAt}`, from the open
+    `upload` row by its `(owner_id, version_id)` index) is there only while the newest version is `uploading`.
+    Every answer is `no-store`. Nothing logs a name, a kind or where a material belongs.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -360,7 +381,9 @@ PostgreSQL and Redis at the test-mode hosts `postgres:5432` and `redis:6379` (`G
 the cross-owner tests of every kind of library item, the starter library's rollback and the owner of
 every query, and the jobs (create and rollback, offer, claims, grants, lapses and attempts, a deleted message,
 a flushed Redis, trimming and the ingestion round robin), and the uploads (the stored rows, a multi-part upload
-read back and decrypted, the lease, completion, a refused format and the sweep resumed after each step). `check` compiles them but does not run them. To run the image by hand:
+read back and decrypted, the lease, completion, a refused format and the sweep resumed after each step), and the
+material details (V7's columns and checks, `material_system` within its owner and its cross-owner test, the newest-version
+query and its cursor). `check` compiles them but does not run them. To run the image by hand:
 
 ```sh
 docker network create gm-it

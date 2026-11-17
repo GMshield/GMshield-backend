@@ -6,5 +6,5 @@
  * encrypted piece by piece as it arrives. Another owner's item is "not found", exactly like an unknown one.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
-        allowedDependencies = {"shared :: service", "vault :: service"})
+        allowedDependencies = {"shared :: service", "vault :: service", "library :: service"})
 package io.github.gmshield.materials;

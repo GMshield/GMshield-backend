@@ -1,6 +1,8 @@
 package io.github.gmshield.materials.data;
 
 import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -14,6 +16,22 @@ public interface MaterialStore {
 
     void insertVersion(VersionRow row);
 
+    /** Says that a material belongs to a game system (Story 1.14). */
+    void insertMaterialSystem(MaterialSystemRow row);
+
+    /** The current owner's game systems of a material, oldest first. */
+    List<MaterialSystemRow> systemsOf(UUID materialId);
+
+    /**
+     * The current owner's materials whose newest version (the latest created, then the greatest id) is in one of
+     * {@code states}, each with that version: newest material first (descending id, a UUID v7), only those whose id is
+     * below {@code before} when it is given, at most {@code limit}.
+     */
+    List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit);
+
+    /** The current owner's material with this id and its newest version; empty for an unknown id or another owner's. */
+    Optional<NewestVersion> newest(UUID materialId);
+
     /** The current owner's material with this id; empty for an unknown id or another owner's. */
     Optional<MaterialRow> findMaterial(UUID id);
 
@@ -26,6 +44,9 @@ public interface MaterialStore {
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);
 
-    /** Deletes the current owner's material, which must have no version left; false when there is none. */
+    /**
+     * Deletes the current owner's material, which must have no version left, with the game systems it belongs to;
+     * false when there is none.
+     */
     boolean deleteMaterial(UUID id);
 }
