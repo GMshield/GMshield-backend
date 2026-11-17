@@ -122,6 +122,10 @@ class JobFlowTest extends HttpTestSupport {
     InMemoryTransactionManager transactions;
     @Autowired
     FileStore files;
+    @Autowired
+    io.github.gmshield.jobs.service.JobFiles jobFiles;
+    @org.springframework.beans.factory.annotation.Value("${gmshield.files.dir}")
+    java.nio.file.Path filesDir;
 
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
     private final Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
@@ -585,18 +589,22 @@ class JobFlowTest extends HttpTestSupport {
         UUID id = createProbe("interactive", 0, 0, null);
         JsonNode claim = json(claim(id));
         int mib = 1024 * 1024;
+        java.util.Set<String> before = fileFolders();
 
         assertProblem(postOutput(id, claim, bytes(6 * mib + 1), true), 413, "job.output_too_large");
+        // Without a length the first 4 MiB piece is written before the limit is passed: it is removed again.
         assertProblem(postOutput(id, claim, bytes(6 * mib + 1), false), 413, "job.output_too_large");
         assertProblem(postOutput(id, claim, new byte[0], true), 400, "request.invalid");
         assertThat(storage.outputs).isEmpty();
-        assertThat(files.fileExists(ProbeJobs.OWNER, id)).isFalse();
+        assertThat(fileFolders()).isEqualTo(before);
 
         assertThat(postOutput(id, claim, bytes(6 * mib), true).statusCode()).isEqualTo(201);
         assertThat(postOutput(id, claim, bytes(4 * mib), false).statusCode()).isEqualTo(201);
+        java.util.Set<String> stored = fileFolders();
         // 10 MiB stored for this claim: one more byte passes the claim's limit.
         assertProblem(postOutput(id, claim, bytes(1), false), 413, "job.output_too_large");
         assertThat(storage.outputs.values()).hasSize(2).allMatch(row -> row.state().equals("stored"));
+        assertThat(fileFolders()).isEqualTo(stored).hasSize(before.size() + 2);
     }
 
     @Test
@@ -605,6 +613,7 @@ class JobFlowTest extends HttpTestSupport {
         UUID b = createProbe("interactive", 0, 0, null);
         JsonNode claimA = json(claim(a));
         JsonNode claimB = json(claim(b));
+        java.util.Set<String> before = fileFolders();
         String outputsA = "/internal/v1/jobs/" + a + "/claims/" + claimA.path("claimId").asString() + "/outputs";
 
         for (String[] headers : new String[][] {{}, {"X-Job-Grant", "A".repeat(43)},
@@ -630,7 +639,51 @@ class JobFlowTest extends HttpTestSupport {
         clock.advance(Duration.ofSeconds(91));
         assertProblem(postOutput(b, claimB, bytes(10), true), 403, "job.grant_refused");
         assertThat(storage.outputs).isEmpty();
-        assertThat(files.fileExists(ProbeJobs.OWNER, a)).isFalse();
+        assertThat(fileFolders()).isEqualTo(before);
+    }
+
+    @Test
+    void aClaimThatEndsWhileAnOutputArrivesStoresNothing() throws Exception {
+        int mib = 1024 * 1024;
+        for (int size : new int[] {4 * mib + 10, 4 * mib}) {
+            UUID id = createProbe("interactive", 0, 0, null);
+            JsonNode claim = json(claim(id));
+            java.util.Set<String> before = fileFolders();
+            // The claim lapses once the first 4 MiB have arrived: either before the next piece (stillLive), or, with
+            // nothing after them, between the last piece and the output's record (the locked re-check).
+            java.io.InputStream body = new java.io.InputStream() {
+                private int sent;
+
+                @Override
+                public int read() {
+                    byte[] one = new byte[1];
+                    return read(one, 0, 1) < 0 ? -1 : one[0] & 0xff;
+                }
+
+                @Override
+                public int read(byte[] buffer, int offset, int length) {
+                    if (sent >= 4 * mib && clock.instant().isBefore(START.plusSeconds(91))) {
+                        clock.advance(Duration.ofSeconds(91));
+                    }
+                    if (sent >= size) {
+                        return -1;
+                    }
+                    int count = Math.min(length, size - sent);
+                    sent += count;
+                    return count;
+                }
+            };
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> jobFiles.store(id,
+                            UUID.fromString(claim.path("claimId").asString()), claim.path("grant").asString(), -1, body))
+                    .isInstanceOf(io.github.gmshield.shared.service.ApiException.class)
+                    .satisfies(thrown -> assertThat(((io.github.gmshield.shared.service.ApiException) thrown).problem()
+                            .code()).isEqualTo("job.grant_refused"));
+
+            assertThat(storage.outputs).as("size %d", size).isEmpty();
+            assertThat(fileFolders()).as("size %d", size).isEqualTo(before);
+            clock.set(START);
+        }
     }
 
     @Test
@@ -777,6 +830,17 @@ class JobFlowTest extends HttpTestSupport {
             request.headers(headers);
         }
         return java.net.http.HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** The file folders of the probe owner in the file store: one per stored output, whatever its pieces. */
+    private java.util.Set<String> fileFolders() throws java.io.IOException {
+        java.nio.file.Path folder = filesDir.resolve(ProbeJobs.OWNER.toString());
+        if (!java.nio.file.Files.isDirectory(folder)) {
+            return java.util.Set.of();
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> entries = java.nio.file.Files.list(folder)) {
+            return entries.map(entry -> entry.getFileName().toString()).collect(java.util.stream.Collectors.toSet());
+        }
     }
 
     private byte[] readBack(UUID owner, UUID fileId, int pieces) {

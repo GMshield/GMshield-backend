@@ -55,7 +55,8 @@ import tools.jackson.databind.json.JsonMapper;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-            "gmshield.materials.upload-sweep.enabled=false"})
+            "gmshield.materials.upload-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-job-it",
+            "gmshield.jobs.output-max-bytes=6MB", "gmshield.jobs.output-claim-max-bytes=10MB"})
 @ActiveProfiles("test-mode")
 class JobIntegrationTest {
 
@@ -113,6 +114,10 @@ class JobIntegrationTest {
     private PlatformTransactionManager transactions;
     @Autowired
     private TestClock clock;
+    @Autowired
+    private io.github.gmshield.jobs.service.JobFiles jobFiles;
+    @Autowired
+    private io.github.gmshield.vault.service.FileStore files;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -290,6 +295,75 @@ class JobIntegrationTest {
 
         assertThat(order).containsExactly(a1, b1, a2);
         assertThat(jobIds(INGESTION)).containsExactly(a1.toString(), b1.toString(), a2.toString());
+    }
+
+    // ---- job outputs (Story 1.15), against PostgreSQL
+
+    @Test
+    void anOutputStillBeingWrittenIsSweptOnlyOnceItsJobEndedMoreThanTheGraceAgo() throws Exception {
+        UUID id = createProbe("interactive", 0, 0);
+        JsonNode claim = json(post("/internal/v1/jobs/" + id + "/claims", null), 201);
+        UUID stored = store(id, claim, 1000).fileId();
+        UUID writing = UUID.randomUUID();
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        jdbc.sql("insert into job_output (id, job_id, owner_id, claim_id, state, created_at, updated_at)"
+                        + " values (?, ?, ?, ?, 'writing', ?, ?)")
+                .params(writing, id, ProbeJobs.OWNER, UUID.fromString(claim.path("claimId").asString()),
+                        java.sql.Timestamp.from(now), java.sql.Timestamp.from(now)).update();
+        files.writePiece(ProbeJobs.OWNER, writing, 0, new byte[] {1, 2, 3});
+        sweep.sweep();
+        assertThat(outputs(id)).containsExactlyInAnyOrder(stored, writing);   // the job still runs
+
+        assertThat(post("/internal/v1/jobs/" + id + "/claims/" + claim.path("claimId").asString() + "/outcome",
+                "{\"outcome\":\"done\"}", "X-Job-Grant", claim.path("grant").asString()).statusCode()).isEqualTo(204);
+        sweep.sweep();
+        // The stored output nobody adopted goes at once; the one still being written waits for its writer.
+        assertThat(outputs(id)).containsExactly(writing);
+        assertThat(files.fileExists(ProbeJobs.OWNER, stored)).isFalse();
+        clock.advance(Duration.ofMinutes(10).minusSeconds(1));
+        sweep.sweep();
+        assertThat(outputs(id)).containsExactly(writing);
+        assertThat(files.fileExists(ProbeJobs.OWNER, writing)).isTrue();
+        clock.advance(Duration.ofSeconds(1));
+        sweep.sweep();
+        assertThat(outputs(id)).isEmpty();
+        assertThat(files.fileExists(ProbeJobs.OWNER, writing)).isFalse();
+    }
+
+    @Test
+    void aClaimsLimitCountsOnlyItsOwnStoredOutputs() throws Exception {
+        UUID id = createProbe("interactive", 0, 0);
+        JsonNode claim = json(post("/internal/v1/jobs/" + id + "/claims", null), 201);
+        UUID claimId = UUID.fromString(claim.path("claimId").asString());
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        int nine = 9 * 1024 * 1024;
+        // Neither counts: one is still being written, the other is another claim's.
+        for (Object[] row : new Object[][] {{claimId, "writing"}, {UUID.randomUUID(), "stored"}}) {
+            jdbc.sql("insert into job_output (id, job_id, owner_id, claim_id, state, size_bytes, piece_count, created_at,"
+                            + " updated_at) values (?, ?, ?, ?, ?, ?, 3, ?, ?)")
+                    .params(UUID.randomUUID(), id, ProbeJobs.OWNER, row[0], row[1], nine, java.sql.Timestamp.from(now),
+                            java.sql.Timestamp.from(now)).update();
+        }
+
+        store(id, claim, 6 * 1024 * 1024);
+        store(id, claim, 4 * 1024 * 1024);
+
+        // 10 MiB stored by this claim: one byte more passes the claim's limit, and nothing of it remains.
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> store(id, claim, 1))
+                .isInstanceOf(io.github.gmshield.shared.service.ApiException.class)
+                .satisfies(thrown -> assertThat(((io.github.gmshield.shared.service.ApiException) thrown).problem().code())
+                        .isEqualTo("job.output_too_large"));
+        assertThat(jdbc.sql("select count(*) from job_output where job_id = ? and state = 'stored' and claim_id = ?")
+                .params(id, claimId).query(Long.class).single()).isEqualTo(2);
+    }
+
+    private io.github.gmshield.jobs.service.JobFiles.Stored store(UUID id, JsonNode claim, int size) {
+        return jobFiles.store(id, UUID.fromString(claim.path("claimId").asString()), claim.path("grant").asString(), -1,
+                new java.io.ByteArrayInputStream(new byte[size]));
+    }
+
+    private List<UUID> outputs(UUID jobId) {
+        return jdbc.sql("select id from job_output where job_id = ?").param(jobId).query(UUID.class).list();
     }
 
     // ---- helpers

@@ -321,6 +321,23 @@ class IngestionFlowTest {
         assertThat(nextClaim.path("input").path("pageTotal").asInt()).isEqualTo(2);
         assertThat(nextClaim.path("input").path("pipelineVersion").asString()).isEqualTo("1");
         assertThat(input(offered.jobId(), nextClaim, "source").body()).hasSize(4000);
+
+        // Another page total than the one recorded: refused, nothing changes.
+        HttpResponse<String> changedTotal = outcome(offered.jobId(), nextClaim,
+                "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"1\",\"pageTotal\":3}}");
+        assertThat(changedTotal.statusCode()).isEqualTo(400);
+        assertThat(json(changedTotal).path("code").asString()).isEqualTo("job.result_invalid");
+        assertThat(jobs.row(offered.jobId()).state()).isEqualTo("running");
+        assertThat(materials.versions.get(uploaded.versionId()).pageTotal()).isEqualTo(2);
+        assertThat(materials.versions.get(uploaded.versionId()).state()).isEqualTo("processing");
+        // Another pipeline version than the chain's first: the version fails, and the first one stays recorded.
+        assertThat(outcome(offered.jobId(), nextClaim,
+                "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"2\",\"pageTotal\":2}}").statusCode())
+                .isEqualTo(204);
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("failed");
+        assertThat(version.failureCode()).isEqualTo("ingestion.pipeline_changed");
+        assertThat(version.pipelineVersion()).isEqualTo("1");
     }
 
     // --- failures
@@ -369,6 +386,25 @@ class IngestionFlowTest {
         assertThat(materials.versions.get(uploaded.versionId()).failureCode()).isEqualTo("ingestion.file_unreadable");
         assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("failure").asString())
                 .isEqualTo("ingestion.file_unreadable");
+    }
+
+    @Test
+    void aFinalFailureWithACodeOutsideIngestionOrNoneIsRecordedAsAStepFailure() throws Exception {
+        Gm gm = signUp();
+        for (String body : List.of("{\"outcome\":\"failed\",\"code\":\"worker.handler_failed\",\"retry\":false}",
+                "{\"outcome\":\"failed\",\"retry\":false}")) {
+            Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+            JsonNode claim = claim(uploaded.jobId());
+
+            assertThat(outcome(uploaded.jobId(), claim, body).statusCode()).as(body).isEqualTo(204);
+
+            assertThat(jobs.row(uploaded.jobId()).state()).isEqualTo("failed");
+            VersionRow version = materials.versions.get(uploaded.versionId());
+            assertThat(version.state()).as(body).isEqualTo("failed");
+            assertThat(version.failureCode()).as(body).isEqualTo("ingestion.step_failed");
+            assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("failure").asString())
+                    .isEqualTo("ingestion.step_failed");
+        }
     }
 
     @Test
