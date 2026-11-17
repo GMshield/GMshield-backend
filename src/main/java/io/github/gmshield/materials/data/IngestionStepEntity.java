@@ -11,7 +11,7 @@ import org.hibernate.annotations.TenantId;
 /**
  * {@code ingestion_step} (Story 1.15): Hibernate fills {@code owner_id} from the owner of the work and filters every
  * query by it. Its version is a plain id: the database's key on (owner, version) keeps it within the same owner.
- * Written once, never changed.
+ * Written once; only {@code ended_at} changes, once (Story 1.16).
  */
 @Entity(name = "IngestionStep")
 @Table(name = "ingestion_step")
@@ -46,6 +46,9 @@ class IngestionStepEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    @Column(name = "ended_at")
+    private Instant endedAt;
+
     protected IngestionStepEntity() {
         // for Hibernate
     }
@@ -60,9 +63,17 @@ class IngestionStepEntity {
         this.lastPage = row.lastPage();
         this.inputFileId = row.inputFileId();
         this.createdAt = row.createdAt();
+        this.endedAt = row.endedAt();
+    }
+
+    /** The step ended at {@code now}; a step that ended already keeps its time. */
+    void end(Instant now) {
+        if (endedAt == null) {
+            endedAt = now;
+        }
     }
 
     StepRow row() {
-        return new StepRow(id, ownerId, versionId, jobId, stage, firstPage, lastPage, inputFileId, createdAt);
+        return new StepRow(id, ownerId, versionId, jobId, stage, firstPage, lastPage, inputFileId, createdAt, endedAt);
     }
 }

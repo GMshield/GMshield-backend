@@ -1,6 +1,8 @@
 package io.github.gmshield.materials.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -23,6 +25,7 @@ import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialTestStores;
+import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionFileRow;
@@ -41,8 +44,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -60,14 +65,18 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Story 1.15 without a database or Redis: every backend row of the I/O matrix, from the GM's upload through the
  * worker's claim, its input and outputs and its report, to what the GM reads. The chain, the version's states, the
- * adopted files, the raw upload's removal, the failures and the step cap. The same tables against PostgreSQL are in
- * {@code IngestionIntegrationTest}.
+ * adopted files, the raw upload's removal, the failures and the step cap. Story 1.16 too: triage and layout steps, the
+ * page ranges and their refusals, {@code pages.done}, the end of the chain, a retried and a re-offered step, the
+ * restart on a pipeline change, a text upload's step, and the cross-owner test of the page ranges. The same tables
+ * against PostgreSQL are in {@code IngestionIntegrationTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -131,6 +140,8 @@ class IngestionFlowTest {
     private FileStore files;
     @Autowired
     private Vault vault;
+    @Autowired
+    private PlatformTransactionManager transactions;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -217,17 +228,24 @@ class IngestionFlowTest {
     }
 
     @Test
-    void aTextMarkdownOrImageUploadGetsNoStepAndStaysWaiting() throws Exception {
+    void aTextOrMarkdownUploadGetsOneTextStepOverItsRawFileAndAnImageStaysWaiting() throws Exception {
         Gm gm = signUp();
         byte[] text = "Regras da casa\n".repeat(400).getBytes(StandardCharsets.UTF_8);
-        byte[] png = png(6000);
-        for (Uploaded uploaded : List.of(upload(gm, text, "notas.txt", null), upload(gm, text, "notas.md", null),
-                upload(gm, png, "mapa.png", null))) {
-            assertThat(uploaded.jobId()).isNull();
-            assertThat(steps(uploaded.versionId())).isEmpty();
+        for (String name : List.of("notas.txt", "notas.md")) {
+            Uploaded uploaded = upload(gm, text, name, null);
+            assertThat(steps(uploaded.versionId())).singleElement().satisfies(step -> {
+                assertThat(step.stage()).isEqualTo("text");
+                assertThat(step.firstPage()).isNull();
+                assertThat(step.inputFileId()).isEqualTo(uploaded.uploadId());
+            });
             assertThat(state(gm, uploaded)).isEqualTo("waiting");
+            // One ingestion job at a time: this one ends before the next upload's is offered.
+            jobs.rows.computeIfPresent(uploaded.jobId(), (id, row) -> row.released("cancelled", null, row.updatedAt()));
         }
-        assertThat(jobs.rows.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        Uploaded image = upload(gm, png(6000), "mapa.png", null);
+        assertThat(image.jobId()).isNull();
+        assertThat(steps(image.versionId())).isEmpty();
+        assertThat(state(gm, image)).isEqualTo("waiting");
     }
 
     // --- a done clean step
@@ -259,9 +277,9 @@ class IngestionFlowTest {
         List<VersionFileRow> stored = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()));
         assertThat(stored).extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::firstPage,
                         VersionFileRow::lastPage)
-                .containsExactly(org.assertj.core.groups.Tuple.tuple("original", original, 1, 25),
-                        org.assertj.core.groups.Tuple.tuple("batch", batch1, 1, 20),
-                        org.assertj.core.groups.Tuple.tuple("batch", batch2, 21, 25));
+                .containsExactly(tuple("original", original, 1, 25),
+                        tuple("batch", batch1, 1, 20),
+                        tuple("batch", batch2, 21, 25));
         assertThat(stored.getFirst().sizeBytes()).isEqualTo(cleaned.length);
         assertThat(stored.getFirst().pieceCount()).isEqualTo(2);
         assertThat(readBack(gm.id(), original, 2)).isEqualTo(cleaned);
@@ -330,14 +348,19 @@ class IngestionFlowTest {
         assertThat(jobs.row(offered.jobId()).state()).isEqualTo("running");
         assertThat(materials.versions.get(uploaded.versionId()).pageTotal()).isEqualTo(2);
         assertThat(materials.versions.get(uploaded.versionId()).state()).isEqualTo("processing");
-        // Another pipeline version than the chain's first: the version fails, and the first one stays recorded.
+        // Another pipeline version than the chain's first counts as pipeline_changed: the chain restarts.
         assertThat(outcome(offered.jobId(), nextClaim,
                 "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"2\",\"pageTotal\":2}}").statusCode())
                 .isEqualTo(204);
         VersionRow version = materials.versions.get(uploaded.versionId());
-        assertThat(version.state()).isEqualTo("failed");
-        assertThat(version.failureCode()).isEqualTo("ingestion.pipeline_changed");
-        assertThat(version.pipelineVersion()).isEqualTo("1");
+        assertThat(version.state()).isEqualTo("processing");
+        assertThat(version.pipelineVersion()).isNull();
+        assertThat(version.pageTotal()).isEqualTo(2);
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).singleElement()
+                .satisfies(step -> {
+                    assertThat(step.stage()).isEqualTo("clean");
+                    assertThat(step.inputFileId()).isEqualTo(original);
+                });
     }
 
     // --- failures
@@ -490,6 +513,407 @@ class IngestionFlowTest {
         assertThat(uploads.row(uploaded.uploadId()).state()).isEqualTo(UploadRow.COMPLETE);
     }
 
+    // --- Story 1.16: reading pages
+
+    @Test
+    void aDigitalPdfOf45PagesGoesThroughThreeTriageAndThreeLayoutStepsToNeedsReview() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 45, "2");
+
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("triage"))
+                .extracting(StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
+                .containsExactlyInAnyOrder(tuple(1, 20, cleaned.batches().get(0)),
+                        tuple(21, 40, cleaned.batches().get(1)),
+                        tuple(41, 45, cleaned.batches().get(2)));
+        List<Integer> done = new ArrayList<>();
+        List<String> stages = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            JsonNode input = claim.path("input");
+            stages.add(input.path("stage").asString());
+            assertThat(input.path("attempt").asInt()).isEqualTo(1);
+            assertThat(input.path("pipelineVersion").asString()).isEqualTo("2");
+            assertThat(input.path("pageTotal").asInt()).isEqualTo(45);
+            VersionFileRow batch = batchOf(gm, uploaded, step.inputFileId());
+            assertThat(input.path("inputFileId").asString()).isEqualTo(batch.fileId().toString());
+            assertThat(input.path("inputFirstPage").asInt()).isEqualTo(batch.firstPage());
+            assertThat(input.path("inputLastPage").asInt()).isEqualTo(batch.lastPage());
+            if (input.path("stage").asString().equals("triage")) {
+                report(step, claim, triage(step, step.firstPage(), step.lastPage(), List.of()));
+            } else {
+                report(step, claim, layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
+            }
+            done.add(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("pages").path("done").asInt());
+        }
+
+        assertThat(stages).containsExactly("triage", "triage", "triage", "layout", "layout", "layout");
+        assertThat(done).containsExactly(0, 0, 0, 20, 40, 45);
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("needs_review");
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(45);
+        assertThat(read.path("pages").path("total").asInt()).isEqualTo(45);
+        assertThat(steps(uploaded.versionId())).hasSize(7).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .filteredOn(file -> file.role().equals("text")).extracting(VersionFileRow::firstPage)
+                .containsExactlyInAnyOrder(1, 21, 41);
+        assertThat(outcomes(uploaded.versionId())).extracting(row -> row.value()).containsOnly("read_directly");
+        assertThat(layers(uploaded.versionId())).extracting(row -> row.value()).containsOnly("text");
+        assertThat(json(get(gm, "/api/v1/materials?state=needs_review")).path("items").get(0).path("pages")
+                .path("done").asInt()).isEqualTo(45);
+    }
+
+    @Test
+    void aMixedPdfReadsItsTextPagesAndStaysProcessingWithItsImagePagesUnread() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Misto.pdf", null);
+        clean(uploaded, 45, "2");
+
+        for (int i = 0; i < 7; i++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            if (step.stage().equals("triage")) {
+                List<Integer> images = step.firstPage() == 1 ? List.of(6, 7) : List.of();
+                report(step, claim, triage(step, step.firstPage(), step.lastPage(), images));
+            } else {
+                report(step, claim, layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
+            }
+        }
+
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("layout"))
+                .extracting(StepRow::firstPage, StepRow::lastPage)
+                .containsExactlyInAnyOrder(tuple(1, 5),
+                        tuple(8, 20), tuple(21, 40),
+                        tuple(41, 45));
+        assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("processing");
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(43);
+        assertThat(read.path("pages").path("total").asInt()).isEqualTo(45);
+        assertThat(layers(uploaded.versionId())).filteredOn(row -> row.value().equals("image"))
+                .extracting(row -> row.firstPage(), row -> row.lastPage())
+                .containsExactly(tuple(6, 7));
+    }
+
+    @Test
+    void aLayoutStepThatFailsIsRetriedAsItsSecondAttemptAndAnUnreadablePageIsRecorded() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 20, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode first = claim(layout.jobId());
+        assertThat(outcome(layout.jobId(), first, "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\"}")
+                .statusCode()).isEqualTo(204);
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).hasSize(1);
+
+        JsonNode second = claim(layout.jobId());
+        assertThat(second.path("input").path("attempt").asInt()).isEqualTo(2);
+        report(layout, second, layout(layout, second, 1, 20, List.of(9)));
+
+        assertThat(outcomes(uploaded.versionId())).extracting(row -> row.firstPage(), row -> row.lastPage(),
+                        row -> row.value())
+                .containsExactly(tuple(1, 8, "read_directly"),
+                        tuple(9, 9, "unreadable"),
+                        tuple(10, 20, "read_directly"));
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("needs_review");
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(20);
+    }
+
+    @Test
+    void aStepWhoseWorkerDiedIsTakenBackWhenItsClaimLapsesAndFinishedStepsAreNotRerun() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 20, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        claim(layout.jobId());
+
+        // The worker is killed mid-layout: its claim lapses, and the sweep offers the step again.
+        jobs.rows.computeIfPresent(layout.jobId(), (id, row) -> new JobRow(row.id(), row.ownerId(), row.kind(),
+                row.lane(), row.state(), row.attempt(), row.traceId(), row.offeredAt(), row.claimId(), row.grantHash(),
+                row.claimRenewAt(), Instant.now().minusSeconds(1), row.outcomeCode(), row.createdAt(),
+                row.updatedAt()));
+        sweep.sweep();
+        assertThat(jobs.row(layout.jobId()).state()).isEqualTo("offered");
+        assertThat(offeredStep(uploaded.versionId()).jobId()).isEqualTo(layout.jobId());
+
+        JsonNode again = claim(layout.jobId());
+        report(layout, again, layout(layout, again, 1, 20, List.of()));
+
+        assertThat(steps(uploaded.versionId())).hasSize(3);
+        assertThat(jobs.row(uploaded.jobId()).attempt()).isEqualTo(1);
+        assertThat(jobs.row(triage.jobId()).attempt()).isEqualTo(1);
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(outcomes(uploaded.versionId())).hasSize(1);
+    }
+
+    @Test
+    void aStepFailedWithPipelineChangedRestartsTheChainFromTheCleanedOriginal() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 25, "1");
+        StepRow firstTriage = offeredStep(uploaded.versionId());
+        JsonNode triageClaim = claim(firstTriage.jobId());
+        assertThat(triageClaim.path("input").path("pipelineVersion").asString()).isEqualTo("1");
+        report(firstTriage, triageClaim, triage(firstTriage, firstTriage.firstPage(), firstTriage.lastPage(), List.of())
+                .replace("\"pipelineVersion\":\"2\"", "\"pipelineVersion\":\"1\""));
+        assertThat(layers(uploaded.versionId())).isNotEmpty();
+
+        // A worker of pipeline "2" claims the next step of this chain of pipeline "1".
+        StepRow secondTriage = offeredStep(uploaded.versionId());
+        JsonNode stale = claim(secondTriage.jobId());
+        assertThat(outcome(secondTriage.jobId(), stale,
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("processing");
+        assertThat(version.pipelineVersion()).isNull();
+        assertThat(version.pageTotal()).isEqualTo(25);
+        assertThat(version.failureCode()).isNull();
+        assertThat(layers(uploaded.versionId())).isEmpty();
+        assertThat(outcomes(uploaded.versionId())).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::role, VersionFileRow::fileId)
+                .containsExactly(tuple("original", cleaned.original()));
+        assertThat(cleaned.batches()).allSatisfy(batch -> assertThat(files.fileExists(gm.id(), batch)).isFalse());
+        // The old steps ended; the first layout step's job, which was waiting, is cancelled.
+        List<StepRow> steps = steps(uploaded.versionId());
+        StepRow oldLayout = steps.stream().filter(step -> step.stage().equals("layout")).findFirst().orElseThrow();
+        assertThat(jobs.row(oldLayout.jobId()).state()).isEqualTo("cancelled");
+        assertThat(jobs.row(secondTriage.jobId()).state()).isEqualTo("failed");
+        assertThat(steps).filteredOn(step -> step.endedAt() == null).singleElement().satisfies(step -> {
+            assertThat(step.stage()).isEqualTo("clean");
+            assertThat(step.inputFileId()).isEqualTo(cleaned.original());
+        });
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("pages").path("done").asInt())
+                .isZero();
+
+        // The new clean step reads the stored original; its report replaces it, under the new pipeline version.
+        StepRow restart = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(restart.jobId());
+        assertThat(claim.path("input").has("pipelineVersion")).isFalse();
+        assertThat(claim.path("input").path("pageTotal").asInt()).isEqualTo(25);
+        assertThat(claim.path("input").path("inputFileId").asString()).isEqualTo(cleaned.original().toString());
+        assertThat(input(restart.jobId(), claim, "source").body()).hasSize(cleaned.originalSize());
+        Cleaned again = cleanReport(restart.jobId(), claim, 25, "2");
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .filteredOn(file -> file.role().equals("original")).extracting(VersionFileRow::fileId)
+                .containsExactly(again.original());
+        assertThat(files.fileExists(gm.id(), cleaned.original())).isFalse();
+        assertThat(materials.versions.get(uploaded.versionId()).pipelineVersion()).isEqualTo("2");
+        assertThat(jobs.row(oldLayout.jobId()).state()).isEqualTo("cancelled");
+    }
+
+    @Test
+    void aReportUnderAnotherPipelineVersionRestartsTheChainLikeTheFailure() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 20, "1");
+        StepRow triage = offeredStep(uploaded.versionId());
+
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+
+        assertThat(jobs.row(triage.jobId()).state()).isEqualTo("done");
+        assertThat(layers(uploaded.versionId())).isEmpty();
+        assertThat(materials.versions.get(uploaded.versionId()).pipelineVersion()).isNull();
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).singleElement()
+                .satisfies(step -> assertThat(step.inputFileId()).isEqualTo(cleaned.original()));
+    }
+
+    @Test
+    void aPageGivenASecondLayerOrOutcomeOrTextOverAnUnreadPageIsRefusedAndNothingIsRecorded() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 20, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        JsonNode triageClaim = claim(triage.jobId());
+        UUID batch = cleaned.batches().getFirst();
+        for (String result : List.of(
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 5, "layer", "text") + ","
+                        + range(5, 6, "layer", "image") + "]}",
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 21, "layer", "text") + "]}",
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(0, 2, "layer", "text") + "]}",
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 2, "layer", "scan") + "]}",
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(3, 2, "outcome", "unreadable") + "]}",
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(1, 2, "outcome", "read") + "]}")) {
+            HttpResponse<String> refused = outcome(triage.jobId(), triageClaim,
+                    "{\"outcome\":\"done\",\"result\":" + result + "}");
+            assertThat(refused.statusCode()).as(result).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("job.result_invalid");
+        }
+        assertThat(layers(uploaded.versionId())).isEmpty();
+        // Two layout steps over the same pages: the backend does not interpret them, but a page is read once.
+        String twice = "{\"stage\":\"layout\",\"firstPage\":1,\"lastPage\":20,\"input\":\"" + batch + "\"}";
+        report(triage, triageClaim, "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 20, "layer", "text")
+                + "],\"next\":[" + twice + "," + twice + "]}");
+
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        UUID text = output(layout.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        for (String result : List.of(
+                // the same pages twice in one report
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(1, 10, "outcome", "read_directly") + ","
+                        + range(10, 20, "outcome", "read_directly") + "]}",
+                // a text file over a page with no outcome, or an unreadable one
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(1, 10, "outcome", "read_directly") + "],"
+                        + "\"texts\":[{\"fileId\":\"" + text + "\",\"firstPage\":1,\"lastPage\":11}]}",
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(1, 10, "outcome", "read_directly") + ","
+                        + range(11, 11, "outcome", "unreadable") + "],"
+                        + "\"texts\":[{\"fileId\":\"" + text + "\",\"firstPage\":1,\"lastPage\":11}]}",
+                // a layer for a page triage already gave one
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(4, 4, "layer", "image") + "]}")) {
+            HttpResponse<String> refused = outcome(layout.jobId(), claim, "{\"outcome\":\"done\",\"result\":" + result + "}");
+            assertThat(refused.statusCode()).as(result).isEqualTo(400);
+        }
+        assertThat(outcomes(uploaded.versionId())).isEmpty();
+        assertThat(jobs.row(layout.jobId()).state()).isEqualTo("running");
+        report(layout, claim, "{\"pipelineVersion\":\"2\",\"pages\":[" + range(1, 20, "outcome", "read_directly")
+                + "],\"texts\":[{\"fileId\":\"" + text + "\",\"firstPage\":1,\"lastPage\":20}]}");
+
+        // An outcome a second time, from a later report: refused, nothing recorded.
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        StepRow extra = offeredStep(uploaded.versionId());
+        JsonNode extraClaim = claim(extra.jobId());
+        HttpResponse<String> repeated = outcome(extra.jobId(), extraClaim, "{\"outcome\":\"done\",\"result\":"
+                + "{\"pipelineVersion\":\"2\",\"pages\":[" + range(20, 20, "outcome", "unreadable") + "]}}");
+        assertThat(repeated.statusCode()).isEqualTo(400);
+        assertThat(json(repeated).path("code").asString()).isEqualTo("job.result_invalid");
+        assertThat(outcomes(uploaded.versionId())).hasSize(1);
+    }
+
+    @Test
+    void aTextUploadsReportGivesItsOriginalItsPagesAndItsTextsAndEndsTheChain() throws Exception {
+        Gm gm = signUp();
+        byte[] text = "# Regras\n\nTexto da casa.\n".repeat(300).getBytes(StandardCharsets.UTF_8);
+        Uploaded uploaded = upload(gm, text, "regras.md", null);
+        JsonNode claim = claim(uploaded.jobId());
+        assertThat(claim.path("input").path("stage").asString()).isEqualTo("text");
+        assertThat(claim.path("input").path("format").asString()).isEqualTo("markdown");
+        assertThat(claim.path("input").has("pipelineVersion")).isFalse();
+        assertThat(claim.path("input").has("inputFileId")).isFalse();
+        assertThat(input(uploaded.jobId(), claim, "source").body()).isEqualTo(text);
+        UUID original = output(uploaded.jobId(), claim, text);
+        UUID pages1 = output(uploaded.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        UUID pages2 = output(uploaded.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+
+        HttpResponse<String> reported = outcome(uploaded.jobId(), claim, "{\"outcome\":\"done\",\"result\":{"
+                + "\"pipelineVersion\":\"2\",\"pageTotal\":600,\"original\":{\"fileId\":\"" + original + "\"},"
+                + "\"pages\":[" + range(1, 600, "outcome", "read_directly") + "],"
+                + "\"texts\":[{\"fileId\":\"" + pages1 + "\",\"firstPage\":1,\"lastPage\":500},"
+                + "{\"fileId\":\"" + pages2 + "\",\"firstPage\":501,\"lastPage\":600}],\"next\":[]}}");
+
+        assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("needs_review");
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(600);
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::firstPage,
+                        VersionFileRow::lastPage)
+                .containsExactlyInAnyOrder(tuple("original", original, 1, 600),
+                        tuple("text", pages1, 1, 500),
+                        tuple("text", pages2, 501, 600));
+        assertThat(readBack(gm.id(), original, 1)).isEqualTo(text);
+        assertThat(uploads.rows).doesNotContainKey(uploaded.uploadId());
+        assertThat(layers(uploaded.versionId())).isEmpty();
+    }
+
+    @Test
+    void aFinalFailureOfOneStepFailsTheVersionAndCancelsItsOtherSteps() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 45, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode()).isEqualTo(204);
+
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("failed");
+        assertThat(version.failureCode()).isEqualTo("ingestion.step_failed");
+        List<StepRow> siblings = steps(uploaded.versionId()).stream()
+                .filter(step -> step.stage().equals("triage") && !step.jobId().equals(triage.jobId())).toList();
+        assertThat(siblings).hasSize(2)
+                .allSatisfy(step -> assertThat(jobs.row(step.jobId()).state()).isEqualTo("cancelled"));
+        assertThat(steps(uploaded.versionId())).hasSize(4).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+    }
+
+    @Test
+    void aRestartedTextUploadsFirstReportMayGiveAnotherPageTotalAndEndsInNeedsReview() throws Exception {
+        Gm gm = signUp();
+        byte[] text = "# Regras\n\nTexto da casa.\n".repeat(50).getBytes(StandardCharsets.UTF_8);
+        Uploaded uploaded = upload(gm, text, "regras.md", null);
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, text);
+        UUID pages = output(uploaded.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        // Pipeline "1" reads pages 1 and 2 of 3, and leaves page 3 to a later step over the original.
+        assertThat(outcome(uploaded.jobId(), claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"1\","
+                + "\"pageTotal\":3,\"original\":{\"fileId\":\"" + original + "\"},\"pages\":["
+                + range(1, 2, "outcome", "read_directly") + "],\"texts\":[{\"fileId\":\"" + pages
+                + "\",\"firstPage\":1,\"lastPage\":2}],\"next\":[{\"stage\":\"text\",\"firstPage\":3,\"lastPage\":3,"
+                + "\"input\":\"" + original + "\"}]}}").statusCode()).isEqualTo(204);
+        StepRow later = offeredStep(uploaded.versionId());
+        assertThat(outcome(later.jobId(), claim(later.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(materials.versions.get(uploaded.versionId()).pageTotal()).isEqualTo(3);
+
+        // Pipeline "2" splits the same file into 5 pages: its first report sets the new page total.
+        StepRow restart = offeredStep(uploaded.versionId());
+        assertThat(restart.stage()).isEqualTo("text");
+        assertThat(restart.inputFileId()).isEqualTo(original);
+        JsonNode again = claim(restart.jobId());
+        assertThat(again.path("input").has("pipelineVersion")).isFalse();
+        UUID newOriginal = output(restart.jobId(), again, text);
+        UUID newPages = output(restart.jobId(), again, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+        report(restart, again, "{\"pipelineVersion\":\"2\",\"pageTotal\":5,\"original\":{\"fileId\":\"" + newOriginal
+                + "\"},\"pages\":[" + range(1, 5, "outcome", "read_directly") + "],\"texts\":[{\"fileId\":\""
+                + newPages + "\",\"firstPage\":1,\"lastPage\":5}],\"next\":[]}");
+
+        VersionRow version = materials.versions.get(uploaded.versionId());
+        assertThat(version.state()).isEqualTo("needs_review");
+        assertThat(version.pageTotal()).isEqualTo(5);
+        assertThat(version.pipelineVersion()).isEqualTo("2");
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(5);
+        assertThat(read.path("pages").path("total").asInt()).isEqualTo(5);
+        // Only the new original and the new text file remain.
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::role, VersionFileRow::fileId, VersionFileRow::lastPage)
+                .containsExactlyInAnyOrder(tuple("original", newOriginal, 5), tuple("text", newPages, 5));
+    }
+
+    @Test
+    void anotherOwnersPageLayersAndOutcomesAreNeverSeenNorWritten() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        Uploaded uploaded = upload(a, pdf(MIB), "Segredo.pdf", null);
+        clean(uploaded, 20, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of(3)));
+
+        OwnerContext.runAs(b.id(), () -> {
+            assertThat(materials.pageLayers(uploaded.versionId())).isEmpty();
+            assertThat(materials.layerOverlaps(uploaded.versionId(), 1, 20)).isFalse();
+            assertThat(materials.outcomesWithin(uploaded.versionId(), 1, 20)).isEmpty();
+            assertThat(materials.pagesDone(List.of(uploaded.versionId()))).isEmpty();
+        });
+        OwnerContext.runAs(a.id(), () -> assertThat(materials.pageLayers(uploaded.versionId())).hasSize(3));
+        assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () ->
+                new TransactionTemplate(transactions).executeWithoutResult(
+                        status -> materials.insertPageOutcome(new PageRangeRow(
+                                UUID.randomUUID(), b.id(), uploaded.versionId(), 1, 1, "unreadable",
+                                Instant.now())))))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(materials.outcomes.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
+    }
+
     // --- owners
 
     @Test
@@ -514,6 +938,116 @@ class IngestionFlowTest {
         HttpResponse<String> theirs = get(b, "/api/v1/materials/" + uploaded.materialId());
         assertThat(theirs.statusCode()).isEqualTo(404);
         assertThat(theirs.body()).doesNotContain("pages").doesNotContain(uploaded.materialId());
+    }
+
+    // --- Story 1.16 helpers
+
+    /** A clean step's report: the original and its batches of 20 pages, and one triage step per batch. */
+    record Cleaned(UUID original, int originalSize, List<UUID> batches) {
+    }
+
+    private Cleaned clean(Uploaded uploaded, int total, String pipeline) throws Exception {
+        return cleanReport(uploaded.jobId(), claim(uploaded.jobId()), total, pipeline);
+    }
+
+    private Cleaned cleanReport(UUID jobId, JsonNode claim, int total, String pipeline) throws Exception {
+        byte[] cleaned = pdf(4000 + total);
+        UUID original = output(jobId, claim, cleaned);
+        List<UUID> batches = new ArrayList<>();
+        StringBuilder batchJson = new StringBuilder();
+        StringBuilder next = new StringBuilder();
+        for (int first = 1; first <= total; first += 20) {
+            int last = Math.min(total, first + 19);
+            UUID batch = output(jobId, claim, pdf(3000));
+            batches.add(batch);
+            String comma = first == 1 ? "" : ",";
+            batchJson.append(comma).append("{\"fileId\":\"").append(batch).append("\",\"firstPage\":").append(first)
+                    .append(",\"lastPage\":").append(last).append('}');
+            next.append(comma).append("{\"stage\":\"triage\",\"firstPage\":").append(first).append(",\"lastPage\":")
+                    .append(last).append(",\"input\":\"").append(batch).append("\"}");
+        }
+        HttpResponse<String> reported = outcome(jobId, claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\""
+                + pipeline + "\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\"" + original + "\"},"
+                + "\"batches\":[" + batchJson + "],\"next\":[" + next + "]}}");
+        assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+        return new Cleaned(original, cleaned.length, batches);
+    }
+
+    /** A triage report: every page of the run a text page but {@code images}, a layout step per run of text pages. */
+    private static String triage(StepRow step, int first, int last, List<Integer> images) {
+        StringBuilder layers = new StringBuilder();
+        StringBuilder next = new StringBuilder();
+        int start = first;
+        for (int page = first; page <= last + 1; page++) {
+            boolean boundary = page > last || images.contains(page) != images.contains(start);
+            if (!boundary) {
+                continue;
+            }
+            boolean image = images.contains(start);
+            layers.append(layers.isEmpty() ? "" : ",").append(range(start, page - 1, "layer", image ? "image" : "text"));
+            if (!image) {
+                next.append(next.isEmpty() ? "" : ",").append("{\"stage\":\"layout\",\"firstPage\":").append(start)
+                        .append(",\"lastPage\":").append(page - 1).append(",\"input\":\"").append(step.inputFileId())
+                        .append("\"}");
+            }
+            start = page;
+        }
+        return "{\"pipelineVersion\":\"2\",\"layers\":[" + layers + "],\"next\":[" + next + "]}";
+    }
+
+    /** A layout report: every page read directly but {@code unreadable}, one text file per run of read pages. */
+    private String layout(StepRow step, JsonNode claim, int first, int last, List<Integer> unreadable) throws Exception {
+        StringBuilder pages = new StringBuilder();
+        StringBuilder texts = new StringBuilder();
+        int start = first;
+        for (int page = first; page <= last + 1; page++) {
+            boolean boundary = page > last || unreadable.contains(page) != unreadable.contains(start);
+            if (!boundary) {
+                continue;
+            }
+            boolean lost = unreadable.contains(start);
+            pages.append(pages.isEmpty() ? "" : ",").append(range(start, page - 1, "outcome",
+                    lost ? "unreadable" : "read_directly"));
+            if (!lost) {
+                UUID text = output(step.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
+                texts.append(texts.isEmpty() ? "" : ",").append("{\"fileId\":\"").append(text)
+                        .append("\",\"firstPage\":").append(start).append(",\"lastPage\":").append(page - 1).append('}');
+            }
+            start = page;
+        }
+        return "{\"pipelineVersion\":\"2\",\"pages\":[" + pages + "],\"texts\":[" + texts + "],\"next\":[]}";
+    }
+
+    private static String range(int first, int last, String field, String value) {
+        return "{\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"" + field + "\":\"" + value + "\"}";
+    }
+
+    private void report(StepRow step, JsonNode claim, String result) throws Exception {
+        HttpResponse<String> reported = outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":" + result + "}");
+        assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+    }
+
+    /** The version's one step whose job is offered: one ingestion job at a time. */
+    private StepRow offeredStep(UUID versionId) {
+        return steps(versionId).stream().filter(step -> jobs.row(step.jobId()).state().equals("offered"))
+                .reduce((first, second) -> {
+                    throw new AssertionError("two offered steps");
+                }).orElseThrow(() -> new AssertionError("no offered step"));
+    }
+
+    private VersionFileRow batchOf(Gm gm, Uploaded uploaded, UUID fileId) {
+        return OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())).stream()
+                .filter(file -> file.fileId().equals(fileId)).findFirst().orElseThrow();
+    }
+
+    private List<PageRangeRow> layers(UUID versionId) {
+        return materials.layers.values().stream().filter(row -> row.versionId().equals(versionId))
+                .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
+    }
+
+    private List<PageRangeRow> outcomes(UUID versionId) {
+        return materials.outcomes.values().stream().filter(row -> row.versionId().equals(versionId))
+                .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
     }
 
     // --- helpers

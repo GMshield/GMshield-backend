@@ -278,6 +278,25 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     `pipeline_version`, `failure_code`; the library tables `ingestion_step` and `version_file`, owner-scoped as in
     V4 and V7). The public read (contract 1.6.0) adds `pages: {done, total}` once the total is known (`done` is 0
     until Story 1.16) and `failure` (the code) when the state is `failed`.
+- **Reading pages (`materials` and `jobs`, Story 1.16, internal contract 1.3.0).** A completed TXT or Markdown upload
+  gets one step too (stage `text`); images still stay `waiting`. The claim input adds `attempt` and, when the step
+  reads a file of the version, `inputFileId`, `inputFirstPage` and `inputLastPage`; it carries the chain's
+  `pipelineVersion` from the second step on. A report may add, all optional and every range inclusive,
+  `layers: [{firstPage, lastPage, layer: text|image}]`, `pages: [{firstPage, lastPage, outcome:
+  read_directly|read_by_ocr|unreadable}]` and `texts: [{fileId, firstPage, lastPage}]` (each adopted as a
+  `version_file` with role `text`). It is refused with `job.result_invalid` when a range is outside 1 to the page
+  total, a page gets a layer or an outcome a second time (in this report or an earlier one; checked in JPQL with the
+  version locked), or a `texts` range covers a page without an outcome other than `unreadable`.
+  - Each `ingestion_step` gets `ended_at` when its job is completed, finally fails or is cancelled. A report that
+    leaves no step unended while every page has an outcome makes the version `needs_review` in the same
+    transaction. `pages.done` is the number of pages with an outcome.
+  - `ingestion.pipeline_changed` (a failed step, or a report under another pipeline version) restarts the chain in
+    one transaction: the version's other unended step jobs are cancelled (`Jobs.cancel`, which also ends a running
+    claim), its layers, outcomes, `batch` and `text` files go, `pipeline_version` is cleared (`page_total` stays),
+    and a new first step (`clean`, or `text` for a text upload) reads the stored original; the next report's original
+    replaces it. A final failure with another code fails the version and cancels its other steps.
+  - `V10__page_ranges.sql`: the library tables `page_layer` and `page_outcome` (owner, id, version, first, last,
+    value), owner-scoped as in V9; `ingestion_step.ended_at`; `version_file.role` gains `text`.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

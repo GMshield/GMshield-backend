@@ -9,6 +9,7 @@ import io.github.gmshield.shared.service.TraceContext;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
@@ -21,12 +22,15 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * Creates jobs (Story 1.12). A job is written in the caller's transaction, as the work of the owner bound in the
  * {@link OwnerContext}: when that transaction rolls back there is no job and no message. After the commit the job
  * is offered on its lane's stream (an interactive job at once; an ingestion job when the lane is free). If Redis
- * fails then, the job is still recorded and the sweep offers it.
+ * fails then, the job is still recorded and the sweep offers it. A job can be cancelled in its owner's transaction
+ * (Story 1.16).
  */
 @Service
 public class Jobs {
 
     private static final Logger log = LoggerFactory.getLogger(Jobs.class);
+    /** The states a job can be cancelled in: it has not ended. */
+    private static final Set<String> CANCELLABLE = Set.of(JobState.WAITING, JobState.OFFERED, JobState.RUNNING);
 
     private final JobStorage storage;
     private final JobHandlers handlers;
@@ -111,5 +115,46 @@ public class Jobs {
         JobOutputRow row = found.get();
         log.atDebug().addKeyValue("jobId", job.id()).addKeyValue("fileId", fileId).log("job.output_adopted");
         return Optional.of(new JobOutput(row.id(), row.sizeBytes(), row.pieceCount()));
+    }
+
+    /**
+     * Cancels a job of the bound owner (Story 1.16), inside the caller's transaction: a {@code waiting},
+     * {@code offered} or {@code running} job becomes {@code cancelled}. A running job's claim ends with it, so its
+     * later renewal, output or report gets the refusal of any ended claim ({@code job.grant_refused}); its outputs go
+     * with the jobs sweep. When the lane was busy with it, the ingestion lane's next job is offered after the commit.
+     * False when the job is unknown, another owner's, or ended already.
+     */
+    public boolean cancel(UUID jobId) {
+        Objects.requireNonNull(jobId, "jobId");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("jobs.transaction_required");
+        }
+        UUID owner = OwnerContext.require();
+        Optional<JobRow> found = storage.joined().findForUpdate(jobId)
+                .filter(row -> row.ownerId().equals(owner) && CANCELLABLE.contains(row.state()));
+        if (found.isEmpty()) {
+            return false;
+        }
+        JobRow row = found.get();
+        if (!storage.joined().replace(row, row.released(JobState.CANCELLED, null, clock.now()))) {
+            return false;
+        }
+        boolean heldTheLane = !JobState.WAITING.equals(row.state());
+        if (heldTheLane && Lane.of(row.lane()).orElse(null) == Lane.INGESTION) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    try {
+                        offers.offerNextIngestion();
+                    } catch (RuntimeException failure) {
+                        // Never the caller's failure: the sweep offers the lane's next job.
+                        log.atWarn().addKeyValue("errorType", failure.getClass().getName()).log("job.offer_failed");
+                    }
+                }
+            });
+        }
+        JobTrace.run(row.traceId(), () -> log.atInfo().addKeyValue("jobId", jobId).addKeyValue("state", row.state())
+                .addKeyValue("attempt", row.attempt()).log("job.cancelled"));
+        return true;
     }
 }

@@ -1,6 +1,7 @@
 package io.github.gmshield.jobs.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -676,7 +677,7 @@ class JobFlowTest extends HttpTestSupport {
                 }
             };
 
-            org.assertj.core.api.Assertions.assertThatThrownBy(() -> jobFiles.store(id,
+            assertThatThrownBy(() -> jobFiles.store(id,
                             UUID.fromString(claim.path("claimId").asString()), claim.path("grant").asString(), -1, body))
                     .isInstanceOf(io.github.gmshield.shared.service.ApiException.class)
                     .satisfies(thrown -> assertThat(((io.github.gmshield.shared.service.ApiException) thrown).problem()
@@ -725,6 +726,63 @@ class JobFlowTest extends HttpTestSupport {
         assertThat(files.fileExists(ProbeJobs.OWNER, writing)).isFalse();
     }
 
+    // ---- cancel (Story 1.16)
+
+    @Test
+    void aRunningJobCancelledByItsOwnerEndsItsClaimSoItsLaterRenewalOutputAndReportAreRefused() throws Exception {
+        UUID owner = UUID.randomUUID();
+        UUID id = createAs(owner, Lane.INGESTION);
+        JsonNode claim = json(claim(id));
+        String claimId = claim.path("claimId").asString();
+        String grant = claim.path("grant").asString();
+
+        assertThat(cancelAs(UUID.randomUUID(), id)).as("another owner's job").isFalse();
+        assertThat(storage.row(id).state()).isEqualTo("running");
+        assertThat(cancelAs(owner, id)).isTrue();
+
+        JobRow cancelled = storage.row(id);
+        assertThat(cancelled.state()).isEqualTo("cancelled");
+        assertThat(cancelled.grantHash()).isNull();
+        assertThat(cancelled.attempt()).isEqualTo(1);
+        assertProblem(renew(id, claimId, grant), 403, "job.grant_refused");
+        assertProblem(postOutput(id, claim, bytes(1000), true), 403, "job.grant_refused");
+        assertProblem(outcome(id, claimId, grant, "{\"outcome\":\"done\"}"), 403, "job.grant_refused");
+        assertThat(storage.row(id).state()).isEqualTo("cancelled");
+        assertThat(storage.outputs).isEmpty();
+        // Ended: a second cancel changes nothing, and neither does a claim.
+        assertThat(cancelAs(owner, id)).isFalse();
+        assertProblem(claim(id), 409, "job.not_offered");
+        assertThat(logEvents()).contains("job.cancelled");
+    }
+
+    @Test
+    void waitingAndOfferedJobsCancelTooAndTheIngestionLaneMovesOn() {
+        UUID owner = UUID.randomUUID();
+        UUID first = createAs(owner, Lane.INGESTION);
+        UUID second = createAs(owner, Lane.INGESTION);
+        assertThat(storage.row(first).state()).isEqualTo("offered");
+        assertThat(storage.row(second).state()).isEqualTo("waiting");
+
+        assertThat(cancelAs(owner, second)).isTrue();
+        assertThat(storage.row(second).state()).isEqualTo("cancelled");
+        assertThat(storage.row(first).state()).isEqualTo("offered");
+
+        UUID third = createAs(owner, Lane.INGESTION);
+        assertThat(cancelAs(owner, first)).isTrue();
+        // The lane was busy with the offered job: once it is cancelled, the next one is offered.
+        assertThat(storage.row(first).state()).isEqualTo("cancelled");
+        assertThat(storage.row(third).state()).isEqualTo("offered");
+    }
+
+    @Test
+    void cancelNeedsATransaction() {
+        UUID owner = UUID.randomUUID();
+        UUID id = createAs(owner, Lane.INTERACTIVE);
+        assertThatThrownBy(() -> OwnerContext.runAs(owner, () -> jobs.cancel(id)))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(storage.row(id).state()).isEqualTo("offered");
+    }
+
     // ---- trace
 
     @Test
@@ -760,6 +818,10 @@ class JobFlowTest extends HttpTestSupport {
                 : postJson(PROBES, body, "traceparent", "00-" + trace + "-00f067aa0ba902b7-01");
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
         return UUID.fromString(json(created).path("id").asString());
+    }
+
+    private boolean cancelAs(UUID owner, UUID id) {
+        return OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> jobs.cancel(id)));
     }
 
     private UUID createAs(UUID owner, Lane lane) {

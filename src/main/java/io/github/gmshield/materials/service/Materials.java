@@ -25,7 +25,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * The owner's materials as the interface shows them (Story 1.14): each with its name, decrypted, and the state of its
  * newest version, which is the material's state; while that version is {@code uploading}, the upload's progress too;
- * from Story 1.15, its pages once the page total is known and the failure code of a failed version.
+ * from Story 1.15, its pages once the page total is known and the failure code of a failed version; from Story 1.16,
+ * the pages done are the pages its chain gave an outcome.
  * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
  * Nothing here logs a name.
  */
@@ -56,7 +57,7 @@ public class Materials {
     public record Upload(UUID id, long offset, long length, Instant expiresAt) {
     }
 
-    /** Pages read of the version's page total (Story 1.15; {@code done} stays 0 until Story 1.16). */
+    /** Pages of the version's page total that have an outcome (Stories 1.15 and 1.16). */
     public record Pages(int done, int total) {
     }
 
@@ -103,6 +104,8 @@ public class Materials {
                 .filter(version -> Uploads.UPLOADING.equals(version.state())).map(version -> version.id()).toList();
         Map<UUID, UploadRow> open = uploads.joined().openForVersions(owner, uploading).stream()
                 .collect(Collectors.toMap(UploadRow::versionId, Function.identity(), (first, second) -> first));
+        Map<UUID, Long> done = materials.pagesDone(rows.stream().map(NewestVersion::version)
+                .filter(version -> version.pageTotal() != null).map(version -> version.id()).toList());
         return rows.stream().map(row -> {
             UploadRow upload = Uploads.UPLOADING.equals(row.version().state()) ? open.get(row.version().id()) : null;
             Integer total = row.version().pageTotal();
@@ -111,7 +114,8 @@ public class Materials {
                             row.material().ownerId()), row.material().name()),
                     row.version().state(), row.material().kind(),
                     upload == null ? null : new Upload(upload.id(), upload.offset(), upload.length(), upload.expiresAt()),
-                    total == null ? null : new Pages(0, total),
+                    total == null ? null
+                            : new Pages(Math.toIntExact(done.getOrDefault(row.version().id(), 0L)), total),
                     FAILED.equals(row.version().state()) ? row.version().failureCode() : null);
         }).toList();
     }

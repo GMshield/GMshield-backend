@@ -2,9 +2,12 @@ package io.github.gmshield.materials.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.LockModeType;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -128,6 +131,23 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public Optional<VersionRow> lockVersion(UUID id) {
+        return em().createQuery("select v from MaterialVersion v where v.id = :id", MaterialVersionEntity.class)
+                .setParameter("id", id).setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst()
+                .map(MaterialVersionEntity::row);
+    }
+
+    @Override
+    public boolean clearPipelineVersion(UUID id, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.clearPipelineVersion(now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
     public boolean failVersion(UUID id, String code, Instant now) {
         Optional<MaterialVersionEntity> version = version(id);
         version.ifPresent(entity -> {
@@ -157,6 +177,25 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public boolean endStep(UUID jobId, Instant now) {
+        Optional<IngestionStepEntity> step = em()
+                .createQuery("select s from IngestionStep s where s.jobId = :job", IngestionStepEntity.class)
+                .setParameter("job", jobId).getResultList().stream().findFirst();
+        step.ifPresent(entity -> {
+            entity.end(now);
+            em().flush();
+        });
+        return step.isPresent();
+    }
+
+    @Override
+    public List<StepRow> unendedSteps(UUID versionId) {
+        return em().createQuery("select s from IngestionStep s where s.versionId = :version and s.endedAt is null"
+                        + " order by s.createdAt, s.id", IngestionStepEntity.class)
+                .setParameter("version", versionId).getResultList().stream().map(IngestionStepEntity::row).toList();
+    }
+
+    @Override
     public void insertVersionFile(VersionFileRow row) {
         EntityManager em = em();
         em.persist(new VersionFileEntity(row));
@@ -174,6 +213,92 @@ class JpaMaterialStore implements MaterialStore {
         found.forEach(em()::remove);
         em().flush();
         return found.stream().map(VersionFileEntity::row).toList();
+    }
+
+    @Override
+    public List<VersionFileRow> deleteVersionFiles(UUID versionId, Collection<String> roles) {
+        List<VersionFileEntity> found = versionFileEntities(versionId).stream()
+                .filter(file -> roles.contains(file.row().role())).toList();
+        found.forEach(em()::remove);
+        em().flush();
+        return found.stream().map(VersionFileEntity::row).toList();
+    }
+
+    @Override
+    public void insertPageLayer(PageRangeRow row) {
+        EntityManager em = em();
+        em.persist(new PageLayerEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public void insertPageOutcome(PageRangeRow row) {
+        EntityManager em = em();
+        em.persist(new PageOutcomeEntity(row));
+        em.flush();
+    }
+
+    /** A range overlaps another when it starts before the other ends and ends after the other starts. */
+    private static final String LAYER_OVERLAP = "select count(r) from PageLayer r where r.versionId = :version"
+            + " and r.firstPage <= :last and r.lastPage >= :first";
+    private static final String OUTCOME_OVERLAP = "select count(r) from PageOutcome r where r.versionId = :version"
+            + " and r.firstPage <= :last and r.lastPage >= :first";
+
+    @Override
+    public boolean layerOverlaps(UUID versionId, int firstPage, int lastPage) {
+        return overlaps(LAYER_OVERLAP, versionId, firstPage, lastPage);
+    }
+
+    @Override
+    public boolean outcomeOverlaps(UUID versionId, int firstPage, int lastPage) {
+        return overlaps(OUTCOME_OVERLAP, versionId, firstPage, lastPage);
+    }
+
+    private boolean overlaps(String query, UUID versionId, int firstPage, int lastPage) {
+        return em().createQuery(query, Long.class).setParameter("version", versionId).setParameter("first", firstPage)
+                .setParameter("last", lastPage).getSingleResult() > 0;
+    }
+
+    @Override
+    public List<PageRangeRow> outcomesWithin(UUID versionId, int firstPage, int lastPage) {
+        return em().createQuery("select r from PageOutcome r where r.versionId = :version and r.firstPage <= :last"
+                        + " and r.lastPage >= :first order by r.firstPage", PageOutcomeEntity.class)
+                .setParameter("version", versionId).setParameter("first", firstPage).setParameter("last", lastPage)
+                .getResultList().stream().map(PageOutcomeEntity::row).toList();
+    }
+
+    @Override
+    public List<PageRangeRow> pageLayers(UUID versionId) {
+        return layerEntities(versionId).stream().map(PageLayerEntity::row).toList();
+    }
+
+    @Override
+    public Map<UUID, Long> pagesDone(Collection<UUID> versionIds) {
+        Map<UUID, Long> done = new HashMap<>();
+        if (versionIds.isEmpty()) {
+            return done;
+        }
+        em().createQuery("select r.versionId, sum(r.lastPage - r.firstPage + 1) from PageOutcome r"
+                        + " where r.versionId in :versions group by r.versionId", Object[].class)
+                .setParameter("versions", versionIds).getResultList()
+                .forEach(pair -> done.put((UUID) pair[0], ((Number) pair[1]).longValue()));
+        return done;
+    }
+
+    @Override
+    public int deletePageRanges(UUID versionId) {
+        List<PageLayerEntity> layers = layerEntities(versionId);
+        List<PageOutcomeEntity> outcomes = em().createQuery("select r from PageOutcome r where r.versionId = :version",
+                PageOutcomeEntity.class).setParameter("version", versionId).getResultList();
+        layers.forEach(em()::remove);
+        outcomes.forEach(em()::remove);
+        em().flush();
+        return layers.size() + outcomes.size();
+    }
+
+    private List<PageLayerEntity> layerEntities(UUID versionId) {
+        return em().createQuery("select r from PageLayer r where r.versionId = :version order by r.firstPage",
+                PageLayerEntity.class).setParameter("version", versionId).getResultList();
     }
 
     private List<VersionFileEntity> versionFileEntities(UUID versionId) {

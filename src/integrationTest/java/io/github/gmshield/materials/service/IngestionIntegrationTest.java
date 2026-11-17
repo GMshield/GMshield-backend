@@ -6,9 +6,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.jobs.service.JobFiles;
 import io.github.gmshield.jobs.service.JobSweep;
+import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
+import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.FileStore;
@@ -20,6 +23,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -37,10 +41,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
- * Story 1.15 against a real PostgreSQL and Redis (test mode): V8 and V9 and their checks, the chain from a completed
- * PDF through the claim, the input, the outputs and the report into {@code version_file}, the raw upload's removal,
- * a password's failure and the sweep of an output nobody adopted, and the cross-owner test of {@code ingestion_step}
- * and {@code version_file}.
+ * Stories 1.15 and 1.16 against a real PostgreSQL and Redis (test mode): V8, V9 and V10 and their checks, the chain
+ * from a completed PDF through the claim, the input, the outputs and the report into {@code version_file}, the raw
+ * upload's removal, a password's failure and the sweep of an output nobody adopted; then triage and layout reports
+ * into {@code page_layer} and {@code page_outcome} (the JPQL overlap checks, {@code pages.done} and the end of the
+ * chain), the restart transaction on a pipeline change, and the cross-owner tests of {@code ingestion_step},
+ * {@code version_file}, {@code page_layer} and {@code page_outcome}.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads the library tables with
  * native SQL.
@@ -71,6 +77,8 @@ class IngestionIntegrationTest {
     private JdbcClient jdbc;
     @Autowired
     private PlatformTransactionManager transactions;
+    @Autowired
+    private Jobs jobs;
     @Value("${gmshield.files.dir}")
     private Path filesDir;
 
@@ -244,6 +252,240 @@ class IngestionIntegrationTest {
                 .query(Long.class).single()).isEqualTo(1);
     }
 
+    // --- Story 1.16
+
+    @Test
+    void triageAndLayoutReportsRecordPageRangesCountPagesDoneAndEndTheChainInNeedsReview() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        UUID batch = cleanReport(chain, 25, "2").get(1);
+        List<UUID> triage = unendedJobs(chain.versionId());
+        assertThat(triage).hasSize(2);
+
+        // The oldest step first: triage of pages 1 to 20, all text.
+        JobClaims.Claim whole = claimOffered(chain);
+        assertThat(whole.input().path("firstPage").asInt()).isEqualTo(1);
+        assertThat(whole.input().path("attempt").asInt()).isEqualTo(1);
+        UUID firstBatch = UUID.fromString(whole.input().path("inputFileId").asString());
+        claims.report(whole.jobId(), whole.claimId(), whole.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 20, "layer", "text") + "],\"next\":["
+                        + layoutStep(1, 20, firstBatch) + "]}"));
+        // Then pages 21 to 25 of the second batch: 23 is an image page.
+        JobClaims.Claim second = claimOffered(chain);
+        assertThat(second.input().path("inputFileId").asString()).isEqualTo(batch.toString());
+        assertThat(second.input().path("inputFirstPage").asInt()).isEqualTo(21);
+        assertThat(second.input().path("inputLastPage").asInt()).isEqualTo(25);
+        claims.report(second.jobId(), second.claimId(), second.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"2\",\"layers\":[" + range(21, 22, "layer", "text") + ","
+                        + range(23, 23, "layer", "image") + "," + range(24, 25, "layer", "text") + "],\"next\":["
+                        + layoutStep(21, 22, batch) + "," + layoutStep(24, 25, batch) + "]}"));
+        assertThat(jdbc.sql("select layer, first_page, last_page, owner_id from page_layer where version_id = ?"
+                + " order by first_page").param(chain.versionId()).query().listOfRows())
+                .extracting(row -> row.get("layer") + " " + row.get("first_page") + "-" + row.get("last_page"))
+                .containsExactly("text 1-20", "text 21-22", "image 23-23", "text 24-25");
+
+        // The three layout steps. The first one's report gives its last page two outcomes: it is refused.
+        for (int i = 0; i < 3; i++) {
+            JobClaims.Claim layout = claimOffered(chain);
+            int first = layout.input().path("firstPage").asInt();
+            int last = layout.input().path("lastPage").asInt();
+            JobFiles.Stored text = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                    new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8)));
+            if (i == 0) {
+                String twice = "{\"pipelineVersion\":\"2\",\"pages\":[" + range(first, last, "outcome", "read_directly")
+                        + "," + range(last, last, "outcome", "unreadable") + "]}";
+                assertThatThrownBy(() -> claims.report(layout.jobId(), layout.claimId(), layout.grant(), "done", null,
+                        null, JSON.readTree(twice))).isInstanceOf(ApiException.class);
+                assertThat(jdbc.sql("select count(*) from page_outcome where version_id = ?").param(chain.versionId())
+                        .query(Long.class).single()).isZero();
+            }
+            claims.report(layout.jobId(), layout.claimId(), layout.grant(), "done", null, null, JSON.readTree(
+                    "{\"pipelineVersion\":\"2\",\"pages\":[" + range(first, last, "outcome", "read_directly") + "],"
+                            + "\"texts\":[{\"fileId\":\"" + text.fileId() + "\",\"firstPage\":" + first
+                            + ",\"lastPage\":" + last + "}]}"));
+        }
+
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages())
+                .isEqualTo(new Materials.Pages(24, 25));
+        // Every step ended, but page 23 waits for OCR: the version stays processing.
+        assertThat(state(chain.versionId())).isEqualTo("processing");
+        assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ? and ended_at is null")
+                .param(chain.versionId()).query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select count(*) from version_file where version_id = ? and role = 'text'")
+                .param(chain.versionId()).query(Long.class).single()).isEqualTo(3);
+
+        // Once page 23 has an outcome, a report that leaves no step unended ends the chain.
+        UUID last = as(chain.owner(), () -> new TransactionTemplate(transactions).execute(status ->
+                jobsCreate(chain, "ocr", 23)));
+        JobClaims.Claim ocr = claims.claim(last);
+        claims.report(last, ocr.claimId(), ocr.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(23, 23, "outcome", "unreadable") + "]}"));
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages())
+                .isEqualTo(new Materials.Pages(25, 25));
+    }
+
+    @Test
+    void aPipelineChangeRestartsTheChainInOneTransaction() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        List<UUID> batches = cleanReport(chain, 25, "1");
+        UUID original = jdbc.sql("select file_id from version_file where version_id = ? and role = 'original'")
+                .param(chain.versionId()).query(UUID.class).single();
+        JobClaims.Claim triage = claimOffered(chain);
+        UUID input = UUID.fromString(triage.input().path("inputFileId").asString());
+        int first = triage.input().path("firstPage").asInt();
+        int lastPage = triage.input().path("lastPage").asInt();
+        claims.report(triage.jobId(), triage.claimId(), triage.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"1\",\"layers\":[" + range(first, lastPage, "layer", "text") + "],\"next\":["
+                        + layoutStep(first, lastPage, input) + "]}"));
+        List<UUID> waiting = unendedJobs(chain.versionId());
+        assertThat(waiting).hasSize(2);
+
+        JobClaims.Claim stale = claimOffered(chain);
+        claims.report(stale.jobId(), stale.claimId(), stale.grant(), "failed", "ingestion.pipeline_changed", false, null);
+
+        assertThat(jdbc.sql("select state, page_total, pipeline_version, failure_code from material_version where id = ?")
+                .param(chain.versionId()).query().singleRow()).containsEntry("state", "processing")
+                .containsEntry("page_total", 25).containsEntry("pipeline_version", null).containsEntry("failure_code", null);
+        assertThat(jdbc.sql("select count(*) from page_layer where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select role, file_id from version_file where version_id = ?").param(chain.versionId())
+                .query().listOfRows()).singleElement().satisfies(row -> assertThat(row)
+                .containsEntry("role", "original").containsEntry("file_id", original));
+        for (UUID batch : batches) {
+            assertThat(files.fileExists(chain.owner(), batch)).isFalse();
+        }
+        for (UUID job : waiting) {
+            String expected = job.equals(stale.jobId()) ? "failed" : "cancelled";
+            assertThat(jdbc.sql("select state from job where id = ?").param(job).query(String.class).single())
+                    .isEqualTo(expected);
+        }
+        Map<String, Object> restart = jdbc.sql("select stage, input_file_id, job_id from ingestion_step"
+                + " where version_id = ? and ended_at is null").param(chain.versionId()).query().singleRow();
+        assertThat(restart).containsEntry("stage", "clean").containsEntry("input_file_id", original);
+        JobClaims.Claim clean = claims.claim((UUID) restart.get("job_id"));
+        assertThat(clean.input().has("pipelineVersion")).isFalse();
+        assertThat(clean.input().path("pageTotal").asInt()).isEqualTo(25);
+    }
+
+    @Test
+    void theNewRangeTablesCheckTheirValuesAndKeepTheirVersionWithinTheOwner() throws Exception {
+        Chain a = completed(pdf(MIB));
+        Chain b = completed(pdf(MIB));
+        jdbc.sql("update material_version set page_total = 5 where id in (?, ?)").params(a.versionId(), b.versionId())
+                .update();
+        UUID layer = Ids.newId();
+        jdbc.sql("insert into page_layer (id, owner_id, version_id, first_page, last_page, layer, created_at)"
+                + " values (?, ?, ?, 1, 2, 'text', now())").params(layer, a.owner(), a.versionId()).update();
+        UUID outcome = Ids.newId();
+        jdbc.sql("insert into page_outcome (id, owner_id, version_id, first_page, last_page, outcome, created_at)"
+                + " values (?, ?, ?, 1, 2, 'read_directly', now())").params(outcome, a.owner(), a.versionId()).update();
+        jdbc.sql("insert into version_file (id, owner_id, version_id, file_id, role, first_page, last_page, size_bytes,"
+                + " piece_count, created_at) values (?, ?, ?, ?, 'text', 1, 2, 10, 1, now())")
+                .params(Ids.newId(), a.owner(), a.versionId(), Ids.newId()).update();
+        jdbc.sql("update ingestion_step set ended_at = now() where job_id = ?").param(a.jobId()).update();
+        Map<String, String> violations = Map.of(
+                "update page_layer set layer = 'scan' where id = '" + layer + "'", "page_layer_layer_check",
+                "update page_layer set last_page = 0 where id = '" + layer + "'", "page_layer_pages_check",
+                "update page_layer set first_page = 0 where id = '" + layer + "'", "page_layer_first_page_check",
+                "update page_layer set version_id = '" + b.versionId() + "' where id = '" + layer + "'",
+                "page_layer_version_fkey",
+                "update page_outcome set outcome = 'read' where id = '" + outcome + "'", "page_outcome_outcome_check",
+                "update page_outcome set last_page = 0 where id = '" + outcome + "'", "page_outcome_pages_check",
+                "update page_outcome set version_id = '" + b.versionId() + "' where id = '" + outcome + "'",
+                "page_outcome_version_fkey");
+        violations.forEach((sql, constraint) -> assertThatThrownBy(() -> jdbc.sql(sql).update())
+                .as(sql).satisfies(failure -> assertThat(messages(failure)).anyMatch(text -> text.contains(constraint))));
+    }
+
+    @Test
+    void anotherOwnersPageLayersAndOutcomesAreNeverSeenOrWritten() throws Exception {
+        Chain a = completed(pdf(MIB));
+        Chain b = completed(pdf(MIB));
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(a.owner(), () -> {
+            store.insertPageLayer(new PageRangeRow(Ids.newId(), a.owner(), a.versionId(), 1, 3, "text", now));
+            store.insertPageOutcome(new PageRangeRow(Ids.newId(), a.owner(), a.versionId(), 1, 3, "read_directly", now));
+        });
+
+        as(b.owner(), () -> {
+            assertThat(store.pageLayers(a.versionId())).isEmpty();
+            assertThat(store.layerOverlaps(a.versionId(), 1, 3)).isFalse();
+            assertThat(store.outcomeOverlaps(a.versionId(), 1, 3)).isFalse();
+            assertThat(store.outcomesWithin(a.versionId(), 1, 3)).isEmpty();
+            assertThat(store.pagesDone(List.of(a.versionId()))).isEmpty();
+            return null;
+        });
+        write(b.owner(), () -> assertThat(store.deletePageRanges(a.versionId())).isZero());
+        as(a.owner(), () -> {
+            assertThat(store.pageLayers(a.versionId())).hasSize(1);
+            assertThat(store.layerOverlaps(a.versionId(), 3, 9)).isTrue();
+            assertThat(store.outcomeOverlaps(a.versionId(), 4, 9)).isFalse();
+            assertThat(store.pagesDone(List.of(a.versionId(), b.versionId()))).containsExactly(Map.entry(a.versionId(), 3L));
+            return null;
+        });
+        // B cannot write a range naming A's version, nor A a range under B's owner id.
+        assertThatThrownBy(() -> write(b.owner(), () -> store.insertPageLayer(new PageRangeRow(Ids.newId(), b.owner(),
+                a.versionId(), 4, 4, "image", now)))).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> write(b.owner(), () -> store.insertPageOutcome(new PageRangeRow(Ids.newId(), b.owner(),
+                a.versionId(), 4, 4, "unreadable", now)))).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> write(a.owner(), () -> store.insertPageOutcome(new PageRangeRow(Ids.newId(), b.owner(),
+                b.versionId(), 1, 1, "unreadable", now)))).isInstanceOf(RuntimeException.class);
+        assertThat(jdbc.sql("select count(*) from page_outcome where version_id in (?, ?)")
+                .params(a.versionId(), b.versionId()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    /** Claims the clean step, sends its original and its batches of 20 pages, and reports a triage step per batch. */
+    private List<UUID> cleanReport(Chain chain, int total, String pipeline) throws Exception {
+        JobClaims.Claim claim = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, claim, pdf(4000));
+        List<UUID> batches = new ArrayList<>();
+        StringBuilder batchJson = new StringBuilder();
+        StringBuilder next = new StringBuilder();
+        for (int first = 1; first <= total; first += 20) {
+            int last = Math.min(total, first + 19);
+            UUID batch = store(chain, claim, pdf(3000)).fileId();
+            batches.add(batch);
+            String comma = first == 1 ? "" : ",";
+            batchJson.append(comma).append("{\"fileId\":\"").append(batch).append("\",\"firstPage\":").append(first)
+                    .append(",\"lastPage\":").append(last).append('}');
+            next.append(comma).append("{\"stage\":\"triage\",\"firstPage\":").append(first).append(",\"lastPage\":")
+                    .append(last).append(",\"input\":\"").append(batch).append("\"}");
+        }
+        claims.report(chain.jobId(), claim.claimId(), claim.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"" + pipeline + "\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\""
+                        + original.fileId() + "\"},\"batches\":[" + batchJson + "],\"next\":[" + next + "]}"));
+        return batches;
+    }
+
+    /** The version's step job that is offered (one ingestion job at a time), claimed. */
+    private JobClaims.Claim claimOffered(Chain chain) {
+        UUID job = jdbc.sql("select s.job_id from ingestion_step s join job j on j.id = s.job_id"
+                + " where s.version_id = ? and j.state = 'offered'").param(chain.versionId()).query(UUID.class).single();
+        return claims.claim(job);
+    }
+
+    private List<UUID> unendedJobs(UUID versionId) {
+        return jdbc.sql("select job_id from ingestion_step where version_id = ? and ended_at is null order by created_at")
+                .param(versionId).query(UUID.class).list();
+    }
+
+    /** A step of the version over one page, recorded as the worker's next steps are (the backend never names one). */
+    private UUID jobsCreate(Chain chain, String stage, int page) {
+        UUID batch = jdbc.sql("select file_id from version_file where version_id = ? and role = 'batch'"
+                + " and first_page <= ? and last_page >= ?").params(chain.versionId(), page, page).query(UUID.class).single();
+        return jobs.create("ingestion", created -> store.insertStep(new StepRow(Ids.newId(), chain.owner(),
+                chain.versionId(), created.id(), stage, page, page, batch,
+                Instant.now().truncatedTo(ChronoUnit.MICROS)))).id();
+    }
+
+    private static String range(int first, int last, String field, String value) {
+        return "{\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"" + field + "\":\"" + value + "\"}";
+    }
+
+    private static String layoutStep(int first, int last, UUID input) {
+        return "{\"stage\":\"layout\",\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"input\":\"" + input + "\"}";
+    }
+
     // --- helpers
 
     private Chain completed(byte[] content) throws Exception {
@@ -303,7 +545,7 @@ class IngestionIntegrationTest {
     }
 
     private static List<String> messages(Throwable failure) {
-        List<String> messages = new java.util.ArrayList<>();
+        List<String> messages = new ArrayList<>();
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
             messages.add(String.valueOf(cause.getMessage()));
         }

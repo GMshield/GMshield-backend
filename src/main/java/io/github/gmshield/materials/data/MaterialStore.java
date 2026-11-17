@@ -3,6 +3,7 @@ package io.github.gmshield.materials.data;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -50,6 +51,16 @@ public interface MaterialStore {
      */
     boolean recordIngestion(UUID id, String pipelineVersion, Integer pageTotal, Instant now);
 
+    /**
+     * The current owner's version with this id, locked until the end of the transaction (Story 1.16: a report's checks
+     * of its page ranges and the end of its chain see no other report's writes); empty for an unknown id or another
+     * owner's.
+     */
+    Optional<VersionRow> lockVersion(UUID id);
+
+    /** A restarted chain (Story 1.16): the version's pipeline version goes, its page total stays; false when none. */
+    boolean clearPipelineVersion(UUID id, Instant now);
+
     /** The current owner's version ends {@code failed} with {@code code}; false when there is none. */
     boolean failVersion(UUID id, String code, Instant now);
 
@@ -62,6 +73,12 @@ public interface MaterialStore {
     /** How many steps the current owner's version has had. */
     long countSteps(UUID versionId);
 
+    /** The current owner's step of this job ends at {@code now} unless it ended already (Story 1.16); false when none. */
+    boolean endStep(UUID jobId, Instant now);
+
+    /** The current owner's steps of a version that have not ended, oldest first (Story 1.16). */
+    List<StepRow> unendedSteps(UUID versionId);
+
     /** Records a file of the current owner's version (Story 1.15). */
     void insertVersionFile(VersionFileRow row);
 
@@ -70,6 +87,35 @@ public interface MaterialStore {
 
     /** Deletes the current owner's files of a version and answers them, so the caller removes them from the store. */
     List<VersionFileRow> deleteVersionFiles(UUID versionId);
+
+    /** {@link #deleteVersionFiles(UUID)} for the files of these roles only (Story 1.16). */
+    List<VersionFileRow> deleteVersionFiles(UUID versionId, Collection<String> roles);
+
+    // --- page_layer and page_outcome (Story 1.16)
+
+    /** Records the layer of a range of pages of the current owner's version. */
+    void insertPageLayer(PageRangeRow row);
+
+    /** Records the outcome of a range of pages of the current owner's version. */
+    void insertPageOutcome(PageRangeRow row);
+
+    /** Whether a page from {@code firstPage} to {@code lastPage} of the version already has a layer. */
+    boolean layerOverlaps(UUID versionId, int firstPage, int lastPage);
+
+    /** Whether a page from {@code firstPage} to {@code lastPage} of the version already has an outcome. */
+    boolean outcomeOverlaps(UUID versionId, int firstPage, int lastPage);
+
+    /** The version's outcome ranges that touch {@code firstPage} to {@code lastPage}, by first page. */
+    List<PageRangeRow> outcomesWithin(UUID versionId, int firstPage, int lastPage);
+
+    /** The version's layer ranges, by first page. */
+    List<PageRangeRow> pageLayers(UUID versionId);
+
+    /** How many pages of each version have an outcome; a version with none is left out. */
+    Map<UUID, Long> pagesDone(Collection<UUID> versionIds);
+
+    /** Deletes the version's layers and outcomes (a restarted chain); answers how many ranges went. */
+    int deletePageRanges(UUID versionId);
 
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);

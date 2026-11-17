@@ -5,6 +5,7 @@ import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,6 +28,10 @@ public class InMemoryMaterialStore implements MaterialStore {
     public final Map<UUID, StepRow> steps = new ConcurrentHashMap<>();
     /** {@code version_file} (Story 1.15). */
     public final Map<UUID, VersionFileRow> files = new ConcurrentHashMap<>();
+    /** {@code page_layer} (Story 1.16). */
+    public final Map<UUID, PageRangeRow> layers = new ConcurrentHashMap<>();
+    /** {@code page_outcome} (Story 1.16). */
+    public final Map<UUID, PageRangeRow> outcomes = new ConcurrentHashMap<>();
 
     @Override
     public synchronized void insertMaterial(MaterialRow row) {
@@ -130,6 +135,18 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public Optional<VersionRow> lockVersion(UUID id) {
+        return findVersion(id);
+    }
+
+    @Override
+    public synchronized boolean clearPipelineVersion(UUID id, Instant now) {
+        return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(),
+                before.state(), before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(), null,
+                before.failureCode()));
+    }
+
+    @Override
     public synchronized boolean failVersion(UUID id, String code, Instant now) {
         return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(), "failed",
                 before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(), before.pipelineVersion(),
@@ -173,6 +190,27 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public synchronized boolean endStep(UUID jobId, Instant now) {
+        Optional<StepRow> found = findStepByJob(jobId);
+        found.ifPresent(before -> {
+            ownerFor(before.ownerId());
+            if (before.endedAt() == null) {
+                steps.put(before.id(), before.ended(now));
+                RollbackUndo.onRollback(() -> steps.put(before.id(), before));
+            }
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public List<StepRow> unendedSteps(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return steps.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
+                        && row.endedAt() == null)
+                .sorted(Comparator.comparing(StepRow::createdAt).thenComparing(StepRow::id)).toList();
+    }
+
+    @Override
     public synchronized void insertVersionFile(VersionFileRow row) {
         UUID owner = ownerFor(row.ownerId());
         VersionRow version = versions.get(row.versionId());
@@ -202,6 +240,91 @@ public class InMemoryMaterialStore implements MaterialStore {
             RollbackUndo.onRollback(() -> files.put(row.id(), row));
         }
         return found;
+    }
+
+    @Override
+    public synchronized List<VersionFileRow> deleteVersionFiles(UUID versionId, Collection<String> roles) {
+        List<VersionFileRow> found = versionFiles(versionId).stream().filter(row -> roles.contains(row.role())).toList();
+        for (VersionFileRow row : found) {
+            ownerFor(row.ownerId());
+            files.remove(row.id());
+            RollbackUndo.onRollback(() -> files.put(row.id(), row));
+        }
+        return found;
+    }
+
+    @Override
+    public synchronized void insertPageLayer(PageRangeRow row) {
+        insertRange(layers, row);
+    }
+
+    @Override
+    public synchronized void insertPageOutcome(PageRangeRow row) {
+        insertRange(outcomes, row);
+    }
+
+    private void insertRange(Map<UUID, PageRangeRow> table, PageRangeRow row) {
+        UUID owner = ownerFor(row.ownerId());
+        VersionRow version = versions.get(row.versionId());
+        if (table.containsKey(row.id()) || version == null || !version.ownerId().equals(owner)
+                || row.firstPage() < 1 || row.lastPage() < row.firstPage()) {
+            throw new IllegalStateException("key, reference or check refused");
+        }
+        table.put(row.id(), row);
+        RollbackUndo.onRollback(() -> table.remove(row.id()));
+    }
+
+    @Override
+    public boolean layerOverlaps(UUID versionId, int firstPage, int lastPage) {
+        return !rangesOf(layers, versionId, firstPage, lastPage).isEmpty();
+    }
+
+    @Override
+    public boolean outcomeOverlaps(UUID versionId, int firstPage, int lastPage) {
+        return !rangesOf(outcomes, versionId, firstPage, lastPage).isEmpty();
+    }
+
+    @Override
+    public List<PageRangeRow> outcomesWithin(UUID versionId, int firstPage, int lastPage) {
+        return rangesOf(outcomes, versionId, firstPage, lastPage);
+    }
+
+    @Override
+    public List<PageRangeRow> pageLayers(UUID versionId) {
+        return rangesOf(layers, versionId, 1, Integer.MAX_VALUE);
+    }
+
+    private static List<PageRangeRow> rangesOf(Map<UUID, PageRangeRow> table, UUID versionId, int first, int last) {
+        UUID owner = OwnerContext.require();
+        return table.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
+                        && row.firstPage() <= last && row.lastPage() >= first)
+                .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
+    }
+
+    @Override
+    public Map<UUID, Long> pagesDone(Collection<UUID> versionIds) {
+        Map<UUID, Long> done = new HashMap<>();
+        for (UUID versionId : versionIds) {
+            long pages = rangesOf(outcomes, versionId, 1, Integer.MAX_VALUE).stream().mapToLong(PageRangeRow::pages).sum();
+            if (pages > 0) {
+                done.put(versionId, pages);
+            }
+        }
+        return done;
+    }
+
+    @Override
+    public synchronized int deletePageRanges(UUID versionId) {
+        int removed = 0;
+        for (Map<UUID, PageRangeRow> table : List.of(layers, outcomes)) {
+            for (PageRangeRow row : rangesOf(table, versionId, 1, Integer.MAX_VALUE)) {
+                ownerFor(row.ownerId());
+                table.remove(row.id());
+                RollbackUndo.onRollback(() -> table.put(row.id(), row));
+                removed++;
+            }
+        }
+        return removed;
     }
 
     @Override
