@@ -18,6 +18,7 @@ import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.FileStore;
+import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -86,6 +87,8 @@ class IngestionIntegrationTest {
     private PlatformTransactionManager transactions;
     @Autowired
     private Jobs jobs;
+    @Autowired
+    private Vault vault;
     @Value("${gmshield.files.dir}")
     private Path filesDir;
 
@@ -694,6 +697,19 @@ class IngestionIntegrationTest {
                 Materials.Ground.REVIEW)).orElseThrow();
         assertThat(page.lines()).extracting(Materials.Line::text).containsExactly("Plate | 1,500 gp | 2");
         assertThat(page.picture()).isEqualTo(new Materials.PictureSize(1545, 2000));
+        // The page's passages, read through the page index: page 2's only, in reading order (inserted out of it,
+        // their ids minted in the reverse order).
+        UUID third = Ids.newId();
+        UUID first = Ids.newId();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(chain.owner(), () -> store.insertPassages(List.of(passageRow(chain, third, 3, 2, now),
+                passageRow(chain, Ids.newId(), 0, 1, now), passageRow(chain, Ids.newId(), 2, 3, now),
+                passageRow(chain, first, 1, 2, now))));
+        assertThat(as(chain.owner(), () -> materials.page(chain.materialId(), 2, Materials.Ground.REVIEW))
+                .orElseThrow().passages()).extracting(Materials.PagePassage::id).containsExactly(first, third);
+        assertThat(as(chain.owner(), () -> materials.page(chain.materialId(), 3, Materials.Ground.REVIEW))
+                .orElseThrow().passages()).hasSize(1).allSatisfy(passage ->
+                        assertThat(passage.boxes()).containsExactly(List.of(0.1, 0.2, 0.9, 0.3)));
         Materials.Picture picture = as(chain.owner(), () -> materials.picture(chain.materialId(), 2,
                 Materials.Ground.REVIEW)).orElseThrow();
         ByteArrayOutputStream read = new ByteArrayOutputStream();
@@ -803,6 +819,14 @@ class IngestionIntegrationTest {
                     assertThat(row.pictureFileId()).isEqualTo(pictureA));
             return null;
         });
+    }
+
+    /** A passage of the chain's version, encrypted as a report stores it. */
+    private PassageRow passageRow(Chain chain, UUID id, int ordinal, int page, Instant now) {
+        return new PassageRow(id, chain.owner(), chain.versionId(), ordinal, page,
+                vault.encryptText(Passages.text(id, chain.owner()), "Passagem " + ordinal),
+                vault.encrypt(Passages.place(id, chain.owner()), Passages.placeJson(new Passages.Place(List.of("A"),
+                        List.of(List.of(0.1, 0.2, 0.9, 0.3)), null))), now);
     }
 
     /** A WebP file's first bytes, then a pattern: the backend never parses a picture. */

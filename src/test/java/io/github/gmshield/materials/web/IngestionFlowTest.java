@@ -1738,6 +1738,30 @@ class IngestionFlowTest {
     }
 
     @Test
+    void aPictureIsNeverTheInputOfANextStep() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 25, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 20, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode claim = claim(layout.jobId());
+        report(layout, claim, withViews(layout(layout, claim, 1, 20, List.of()),
+                List.of(pictureView(layout, claim, 3, webp(1500), "Três"))));
+        UUID picture = pageViews(uploaded.versionId()).getFirst().pictureFileId();
+        StepRow second = offeredStep(uploaded.versionId());
+        int steps = steps(uploaded.versionId()).size();
+
+        HttpResponse<String> refused = outcome(second.jobId(), claim(second.jobId()), "{\"outcome\":\"done\",\"result\":"
+                + "{\"pipelineVersion\":\"2\",\"next\":[{\"stage\":\"layout\",\"firstPage\":21,\"lastPage\":25,"
+                + "\"input\":\"" + picture + "\"}]}}");
+
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
+        assertThat(json(refused).path("code").asString()).isEqualTo("job.result_invalid");
+        assertThat(steps(uploaded.versionId())).hasSize(steps);
+    }
+
+    @Test
     void anotherOwnersPageAndPictureAreNotFoundAndLeakNoId() throws Exception {
         Gm a = signUp();
         Gm b = signUp();
