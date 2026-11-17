@@ -241,6 +241,8 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
 
 Read from the environment and checked before anything starts. A refused start prints one line
 that names the settings, never a value, and exits with status 78.
+[`.env.example`](.env.example) lists them with their defaults and empty secrets, for a start by hand
+(`docker run --env-file .env`); [`dev/.env.example`](dev/.env.example) holds the development setup's overrides.
 
 | Setting | Meaning |
 |---|---|
