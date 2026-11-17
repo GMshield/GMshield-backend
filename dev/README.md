@@ -40,6 +40,8 @@ Every port is bound to 127.0.0.1: nothing is reachable from another machine. The
 for development on this machine only. A port that is taken can be moved for one start, for example
 `GMSHIELD_DEV_BACKEND_PORT=18080 dev/start` (also `GMSHIELD_DEV_POSTGRES_PORT`,
 `GMSHIELD_DEV_REDIS_PORT`, `GMSHIELD_DEV_QDRANT_PORT`, `GMSHIELD_DEV_FRONTEND_PORT`).
+To keep overrides, and the real Google client and model key, without exporting them in the shell,
+copy [`.env.example`](.env.example) to `dev/.env` (git-ignored): Docker Compose reads it on every start.
 
 The backend, the frontend and the worker run here as they do in production: outside test mode,
 with their settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with
