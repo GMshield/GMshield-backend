@@ -37,6 +37,8 @@ public class InMemoryMaterialStore implements MaterialStore {
     public final Map<UUID, PassageRow> passages = new ConcurrentHashMap<>();
     /** {@code version_outline} (Story 1.18). */
     public final Map<UUID, OutlineRow> outlines = new ConcurrentHashMap<>();
+    /** {@code page_view} (Story 1.19). */
+    public final Map<UUID, PageViewRow> pageViews = new ConcurrentHashMap<>();
 
     @Override
     public synchronized void insertMaterial(MaterialRow row) {
@@ -275,8 +277,39 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionFileRow> versionFiles(UUID versionId, Collection<String> roles) {
+        return versionFiles(versionId).stream().filter(row -> roles.contains(row.role())).toList();
+    }
+
+    @Override
+    public Optional<VersionFileRow> versionFile(UUID versionId, UUID fileId) {
+        return versionFiles(versionId).stream().filter(row -> row.fileId().equals(fileId)).findFirst();
+    }
+
+    @Override
+    public synchronized Optional<VersionFileRow> deleteVersionFile(UUID versionId, UUID fileId) {
+        Optional<VersionFileRow> found = versionFile(versionId, fileId);
+        found.ifPresent(row -> {
+            ownerFor(row.ownerId());
+            refusePictureInUse(row);
+            files.remove(row.id());
+            RollbackUndo.onRollback(() -> files.put(row.id(), row));
+        });
+        return found;
+    }
+
+    /** Like the key of {@code page_view} on its picture: a file a page view shows cannot go first. */
+    private void refusePictureInUse(VersionFileRow row) {
+        if (pageViews.values().stream().anyMatch(view -> view.ownerId().equals(row.ownerId())
+                && row.fileId().equals(view.pictureFileId()))) {
+            throw new IllegalStateException("reference refused");
+        }
+    }
+
+    @Override
     public synchronized List<VersionFileRow> deleteVersionFiles(UUID versionId) {
         List<VersionFileRow> found = versionFiles(versionId);
+        found.forEach(this::refusePictureInUse);
         for (VersionFileRow row : found) {
             ownerFor(row.ownerId());
             files.remove(row.id());
@@ -288,6 +321,7 @@ public class InMemoryMaterialStore implements MaterialStore {
     @Override
     public synchronized List<VersionFileRow> deleteVersionFiles(UUID versionId, Collection<String> roles) {
         List<VersionFileRow> found = versionFiles(versionId).stream().filter(row -> roles.contains(row.role())).toList();
+        found.forEach(this::refusePictureInUse);
         for (VersionFileRow row : found) {
             ownerFor(row.ownerId());
             files.remove(row.id());
@@ -460,6 +494,53 @@ public class InMemoryMaterialStore implements MaterialStore {
             RollbackUndo.onRollback(() -> outlines.put(row.id(), row));
         });
         return found.isPresent();
+    }
+
+    @Override
+    public synchronized void insertPageView(PageViewRow row) {
+        UUID owner = ownerFor(row.ownerId());
+        VersionRow version = versions.get(row.versionId());
+        boolean taken = pageViews.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                && other.versionId().equals(row.versionId()) && other.page() == row.page());
+        boolean picture = row.pictureFileId() == null || files.values().stream().anyMatch(file
+                -> file.ownerId().equals(owner) && file.fileId().equals(row.pictureFileId()));
+        if (pageViews.containsKey(row.id()) || taken || version == null || !version.ownerId().equals(owner)
+                || !picture || row.page() < 1 || (row.pictureFileId() == null) != (row.width() == null)
+                || (row.width() == null) != (row.height() == null)) {
+            throw new IllegalStateException("key, reference or check refused");
+        }
+        pageViews.put(row.id(), row);
+        RollbackUndo.onRollback(() -> pageViews.remove(row.id()));
+    }
+
+    @Override
+    public Optional<PageViewRow> findPageView(UUID versionId, int page) {
+        UUID owner = OwnerContext.require();
+        return pageViews.values().stream().filter(row -> row.ownerId().equals(owner)
+                && row.versionId().equals(versionId) && row.page() == page).findFirst();
+    }
+
+    @Override
+    public synchronized List<PageViewRow> deletePageViews(UUID versionId, int firstPage, int lastPage) {
+        UUID owner = OwnerContext.require();
+        List<PageViewRow> found = pageViews.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && row.versionId().equals(versionId) && row.page() >= firstPage && row.page() <= lastPage)
+                .sorted(Comparator.comparingInt(PageViewRow::page)).toList();
+        for (PageViewRow row : found) {
+            pageViews.remove(row.id());
+            RollbackUndo.onRollback(() -> pageViews.put(row.id(), row));
+        }
+        return found;
+    }
+
+    @Override
+    public int deletePageViews(UUID versionId) {
+        return deletePageViews(versionId, 1, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public List<PassageRow> passagesOnPage(UUID versionId, int page) {
+        return passages(versionId).stream().filter(row -> row.page() == page).toList();
     }
 
     @Override

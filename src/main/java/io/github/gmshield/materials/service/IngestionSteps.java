@@ -10,6 +10,7 @@ import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
@@ -28,6 +29,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,7 +69,9 @@ import tools.jackson.databind.node.ObjectNode;
  *       layer or outcome, or a {@code texts} range over a page not read, refuses the report), and the next steps (one
  *       whose input is {@value #TEXTS} is held: it gets no job yet). From Story 1.18, a report carrying
  *       {@code passages} replaces the version's passages and outline, each passage's text and place and the outline
- *       encrypted. Next steps that would take the version past {@link IngestionSettings#stepCap} fail it with
+ *       encrypted. From Story 1.19, a report's {@code pageViews} replace the page views of the pages they name: each
+ *       picture is adopted as a {@code picture} file of its page, and each page's lines or text are encrypted. Next
+ *       steps that would take the version past {@link IngestionSettings#stepCap} fail it with
  *       {@value #TOO_MANY_STEPS}.
  *       Once an original is recorded the raw upload is marked {@code removing} in the same transaction, and its pieces
  *       go after the commit (the upload sweep finishes whatever is left). A report that leaves every page with an
@@ -76,11 +80,12 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #failed}: a step that ended failed fails the version with its code (a code outside the
  *       {@code ingestion} category is recorded as {@value #STEP_FAILED}), and cancels its other steps (a held step
  *       just ends). For
- *       {@value #PASSWORD_REQUIRED}, the raw upload and every file of the version are removed too; the material stays,
+ *       {@value #PASSWORD_REQUIRED}, the raw upload, every page view and every file of the version are removed too; the
+ *       material stays,
  *       so the GM sees why. {@value #PIPELINE_CHANGED} restarts the chain instead.</li>
  *   <li>A restart (Story 1.16), in one transaction: the version's other unended step jobs are cancelled (held steps
- *       end), its layers, outcomes, batches and {@code texts} files, passages and outline go, its pipeline version is
- *       cleared (its page total stays), and a new first step reads the stored original.</li>
+ *       end), its layers, outcomes, batches and {@code texts} files, passages and outline, page views and pictures go,
+ *       its pipeline version is cleared (its page total stays), and a new first step reads the stored original.</li>
  * </ul>
  *
  * Every step row gets {@code ended_at} when its job is completed, finally fails or is cancelled here. Every call runs
@@ -118,6 +123,14 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     static final int MAX_LEVEL = 1_000;
     static final String PASSAGE_INVALID = "ingestion.passage_invalid";
     static final String OUTLINE_INVALID = "ingestion.outline_invalid";
+    /** A page view's picture side, at most, in pixels; its lines and each line's code points; a text page's text. */
+    static final int MAX_SIDE = 10_000;
+    static final int MAX_LINES = 10_000;
+    static final int MAX_LINE = 4_096;
+    static final int MAX_PAGE_TEXT = 16_384;
+    static final String PAGE_VIEW_INVALID = "ingestion.page_view_invalid";
+    /** The files a step may read or a next step may name: never the pictures, which may be one per page. */
+    static final Set<String> STEP_FILES = Set.of(VersionFileRow.ORIGINAL, VersionFileRow.BATCH, VersionFileRow.TEXT);
     /** The first stage of each format with a chain in this release; the stage a restart starts from too. */
     static final Map<String, String> START_STAGES = Map.of("pdf", CLEAN, "txt", TEXT_STAGE, "markdown", TEXT_STAGE);
     static final Set<String> LAYERS = Set.of(PageRangeRow.TEXT, PageRangeRow.IMAGE);
@@ -195,8 +208,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                     .put("firstPage", file.firstPage()).put("lastPage", file.lastPage()));
         } else {
             input.put("input", SOURCE);
-            materials.versionFiles(version.id()).stream().filter(file -> file.fileId().equals(step.inputFileId()))
-                    .findFirst().ifPresent(file -> {
+            Optional.ofNullable(step.inputFileId()).flatMap(fileId -> materials.versionFile(version.id(), fileId))
+                    .filter(file -> STEP_FILES.contains(file.role())).ifPresent(file -> {
                         input.put("inputFileId", file.fileId().toString());
                         input.put("inputFirstPage", file.firstPage());
                         input.put("inputLastPage", file.lastPage());
@@ -217,7 +230,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
 
     /** The version's text files, in page order. */
     private List<VersionFileRow> textFiles(UUID versionId) {
-        return materials.versionFiles(versionId).stream().filter(file -> VersionFileRow.TEXT.equals(file.role()))
+        return materials.versionFiles(versionId, Set.of(VersionFileRow.TEXT)).stream()
                 .sorted(Comparator.comparingInt(VersionFileRow::firstPage)).toList();
     }
 
@@ -239,8 +252,9 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             return Optional.empty();
         }
         UUID fileId = step.get().inputFileId();
-        Optional<StoredFile> stored = materials.versionFiles(version.get().id()).stream()
-                .filter(file -> file.fileId().equals(fileId)).findFirst()
+        Optional<StoredFile> stored = Optional.ofNullable(fileId)
+                .flatMap(found -> materials.versionFile(version.get().id(), found))
+                .filter(file -> STEP_FILES.contains(file.role()))
                 .map(file -> new StoredFile(owner, file.fileId(), file.sizeBytes(), file.pieceCount()))
                 .or(() -> uploads.joined().completeForVersion(owner, version.get().id())
                         .filter(upload -> upload.id().equals(fileId))
@@ -312,7 +326,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         }
         report.checkPages(total == null ? 0 : total);
         Map<UUID, VersionFileRow> known = new HashMap<>();
-        materials.versionFiles(version.id()).forEach(file -> known.put(file.fileId(), file));
+        materials.versionFiles(version.id(), STEP_FILES).forEach(file -> known.put(file.fileId(), file));
         if (report.original() != null) {
             // A restarted chain's clean report replaces the original it read.
             List<VersionFileRow> replaced = materials.deleteVersionFiles(version.id(), Set.of(VersionFileRow.ORIGINAL));
@@ -332,6 +346,9 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         recordRanges(job, version, report, now);
         if (report.carriesPassages()) {
             replacePassages(job, version.id(), report, now);
+        }
+        if (!report.pageViews().isEmpty()) {
+            replacePageViews(job, version, report, now);
         }
         for (Report.Next next : report.next()) {
             if (next.texts()) {
@@ -355,7 +372,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 .addKeyValue("layers", report.layers().size()).addKeyValue("outcomes", report.pages().size())
                 .addKeyValue("texts", report.texts().size()).addKeyValue("next", report.next().size())
                 .addKeyValue("passages", report.carriesPassages() ? report.passages().size() : 0)
-                .log("ingestion.recorded");
+                .addKeyValue("pageViews", report.pageViews().size()).log("ingestion.recorded");
         endChainIfDone(job, version.id(), total, now);
     }
 
@@ -381,6 +398,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         fail(job, version.get(), recorded, now);
         if (PASSWORD_REQUIRED.equals(recorded)) {
             removeRawUpload(job.ownerId(), version.get().id(), now);
+            materials.deletePageViews(version.get().id());
             removeFilesAfterCommit(materials.deleteVersionFiles(version.get().id()));
         }
     }
@@ -397,12 +415,13 @@ public class IngestionSteps implements JobHandler, IngestionStart {
 
     /**
      * Restarts the chain from the stored original (Story 1.16): the other unended steps are cancelled; the layers,
-     * outcomes, batches and {@code texts} files go; the pipeline version is cleared and the page total kept; a new first
-     * step reads the original. Without an original, or past the step cap, the version fails instead.
+     * outcomes, batches and {@code texts} files go, and the passages, outline, page views and pictures; the pipeline
+     * version is cleared and the page total kept; a new first step reads the original. Without an original, or past
+     * the step cap, the version fails instead.
      */
     private void restart(JobRef job, VersionRow version, Instant now) {
-        Optional<VersionFileRow> original = materials.versionFiles(version.id()).stream()
-                .filter(file -> VersionFileRow.ORIGINAL.equals(file.role())).findFirst();
+        Optional<VersionFileRow> original = materials.versionFiles(version.id(), Set.of(VersionFileRow.ORIGINAL))
+                .stream().findFirst();
         String stage = START_STAGES.get(version.format());
         if (original.isEmpty() || stage == null) {
             fail(job, version, PIPELINE_CHANGED, now);
@@ -417,8 +436,10 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         int ranges = materials.deletePageRanges(version.id());
         int passages = materials.deletePassages(version.id());
         boolean outline = materials.deleteOutline(version.id());
+        // Page views first: each names its picture file.
+        int pageViews = materials.deletePageViews(version.id());
         removeFilesAfterCommit(materials.deleteVersionFiles(version.id(),
-                Set.of(VersionFileRow.BATCH, VersionFileRow.TEXT)));
+                Set.of(VersionFileRow.BATCH, VersionFileRow.TEXT, VersionFileRow.PICTURE)));
         materials.clearPipelineVersion(version.id(), now);
         UUID input = original.get().fileId();
         JobRef first = jobs.create(KIND, created -> materials.insertStep(new StepRow(Ids.newId(), job.ownerId(),
@@ -426,7 +447,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("jobId", job.id())
                 .addKeyValue("newJobId", first.id()).addKeyValue("stage", stage).addKeyValue("cancelled", cancelled)
                 .addKeyValue("ranges", ranges).addKeyValue("passages", passages).addKeyValue("outline", outline)
-                .log("ingestion.restarted");
+                .addKeyValue("pageViews", pageViews).log("ingestion.restarted");
     }
 
     /**
@@ -469,6 +490,51 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         log.atInfo().addKeyValue("versionId", versionId).addKeyValue("jobId", job.id())
                 .addKeyValue("passages", rows.size()).addKeyValue("replaced", removed)
                 .addKeyValue("sections", report.outline().size()).log("ingestion.passages_recorded");
+    }
+
+    /**
+     * The page views of the pages the report names become the report's (Story 1.19): a page's earlier view and its
+     * picture go, so a retried report leaves one view per page. Each picture must be an output of this job, refused
+     * with {@value #PAGE_VIEW_INVALID} otherwise, and becomes a {@code picture} file of its page; each view's lines or
+     * text are encrypted under its own id.
+     */
+    private void replacePageViews(JobRef job, VersionRow version, Report report, Instant now) {
+        UUID owner = job.ownerId();
+        List<PageViewRow> replaced = new ArrayList<>();
+        for (int[] run : runs(report.pageViews().stream().map(Report.PageView::page).toList())) {
+            replaced.addAll(materials.deletePageViews(version.id(), run[0], run[1]));
+        }
+        List<VersionFileRow> pictures = replaced.stream().filter(PageViewRow::hasPicture)
+                .flatMap(view -> materials.deleteVersionFile(version.id(), view.pictureFileId()).stream()).toList();
+        removeFilesAfterCommit(pictures);
+        int withPicture = 0;
+        for (Report.PageView view : report.pageViews()) {
+            UUID id = Ids.newId();
+            if (view.pictureFileId() != null) {
+                adopt(job, version, view.pictureFileId(), VersionFileRow.PICTURE, view.page(), view.page(), now,
+                        PAGE_VIEW_INVALID);
+                withPicture++;
+            }
+            materials.insertPageView(new PageViewRow(id, owner, version.id(), view.page(), view.pictureFileId(),
+                    view.width(), view.height(), vault.encrypt(PageViews.content(id, owner),
+                    PageViews.contentJson(view.content())), now));
+        }
+        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("jobId", job.id())
+                .addKeyValue("pageViews", report.pageViews().size()).addKeyValue("pictures", withPicture)
+                .addKeyValue("replaced", replaced.size()).log("ingestion.page_views_recorded");
+    }
+
+    /** Pages as inclusive runs of consecutive pages, each {@code [first, last]}. */
+    private static List<int[]> runs(List<Integer> pages) {
+        List<int[]> runs = new ArrayList<>();
+        pages.stream().sorted().forEach(page -> {
+            if (!runs.isEmpty() && runs.getLast()[1] == page - 1) {
+                runs.getLast()[1] = page;
+            } else {
+                runs.add(new int[] {page, page});
+            }
+        });
+        return runs;
     }
 
     /**
@@ -547,8 +613,13 @@ public class IngestionSteps implements JobHandler, IngestionStart {
 
     private VersionFileRow adopt(JobRef job, VersionRow version, UUID fileId, String role, int firstPage, int lastPage,
                                  Instant now) {
-        JobOutput output = jobs.adoptOutput(job, fileId)
-                .orElseThrow(() -> new JobResultInvalid("ingestion.output_unknown"));
+        return adopt(job, version, fileId, role, firstPage, lastPage, now, "ingestion.output_unknown");
+    }
+
+    /** One of the job's outputs becomes a file of the version; refused with {@code code} when it is not one. */
+    private VersionFileRow adopt(JobRef job, VersionRow version, UUID fileId, String role, int firstPage, int lastPage,
+                                 Instant now, String code) {
+        JobOutput output = jobs.adoptOutput(job, fileId).orElseThrow(() -> new JobResultInvalid(code));
         VersionFileRow row = new VersionFileRow(Ids.newId(), job.ownerId(), version.id(), output.fileId(), role,
                 firstPage, lastPage, output.sizeBytes(), output.pieceCount(), now);
         materials.insertVersionFile(row);
@@ -596,11 +667,21 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * {@value #TEXTS}). Every range is inclusive. From Story 1.18, {@code passages} ({@code page}, {@code sectionPath},
      * {@code text}, and {@code boxes} or {@code range}) in reading order and {@code outline} ({@code level},
      * {@code title}, {@code page}): when the report gives either, both are lists (an absent one empty); when it gives
-     * neither, both are null.
+     * neither, both are null. From Story 1.19, {@code pageViews}: each {@code page}, which this report's
+     * {@code pages} must give an outcome and no other view names, with either {@code picture} ({@code fileId},
+     * {@code width}, {@code height}) and {@code lines} ({@code text}, {@code box}), or a text page's {@code text}.
      */
     record Report(String pipelineVersion, Integer pageTotal, UUID original, List<Batch> batches, List<Batch> texts,
                   List<Range> layers, List<Range> pages, List<Next> next, List<Passage> passages,
-                  List<Passages.Entry> outline) {
+                  List<Passages.Entry> outline, List<PageView> pageViews) {
+
+        /** A page view: a picture page's file, size and lines, or a text page's text (no picture). */
+        record PageView(int page, UUID pictureFileId, Integer width, Integer height, PageViews.Content content) {
+            @Override
+            public String toString() {
+                return "PageView[page=" + page + "]";
+            }
+        }
 
         record Batch(UUID fileId, int firstPage, int lastPage) {
         }
@@ -656,9 +737,89 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 passages = passages(result.path("passages"));
                 outline = outline(result.path("outline"));
             }
+            List<Range> pages = ranges(result.path("pages"), "outcome", OUTCOMES);
             return new Report(version.asString(), total, original, files(result.path("batches")),
-                    files(result.path("texts")), ranges(result.path("layers"), "layer", LAYERS),
-                    ranges(result.path("pages"), "outcome", OUTCOMES), List.copyOf(next), passages, outline);
+                    files(result.path("texts")), ranges(result.path("layers"), "layer", LAYERS), pages,
+                    List.copyOf(next), passages, outline, pageViews(result.path("pageViews"), pages));
+        }
+
+        /**
+         * The report's page views (Story 1.19), each on a page this report gives an outcome, no page twice: a picture
+         * of 1 to {@value #MAX_SIDE} pixels a side with at most {@value #MAX_LINES} lines (each 1 to
+         * {@value #MAX_LINE} code points, its box four fractions), or a text of at most {@value #MAX_PAGE_TEXT} code
+         * points.
+         */
+        private static List<PageView> pageViews(JsonNode node, List<Range> pages) {
+            if (node.isMissingNode() || node.isNull()) {
+                return List.of();
+            }
+            if (!node.isArray()) {
+                throw new JobResultInvalid(PAGE_VIEW_INVALID);
+            }
+            List<PageView> found = new ArrayList<>(node.size());
+            Set<Integer> seen = new HashSet<>();
+            for (JsonNode item : node) {
+                JsonNode pageNode = item.path("page");
+                if (!item.isObject() || !pageNode.isIntegralNumber() || !pageNode.canConvertToInt()) {
+                    throw new JobResultInvalid(PAGE_VIEW_INVALID);
+                }
+                int page = pageNode.intValue();
+                if (!seen.add(page) || pages.stream().noneMatch(range -> range.firstPage() <= page
+                        && page <= range.lastPage())) {
+                    throw new JobResultInvalid(PAGE_VIEW_INVALID);
+                }
+                boolean picture = present(item.path("picture"));
+                if (picture == present(item.path("text"))) {
+                    throw new JobResultInvalid(PAGE_VIEW_INVALID);
+                }
+                found.add(picture ? picturePage(page, item) : textPage(page, item));
+            }
+            return List.copyOf(found);
+        }
+
+        private static PageView textPage(int page, JsonNode item) {
+            JsonNode text = item.path("text");
+            if (present(item.path("lines")) || !text.isString() || !within(text.asString(), 0, MAX_PAGE_TEXT)) {
+                throw new JobResultInvalid(PAGE_VIEW_INVALID);
+            }
+            return new PageView(page, null, null, null, new PageViews.Content(null, text.asString()));
+        }
+
+        private static PageView picturePage(int page, JsonNode item) {
+            JsonNode picture = item.path("picture");
+            JsonNode fileId = picture.path("fileId");
+            JsonNode lines = item.path("lines");
+            if (!picture.isObject() || !fileId.isString() || !UUID_TEXT.matcher(fileId.asString()).matches()
+                    || !lines.isArray() || lines.size() > MAX_LINES) {
+                throw new JobResultInvalid(PAGE_VIEW_INVALID);
+            }
+            List<PageViews.Line> found = new ArrayList<>(lines.size());
+            for (JsonNode line : lines) {
+                JsonNode text = line.path("text");
+                JsonNode box = line.path("box");
+                if (!line.isObject() || !text.isString() || !within(text.asString(), 1, MAX_LINE) || !box.isArray()
+                        || box.size() != 4) {
+                    throw new JobResultInvalid(PAGE_VIEW_INVALID);
+                }
+                List<Double> sides = new ArrayList<>(4);
+                for (JsonNode side : box) {
+                    if (!fraction(side)) {
+                        throw new JobResultInvalid(PAGE_VIEW_INVALID);
+                    }
+                    sides.add(side.asDouble());
+                }
+                found.add(new PageViews.Line(text.asString(), List.copyOf(sides)));
+            }
+            return new PageView(page, UUID.fromString(fileId.asString()), side(picture.path("width")),
+                    side(picture.path("height")), new PageViews.Content(List.copyOf(found), null));
+        }
+
+        private static int side(JsonNode node) {
+            if (!node.isIntegralNumber() || !node.canConvertToInt() || node.intValue() < 1
+                    || node.intValue() > MAX_SIDE) {
+                throw new JobResultInvalid(PAGE_VIEW_INVALID);
+            }
+            return node.intValue();
         }
 
         private static boolean present(JsonNode node) {
@@ -777,7 +938,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         /** Whether the report names a page or a file of pages, which needs a page total. */
         boolean namesPages() {
             return original != null || !batches.isEmpty() || !texts.isEmpty() || !layers.isEmpty() || !pages.isEmpty()
-                    || !next.isEmpty() || carriesPassages() && (!passages.isEmpty() || !outline.isEmpty());
+                    || !next.isEmpty() || carriesPassages() && (!passages.isEmpty() || !outline.isEmpty())
+                    || !pageViews.isEmpty();
         }
 
         /** Whether the report gives the version's passages and outline (Story 1.18), which replace its earlier ones. */
