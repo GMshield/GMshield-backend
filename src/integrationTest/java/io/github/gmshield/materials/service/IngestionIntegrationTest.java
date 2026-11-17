@@ -8,7 +8,9 @@ import io.github.gmshield.jobs.service.JobFiles;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.shared.service.ApiException;
@@ -46,7 +48,9 @@ import tools.jackson.databind.json.JsonMapper;
  * upload's removal, a password's failure and the sweep of an output nobody adopted; then triage and layout reports
  * into {@code page_layer} and {@code page_outcome} (the JPQL overlap checks, {@code pages.done} and the end of the
  * chain), the restart transaction on a pipeline change, and the cross-owner tests of {@code ingestion_step},
- * {@code version_file}, {@code page_layer} and {@code page_outcome}.
+ * {@code version_file}, {@code page_layer} and {@code page_outcome}. Story 1.18: V11, the held passages step and its
+ * job, its text inputs, passages and the outline stored encrypted and replaced by a second report, a failure ending
+ * the held step, and the cross-owner tests of {@code passage} and {@code version_outline}.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads the library tables with
  * native SQL.
@@ -457,6 +461,193 @@ class IngestionIntegrationTest {
                 b.versionId(), 1, 1, "unreadable", now)))).isInstanceOf(RuntimeException.class);
         assertThat(jdbc.sql("select count(*) from page_outcome where version_id in (?, ?)")
                 .params(a.versionId(), b.versionId()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    // --- Story 1.18
+
+    @Test
+    void theHeldPassagesStepsGetTheirJobsOnceEveryPageIsReadAndTheirPassagesAreStoredEncryptedAndReplaced()
+            throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        String held = "{\"stage\":\"passages\",\"firstPage\":1,\"lastPage\":3,\"input\":\"texts\"}";
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"4\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
+                        + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + "," + held + "," + held + "]}"));
+        List<Map<String, Object>> heldRows = jdbc.sql("select job_id, input_file_id, input_texts, first_page, last_page"
+                + " from ingestion_step where version_id = ? and stage = 'passages'").param(chain.versionId()).query()
+                .listOfRows();
+        assertThat(heldRows).hasSize(2).allSatisfy(row -> assertThat(row).containsEntry("job_id", null)
+                .containsEntry("input_file_id", null).containsEntry("input_texts", true).containsEntry("first_page", 1)
+                .containsEntry("last_page", 3));
+
+        JobClaims.Claim layout = claimOffered(chain);
+        JobFiles.Stored text = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8)));
+        claims.report(layout.jobId(), layout.claimId(), layout.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"4\",\"pages\":[" + range(1, 3, "outcome", "read_directly") + "],"
+                        + "\"texts\":[{\"fileId\":\"" + text.fileId() + "\",\"firstPage\":1,\"lastPage\":3}]}"));
+
+        // The report that read the last page gave both held steps their jobs; the version still processes.
+        assertThat(jdbc.sql("select count(*) from ingestion_step s join job j on j.id = s.job_id where s.version_id = ?"
+                + " and s.stage = 'passages' and j.state in ('offered', 'waiting')").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(2);
+        assertThat(state(chain.versionId())).isEqualTo("processing");
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
+                .isNull();
+        JobClaims.Claim first = claimOffered(chain);
+        assertThat(first.input().path("input").asString()).isEqualTo("texts");
+        assertThat(first.input().path("texts").get(0).path("name").asString()).isEqualTo("text-" + text.fileId());
+        ByteArrayOutputStream read = new ByteArrayOutputStream();
+        jobFiles.open(first.jobId(), first.claimId(), first.grant(), "text-" + text.fileId()).input().writeTo(read);
+        assertThat(read.toString(StandardCharsets.UTF_8)).isEqualTo("{\"pages\":[]}");
+        assertThatThrownBy(() -> jobFiles.open(first.jobId(), first.claimId(), first.grant(), "source"))
+                .isInstanceOf(ApiException.class);
+        claims.report(first.jobId(), first.claimId(), first.grant(), "done", null, null, JSON.readTree(
+                passagesReport("Wyvern sting", "Bestiary", "Wyvern")));
+        assertThat(jdbc.sql("select count(*) from passage where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(2);
+
+        // The second report replaces the first set, in its transaction: one set, with the same ordinals.
+        JobClaims.Claim second = claimOffered(chain);
+        claims.report(second.jobId(), second.claimId(), second.grant(), "done", null, null, JSON.readTree(
+                passagesReport("Vorpal blade", "Magic Items", "Vorpal Sword")));
+
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        List<Map<String, Object>> rows = jdbc.sql("select id, owner_id, ordinal, page, text, place from passage"
+                + " where version_id = ? order by ordinal").param(chain.versionId()).query().listOfRows();
+        assertThat(rows).extracting(row -> row.get("ordinal") + "@" + row.get("page")).containsExactly("0@1", "1@3");
+        // Nothing of the text, the path or the outline is stored in the clear.
+        for (Map<String, Object> row : rows) {
+            assertThat(row).containsEntry("owner_id", chain.owner());
+            for (String column : List.of("text", "place")) {
+                String stored = new String((byte[]) row.get(column), StandardCharsets.ISO_8859_1);
+                assertThat(stored).doesNotContain("Vorpal").doesNotContain("Magic").doesNotContain("Wyvern");
+            }
+        }
+        byte[] outline = jdbc.sql("select outline from version_outline where version_id = ?").param(chain.versionId())
+                .query(byte[].class).single();
+        assertThat(new String(outline, StandardCharsets.ISO_8859_1)).doesNotContain("Magic").doesNotContain("Vorpal");
+        UUID id = (UUID) rows.get(1).get("id");
+        Materials.Passage passage = as(chain.owner(), () -> materials.passage(id)).orElseThrow();
+        assertThat(passage.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
+        assertThat(passage.text()).isEqualTo("Vorpal blade 3");
+        assertThat(passage.page()).isEqualTo(3);
+        assertThat(passage.materialId()).isEqualTo(chain.materialId());
+        assertThat(passage.materialName()).isEqualTo("Livro.pdf");
+        assertThat(as(chain.owner(), () -> materials.outline(chain.versionId()))).hasValue(List.of(
+                new Materials.Section(1, "Magic Items", 1), new Materials.Section(2, "Vorpal Sword", 3)));
+        // A ciphertext moved to another row fails its integrity check rather than being shown.
+        jdbc.sql("update passage set text = (select text from passage where id = ?) where version_id = ? and id <> ?")
+                .params(rows.get(0).get("id"), chain.versionId(), rows.get(0).get("id")).update();
+        assertThatThrownBy(() -> as(chain.owner(), () -> materials.passage(id))).isInstanceOf(ApiException.class);
+    }
+
+    @Test
+    void aFailureEndsTheHeldStepWithoutAJobOnPostgres() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"4\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
+                        + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + ",{\"stage\":\"passages\",\"firstPage\":1,"
+                        + "\"lastPage\":3,\"input\":\"texts\"}]}"));
+        JobClaims.Claim layout = claimOffered(chain);
+
+        claims.report(layout.jobId(), layout.claimId(), layout.grant(), "failed", "ingestion.step_failed", false, null);
+
+        assertThat(state(chain.versionId())).isEqualTo("failed");
+        assertThat(jdbc.sql("select job_id, ended_at is not null as ended from ingestion_step where version_id = ?"
+                + " and stage = 'passages'").param(chain.versionId()).query().singleRow())
+                .containsEntry("job_id", null).containsEntry("ended", true);
+        assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ? and ended_at is null")
+                .param(chain.versionId()).query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void theStory118TablesCheckTheirValuesAndKeepTheirVersionWithinTheOwner() throws Exception {
+        Chain a = completed(pdf(MIB));
+        Chain b = completed(pdf(MIB));
+        UUID passage = Ids.newId();
+        jdbc.sql("insert into passage (id, owner_id, version_id, ordinal, page, text, place, created_at)"
+                + " values (?, ?, ?, 0, 1, ?, ?, now())").params(passage, a.owner(), a.versionId(), new byte[] {1},
+                new byte[] {2}).update();
+        UUID outline = Ids.newId();
+        jdbc.sql("insert into version_outline (id, owner_id, version_id, outline, created_at) values (?, ?, ?, ?, now())")
+                .params(outline, a.owner(), a.versionId(), new byte[] {3}).update();
+        Map<String, String> violations = Map.of(
+                "update passage set page = 0 where id = '" + passage + "'", "passage_page_check",
+                "update passage set ordinal = -1 where id = '" + passage + "'", "passage_ordinal_check",
+                "update passage set version_id = '" + b.versionId() + "' where id = '" + passage + "'",
+                "passage_version_fkey",
+                "update version_outline set version_id = '" + b.versionId() + "' where id = '" + outline + "'",
+                "version_outline_version_fkey",
+                "insert into version_outline (id, owner_id, version_id, outline, created_at) values ('" + Ids.newId()
+                        + "', '" + a.owner() + "', '" + a.versionId() + "', '\\x01', now())",
+                "version_outline_owner_version_key",
+                "insert into passage (id, owner_id, version_id, ordinal, page, text, place, created_at) values ('"
+                        + Ids.newId() + "', '" + a.owner() + "', '" + a.versionId() + "', 0, 1, '\\x01', '\\x01', now())",
+                "passage_owner_version_ordinal_key",
+                "update ingestion_step set job_id = null where job_id = '" + a.jobId() + "'", "ingestion_step_held_check",
+                "update ingestion_step set input_texts = true where job_id = '" + a.jobId() + "'",
+                "ingestion_step_input_check");
+        violations.forEach((sql, constraint) -> assertThatThrownBy(() -> jdbc.sql(sql).update())
+                .as(sql).satisfies(failure -> assertThat(messages(failure)).anyMatch(text -> text.contains(constraint))));
+    }
+
+    @Test
+    void anotherOwnersPassagesAndOutlineAreNeverSeenOrWritten() throws Exception {
+        Chain a = completed(pdf(MIB));
+        Chain b = completed(pdf(MIB));
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID passage = Ids.newId();
+        write(a.owner(), () -> {
+            store.insertPassages(List.of(new PassageRow(passage, a.owner(), a.versionId(), 0, 1, new byte[] {1},
+                    new byte[] {2}, now)));
+            store.insertOutline(new OutlineRow(Ids.newId(), a.owner(), a.versionId(), new byte[] {3}, now));
+        });
+
+        // Matrix row "Two owners": empty for B, through the store and the service.
+        as(b.owner(), () -> {
+            assertThat(store.findPassage(passage)).isEmpty();
+            assertThat(store.passages(a.versionId())).isEmpty();
+            assertThat(store.findOutline(a.versionId())).isEmpty();
+            assertThat(materials.passage(passage)).isEmpty();
+            assertThat(materials.outline(a.versionId())).isEmpty();
+            return null;
+        });
+        write(b.owner(), () -> {
+            assertThat(store.deletePassages(a.versionId())).isZero();
+            assertThat(store.deleteOutline(a.versionId())).isFalse();
+        });
+        as(a.owner(), () -> {
+            assertThat(store.findPassage(passage)).isPresent();
+            assertThat(store.passages(a.versionId())).hasSize(1);
+            assertThat(store.findOutline(a.versionId())).isPresent();
+            return null;
+        });
+        // B cannot write a passage or an outline naming A's version, nor A one under B's owner id.
+        assertThatThrownBy(() -> write(b.owner(), () -> store.insertPassages(List.of(new PassageRow(Ids.newId(),
+                b.owner(), a.versionId(), 1, 1, new byte[] {1}, new byte[] {2}, now))))).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> write(b.owner(), () -> store.insertOutline(new OutlineRow(Ids.newId(), b.owner(),
+                a.versionId(), new byte[] {3}, now)))).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> write(a.owner(), () -> store.insertPassages(List.of(new PassageRow(Ids.newId(),
+                b.owner(), b.versionId(), 0, 1, new byte[] {1}, new byte[] {2}, now))))).isInstanceOf(RuntimeException.class);
+        assertThat(jdbc.sql("select count(*) from passage where version_id in (?, ?)").params(a.versionId(),
+                b.versionId()).query(Long.class).single()).isEqualTo(1);
+    }
+
+    /** A passages report: page 1 under the first title, page 3 under both, and the outline of the two. */
+    private static String passagesReport(String text, String chapter, String section) {
+        return "{\"pipelineVersion\":\"4\",\"passages\":[{\"page\":1,\"sectionPath\":[\"" + chapter + "\"],\"text\":\""
+                + text + " 1\",\"boxes\":[[0,0,1,0.5]]},{\"page\":3,\"sectionPath\":[\"" + chapter + "\",\"" + section
+                + "\"],\"text\":\"" + text + " 3\",\"boxes\":[[0,0.5,1,1]]}],\"outline\":[{\"level\":1,\"title\":\""
+                + chapter + "\",\"page\":1},{\"level\":2,\"title\":\"" + section + "\",\"page\":3}],\"next\":[]}";
     }
 
     /** Claims the clean step, sends its original and its batches of 20 pages, and reports a triage step per batch. */

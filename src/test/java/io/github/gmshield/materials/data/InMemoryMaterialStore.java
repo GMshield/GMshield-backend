@@ -33,6 +33,10 @@ public class InMemoryMaterialStore implements MaterialStore {
     public final Map<UUID, PageRangeRow> layers = new ConcurrentHashMap<>();
     /** {@code page_outcome} (Story 1.16). */
     public final Map<UUID, PageRangeRow> outcomes = new ConcurrentHashMap<>();
+    /** {@code passage} (Story 1.18). */
+    public final Map<UUID, PassageRow> passages = new ConcurrentHashMap<>();
+    /** {@code version_outline} (Story 1.18). */
+    public final Map<UUID, OutlineRow> outlines = new ConcurrentHashMap<>();
 
     @Override
     public synchronized void insertMaterial(MaterialRow row) {
@@ -168,9 +172,12 @@ public class InMemoryMaterialStore implements MaterialStore {
     public synchronized void insertStep(StepRow row) {
         UUID owner = ownerFor(row.ownerId());
         VersionRow version = versions.get(row.versionId());
-        boolean jobTaken = steps.values().stream().anyMatch(other -> other.ownerId().equals(owner)
-                && other.jobId().equals(row.jobId()));
-        if (steps.containsKey(row.id()) || jobTaken || version == null || !version.ownerId().equals(owner)) {
+        boolean jobTaken = row.jobId() != null && steps.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                && row.jobId().equals(other.jobId()));
+        // The table's checks: an input file or every text file, never both; only a step over every text file waits
+        // for its job.
+        boolean checked = (row.inputTexts() == (row.inputFileId() == null)) && (row.jobId() != null || row.inputTexts());
+        if (steps.containsKey(row.id()) || jobTaken || !checked || version == null || !version.ownerId().equals(owner)) {
             throw new IllegalStateException("key or reference refused");
         }
         steps.put(row.id(), row);
@@ -180,7 +187,7 @@ public class InMemoryMaterialStore implements MaterialStore {
     @Override
     public Optional<StepRow> findStepByJob(UUID jobId) {
         UUID owner = OwnerContext.require();
-        return steps.values().stream().filter(row -> row.ownerId().equals(owner) && row.jobId().equals(jobId)).findFirst();
+        return steps.values().stream().filter(row -> row.ownerId().equals(owner) && jobId.equals(row.jobId())).findFirst();
     }
 
     @Override
@@ -199,6 +206,32 @@ public class InMemoryMaterialStore implements MaterialStore {
                 steps.put(before.id(), before.ended(now));
                 RollbackUndo.onRollback(() -> steps.put(before.id(), before));
             }
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public synchronized boolean endHeldStep(UUID stepId, Instant now) {
+        return changeHeld(stepId, before -> before.ended(now));
+    }
+
+    @Override
+    public synchronized boolean startHeldStep(UUID stepId, UUID jobId) {
+        boolean taken = steps.values().stream().anyMatch(other -> jobId.equals(other.jobId()));
+        if (taken) {
+            throw new IllegalStateException("unique key taken");
+        }
+        return changeHeld(stepId, before -> before.started(jobId));
+    }
+
+    private boolean changeHeld(UUID stepId, java.util.function.UnaryOperator<StepRow> change) {
+        UUID owner = OwnerContext.require();
+        Optional<StepRow> found = Optional.ofNullable(steps.get(stepId))
+                .filter(row -> row.ownerId().equals(owner) && row.held());
+        found.ifPresent(before -> {
+            ownerFor(before.ownerId());
+            steps.put(stepId, change.apply(before));
+            RollbackUndo.onRollback(() -> steps.put(stepId, before));
         });
         return found.isPresent();
     }
@@ -356,6 +389,77 @@ public class InMemoryMaterialStore implements MaterialStore {
             }
         }
         return removed;
+    }
+
+    @Override
+    public synchronized void insertPassages(List<PassageRow> rows) {
+        for (PassageRow row : rows) {
+            UUID owner = ownerFor(row.ownerId());
+            VersionRow version = versions.get(row.versionId());
+            boolean ordinalTaken = passages.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                    && other.versionId().equals(row.versionId()) && other.ordinal() == row.ordinal());
+            if (passages.containsKey(row.id()) || ordinalTaken || version == null || !version.ownerId().equals(owner)
+                    || row.ordinal() < 0 || row.page() < 1) {
+                throw new IllegalStateException("key, reference or check refused");
+            }
+            passages.put(row.id(), row);
+            RollbackUndo.onRollback(() -> passages.remove(row.id()));
+        }
+    }
+
+    @Override
+    public Optional<PassageRow> findPassage(UUID id) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(passages.get(id)).filter(row -> row.ownerId().equals(owner));
+    }
+
+    @Override
+    public List<PassageRow> passages(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return passages.values().stream().filter(row -> row.ownerId().equals(owner)
+                && row.versionId().equals(versionId)).sorted(Comparator.comparingInt(PassageRow::ordinal)).toList();
+    }
+
+    @Override
+    public synchronized int deletePassages(UUID versionId) {
+        List<PassageRow> found = passages(versionId);
+        for (PassageRow row : found) {
+            ownerFor(row.ownerId());
+            passages.remove(row.id());
+            RollbackUndo.onRollback(() -> passages.put(row.id(), row));
+        }
+        return found.size();
+    }
+
+    @Override
+    public synchronized void insertOutline(OutlineRow row) {
+        UUID owner = ownerFor(row.ownerId());
+        VersionRow version = versions.get(row.versionId());
+        boolean taken = outlines.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                && other.versionId().equals(row.versionId()));
+        if (outlines.containsKey(row.id()) || taken || version == null || !version.ownerId().equals(owner)) {
+            throw new IllegalStateException("key or reference refused");
+        }
+        outlines.put(row.id(), row);
+        RollbackUndo.onRollback(() -> outlines.remove(row.id()));
+    }
+
+    @Override
+    public Optional<OutlineRow> findOutline(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return outlines.values().stream().filter(row -> row.ownerId().equals(owner)
+                && row.versionId().equals(versionId)).findFirst();
+    }
+
+    @Override
+    public synchronized boolean deleteOutline(UUID versionId) {
+        Optional<OutlineRow> found = findOutline(versionId);
+        found.ifPresent(row -> {
+            ownerFor(row.ownerId());
+            outlines.remove(row.id());
+            RollbackUndo.onRollback(() -> outlines.put(row.id(), row));
+        });
+        return found.isPresent();
     }
 
     @Override

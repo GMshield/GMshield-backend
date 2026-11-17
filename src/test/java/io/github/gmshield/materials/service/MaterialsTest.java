@@ -357,6 +357,132 @@ class MaterialsTest {
         assertThat(Materials.reading(layers, List.of(stepRow(1, 2), stepRow(4, 5)))).isEqualTo("text");
     }
 
+    @Test
+    void neitherAHeldStepNorTheStepOverEveryTextFileCountsTowardReading() {
+        // Matrix row "Held step": the passages step waits with no job, then runs over no page of its own.
+        UUID material = create(owner, "livro.pdf", Uploads.Details.NONE);
+        setState(material, "processing");
+        UUID version = versionOf(material).id();
+        write(() -> materials.recordIngestion(version, "4", 30, clock.instant()));
+        layer(version, 1, 30, PageRangeRow.TEXT);
+        outcome(version, 1, 8, PageRangeRow.READ_DIRECTLY);
+        UUID held = Ids.newId();
+        write(() -> {
+            materials.insertStep(StepRow.held(held, owner, version, "passages", 1, 30, clock.instant()));
+            return true;
+        });
+        UUID layout = step(version, 9, 30);
+        running.add(layout);
+        List<java.util.Collection<UUID>> asked = new ArrayList<>();
+        Materials watched = new Materials(materials, uploads, vault, ids -> {
+            asked.add(List.copyOf(ids));
+            return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
+        }, beansFor(transactions));
+
+        assertThat(as(owner, () -> watched.find(material)).orElseThrow().pages().reading()).isEqualTo("text");
+        assertThat(asked).singleElement().satisfies(ids -> assertThat(ids).containsExactly(layout));
+
+        // The layout step ends, every page has an outcome, and the held step gets its job, which then runs.
+        running.clear();
+        write(() -> materials.endStep(layout, clock.instant()));
+        outcome(version, 9, 30, PageRangeRow.READ_DIRECTLY);
+        UUID job = Ids.newId();
+        write(() -> materials.startHeldStep(held, job));
+        running.add(job);
+        asked.clear();
+
+        Materials.Pages pages = as(owner, () -> watched.find(material)).orElseThrow().pages();
+
+        assertThat(pages.reading()).isNull();
+        assertThat(pages.done()).isEqualTo(30);
+        assertThat(asked).isEmpty();
+    }
+
+    // --- passages and outline (Story 1.18)
+
+    @Test
+    void aPassageNamesItsMaterialItsSectionPathAndItsPageToItsOwnerOnly() {
+        UUID material = create(owner, "Livro do Mestre.pdf", Uploads.Details.NONE);
+        UUID version = versionOf(material).id();
+        UUID first = passage(version, 0, 21, List.of("Magic Items", "Vorpal Sword"), "Vorpal Sword\nA legendary blade.");
+        UUID second = passage(version, 1, 22, List.of(), "Prefácio");
+
+        Materials.Passage found = as(owner, () -> reads.passage(first)).orElseThrow();
+
+        assertThat(found.id()).isEqualTo(first);
+        assertThat(found.materialId()).isEqualTo(material);
+        assertThat(found.materialName()).isEqualTo("Livro do Mestre.pdf");
+        assertThat(found.versionId()).isEqualTo(version);
+        assertThat(found.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
+        assertThat(found.page()).isEqualTo(21);
+        assertThat(found.text()).isEqualTo("Vorpal Sword\nA legendary blade.");
+        assertThat(found.toString()).doesNotContain("Vorpal").doesNotContain("Livro");
+        assertThat(as(owner, () -> reads.passage(second)).orElseThrow().sectionPath()).isEmpty();
+        // Matrix row "Two owners": B asks for A's passage id, and for an unknown one.
+        assertThat(as(other, () -> reads.passage(first))).isEmpty();
+        assertThat(as(owner, () -> reads.passage(Ids.newId()))).isEmpty();
+        // Nothing is stored in the clear.
+        assertThat(new String(materials.passages.get(first).text(), java.nio.charset.StandardCharsets.ISO_8859_1))
+                .doesNotContain("Vorpal");
+        assertThat(new String(materials.passages.get(first).place(), java.nio.charset.StandardCharsets.ISO_8859_1))
+                .doesNotContain("Magic");
+    }
+
+    @Test
+    void aPassageCopiedToAnotherRowFailsItsIntegrityCheck() {
+        UUID material = create(owner, "livro.pdf", Uploads.Details.NONE);
+        UUID version = versionOf(material).id();
+        UUID first = passage(version, 0, 1, List.of("A"), "Primeiro");
+        UUID second = passage(version, 1, 2, List.of("B"), "Segundo");
+        io.github.gmshield.materials.data.PassageRow original = materials.passages.get(second);
+        materials.passages.put(second, new io.github.gmshield.materials.data.PassageRow(second, owner, version, 1, 2,
+                materials.passages.get(first).text(), original.place(), original.createdAt()));
+
+        assertThatThrownBy(() -> as(owner, () -> reads.passage(second)))
+                .isInstanceOf(io.github.gmshield.vault.service.IntegrityException.class);
+    }
+
+    @Test
+    void theOutlineOfAVersionIsItsOwnersOnly() {
+        UUID material = create(owner, "livro.pdf", Uploads.Details.NONE);
+        UUID version = versionOf(material).id();
+        assertThat(as(owner, () -> reads.outline(version))).isEmpty();
+        UUID row = Ids.newId();
+        write(() -> {
+            materials.insertOutline(new io.github.gmshield.materials.data.OutlineRow(row, owner, version,
+                    vault.encrypt(Passages.outline(row, owner), Passages.outlineJson(List.of(
+                            new Passages.Entry(1, "Magic Items", 19), new Passages.Entry(2, "Vorpal Sword", 21)))),
+                    clock.instant()));
+            return true;
+        });
+
+        assertThat(as(owner, () -> reads.outline(version))).hasValueSatisfying(sections -> assertThat(sections)
+                .containsExactly(new Materials.Section(1, "Magic Items", 19), new Materials.Section(2, "Vorpal Sword",
+                        21)));
+        assertThat(as(other, () -> reads.outline(version))).isEmpty();
+        assertThat(as(owner, () -> reads.outline(Ids.newId()))).isEmpty();
+    }
+
+    /** A passage of the owner's version, stored as the report stores it; answers its id. */
+    private UUID passage(UUID version, int ordinal, int page, List<String> path, String text) {
+        UUID id = Ids.newId();
+        write(() -> {
+            materials.insertPassages(List.of(new io.github.gmshield.materials.data.PassageRow(id, owner, version,
+                    ordinal, page, vault.encryptText(Passages.text(id, owner), text),
+                    vault.encrypt(Passages.place(id, owner), Passages.placeJson(new Passages.Place(path,
+                            List.of(List.of(0.1, 0.2, 0.9, 0.3)), null))), clock.instant())));
+            return true;
+        });
+        return id;
+    }
+
+    private static org.springframework.beans.factory.ObjectProvider<PlatformTransactionManager> beansFor(
+            PlatformTransactionManager manager) {
+        StaticListableBeanFactory beans = new StaticListableBeanFactory();
+        beans.addBean("transactions", manager);
+        return beans.getBeanProvider(PlatformTransactionManager.class);
+    }
+
     private StepRow stepRow(Integer first, Integer last) {
         return new StepRow(Ids.newId(), owner, Ids.newId(), Ids.newId(), "any", first, last, null, clock.instant(), null);
     }
@@ -366,8 +492,8 @@ class MaterialsTest {
         UUID job = Ids.newId();
         clock.advance(Duration.ofSeconds(1));
         write(() -> {
-            materials.insertStep(new StepRow(Ids.newId(), owner, version, job, "any", first, last, null, clock.instant(),
-                    null));
+            materials.insertStep(new StepRow(Ids.newId(), owner, version, job, "any", first, last, Ids.newId(),
+                    clock.instant(), null));
             return true;
         });
         return job;

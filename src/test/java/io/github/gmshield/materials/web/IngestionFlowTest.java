@@ -25,15 +25,19 @@ import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialTestStores;
+import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.materials.data.VersionRow;
+import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
+import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayOutputStream;
@@ -78,7 +82,10 @@ import tools.jackson.databind.json.JsonMapper;
  * page ranges and their refusals, {@code pages.done}, the end of the chain, a retried and a re-offered step, the
  * restart on a pipeline change, a text upload's step, and the cross-owner test of the page ranges. Story 1.17: OCR
  * steps over a scanned and a mixed PDF, the page counts by layer and outcome the GM reads, and two owners' scans
- * offered in turn. The same tables against PostgreSQL are in {@code IngestionIntegrationTest}.
+ * offered in turn. Story 1.18: the held step over every text file, its job once every page has an outcome, its claim
+ * input and text inputs, the passages and outline it reports (refused when invalid, replaced when reported again), a
+ * failure or a restart ending it, and the cross-owner test of passages and outlines. The same tables against
+ * PostgreSQL are in {@code IngestionIntegrationTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -144,6 +151,8 @@ class IngestionFlowTest {
     private Vault vault;
     @Autowired
     private PlatformTransactionManager transactions;
+    @Autowired
+    private Materials reads;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -1045,6 +1054,452 @@ class IngestionFlowTest {
         assertThat(materials.outcomes.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
     }
 
+    // --- Story 1.18: passages
+
+    @Test
+    void aPdfOfTwoBatchesHoldsItsPassagesStepUntilEveryPageHasAnOutcomeThenReadsEveryTextFileInPageOrder()
+            throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 25, "2", true);
+        assertThat(passagesStep(uploaded.versionId())).satisfies(held -> {
+            assertThat(held.jobId()).isNull();
+            assertThat(held.inputTexts()).isTrue();
+            assertThat(held.inputFileId()).isNull();
+            assertThat(held.firstPage()).isEqualTo(1);
+            assertThat(held.lastPage()).isEqualTo(25);
+            assertThat(held.endedAt()).isNull();
+        });
+
+        // Matrix row "Held step": triage and layout of both batches; the passages step gets no job until the last.
+        for (int i = 0; i < 4; i++) {
+            assertThat(passagesStep(uploaded.versionId()).jobId()).isNull();
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            if (step.stage().equals("triage")) {
+                report(step, claim, triage(step, step.firstPage(), step.lastPage(), List.of()));
+            } else {
+                report(step, claim, layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
+            }
+        }
+
+        StepRow passages = passagesStep(uploaded.versionId());
+        assertThat(passages.jobId()).isNotNull();
+        assertThat(jobs.row(passages.jobId()).state()).isEqualTo("offered");
+        assertThat(jobs.row(passages.jobId()).kind()).isEqualTo("ingestion");
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("processing");
+        assertThat(read.path("pages").path("done").asInt()).isEqualTo(25);
+        assertThat(read.path("pages").path("reading").isNull()).isTrue();
+
+        JsonNode claim = claim(passages.jobId());
+        JsonNode input = claim.path("input");
+        assertThat(input.path("stage").asString()).isEqualTo("passages");
+        assertThat(input.path("input").asString()).isEqualTo("texts");
+        assertThat(input.has("inputFileId")).isFalse();
+        assertThat(input.path("firstPage").asInt()).isEqualTo(1);
+        assertThat(input.path("lastPage").asInt()).isEqualTo(25);
+        assertThat(input.path("pageTotal").asInt()).isEqualTo(25);
+        List<VersionFileRow> texts = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()))
+                .stream().filter(file -> file.role().equals("text")).toList();
+        List<String> names = new ArrayList<>();
+        input.path("texts").forEach(text -> names.add(text.path("name").asString() + " "
+                + text.path("firstPage").asInt() + "-" + text.path("lastPage").asInt()));
+        assertThat(names).containsExactly("text-" + texts.get(0).fileId() + " 1-20",
+                "text-" + texts.get(1).fileId() + " 21-25");
+        for (VersionFileRow text : texts) {
+            HttpResponse<byte[]> opened = input(passages.jobId(), claim, "text-" + text.fileId());
+            assertThat(opened.statusCode()).isEqualTo(200);
+            assertThat(opened.body()).isEqualTo(readBack(gm.id(), text.fileId(), 1));
+        }
+        // Only the version's text files, by their names: not the source, a batch, nor another version's text file.
+        assertThat(input(passages.jobId(), claim, "source").statusCode()).isEqualTo(404);
+        assertThat(input(passages.jobId(), claim, "text-" + cleaned.batches().getFirst()).statusCode()).isEqualTo(404);
+        assertThat(input(passages.jobId(), claim, "text-" + cleaned.original()).statusCode()).isEqualTo(404);
+        assertThat(input(passages.jobId(), claim, "texts").statusCode()).isEqualTo(404);
+
+        // Matrix row "Path across batches": what the worker cut, stored as it reported it.
+        report(passages, claim, passagesReport(
+                passage(19, "Magic Items\nItems of wonder.", "Magic Items"),
+                passage(21, "Vorpal Sword\nA legendary blade.", "Magic Items", "Vorpal Sword"),
+                passage(21, "Vorpal Sword\nIts edge.", "Magic Items", "Vorpal Sword"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "Magic Items", 19) + ","
+                        + section(2, "Vorpal Sword", 21) + "]"));
+
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        List<PassageRow> stored = passages(uploaded.versionId());
+        assertThat(stored).extracting(PassageRow::ordinal, PassageRow::page)
+                .containsExactly(tuple(0, 19), tuple(1, 21), tuple(2, 21));
+        assertThat(stored).allSatisfy(row -> assertThat(row.ownerId()).isEqualTo(gm.id()));
+        Materials.Passage vorpal = OwnerContext.callAs(gm.id(), () -> reads.passage(stored.get(1).id())).orElseThrow();
+        assertThat(vorpal.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
+        assertThat(vorpal.page()).isEqualTo(21);
+        assertThat(vorpal.text()).isEqualTo("Vorpal Sword\nA legendary blade.");
+        assertThat(vorpal.materialId().toString()).isEqualTo(uploaded.materialId());
+        assertThat(vorpal.materialName()).isEqualTo("Livro.pdf");
+        assertThat(vorpal.versionId()).isEqualTo(uploaded.versionId());
+        assertThat(place(gm, stored.get(1)).path("boxes").get(0).size()).isEqualTo(4);
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.outline(uploaded.versionId()))).hasValueSatisfying(
+                sections -> assertThat(sections).containsExactly(new Materials.Section(1, "Magic Items", 19),
+                        new Materials.Section(2, "Vorpal Sword", 21)));
+        // The ids, the counts and the page: never a text, a title or a path in the log.
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Vorpal")
+                || String.valueOf(event.getKeyValuePairs()).contains("Vorpal"));
+    }
+
+    @Test
+    void aScanWhosePagesAreAllUnreadableStillRunsItsPassagesStepWhichReportsNoneAndNeedsReview() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Branco.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 12, "2", true);
+        List<Integer> all = IntStream.rangeClosed(1, 12).boxed().toList();
+        for (int i = 0; i < 3; i++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            if (step.stage().equals("triage")) {
+                report(step, claim, triage(step, 1, 12, all));
+            } else {
+                report(step, claim, ocr(step, claim, step.firstPage(), step.lastPage(), all));
+            }
+        }
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .noneMatch(file -> file.role().equals("text"));
+
+        // Matrix row "All unreadable": the passages step runs over no text file and reports none.
+        StepRow passages = offeredStep(uploaded.versionId());
+        assertThat(passages.stage()).isEqualTo("passages");
+        JsonNode claim = claim(passages.jobId());
+        assertThat(claim.path("input").path("texts").isArray()).isTrue();
+        assertThat(claim.path("input").path("texts").size()).isZero();
+        report(passages, claim, passagesReport());
+
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(passages(uploaded.versionId())).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.outline(uploaded.versionId()))).hasValue(List.of());
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("pages").path("unreadable")
+                .asInt()).isEqualTo(12);
+    }
+
+    @Test
+    void aMarkdownUploadsPassagesStepGetsItsJobFromTheTextReportAndKeepsRangesInItsPages() throws Exception {
+        Gm gm = signUp();
+        byte[] text = "# A\n\nUnder A.\n\n## B\n\nUnder B.\n".getBytes(StandardCharsets.UTF_8);
+        Uploaded uploaded = upload(gm, text, "regras.md", null);
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, text);
+        byte[] pagesJson = ("{\"pages\":[{\"page\":1,\"headingPath\":[\"A\"],\"text\":\"# A\\n\\nUnder A.\\n\\n\","
+                + "\"start\":0,\"end\":15},{\"page\":2,\"headingPath\":[\"A\",\"B\"],\"text\":\"## B\\n\\nUnder B.\\n\","
+                + "\"start\":15,\"end\":30}]}").getBytes(StandardCharsets.UTF_8);
+        UUID pages = output(uploaded.jobId(), claim, pagesJson);
+
+        // The text step's one report gives every page an outcome: its held passages step gets its job at once.
+        report(steps(uploaded.versionId()).getFirst(), claim, "{\"pipelineVersion\":\"2\",\"pageTotal\":2,"
+                + "\"original\":{\"fileId\":\"" + original + "\"},\"pages\":[" + range(1, 2, "outcome", "read_directly")
+                + "],\"texts\":[{\"fileId\":\"" + pages + "\",\"firstPage\":1,\"lastPage\":2}],\"next\":["
+                + passagesStep(2) + "]}");
+
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        StepRow passages = offeredStep(uploaded.versionId());
+        assertThat(passages.stage()).isEqualTo("passages");
+        assertThat(passages.inputTexts()).isTrue();
+        JsonNode passagesClaim = claim(passages.jobId());
+        assertThat(passagesClaim.path("input").path("format").asString()).isEqualTo("markdown");
+        assertThat(input(passages.jobId(), passagesClaim, "text-" + pages).body()).isEqualTo(pagesJson);
+        report(passages, passagesClaim, passagesReport(
+                "{\"page\":1,\"sectionPath\":[\"A\"],\"text\":\"# A\\n\\nUnder A.\",\"range\":[0,13]}",
+                "{\"page\":2,\"sectionPath\":[\"A\",\"B\"],\"text\":\"## B\\n\\nUnder B.\",\"range\":[0,14]}")
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 1) + "," + section(2, "B", 2) + "]"));
+
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        List<PassageRow> stored = passages(uploaded.versionId());
+        assertThat(stored).extracting(PassageRow::page).containsExactly(1, 2);
+        // Matrix row "Markdown": path [A, B], and the range in its page.
+        JsonNode place = place(gm, stored.get(1));
+        assertThat(place.path("sectionPath").toString()).isEqualTo("[\"A\",\"B\"]");
+        assertThat(place.path("range").toString()).isEqualTo("[0,14]");
+        assertThat(place.has("boxes")).isFalse();
+    }
+
+    @Test
+    void aPassagesReportThatCannotBeRecordedIsRefusedAndKeepsNothing() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 3);
+        JsonNode claim = claim(passages.jobId());
+        String title = "T".repeat(1001);
+        String deep = "\"x\",".repeat(32) + "\"x\"";
+        for (String result : List.of(
+                passagesReport(passage(0, "Texto")),
+                passagesReport(passage(4, "Texto")),
+                passagesReport(passage(1, "")),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"" + "a".repeat(16_385)
+                        + "\",\"boxes\":[]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[" + deep + "],\"text\":\"a\",\"boxes\":[]}"),
+                passagesReport(passage(1, "Texto", title)),
+                passagesReport(passage(1, "Texto", "")),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\"}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"boxes\":[],\"range\":[0,1]}"),
+                passagesReport("{\"page\":1,\"text\":\"a\",\"boxes\":[]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"boxes\":[[0,0,1.5,1]]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"boxes\":[[0,0,1]]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"range\":[3,3]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[1],\"text\":\"a\",\"range\":[0,1]}"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(1, title, 1)
+                        + "]"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 4)
+                        + "]"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(-1, "A", 1)
+                        + "]"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":[" + section(1001, "A", 1)
+                        + "]"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"range\":[-1,2]}"),
+                passagesReport("{\"page\":1,\"sectionPath\":[],\"text\":\"a\",\"range\":[0,1.5]}"),
+                passagesReport(passage(1, "Texto")).replace("\"outline\":[]", "\"outline\":{}"))) {
+            HttpResponse<String> refused = outcome(passages.jobId(), claim, "{\"outcome\":\"done\",\"result\":" + result
+                    + "}");
+            assertThat(refused.statusCode()).as(result.length() > 300 ? result.substring(0, 300) : result)
+                    .isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("job.result_invalid");
+        }
+        assertThat(passages(uploaded.versionId())).isEmpty();
+        assertThat(materials.outlines.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
+        assertThat(jobs.row(passages.jobId()).state()).isEqualTo("running");
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+
+        // At the limits: 16,384 code points (a character outside the BMP counts once), a path of 32, a title of 1,000.
+        String limit = "🐉".repeat(16_384);
+        String titles = ("\"" + "T".repeat(1000) + "\",").repeat(31) + "\"" + "T".repeat(1000) + "\"";
+        report(passages, claim, passagesReport("{\"page\":3,\"sectionPath\":[" + titles + "],\"text\":\"" + limit
+                + "\",\"boxes\":[[0,0,1,1]]}"));
+        assertThat(passages(uploaded.versionId())).singleElement()
+                .satisfies(row -> assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
+                        .orElseThrow().text()).isEqualTo(limit));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    @Test
+    void aPassagesStepIsRefusedATextFileOfAnotherVersionOfTheSameOwner() throws Exception {
+        Gm gm = signUp();
+        Uploaded other = upload(gm, pdf(MIB), "Outro.pdf", null);
+        cleanReport(other.jobId(), claim(other.jobId()), 3, "2");
+        StepRow otherTriage = offeredStep(other.versionId());
+        report(otherTriage, claim(otherTriage.jobId()), triage(otherTriage, 1, 3, List.of()));
+        StepRow otherLayout = offeredStep(other.versionId());
+        JsonNode otherClaim = claim(otherLayout.jobId());
+        report(otherLayout, otherClaim, layout(otherLayout, otherClaim, 1, 3, List.of()));
+        assertThat(state(gm, other)).isEqualTo("needs_review");
+        UUID theirs = textFileOf(gm, other);
+
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 3);
+        JsonNode claim = claim(passages.jobId());
+
+        assertThat(input(passages.jobId(), claim, "text-" + textFileOf(gm, uploaded)).statusCode()).isEqualTo(200);
+        // A text file of the same owner's other version is not this step's input.
+        assertThat(input(passages.jobId(), claim, "text-" + theirs).statusCode()).isEqualTo(404);
+    }
+
+    private UUID textFileOf(Gm gm, Uploaded uploaded) {
+        return OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())).stream()
+                .filter(file -> file.role().equals("text")).findFirst().orElseThrow().fileId();
+    }
+
+    @Test
+    void passagesReportedAgainReplaceTheVersionsPassagesAndOutline() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        // Two held steps over every text file: each one's report carries the version's whole set.
+        StepRow first = passagesStepAfterReading(uploaded, 3, 2);
+        report(first, claim(first.jobId()), passagesReport(passage(1, "Um", "A"), passage(2, "Dois", "A"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 1) + "]"));
+        assertThat(passages(uploaded.versionId())).hasSize(2);
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+
+        // Matrix row "Retried report": the second report leaves one set, its own.
+        StepRow second = offeredStep(uploaded.versionId());
+        assertThat(second.stage()).isEqualTo("passages");
+        report(second, claim(second.jobId()), passagesReport(passage(1, "Um", "B"), passage(2, "Dois", "B"),
+                passage(3, "Tres", "B")).replace("\"outline\":[]", "\"outline\":[" + section(1, "B", 1) + "]"));
+
+        List<PassageRow> stored = passages(uploaded.versionId());
+        assertThat(stored).extracting(PassageRow::ordinal).containsExactly(0, 1, 2);
+        assertThat(stored).extracting(row -> OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
+                .orElseThrow().sectionPath()).containsOnly(List.of("B"));
+        assertThat(materials.outlines.values()).filteredOn(row -> row.versionId().equals(uploaded.versionId()))
+                .hasSize(1);
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.outline(uploaded.versionId()))).hasValue(
+                List.of(new Materials.Section(1, "B", 1)));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    @Test
+    void aFinalFailureEndsTheHeldStepWithoutAJob() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 25, "2", true);
+        StepRow triage = offeredStep(uploaded.versionId());
+
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode()).isEqualTo(204);
+
+        assertThat(state(gm, uploaded)).isEqualTo("failed");
+        assertThat(passagesStep(uploaded.versionId())).satisfies(held -> {
+            assertThat(held.jobId()).isNull();
+            assertThat(held.endedAt()).isNotNull();
+        });
+        assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        assertThat(jobs.rows.values()).noneMatch(row -> row.state().equals("offered") || row.state().equals("waiting"));
+    }
+
+    @Test
+    void aRestartEndsTheHeldStepAndRemovesThePassagesAndOutline() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 25, "2", true);
+        StepRow held = passagesStep(uploaded.versionId());
+        // Passages an earlier chain left (the restart must not keep them for the new one).
+        UUID passageId = UUID.randomUUID();
+        UUID outlineId = UUID.randomUUID();
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            materials.insertPassages(List.of(new PassageRow(passageId, gm.id(), uploaded.versionId(), 0, 1,
+                    new byte[] {1}, new byte[] {2}, Instant.now())));
+            materials.insertOutline(new OutlineRow(outlineId, gm.id(), uploaded.versionId(), new byte[] {3},
+                    Instant.now()));
+        }));
+        StepRow triage = offeredStep(uploaded.versionId());
+
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        assertThat(materials.steps.get(held.id())).satisfies(ended -> {
+            assertThat(ended.jobId()).isNull();
+            assertThat(ended.endedAt()).isNotNull();
+        });
+        assertThat(materials.passages).doesNotContainKey(passageId);
+        assertThat(materials.outlines).doesNotContainKey(outlineId);
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).singleElement()
+                .satisfies(step -> {
+                    assertThat(step.stage()).isEqualTo("clean");
+                    assertThat(step.inputFileId()).isEqualTo(cleaned.original());
+                });
+    }
+
+    @Test
+    void anotherOwnersPassagesAndOutlineAreNeverSeenNorWritten() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        Uploaded uploaded = upload(a, pdf(MIB), "Segredo.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 2);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Segredo", "Capítulo"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "Capítulo", 1) + "]"));
+        PassageRow theirs = passages(uploaded.versionId()).getFirst();
+
+        // Matrix row "Two owners": B asks for A's passage id and A's outline.
+        OwnerContext.runAs(b.id(), () -> {
+            assertThat(reads.passage(theirs.id())).isEmpty();
+            assertThat(reads.outline(uploaded.versionId())).isEmpty();
+            assertThat(materials.findPassage(theirs.id())).isEmpty();
+            assertThat(materials.passages(uploaded.versionId())).isEmpty();
+            assertThat(materials.findOutline(uploaded.versionId())).isEmpty();
+        });
+        OwnerContext.runAs(a.id(), () -> {
+            assertThat(reads.passage(theirs.id())).isPresent();
+            assertThat(reads.outline(uploaded.versionId())).isPresent();
+        });
+        // B cannot write a passage or an outline naming A's version, nor remove A's.
+        assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> materials.insertPassages(List.of(new PassageRow(UUID.randomUUID(),
+                        b.id(), uploaded.versionId(), 7, 1, new byte[] {1}, new byte[] {2}, Instant.now()))))))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> OwnerContext.runAs(b.id(), () -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> materials.insertOutline(new OutlineRow(UUID.randomUUID(), b.id(),
+                        uploaded.versionId(), new byte[] {3}, Instant.now())))))
+                .isInstanceOf(IllegalStateException.class);
+        OwnerContext.runAs(b.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            assertThat(materials.deletePassages(uploaded.versionId())).isZero();
+            assertThat(materials.deleteOutline(uploaded.versionId())).isFalse();
+        }));
+        assertThat(passages(uploaded.versionId())).hasSize(1);
+        // There is no public route to a passage: the material's read names none.
+        assertThat(get(b, "/api/v1/materials/" + uploaded.materialId()).statusCode()).isEqualTo(404);
+        assertThat(get(a, "/api/v1/materials/" + uploaded.materialId()).body()).doesNotContain("Segredo\"")
+                .doesNotContain("Capítulo").doesNotContain(theirs.id().toString());
+    }
+
+    // --- Story 1.18 helpers
+
+    private static String passagesStep(int total) {
+        return "{\"stage\":\"passages\",\"firstPage\":1,\"lastPage\":" + total + ",\"input\":\"texts\"}";
+    }
+
+    /** The version's one passages step. */
+    private StepRow passagesStep(UUID versionId) {
+        return steps(versionId).stream().filter(step -> step.stage().equals("passages")).reduce((first, second) -> {
+            throw new AssertionError("two passages steps");
+        }).orElseThrow(() -> new AssertionError("no passages step"));
+    }
+
+    private StepRow passagesStepAfterReading(Uploaded uploaded, int total) throws Exception {
+        return passagesStepAfterReading(uploaded, total, 1);
+    }
+
+    /**
+     * A PDF of {@code total} pages (one batch) cleaned with {@code held} passages steps, triaged and read: answers
+     * the passages step that is offered.
+     */
+    private StepRow passagesStepAfterReading(Uploaded uploaded, int total, int held) throws Exception {
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, pdf(4000));
+        UUID batch = output(uploaded.jobId(), claim, pdf(3000));
+        StringBuilder next = new StringBuilder("{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":" + total
+                + ",\"input\":\"" + batch + "\"}");
+        for (int i = 0; i < held; i++) {
+            next.append(',').append(passagesStep(total));
+        }
+        report(steps(uploaded.versionId()).getFirst(), claim, "{\"pipelineVersion\":\"2\",\"pageTotal\":" + total
+                + ",\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[{\"fileId\":\"" + batch
+                + "\",\"firstPage\":1,\"lastPage\":" + total + "}],\"next\":[" + next + "]}");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, total, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 1, total, List.of()));
+        StepRow passages = offeredStep(uploaded.versionId());
+        assertThat(passages.stage()).isEqualTo("passages");
+        return passages;
+    }
+
+    private static String passagesReport(String... passages) {
+        return "{\"pipelineVersion\":\"2\",\"passages\":[" + String.join(",", passages) + "],\"outline\":[],"
+                + "\"next\":[]}";
+    }
+
+    private static String passage(int page, String text, String... path) {
+        StringBuilder titles = new StringBuilder();
+        for (String title : path) {
+            titles.append(titles.isEmpty() ? "" : ",").append('"').append(title).append('"');
+        }
+        return "{\"page\":" + page + ",\"sectionPath\":[" + titles + "],\"text\":\"" + text.replace("\n", "\\n")
+                + "\",\"boxes\":[[0.1,0.2,0.9,0.3]]}";
+    }
+
+    private static String section(int level, String title, int page) {
+        return "{\"level\":" + level + ",\"title\":\"" + title + "\",\"page\":" + page + "}";
+    }
+
+    private List<PassageRow> passages(UUID versionId) {
+        return materials.passages.values().stream().filter(row -> row.versionId().equals(versionId))
+                .sorted(Comparator.comparingInt(PassageRow::ordinal)).toList();
+    }
+
+    /** A stored passage's place, decrypted as the owner. */
+    private JsonNode place(Gm gm, PassageRow row) {
+        return JSON.readTree(vault.decrypt(new Binding("passage", "place", row.id(), gm.id()), row.place()));
+    }
+
     // --- owners
 
     @Test
@@ -1082,6 +1537,12 @@ class IngestionFlowTest {
     }
 
     private Cleaned cleanReport(UUID jobId, JsonNode claim, int total, String pipeline) throws Exception {
+        return cleanReport(jobId, claim, total, pipeline, false);
+    }
+
+    /** {@link #cleanReport(UUID, JsonNode, int, String)}, with the held passages step last when {@code passages}. */
+    private Cleaned cleanReport(UUID jobId, JsonNode claim, int total, String pipeline, boolean passages)
+            throws Exception {
         byte[] cleaned = pdf(4000 + total);
         UUID original = output(jobId, claim, cleaned);
         List<UUID> batches = new ArrayList<>();
@@ -1096,6 +1557,9 @@ class IngestionFlowTest {
                     .append(",\"lastPage\":").append(last).append('}');
             next.append(comma).append("{\"stage\":\"triage\",\"firstPage\":").append(first).append(",\"lastPage\":")
                     .append(last).append(",\"input\":\"").append(batch).append("\"}");
+        }
+        if (passages) {
+            next.append(',').append(passagesStep(total));
         }
         HttpResponse<String> reported = outcome(jobId, claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\""
                 + pipeline + "\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\"" + original + "\"},"
@@ -1188,7 +1652,7 @@ class IngestionFlowTest {
     /** The one step of these versions whose job is offered. */
     private StepRow offeredStep(List<UUID> versionIds) {
         return versionIds.stream().flatMap(versionId -> steps(versionId).stream())
-                .filter(step -> jobs.row(step.jobId()).state().equals("offered"))
+                .filter(step -> step.jobId() != null && jobs.row(step.jobId()).state().equals("offered"))
                 .reduce((first, second) -> {
                     throw new AssertionError("two offered steps");
                 }).orElseThrow(() -> new AssertionError("no offered step"));
