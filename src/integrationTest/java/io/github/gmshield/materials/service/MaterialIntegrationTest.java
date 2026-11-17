@@ -109,11 +109,12 @@ class MaterialIntegrationTest {
         Owner b = owner();
         UUID bMaterial = material(b.id(), as(b.id(), () -> uploads.create(10, "b.pdf")));
 
-        for (String sql : List.of("update material set kind = 'novel' where id = ?",
-                "update material set language = 'fr' where id = ?",
-                "update material set campaign_id = '" + a.campaign() + "' where id = ?")) {
-            assertThatThrownBy(() -> jdbc.sql(sql).param(bMaterial).update()).as(sql).isNotNull();
-        }
+        Map<String, String> violations = Map.of(
+                "update material set kind = 'novel' where id = ?", "material_kind_check",
+                "update material set language = 'fr' where id = ?", "material_language_check",
+                "update material set campaign_id = '" + a.campaign() + "' where id = ?", "material_campaign_fkey");
+        violations.forEach((sql, constraint) -> assertThatThrownBy(() -> jdbc.sql(sql).param(bMaterial).update())
+                .as(sql).satisfies(failure -> assertThat(messages(failure)).anyMatch(text -> text.contains(constraint))));
         // A material_system row of B naming A's system, or A's material, is refused by the owner-scoped keys.
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
         assertThatThrownBy(() -> as(b.id(), () -> new TransactionTemplate(transactions).execute(status -> {

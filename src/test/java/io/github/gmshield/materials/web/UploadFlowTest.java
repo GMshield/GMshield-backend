@@ -357,6 +357,28 @@ class UploadFlowTest {
     }
 
     @Test
+    void theListPagesWithItsLimitAndCursor() throws Exception {
+        Gm gm = signUp();
+        for (String name : List.of("a.pdf", "b.pdf", "c.pdf")) {
+            assertThat(create(gm, 10, name).statusCode()).isEqualTo(201);
+        }
+
+        JsonNode first = json(get(gm, "/api/v1/materials?state=uploading&limit=2"));
+        assertThat(first.path("items").size()).isEqualTo(2);
+        String cursor = first.path("nextCursor").asString();
+        assertThat(cursor).matches("[0-9a-f-]{36}");
+        assertThat(cursor).isEqualTo(first.path("items").get(1).path("id").asString());
+        JsonNode second = json(get(gm, "/api/v1/materials?state=uploading&limit=2&cursor=" + cursor));
+        assertThat(second.path("items").size()).isEqualTo(1);
+        assertThat(second.has("nextCursor")).isFalse();
+        List<String> names = new ArrayList<>();
+        for (JsonNode page : List.of(first, second)) {
+            page.path("items").forEach(item -> names.add(item.path("name").asString()));
+        }
+        assertThat(names).containsExactlyInAnyOrder("a.pdf", "b.pdf", "c.pdf");
+    }
+
+    @Test
     void theListNeedsAKnownStateALimitFromOneToFiftyAndAWellFormedCursorAndASession() throws Exception {
         Gm gm = signUp();
         for (String query : List.of("", "?limit=5", "?state=", "?state=lost", "?state=waiting&state=lost",
