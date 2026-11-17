@@ -6,6 +6,7 @@ import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -167,6 +168,16 @@ class JdbcJobStorage implements JobStorage {
             return jdbc.get().sql("select owner_id from job where lane = :lane and offered_at is not null"
                             + " order by offered_at desc, id desc limit 1")
                     .param("lane", lane).query((rs, n) -> rs.getObject(1, UUID.class)).optional();
+        }
+
+        @Override
+        public List<UUID> inProgress(Collection<UUID> ids, UUID owner) {
+            if (ids.isEmpty()) {
+                return List.of();
+            }
+            return jdbc.get().sql("select id from job where owner_id = :owner and state in ('offered', 'running')"
+                            + " and id in (:ids)")
+                    .param("owner", owner).param("ids", List.copyOf(ids)).query(UUID.class).list();
         }
 
         @Override

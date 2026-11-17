@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -211,6 +212,15 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<StepRow> unendedSteps(Collection<UUID> versionIds) {
+        rangeReads.incrementAndGet();
+        UUID owner = OwnerContext.require();
+        return steps.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && versionIds.contains(row.versionId()) && row.endedAt() == null)
+                .sorted(Comparator.comparing(StepRow::createdAt).thenComparing(StepRow::id)).toList();
+    }
+
+    @Override
     public synchronized void insertVersionFile(VersionFileRow row) {
         UUID owner = ownerFor(row.ownerId());
         VersionRow version = versions.get(row.versionId());
@@ -299,6 +309,27 @@ public class InMemoryMaterialStore implements MaterialStore {
         return table.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
                         && row.firstPage() <= last && row.lastPage() >= first)
                 .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
+    }
+
+    /** How many times the batched range reads ran: a list of materials reads each kind once (Story 1.17). */
+    public final AtomicInteger rangeReads = new AtomicInteger();
+
+    @Override
+    public List<PageRangeRow> pageLayers(Collection<UUID> versionIds) {
+        rangeReads.incrementAndGet();
+        return rangesOf(layers, versionIds);
+    }
+
+    @Override
+    public List<PageRangeRow> pageOutcomes(Collection<UUID> versionIds) {
+        rangeReads.incrementAndGet();
+        return rangesOf(outcomes, versionIds);
+    }
+
+    private static List<PageRangeRow> rangesOf(Map<UUID, PageRangeRow> table, Collection<UUID> versionIds) {
+        UUID owner = OwnerContext.require();
+        return table.values().stream().filter(row -> row.ownerId().equals(owner) && versionIds.contains(row.versionId()))
+                .sorted(Comparator.comparing(PageRangeRow::versionId).thenComparing(PageRangeRow::firstPage)).toList();
     }
 
     @Override

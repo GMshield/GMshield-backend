@@ -305,7 +305,8 @@ class IngestionIntegrationTest {
         }
 
         assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages())
-                .isEqualTo(new Materials.Pages(24, 25));
+                .isEqualTo(new Materials.Pages(24, 25, new Materials.Count(24, 24), new Materials.Count(0, 1), 24, 0,
+                        0));
         // Every step ended, but page 23 waits for OCR: the version stays processing.
         assertThat(state(chain.versionId())).isEqualTo("processing");
         assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ? and ended_at is null")
@@ -313,15 +314,33 @@ class IngestionIntegrationTest {
         assertThat(jdbc.sql("select count(*) from version_file where version_id = ? and role = 'text'")
                 .param(chain.versionId()).query(Long.class).single()).isEqualTo(3);
 
-        // Once page 23 has an outcome, a report that leaves no step unended ends the chain.
+        // Once page 23 is read by OCR (Story 1.17), a report that leaves no step unended ends the chain.
         UUID last = as(chain.owner(), () -> new TransactionTemplate(transactions).execute(status ->
                 jobsCreate(chain, "ocr", 23)));
+        // Offered, then running, the version is reading its image page: the job's state and the step's pages, on
+        // Postgres.
+        assertThat(jdbc.sql("select state from job where id = ?").param(last).query(String.class).single())
+                .isEqualTo("offered");
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
+                .isEqualTo("image");
         JobClaims.Claim ocr = claims.claim(last);
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages().reading())
+                .isEqualTo("image");
+        JobFiles.Stored scanned = jobFiles.store(last, ocr.claimId(), ocr.grant(), -1,
+                new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8)));
         claims.report(last, ocr.claimId(), ocr.grant(), "done", null, null, JSON.readTree(
-                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(23, 23, "outcome", "unreadable") + "]}"));
+                "{\"pipelineVersion\":\"2\",\"pages\":[" + range(23, 23, "outcome", "read_by_ocr") + "],"
+                        + "\"texts\":[{\"fileId\":\"" + scanned.fileId() + "\",\"firstPage\":23,\"lastPage\":23}]}"));
         assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        assertThat(jdbc.sql("select outcome from page_outcome where version_id = ? and first_page = 23")
+                .param(chain.versionId()).query(String.class).single()).isEqualTo("read_by_ocr");
+        // The counts the GM reads, derived from the ranges Postgres holds.
         assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().pages())
-                .isEqualTo(new Materials.Pages(25, 25));
+                .isEqualTo(new Materials.Pages(25, 25, new Materials.Count(24, 24), new Materials.Count(1, 1), 24, 1,
+                        0));
+        assertThat(as(chain.owner(), () -> materials.list(List.of("needs_review"), null, 50)).items())
+                .filteredOn(item -> item.id().equals(chain.materialId())).singleElement()
+                .satisfies(item -> assertThat(item.pages().readByOcr()).isEqualTo(1));
     }
 
     @Test
@@ -413,6 +432,8 @@ class IngestionIntegrationTest {
             assertThat(store.outcomeOverlaps(a.versionId(), 1, 3)).isFalse();
             assertThat(store.outcomesWithin(a.versionId(), 1, 3)).isEmpty();
             assertThat(store.pagesDone(List.of(a.versionId()))).isEmpty();
+            assertThat(store.pageLayers(List.of(a.versionId(), b.versionId()))).isEmpty();
+            assertThat(store.pageOutcomes(List.of(a.versionId(), b.versionId()))).isEmpty();
             return null;
         });
         write(b.owner(), () -> assertThat(store.deletePageRanges(a.versionId())).isZero());
@@ -421,6 +442,10 @@ class IngestionIntegrationTest {
             assertThat(store.layerOverlaps(a.versionId(), 3, 9)).isTrue();
             assertThat(store.outcomeOverlaps(a.versionId(), 4, 9)).isFalse();
             assertThat(store.pagesDone(List.of(a.versionId(), b.versionId()))).containsExactly(Map.entry(a.versionId(), 3L));
+            assertThat(store.pageLayers(List.of(a.versionId(), b.versionId()))).singleElement()
+                    .satisfies(row -> assertThat(row.value()).isEqualTo("text"));
+            assertThat(store.pageOutcomes(List.of(a.versionId(), b.versionId()))).singleElement()
+                    .satisfies(row -> assertThat(row.value()).isEqualTo("read_directly"));
             return null;
         });
         // B cannot write a range naming A's version, nor A a range under B's owner id.

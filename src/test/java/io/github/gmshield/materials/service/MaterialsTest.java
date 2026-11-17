@@ -13,6 +13,8 @@ import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.data.InMemoryTransactionManager;
@@ -62,6 +64,8 @@ class MaterialsTest {
     private Uploads service;
     private Materials reads;
     private final List<VersionRow> started = new java.util.ArrayList<>();
+    /** The jobs offered or running, as the jobs module would answer (Story 1.17). */
+    private final java.util.Set<UUID> running = new java.util.HashSet<>();
 
     @BeforeEach
     void wire() {
@@ -74,7 +78,8 @@ class MaterialsTest {
         service = new Uploads(materials, uploads, vault, files, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
-        reads = new Materials(materials, uploads, vault, beans.getBeanProvider(PlatformTransactionManager.class));
+        reads = new Materials(materials, uploads, vault, ids -> ids.stream().filter(running::contains)
+                .collect(java.util.stream.Collectors.toSet()), beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
                 library.createStarter(Language.EN);
@@ -249,6 +254,143 @@ class MaterialsTest {
         assertThat(as(owner, () -> reads.list(List.of("processing"), null, 20)).items())
                 .filteredOn(item -> item.id().equals(processing)).singleElement()
                 .satisfies(item -> assertThat(item.pages().total()).isEqualTo(320));
+    }
+
+    // --- page counts (Story 1.17)
+
+    @Test
+    void theCountsOfAMixedPdfComeFromItsRecordedLayersAndOutcomes() {
+        UUID mixed = create(owner, "mixed.pdf", Uploads.Details.NONE);
+        setState(mixed, "processing");
+        UUID version = versionOf(mixed).id();
+        write(() -> materials.recordIngestion(version, "3", 25, clock.instant()));
+        layer(version, 1, 5, PageRangeRow.TEXT);
+        layer(version, 6, 7, PageRangeRow.IMAGE);
+        layer(version, 8, 20, PageRangeRow.TEXT);
+        layer(version, 21, 25, PageRangeRow.IMAGE);
+        outcome(version, 1, 5, PageRangeRow.READ_DIRECTLY);
+        outcome(version, 6, 6, PageRangeRow.READ_BY_OCR);
+        outcome(version, 7, 7, PageRangeRow.UNREADABLE);
+
+        Materials.Pages pages = as(owner, () -> reads.find(mixed)).orElseThrow().pages();
+
+        assertThat(pages).isEqualTo(new Materials.Pages(7, 25, new Materials.Count(5, 18), new Materials.Count(2, 7),
+                5, 1, 1));
+        // Another owner's ranges never count.
+        assertThat(as(other, () -> materials.pageLayers(List.of(version)))).isEmpty();
+    }
+
+    @Test
+    void anOutcomeAcrossLayersCountsForEachAndTheTrayProgressRowReadsTextFirst() {
+        List<PageRangeRow> layers = List.of(range(1, 364, PageRangeRow.TEXT), range(365, 444, PageRangeRow.IMAGE));
+        assertThat(Materials.pages(444, layers, List.of(range(1, 40, PageRangeRow.READ_DIRECTLY))))
+                .isEqualTo(new Materials.Pages(40, 444, new Materials.Count(40, 364), new Materials.Count(0, 80),
+                        40, 0, 0));
+        List<PageRangeRow> split = List.of(range(1, 5, PageRangeRow.TEXT), range(6, 10, PageRangeRow.IMAGE),
+                range(11, 12, PageRangeRow.TEXT));
+        List<PageRangeRow> outcomes = List.of(range(3, 7, PageRangeRow.UNREADABLE), range(9, 11,
+                PageRangeRow.READ_BY_OCR));
+        assertThat(Materials.pages(12, split, outcomes)).isEqualTo(new Materials.Pages(8, 12,
+                new Materials.Count(4, 7), new Materials.Count(4, 5), 0, 3, 5));
+        assertThat(Materials.pages(5, List.of(), List.of(range(1, 5, PageRangeRow.READ_DIRECTLY))))
+                .isEqualTo(new Materials.Pages(5, 5, Materials.Count.NONE, Materials.Count.NONE, 5, 0, 0));
+    }
+
+    @Test
+    void aListReadsEachKindOfRangeOnceForAllItsVersions() {
+        for (int i = 0; i < 3; i++) {
+            UUID material = create(owner, "scan" + i + ".pdf", Uploads.Details.NONE);
+            setState(material, "processing");
+            UUID version = versionOf(material).id();
+            write(() -> materials.recordIngestion(version, "3", 10, clock.instant()));
+            layer(version, 1, 10, PageRangeRow.IMAGE);
+            outcome(version, 1, i + 1, PageRangeRow.READ_BY_OCR);
+        }
+        materials.rangeReads.set(0);
+
+        List<Materials.Material> items = as(owner, () -> reads.list(List.of("processing"), null, 20)).items();
+
+        // Layers, outcomes and unended steps: one read each for the whole list.
+        assertThat(materials.rangeReads.get()).isEqualTo(3);
+        assertThat(items).extracting(item -> item.pages().image().done()).containsExactlyInAnyOrder(1, 2, 3);
+    }
+
+    @Test
+    void readingIsTheLayerOfThePagesOfTheStepInProgressEvenWhileTextPagesOfALaterBatchWait() {
+        // Matrix row "OCR between text batches": batch 1's OCR 9-18 runs while batch 2's text pages 21-30 wait.
+        UUID mixed = create(owner, "misto.pdf", Uploads.Details.NONE);
+        setState(mixed, "processing");
+        UUID version = versionOf(mixed).id();
+        write(() -> materials.recordIngestion(version, "3", 30, clock.instant()));
+        layer(version, 1, 8, PageRangeRow.TEXT);
+        layer(version, 9, 20, PageRangeRow.IMAGE);
+        layer(version, 21, 30, PageRangeRow.TEXT);
+        outcome(version, 1, 8, PageRangeRow.READ_DIRECTLY);
+        UUID ocr = step(version, 9, 18);
+        UUID waitingOcr = step(version, 19, 20);
+        step(version, 21, 30);
+        running.add(ocr);
+
+        Materials.Pages pages = as(owner, () -> reads.find(mixed)).orElseThrow().pages();
+
+        assertThat(pages.reading()).isEqualTo("image");
+        assertThat(pages.text()).isEqualTo(new Materials.Count(8, 18));
+        assertThat(pages.image()).isEqualTo(new Materials.Count(0, 12));
+        // No step in progress: null.
+        running.clear();
+        assertThat(as(owner, () -> reads.find(mixed)).orElseThrow().pages().reading()).isNull();
+        running.add(waitingOcr);
+        assertThat(as(owner, () -> reads.find(mixed)).orElseThrow().pages().reading()).isEqualTo("image");
+    }
+
+    @Test
+    void readingIsNullWithoutPagesWithoutALayerYetOrAcrossLayers() {
+        List<PageRangeRow> layers = List.of(range(1, 5, PageRangeRow.TEXT), range(6, 10, PageRangeRow.IMAGE));
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 5)))).isEqualTo("text");
+        assertThat(Materials.reading(layers, List.of(stepRow(6, 7)))).isEqualTo("image");
+        assertThat(Materials.reading(layers, List.of())).isNull();
+        assertThat(Materials.reading(layers, List.of(stepRow(null, null)))).isNull();     // clean
+        assertThat(Materials.reading(layers, List.of(stepRow(11, 20)))).isNull();         // triage, no layer yet
+        assertThat(Materials.reading(layers, List.of(stepRow(9, 12)))).isNull();          // partly sorted
+        assertThat(Materials.reading(layers, List.of(stepRow(4, 7)))).isNull();           // two layers
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 2), stepRow(6, 6)))).isNull();
+        assertThat(Materials.reading(layers, List.of(stepRow(1, 2), stepRow(4, 5)))).isEqualTo("text");
+    }
+
+    private StepRow stepRow(Integer first, Integer last) {
+        return new StepRow(Ids.newId(), owner, Ids.newId(), Ids.newId(), "any", first, last, null, clock.instant(), null);
+    }
+
+    /** An unended step over pages of the version, with a job id of its own; answers that job id. */
+    private UUID step(UUID version, int first, int last) {
+        UUID job = Ids.newId();
+        clock.advance(Duration.ofSeconds(1));
+        write(() -> {
+            materials.insertStep(new StepRow(Ids.newId(), owner, version, job, "any", first, last, null, clock.instant(),
+                    null));
+            return true;
+        });
+        return job;
+    }
+
+    private void layer(UUID version, int first, int last, String value) {
+        write(() -> {
+            materials.insertPageLayer(new PageRangeRow(Ids.newId(), owner, version, first, last, value,
+                    clock.instant()));
+            return true;
+        });
+    }
+
+    private void outcome(UUID version, int first, int last, String value) {
+        write(() -> {
+            materials.insertPageOutcome(new PageRangeRow(Ids.newId(), owner, version, first, last, value,
+                    clock.instant()));
+            return true;
+        });
+    }
+
+    private PageRangeRow range(int first, int last, String value) {
+        return new PageRangeRow(Ids.newId(), owner, Ids.newId(), first, last, value, clock.instant());
     }
 
     @Test

@@ -3,6 +3,7 @@ package io.github.gmshield.jobs.data;
 import io.github.gmshield.shared.data.RollbackUndo;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -125,6 +126,12 @@ public class InMemoryJobStorage implements JobStorage {
         public Optional<UUID> lastOfferedOwner(String lane) {
             return rows.values().stream().filter(row -> row.lane().equals(lane) && row.offeredAt() != null)
                     .max(Comparator.comparing(JobRow::offeredAt).thenComparing(JobRow::id)).map(JobRow::ownerId);
+        }
+
+        @Override
+        public List<UUID> inProgress(Collection<UUID> ids, UUID owner) {
+            return ids.stream().map(rows::get).filter(Objects::nonNull).filter(row -> row.ownerId().equals(owner)
+                    && (row.state().equals("offered") || row.state().equals("running"))).map(JobRow::id).toList();
         }
 
         @Override

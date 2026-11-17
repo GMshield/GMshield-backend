@@ -53,6 +53,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -75,8 +76,9 @@ import tools.jackson.databind.json.JsonMapper;
  * worker's claim, its input and outputs and its report, to what the GM reads. The chain, the version's states, the
  * adopted files, the raw upload's removal, the failures and the step cap. Story 1.16 too: triage and layout steps, the
  * page ranges and their refusals, {@code pages.done}, the end of the chain, a retried and a re-offered step, the
- * restart on a pipeline change, a text upload's step, and the cross-owner test of the page ranges. The same tables
- * against PostgreSQL are in {@code IngestionIntegrationTest}.
+ * restart on a pipeline change, a text upload's step, and the cross-owner test of the page ranges. Story 1.17: OCR
+ * steps over a scanned and a mixed PDF, the page counts by layer and outcome the GM reads, and two owners' scans
+ * offered in turn. The same tables against PostgreSQL are in {@code IngestionIntegrationTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -565,20 +567,24 @@ class IngestionFlowTest {
     }
 
     @Test
-    void aMixedPdfReadsItsTextPagesAndStaysProcessingWithItsImagePagesUnread() throws Exception {
+    void aMixedPdfReadsItsTextPagesByLayoutAndItsImagePagesByOcrToNeedsReview() throws Exception {
         Gm gm = signUp();
         Uploaded uploaded = upload(gm, pdf(MIB), "Misto.pdf", null);
         clean(uploaded, 45, "2");
 
-        for (int i = 0; i < 7; i++) {
+        List<JsonNode> counts = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
             StepRow step = offeredStep(uploaded.versionId());
             JsonNode claim = claim(step.jobId());
-            if (step.stage().equals("triage")) {
-                List<Integer> images = step.firstPage() == 1 ? List.of(6, 7) : List.of();
-                report(step, claim, triage(step, step.firstPage(), step.lastPage(), images));
-            } else {
-                report(step, claim, layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
+            switch (step.stage()) {
+                case "triage" -> {
+                    List<Integer> images = step.firstPage() == 1 ? List.of(6, 7) : List.of();
+                    report(step, claim, triage(step, step.firstPage(), step.lastPage(), images));
+                }
+                case "ocr" -> report(step, claim, ocr(step, claim, step.firstPage(), step.lastPage(), List.of()));
+                default -> report(step, claim, layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
             }
+            counts.add(json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("pages"));
         }
 
         assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("layout"))
@@ -586,14 +592,139 @@ class IngestionFlowTest {
                 .containsExactlyInAnyOrder(tuple(1, 5),
                         tuple(8, 20), tuple(21, 40),
                         tuple(41, 45));
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("ocr"))
+                .extracting(StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
+                .containsExactly(tuple(6, 7, steps(uploaded.versionId()).stream()
+                        .filter(step -> step.stage().equals("triage") && step.firstPage() == 1).findFirst()
+                        .orElseThrow().inputFileId()));
         assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        // While pages wait, the counts say which kind: the first triage alone sorted 18 text and 2 image pages.
+        assertThat(counts.get(0).path("text").path("total").asInt()).isEqualTo(18);
+        assertThat(counts.get(0).path("image").path("total").asInt()).isEqualTo(2);
+        assertThat(counts.get(0).path("image").path("done").asInt()).isZero();
         JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
-        assertThat(read.path("state").asString()).isEqualTo("processing");
-        assertThat(read.path("pages").path("done").asInt()).isEqualTo(43);
-        assertThat(read.path("pages").path("total").asInt()).isEqualTo(45);
+        assertThat(read.path("state").asString()).isEqualTo("needs_review");
+        JsonNode pages = read.path("pages");
+        assertThat(pages.path("done").asInt()).isEqualTo(45);
+        assertThat(pages.path("total").asInt()).isEqualTo(45);
+        assertThat(pages.path("text").path("done").asInt()).isEqualTo(43);
+        assertThat(pages.path("text").path("total").asInt()).isEqualTo(43);
+        assertThat(pages.path("image").path("done").asInt()).isEqualTo(2);
+        assertThat(pages.path("image").path("total").asInt()).isEqualTo(2);
+        assertThat(pages.path("readDirectly").asInt()).isEqualTo(43);
+        assertThat(pages.path("readByOcr").asInt()).isEqualTo(2);
+        assertThat(pages.path("unreadable").asInt()).isZero();
         assertThat(layers(uploaded.versionId())).filteredOn(row -> row.value().equals("image"))
                 .extracting(row -> row.firstPage(), row -> row.lastPage())
                 .containsExactly(tuple(6, 7));
+        assertThat(outcomes(uploaded.versionId())).filteredOn(row -> row.value().equals("read_by_ocr"))
+                .extracting(row -> row.firstPage(), row -> row.lastPage())
+                .containsExactly(tuple(6, 7));
+    }
+
+    // --- Story 1.17: reading scanned pages
+
+    @Test
+    void aScannedPdfOf25PagesIsReadByThreeOcrStepsToNeedsReview() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Digitalizado.pdf", null);
+        clean(uploaded, 25, "2");
+        List<Integer> all = IntStream.rangeClosed(1, 25).boxed().toList();
+
+        List<String> stages = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            stages.add(step.stage());
+            if (step.stage().equals("triage")) {
+                report(step, claim, triage(step, step.firstPage(), step.lastPage(), all));
+            } else {
+                // A blank scan on page 13 is unreadable; the chain goes on.
+                List<Integer> blank = step.firstPage() == 11 ? List.of(13) : List.of();
+                report(step, claim, ocr(step, claim, step.firstPage(), step.lastPage(), blank));
+            }
+        }
+
+        assertThat(stages).containsExactly("triage", "triage", "ocr", "ocr", "ocr");
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.stage().equals("ocr"))
+                .extracting(StepRow::firstPage, StepRow::lastPage)
+                .containsExactlyInAnyOrder(tuple(1, 10), tuple(11, 20), tuple(21, 25));
+        JsonNode read = json(get(gm, "/api/v1/materials/" + uploaded.materialId()));
+        assertThat(read.path("state").asString()).isEqualTo("needs_review");
+        JsonNode pages = read.path("pages");
+        assertThat(pages.path("done").asInt()).isEqualTo(25);
+        assertThat(pages.path("text").path("total").asInt()).isZero();
+        assertThat(pages.path("image").path("done").asInt()).isEqualTo(25);
+        assertThat(pages.path("image").path("total").asInt()).isEqualTo(25);
+        assertThat(pages.path("readDirectly").asInt()).isZero();
+        assertThat(pages.path("readByOcr").asInt()).isEqualTo(24);
+        assertThat(pages.path("unreadable").asInt()).isEqualTo(1);
+        assertThat(json(get(gm, "/api/v1/materials?state=needs_review")).path("items").get(0).path("pages")
+                .path("readByOcr").asInt()).isEqualTo(24);
+    }
+
+    @Test
+    void anOcrStepInProgressBetweenTextBatchesIsReadingImageWhileLaterTextPagesWait() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Misto.pdf", null);
+        clean(uploaded, 30, "2");
+        String path = "/api/v1/materials/" + uploaded.materialId();
+        // Before any layer is recorded, the triage in progress reads nothing yet.
+        assertThat(json(get(gm, path)).path("pages").path("reading").isNull()).isTrue();
+        for (int i = 0; i < 2; i++) {
+            StepRow triage = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(triage.jobId());
+            List<Integer> images = triage.firstPage() == 1 ? IntStream.rangeClosed(9, 20).boxed().toList() : List.of();
+            report(triage, claim, triage(triage, triage.firstPage(), triage.lastPage(), images));
+        }
+        StepRow layout = offeredStep(uploaded.versionId());
+        assertThat(layout.stage()).isEqualTo("layout");
+        assertThat(json(get(gm, path)).path("pages").path("reading").asString()).isEqualTo("text");
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 1, 8, List.of()));
+
+        // Batch 1's OCR 9-18 is offered, then running, while batch 2's text pages 21-30 still wait.
+        StepRow ocr = offeredStep(uploaded.versionId());
+        assertThat(ocr.stage()).isEqualTo("ocr");
+        assertThat(json(get(gm, path)).path("pages").path("reading").asString()).isEqualTo("image");
+        claim(ocr.jobId());
+        JsonNode pages = json(get(gm, path)).path("pages");
+        assertThat(pages.path("reading").asString()).isEqualTo("image");
+        assertThat(pages.path("text").path("done").asInt()).isEqualTo(8);
+        assertThat(pages.path("text").path("total").asInt()).isEqualTo(18);
+        assertThat(pages.path("image").path("done").asInt()).isZero();
+        assertThat(pages.path("image").path("total").asInt()).isEqualTo(12);
+        assertThat(json(get(gm, "/api/v1/materials?state=processing")).path("items").get(0).path("pages")
+                .path("reading").asString()).isEqualTo("image");
+    }
+
+    @Test
+    void twoOwnersScansAreOfferedInTurnOneStepAtATime() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        Uploaded scanA = upload(a, pdf(MIB), "A.pdf", null);
+        Uploaded scanB = upload(b, pdf(MIB), "B.pdf", null);
+        Map<UUID, UUID> ownerOf = Map.of(scanA.versionId(), a.id(), scanB.versionId(), b.id());
+        List<Integer> all = IntStream.rangeClosed(1, 20).boxed().toList();
+
+        List<UUID> owners = new ArrayList<>();
+        List<String> stages = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            StepRow step = offeredStep(List.of(scanA.versionId(), scanB.versionId()));
+            owners.add(ownerOf.get(step.versionId()));
+            stages.add(step.stage());
+            JsonNode claim = claim(step.jobId());
+            switch (step.stage()) {
+                case "clean" -> cleanReport(step.jobId(), claim, 20, "2");
+                case "triage" -> report(step, claim, triage(step, 1, 20, all));
+                default -> report(step, claim, ocr(step, claim, step.firstPage(), step.lastPage(), List.of()));
+            }
+        }
+
+        assertThat(owners).containsExactly(a.id(), b.id(), a.id(), b.id(), a.id(), b.id(), a.id(), b.id());
+        assertThat(stages).containsExactly("clean", "clean", "triage", "triage", "ocr", "ocr", "ocr", "ocr");
+        assertThat(state(a, scanA)).isEqualTo("needs_review");
+        assertThat(state(b, scanB)).isEqualTo("needs_review");
     }
 
     @Test
@@ -973,10 +1104,14 @@ class IngestionFlowTest {
         return new Cleaned(original, cleaned.length, batches);
     }
 
-    /** A triage report: every page of the run a text page but {@code images}, a layout step per run of text pages. */
+    /**
+     * A triage report: every page of the run a text page but {@code images}, a layout step per run of text pages, then
+     * an OCR step per run of at most 10 image pages.
+     */
     private static String triage(StepRow step, int first, int last, List<Integer> images) {
         StringBuilder layers = new StringBuilder();
         StringBuilder next = new StringBuilder();
+        StringBuilder ocrSteps = new StringBuilder();
         int start = first;
         for (int page = first; page <= last + 1; page++) {
             boolean boundary = page > last || images.contains(page) != images.contains(start);
@@ -986,17 +1121,35 @@ class IngestionFlowTest {
             boolean image = images.contains(start);
             layers.append(layers.isEmpty() ? "" : ",").append(range(start, page - 1, "layer", image ? "image" : "text"));
             if (!image) {
-                next.append(next.isEmpty() ? "" : ",").append("{\"stage\":\"layout\",\"firstPage\":").append(start)
-                        .append(",\"lastPage\":").append(page - 1).append(",\"input\":\"").append(step.inputFileId())
-                        .append("\"}");
+                next.append(next.isEmpty() ? "" : ",").append(nextStep(step, "layout", start, page - 1));
+            }
+            for (int ocr = start; image && ocr < page; ocr += 10) {
+                ocrSteps.append(ocrSteps.isEmpty() ? "" : ",").append(nextStep(step, "ocr", ocr,
+                        Math.min(ocr + 9, page - 1)));
             }
             start = page;
         }
+        next.append(next.isEmpty() || ocrSteps.isEmpty() ? "" : ",").append(ocrSteps);
         return "{\"pipelineVersion\":\"2\",\"layers\":[" + layers + "],\"next\":[" + next + "]}";
+    }
+
+    private static String nextStep(StepRow step, String stage, int first, int last) {
+        return "{\"stage\":\"" + stage + "\",\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"input\":\""
+                + step.inputFileId() + "\"}";
     }
 
     /** A layout report: every page read directly but {@code unreadable}, one text file per run of read pages. */
     private String layout(StepRow step, JsonNode claim, int first, int last, List<Integer> unreadable) throws Exception {
+        return read(step, claim, first, last, unreadable, "read_directly");
+    }
+
+    /** An OCR report: every page read by OCR but {@code unreadable}, one text file per run of read pages. */
+    private String ocr(StepRow step, JsonNode claim, int first, int last, List<Integer> unreadable) throws Exception {
+        return read(step, claim, first, last, unreadable, "read_by_ocr");
+    }
+
+    private String read(StepRow step, JsonNode claim, int first, int last, List<Integer> unreadable, String outcome)
+            throws Exception {
         StringBuilder pages = new StringBuilder();
         StringBuilder texts = new StringBuilder();
         int start = first;
@@ -1007,7 +1160,7 @@ class IngestionFlowTest {
             }
             boolean lost = unreadable.contains(start);
             pages.append(pages.isEmpty() ? "" : ",").append(range(start, page - 1, "outcome",
-                    lost ? "unreadable" : "read_directly"));
+                    lost ? "unreadable" : outcome));
             if (!lost) {
                 UUID text = output(step.jobId(), claim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
                 texts.append(texts.isEmpty() ? "" : ",").append("{\"fileId\":\"").append(text)
@@ -1029,7 +1182,13 @@ class IngestionFlowTest {
 
     /** The version's one step whose job is offered: one ingestion job at a time. */
     private StepRow offeredStep(UUID versionId) {
-        return steps(versionId).stream().filter(step -> jobs.row(step.jobId()).state().equals("offered"))
+        return offeredStep(List.of(versionId));
+    }
+
+    /** The one step of these versions whose job is offered. */
+    private StepRow offeredStep(List<UUID> versionIds) {
+        return versionIds.stream().flatMap(versionId -> steps(versionId).stream())
+                .filter(step -> jobs.row(step.jobId()).state().equals("offered"))
                 .reduce((first, second) -> {
                     throw new AssertionError("two offered steps");
                 }).orElseThrow(() -> new AssertionError("no offered step"));

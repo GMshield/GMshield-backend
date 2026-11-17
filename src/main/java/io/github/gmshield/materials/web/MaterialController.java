@@ -59,11 +59,38 @@ class MaterialController {
         }
     }
 
-    @Schema(name = "MaterialPages", requiredProperties = {"done", "total"})
+    @Schema(name = "MaterialPageCount", requiredProperties = {"done", "total"})
+    record CountView(
+            @Schema(description = "Pages of this kind that have an outcome", format = "int32", example = "40") int done,
+            @Schema(description = "All the pages of this kind", format = "int32", example = "364") int total) {
+
+        static CountView of(Materials.Count count) {
+            return new CountView(count.done(), count.total());
+        }
+    }
+
+    @Schema(name = "MaterialPages", requiredProperties = {"done", "total", "text", "image", "readDirectly", "readByOcr",
+        "unreadable", "reading"})
     record PagesView(
             @Schema(description = "Pages read so far (0 until the reading stages run)", format = "int32", example = "0")
             int done,
-            @Schema(description = "The version's page total", format = "int32", example = "320") int total) {
+            @Schema(description = "The version's page total", format = "int32", example = "320") int total,
+            @Schema(description = "The pages found to have a text layer, and those of them with an outcome (0 of 0"
+                    + " until the pages are sorted, and for a text upload)") CountView text,
+            @Schema(description = "The pages found to be images only, read by OCR, and those of them with an outcome")
+            CountView image,
+            @Schema(description = "Pages read from their text layer", format = "int32", example = "40")
+            int readDirectly,
+            @Schema(description = "Pages read by OCR", format = "int32", example = "0") int readByOcr,
+            @Schema(description = "Pages that could not be read", format = "int32", example = "0") int unreadable,
+            @Schema(description = "The layer of the pages being read now, by the step whose job is offered or running:"
+                    + " \"text\" or \"image\"; null when none is, when those pages have no layer yet, or when their"
+                    + " layers differ", types = {"string", "null"}, example = "text") String reading) {
+
+        static PagesView of(Materials.Pages pages) {
+            return new PagesView(pages.done(), pages.total(), CountView.of(pages.text()), CountView.of(pages.image()),
+                    pages.readDirectly(), pages.readByOcr(), pages.unreadable(), pages.reading());
+        }
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -85,7 +112,7 @@ class MaterialController {
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
                     material.upload() == null ? null : UploadView.of(material.upload()),
-                    material.pages() == null ? null : new PagesView(material.pages().done(), material.pages().total()),
+                    material.pages() == null ? null : PagesView.of(material.pages()),
                     material.failure());
         }
 

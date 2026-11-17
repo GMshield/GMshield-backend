@@ -196,6 +196,16 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<StepRow> unendedSteps(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select s from IngestionStep s where s.versionId in :versions and s.endedAt is null"
+                        + " order by s.createdAt, s.id", IngestionStepEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(IngestionStepEntity::row).toList();
+    }
+
+    @Override
     public void insertVersionFile(VersionFileRow row) {
         EntityManager em = em();
         em.persist(new VersionFileEntity(row));
@@ -270,6 +280,26 @@ class JpaMaterialStore implements MaterialStore {
     @Override
     public List<PageRangeRow> pageLayers(UUID versionId) {
         return layerEntities(versionId).stream().map(PageLayerEntity::row).toList();
+    }
+
+    @Override
+    public List<PageRangeRow> pageLayers(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from PageLayer r where r.versionId in :versions"
+                        + " order by r.versionId, r.firstPage", PageLayerEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(PageLayerEntity::row).toList();
+    }
+
+    @Override
+    public List<PageRangeRow> pageOutcomes(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from PageOutcome r where r.versionId in :versions"
+                        + " order by r.versionId, r.firstPage", PageOutcomeEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(PageOutcomeEntity::row).toList();
     }
 
     @Override
