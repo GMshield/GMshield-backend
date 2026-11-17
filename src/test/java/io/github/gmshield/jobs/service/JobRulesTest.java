@@ -63,6 +63,21 @@ class JobRulesTest {
     }
 
     @Test
+    void outputLimitsThatAreNotPositiveOrPassTheClaimsStopTheStart() {
+        org.springframework.util.unit.DataSize three = org.springframework.util.unit.DataSize.ofGigabytes(3);
+        org.springframework.util.unit.DataSize eight = org.springframework.util.unit.DataSize.ofGigabytes(8);
+        JobFileSettings settings = new JobFileSettings(three, eight);
+        assertThat(settings.outputMaxBytes()).isEqualTo(3L * 1024 * 1024 * 1024);
+        assertThat(settings.claimMaxBytes()).isEqualTo(8L * 1024 * 1024 * 1024);
+        for (Runnable bad : List.<Runnable>of(
+                () -> new JobFileSettings(org.springframework.util.unit.DataSize.ofBytes(0), eight),
+                () -> new JobFileSettings(eight, three),
+                () -> new JobFileSettings(null, eight))) {
+            assertThatThrownBy(bad::run).hasMessageStartingWith("setting.invalid: GMSHIELD_JOB_OUTPUT_MAX_BYTES");
+        }
+    }
+
+    @Test
     void aGrantIs32RandomBytesInBase64Url() {
         String first = JobClaims.newGrant();
         String second = JobClaims.newGrant();

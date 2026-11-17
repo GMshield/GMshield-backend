@@ -22,6 +22,8 @@ import java.util.stream.Collectors;
 public class InMemoryJobStorage implements JobStorage {
 
     public final Map<UUID, JobRow> rows = new ConcurrentHashMap<>();
+    /** {@code job_output} (Story 1.15). */
+    public final Map<UUID, JobOutputRow> outputs = new ConcurrentHashMap<>();
     /** Runs once before the next locked read: what another transaction commits while the caller waits for the lock. */
     public volatile Runnable beforeNextLockedRead;
     private final Store joined = new Store(true);
@@ -35,11 +37,14 @@ public class InMemoryJobStorage implements JobStorage {
     @Override
     public synchronized <T> T separately(Function<JobStore, T> work) {
         Map<UUID, JobRow> before = new HashMap<>(rows);
+        Map<UUID, JobOutputRow> outputsBefore = new HashMap<>(outputs);
         try {
             return work.apply(separate);
         } catch (RuntimeException failure) {
             rows.clear();
             rows.putAll(before);
+            outputs.clear();
+            outputs.putAll(outputsBefore);
             throw failure;
         }
     }
@@ -143,6 +148,78 @@ public class InMemoryJobStorage implements JobStorage {
         @Override
         public void lockLane(String lane) {
             // separately() already runs one piece of work at a time
+        }
+
+        @Override
+        public void insertOutput(JobOutputRow row) {
+            synchronized (InMemoryJobStorage.this) {
+                if (!rows.containsKey(row.jobId()) || outputs.putIfAbsent(row.id(), row) != null) {
+                    throw new IllegalStateException("key or reference refused");
+                }
+            }
+            if (undoOnRollback) {
+                RollbackUndo.onRollback(() -> outputs.remove(row.id()));
+            }
+        }
+
+        @Override
+        public Optional<JobOutputRow> findOutput(UUID id) {
+            return Optional.ofNullable(outputs.get(id));
+        }
+
+        @Override
+        public boolean finishOutput(UUID id, long sizeBytes, int pieceCount, Instant now) {
+            synchronized (InMemoryJobStorage.this) {
+                JobOutputRow row = outputs.get(id);
+                if (row == null || !row.state().equals(JobOutputRow.WRITING)) {
+                    return false;
+                }
+                outputs.put(id, new JobOutputRow(id, row.jobId(), row.ownerId(), row.claimId(), JobOutputRow.STORED,
+                        sizeBytes, pieceCount, row.createdAt(), now));
+                if (undoOnRollback) {
+                    RollbackUndo.onRollback(() -> outputs.put(id, row));
+                }
+                return true;
+            }
+        }
+
+        @Override
+        public long claimOutputBytes(UUID jobId, UUID claimId) {
+            return outputs.values().stream().filter(row -> row.jobId().equals(jobId) && row.claimId().equals(claimId)
+                    && row.state().equals(JobOutputRow.STORED)).mapToLong(JobOutputRow::sizeBytes).sum();
+        }
+
+        @Override
+        public boolean deleteOutput(UUID id) {
+            return remove(id, row -> true);
+        }
+
+        @Override
+        public boolean adoptOutput(UUID id, UUID jobId) {
+            return remove(id, row -> row.jobId().equals(jobId) && row.state().equals(JobOutputRow.STORED));
+        }
+
+        private boolean remove(UUID id, java.util.function.Predicate<JobOutputRow> when) {
+            synchronized (InMemoryJobStorage.this) {
+                JobOutputRow row = outputs.get(id);
+                if (row == null || !when.test(row)) {
+                    return false;
+                }
+                outputs.remove(id);
+                if (undoOnRollback) {
+                    RollbackUndo.onRollback(() -> outputs.put(id, row));
+                }
+                return true;
+            }
+        }
+
+        @Override
+        public List<JobOutputRow> orphanOutputs(Instant writingEndedBefore, int limit) {
+            return outputs.values().stream().filter(output -> {
+                JobRow job = rows.get(output.jobId());
+                return job != null && List.of("done", "failed", "cancelled").contains(job.state())
+                        && (output.state().equals(JobOutputRow.STORED) || !job.updatedAt().isAfter(writingEndedBefore));
+            }).sorted(Comparator.comparing(JobOutputRow::createdAt).thenComparing(JobOutputRow::id)).limit(limit).toList();
         }
     }
 }

@@ -59,6 +59,13 @@ class MaterialController {
         }
     }
 
+    @Schema(name = "MaterialPages", requiredProperties = {"done", "total"})
+    record PagesView(
+            @Schema(description = "Pages read so far (0 until the reading stages run)", format = "int32", example = "0")
+            int done,
+            @Schema(description = "The version's page total", format = "int32", example = "320") int total) {
+    }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @Schema(name = "Material", requiredProperties = {"id", "name", "state"})
     record MaterialView(
@@ -70,11 +77,16 @@ class MaterialController {
                         "failed", "discarded"}) String state,
             @Schema(description = "What the material is, when the GM said", example = "rulebook",
                     allowableValues = {"rulebook", "supplement", "homebrew", "campaign_notes", "other"}) String kind,
-            @Schema(description = "The unfinished upload, only while the state is uploading") UploadView upload) {
+            @Schema(description = "The unfinished upload, only while the state is uploading") UploadView upload,
+            @Schema(description = "Pages done of the total, once the total is known") PagesView pages,
+            @Schema(description = "Why the version failed (category.reason), only when the state is failed",
+                    example = "ingestion.password_required") String failure) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
-                    material.upload() == null ? null : UploadView.of(material.upload()));
+                    material.upload() == null ? null : UploadView.of(material.upload()),
+                    material.pages() == null ? null : new PagesView(material.pages().done(), material.pages().total()),
+                    material.failure());
         }
 
         @Override

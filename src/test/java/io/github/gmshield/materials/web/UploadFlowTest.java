@@ -11,6 +11,8 @@ import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
+import io.github.gmshield.jobs.data.InMemoryJobStorage;
+import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
@@ -64,7 +66,7 @@ class UploadFlowTest {
     private static final String TUS = "1.0.0";
 
     @TestConfiguration
-    @Import({LibraryTestStores.class, MaterialTestStores.class})
+    @Import({LibraryTestStores.class, MaterialTestStores.class, JobMemoryStores.class})
     static class Stores {
         @Bean
         @Primary
@@ -107,6 +109,8 @@ class UploadFlowTest {
     private InMemoryMaterialStore materials;
     @Autowired
     private FileStore files;
+    @Autowired
+    private InMemoryJobStorage jobs;
     @Autowired
     private Vault vault;
 
@@ -198,6 +202,15 @@ class UploadFlowTest {
             stored.writeBytes(files.readPiece(gm.id(), id, i));
         }
         assertThat(stored.toByteArray()).isEqualTo(content);
+        // Story 1.15: the completion created the version's first ingestion step, for this owner only.
+        assertThat(materials.steps.values()).filteredOn(step -> step.versionId().equals(version.id()))
+                .singleElement().satisfies(step -> {
+                    assertThat(step.ownerId()).isEqualTo(gm.id());
+                    assertThat(step.stage()).isEqualTo("clean");
+                    assertThat(jobs.row(step.jobId()).kind()).isEqualTo("ingestion");
+                    assertThat(jobs.row(step.jobId()).ownerId()).isEqualTo(gm.id());
+                    OwnerContext.runAs(UUID.randomUUID(), () -> assertThat(materials.findStepByJob(step.jobId())).isEmpty());
+                });
     }
 
     @Test

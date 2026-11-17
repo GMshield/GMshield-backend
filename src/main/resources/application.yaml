@@ -76,10 +76,19 @@ gmshield:
     max-attempts: ${GMSHIELD_JOB_MAX_ATTEMPTS:3}
     reoffer-after: ${GMSHIELD_JOB_REOFFER_AFTER:2m}
     sweep-every: ${GMSHIELD_JOB_SWEEP_EVERY:10s}
+    # The files a worker sends back (Story 1.15), Spring data sizes: one output at most 3 GiB, all the outputs of one
+    # claim together at most 8 GiB. JobFileSettings refuses a start unless 1 byte <= output <= claim.
+    output-max-bytes: ${GMSHIELD_JOB_OUTPUT_MAX_BYTES:3GB}
+    output-claim-max-bytes: ${GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES:8GB}
   # Materials (materials module, Story 1.13), a Spring duration: how often unfinished uploads past their 6 hours are
   # discarded, and removals that stopped half way are finished.
   materials:
     upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
+  # Ingestion (materials module, Story 1.15): a version may have at most steps-per-page x its pages + 1 steps; a report
+  # whose next steps would pass that fails the version with ingestion.too_many_steps. IngestionSettings refuses a
+  # start unless 1 <= steps-per-page <= 100.
+  ingestion:
+    steps-per-page: ${GMSHIELD_INGESTION_STEPS_PER_PAGE:4}
 
 server:
   port: 8080

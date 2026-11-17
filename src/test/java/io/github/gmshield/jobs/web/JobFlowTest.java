@@ -9,24 +9,31 @@ import io.github.gmshield.HttpTestSupport;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.InMemoryProbeJobStore;
+import io.github.gmshield.jobs.data.JobOutputRow;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.JobTestStores;
 import io.github.gmshield.jobs.data.MutableClock;
+import io.github.gmshield.jobs.data.ProbeJobRow;
 import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.jobs.service.ProbeJobs;
-import io.github.gmshield.jobs.data.ProbeJobRow;
 import io.github.gmshield.shared.data.InMemoryTransactionManager;
 import io.github.gmshield.shared.service.JsonLineLogFormatter;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
+import io.github.gmshield.vault.service.FileStore;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
@@ -45,7 +52,8 @@ import tools.jackson.databind.JsonNode;
  * the internal API as the worker calls it (test mode, so the probe kind and its route exist). The same rows against
  * PostgreSQL and Redis are in the integration tests.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
+    "gmshield.jobs.output-max-bytes=6MB", "gmshield.jobs.output-claim-max-bytes=10MB"})
 @ActiveProfiles(value = {"test-mode", "unit"}, inheritProfiles = false)
 @Import({JobTestStores.class, JobFlowTest.Handlers.class})
 class JobFlowTest extends HttpTestSupport {
@@ -55,6 +63,13 @@ class JobFlowTest extends HttpTestSupport {
 
     @org.springframework.boot.test.context.TestConfiguration(proxyBeanMethods = false)
     static class Handlers {
+        /** The files of a job are sealed with the owner's data key (Story 1.15): kept in memory here. */
+        @org.springframework.context.annotation.Bean
+        @org.springframework.context.annotation.Primary
+        io.github.gmshield.vault.data.DataKeyStore inMemoryDataKeys() {
+            return new io.github.gmshield.vault.data.InMemoryDataKeyStore();
+        }
+
         @org.springframework.context.annotation.Bean
         io.github.gmshield.jobs.service.JobHandler arrayInputHandler() {
             return new io.github.gmshield.jobs.service.JobHandler() {
@@ -105,6 +120,12 @@ class JobFlowTest extends HttpTestSupport {
     Jobs jobs;
     @Autowired
     InMemoryTransactionManager transactions;
+    @Autowired
+    FileStore files;
+    @Autowired
+    io.github.gmshield.jobs.service.JobFiles jobFiles;
+    @org.springframework.beans.factory.annotation.Value("${gmshield.files.dir}")
+    java.nio.file.Path filesDir;
 
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
     private final Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
@@ -112,6 +133,7 @@ class JobFlowTest extends HttpTestSupport {
     @BeforeEach
     void reset() {
         storage.rows.clear();
+        storage.outputs.clear();
         probes.rows.clear();
         stream.clear();
         clock.set(START);
@@ -501,6 +523,206 @@ class JobFlowTest extends HttpTestSupport {
         assertThat(claim(interactive).statusCode()).isEqualTo(201);
     }
 
+    // ---- retry (Story 1.15)
+
+    @Test
+    void aFailedOutcomeWithRetryFalseEndsTheJobAtOnceAndRetryIsForFailedOnly() throws Exception {
+        UUID id = createProbe("interactive", 0, 3, null);
+        JsonNode claim = json(claim(id));
+        assertThat(outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(),
+                "{\"outcome\":\"done\",\"retry\":false}").statusCode()).isEqualTo(400);
+        assertThat(outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(),
+                "{\"outcome\":\"failed\",\"retry\":\"no\"}").statusCode()).isEqualTo(400);
+        assertThat(storage.row(id).state()).isEqualTo("running");
+
+        assertThat(outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(),
+                "{\"outcome\":\"failed\",\"code\":\"probe.password\",\"retry\":false}").statusCode()).isEqualTo(204);
+
+        JobRow row = storage.row(id);
+        assertThat(row.state()).isEqualTo("failed");
+        assertThat(row.attempt()).isEqualTo(1);
+        assertThat(row.outcomeCode()).isEqualTo("probe.password");
+        assertThat(stream.offered(INTERACTIVE)).containsExactly(id);
+        assertThat(logEvents()).contains("probe.failed");
+
+        UUID retried = createProbe("interactive", 0, 3, null);
+        JsonNode first = json(claim(retried));
+        outcome(retried, first.path("claimId").asString(), first.path("grant").asString(),
+                "{\"outcome\":\"failed\",\"code\":\"probe.failed\",\"retry\":true}");
+        assertThat(storage.row(retried).state()).isEqualTo("offered");
+    }
+
+    // ---- files (Story 1.15)
+
+    @Test
+    void anOutputIsStreamedIntoSealedPiecesUnderAMintedIdAndAnsweredWithItsSizeAndSha256() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        JsonNode claim = json(claim(id));
+        byte[] content = bytes(5 * 1024 * 1024 + 123);
+
+        HttpResponse<String> stored = postOutput(id, claim, content, true);
+
+        assertThat(stored.statusCode()).as(stored.body()).isEqualTo(201);
+        assertThat(stored.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode body = json(stored);
+        UUID fileId = UUID.fromString(body.path("fileId").asString());
+        assertThat(body.path("size").asLong()).isEqualTo(content.length);
+        assertThat(body.path("sha256").asString()).isEqualTo(HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(content)));
+        JobOutputRow row = storage.outputs.get(fileId);
+        assertThat(row.state()).isEqualTo("stored");
+        assertThat(row.jobId()).isEqualTo(id);
+        assertThat(row.ownerId()).isEqualTo(ProbeJobs.OWNER);
+        assertThat(row.claimId()).hasToString(claim.path("claimId").asString());
+        assertThat(row.sizeBytes()).isEqualTo(content.length);
+        assertThat(row.pieceCount()).isEqualTo(2);
+        assertThat(readBack(ProbeJobs.OWNER, fileId, 2)).isEqualTo(content);
+        // A body without a length (chunked) is stored the same way.
+        HttpResponse<String> chunked = postOutput(id, claim, bytes(1000), false);
+        assertThat(chunked.statusCode()).as(chunked.body()).isEqualTo(201);
+        assertThat(json(chunked).path("size").asLong()).isEqualTo(1000);
+        assertThat(logText()).doesNotContain(claim.path("grant").asString());
+    }
+
+    @Test
+    void anOutputPastItsLimitOrTheClaimsIsRefusedAndLeavesNothing() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        JsonNode claim = json(claim(id));
+        int mib = 1024 * 1024;
+        java.util.Set<String> before = fileFolders();
+
+        assertProblem(postOutput(id, claim, bytes(6 * mib + 1), true), 413, "job.output_too_large");
+        // Without a length the first 4 MiB piece is written before the limit is passed: it is removed again.
+        assertProblem(postOutput(id, claim, bytes(6 * mib + 1), false), 413, "job.output_too_large");
+        assertProblem(postOutput(id, claim, new byte[0], true), 400, "request.invalid");
+        assertThat(storage.outputs).isEmpty();
+        assertThat(fileFolders()).isEqualTo(before);
+
+        assertThat(postOutput(id, claim, bytes(6 * mib), true).statusCode()).isEqualTo(201);
+        assertThat(postOutput(id, claim, bytes(4 * mib), false).statusCode()).isEqualTo(201);
+        java.util.Set<String> stored = fileFolders();
+        // 10 MiB stored for this claim: one more byte passes the claim's limit.
+        assertProblem(postOutput(id, claim, bytes(1), false), 413, "job.output_too_large");
+        assertThat(storage.outputs.values()).hasSize(2).allMatch(row -> row.state().equals("stored"));
+        assertThat(fileFolders()).isEqualTo(stored).hasSize(before.size() + 2);
+    }
+
+    @Test
+    void filesNeedTheLiveClaimsGrantAndAnInputTheHandlerOpens() throws Exception {
+        UUID a = createProbe("interactive", 0, 0, null);
+        UUID b = createProbe("interactive", 0, 0, null);
+        JsonNode claimA = json(claim(a));
+        JsonNode claimB = json(claim(b));
+        java.util.Set<String> before = fileFolders();
+        String outputsA = "/internal/v1/jobs/" + a + "/claims/" + claimA.path("claimId").asString() + "/outputs";
+
+        for (String[] headers : new String[][] {{}, {"X-Job-Grant", "A".repeat(43)},
+                {"X-Job-Grant", claimB.path("grant").asString()}, {"X-Job-Grant", "not a grant"}}) {
+            assertProblem(sendBytesAsWorker(outputsA, bytes(10), headers), 403, "job.grant_refused");
+            assertProblem(getAsWorker("/internal/v1/jobs/" + a + "/claims/" + claimA.path("claimId").asString()
+                    + "/inputs/source", headers), 403, "job.grant_refused");
+        }
+        // B's grant with B's claim id on job A, and A's grant with another claim id.
+        assertProblem(sendBytesAsWorker("/internal/v1/jobs/" + a + "/claims/" + claimB.path("claimId").asString()
+                + "/outputs", bytes(10), "X-Job-Grant", claimB.path("grant").asString()), 403, "job.grant_refused");
+        assertProblem(sendBytesAsWorker("/internal/v1/jobs/" + a + "/claims/" + UUID.randomUUID() + "/outputs",
+                bytes(10), "X-Job-Grant", claimA.path("grant").asString()), 403, "job.grant_refused");
+        // The probe's handler opens no input.
+        assertProblem(getAsWorker("/internal/v1/jobs/" + a + "/claims/" + claimA.path("claimId").asString()
+                + "/inputs/source", "X-Job-Grant", claimA.path("grant").asString()), 404, "request.not_found");
+        assertThat(storage.outputs).isEmpty();
+
+        // An ended claim: nothing more is stored.
+        outcome(a, claimA.path("claimId").asString(), claimA.path("grant").asString(), "{\"outcome\":\"done\"}");
+        assertProblem(postOutput(a, claimA, bytes(10), true), 403, "job.grant_refused");
+        // A lapsed claim, before any sweep.
+        clock.advance(Duration.ofSeconds(91));
+        assertProblem(postOutput(b, claimB, bytes(10), true), 403, "job.grant_refused");
+        assertThat(storage.outputs).isEmpty();
+        assertThat(fileFolders()).isEqualTo(before);
+    }
+
+    @Test
+    void aClaimThatEndsWhileAnOutputArrivesStoresNothing() throws Exception {
+        int mib = 1024 * 1024;
+        for (int size : new int[] {4 * mib + 10, 4 * mib}) {
+            UUID id = createProbe("interactive", 0, 0, null);
+            JsonNode claim = json(claim(id));
+            java.util.Set<String> before = fileFolders();
+            // The claim lapses once the first 4 MiB have arrived: either before the next piece (stillLive), or, with
+            // nothing after them, between the last piece and the output's record (the locked re-check).
+            java.io.InputStream body = new java.io.InputStream() {
+                private int sent;
+
+                @Override
+                public int read() {
+                    byte[] one = new byte[1];
+                    return read(one, 0, 1) < 0 ? -1 : one[0] & 0xff;
+                }
+
+                @Override
+                public int read(byte[] buffer, int offset, int length) {
+                    if (sent >= 4 * mib && clock.instant().isBefore(START.plusSeconds(91))) {
+                        clock.advance(Duration.ofSeconds(91));
+                    }
+                    if (sent >= size) {
+                        return -1;
+                    }
+                    int count = Math.min(length, size - sent);
+                    sent += count;
+                    return count;
+                }
+            };
+
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> jobFiles.store(id,
+                            UUID.fromString(claim.path("claimId").asString()), claim.path("grant").asString(), -1, body))
+                    .isInstanceOf(io.github.gmshield.shared.service.ApiException.class)
+                    .satisfies(thrown -> assertThat(((io.github.gmshield.shared.service.ApiException) thrown).problem()
+                            .code()).isEqualTo("job.grant_refused"));
+
+            assertThat(storage.outputs).as("size %d", size).isEmpty();
+            assertThat(fileFolders()).as("size %d", size).isEqualTo(before);
+            clock.set(START);
+        }
+    }
+
+    @Test
+    void anOutputNoDoneOutcomeAdoptsIsRemovedByTheSweepOnceItsJobEnded() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        JsonNode claim = json(claim(id));
+        UUID fileId = UUID.fromString(json(postOutput(id, claim, bytes(3000), true)).path("fileId").asString());
+
+        sweep.sweep();   // the job is still running: its output stays
+        assertThat(storage.outputs).containsKey(fileId);
+        assertThat(files.fileExists(ProbeJobs.OWNER, fileId)).isTrue();
+
+        outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(),
+                "{\"outcome\":\"failed\",\"code\":\"probe.failed\",\"retry\":false}");
+        sweep.sweep();
+
+        assertThat(storage.outputs).isEmpty();
+        assertThat(files.fileExists(ProbeJobs.OWNER, fileId)).isFalse();
+        assertThat(logEvents()).contains("job.output_removed");
+    }
+
+    @Test
+    void anOutputStillMarkedAsWritingIsLeftToItsWriterForTenMinutesAfterItsJobEnded() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        outcomeDone(id);
+        UUID writing = UUID.randomUUID();
+        storage.outputs.put(writing, new JobOutputRow(writing, id, ProbeJobs.OWNER, storage.row(id).claimId(), "writing",
+                0, 0, START, START));
+        files.writePiece(ProbeJobs.OWNER, writing, 0, bytes(10));
+
+        clock.advance(Duration.ofMinutes(10).minusSeconds(1));
+        sweep.sweep();
+        assertThat(storage.outputs).containsKey(writing);
+        clock.advance(Duration.ofSeconds(1));
+        sweep.sweep();
+        assertThat(storage.outputs).doesNotContainKey(writing);
+        assertThat(files.fileExists(ProbeJobs.OWNER, writing)).isFalse();
+    }
+
     // ---- trace
 
     @Test
@@ -588,6 +810,53 @@ class JobFlowTest extends HttpTestSupport {
             request.headers(headers);
         }
         return java.net.http.HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> postOutput(UUID id, JsonNode claim, byte[] content, boolean withLength) throws Exception {
+        HttpRequest.BodyPublisher body = withLength ? HttpRequest.BodyPublishers.ofByteArray(content)
+                : HttpRequest.BodyPublishers.ofInputStream(() -> new ByteArrayInputStream(content));
+        HttpRequest request = HttpRequest.newBuilder(uri("/internal/v1/jobs/" + id + "/claims/"
+                        + claim.path("claimId").asString() + "/outputs"))
+                .header("Authorization", "Bearer " + WORKER_CREDENTIAL).header("Content-Type", "application/octet-stream")
+                .header("X-Job-Grant", claim.path("grant").asString()).POST(body).build();
+        return java.net.http.HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> sendBytesAsWorker(String path, byte[] content, String... headers) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri(path))
+                .header("Authorization", "Bearer " + WORKER_CREDENTIAL).header("Content-Type", "application/octet-stream")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(content));
+        if (headers.length > 0) {
+            request.headers(headers);
+        }
+        return java.net.http.HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** The file folders of the probe owner in the file store: one per stored output, whatever its pieces. */
+    private java.util.Set<String> fileFolders() throws java.io.IOException {
+        java.nio.file.Path folder = filesDir.resolve(ProbeJobs.OWNER.toString());
+        if (!java.nio.file.Files.isDirectory(folder)) {
+            return java.util.Set.of();
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> entries = java.nio.file.Files.list(folder)) {
+            return entries.map(entry -> entry.getFileName().toString()).collect(java.util.stream.Collectors.toSet());
+        }
+    }
+
+    private byte[] readBack(UUID owner, UUID fileId, int pieces) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (int i = 0; i < pieces; i++) {
+            out.writeBytes(files.readPiece(owner, fileId, i));
+        }
+        return out.toByteArray();
+    }
+
+    private static byte[] bytes(int size) {
+        byte[] content = new byte[size];
+        for (int i = 0; i < size; i++) {
+            content[i] = (byte) (i * 31 + (i >>> 11));
+        }
+        return content;
     }
 
     private static void assertProblem(HttpResponse<String> response, int status, String code) {

@@ -1,5 +1,6 @@
 package io.github.gmshield.jobs.service;
 
+import java.util.Optional;
 import tools.jackson.databind.JsonNode;
 
 /**
@@ -22,7 +23,20 @@ public interface JobHandler {
     /** The input handed to the worker with a claim: everything it needs for this attempt. */
     JsonNode input(JobRef job);
 
-    /** The worker reported the job done; {@code result} is what it sent (an empty object when it sent none). */
+    /**
+     * The input file {@code name} of the job for its live claim (Story 1.15), streamed to the worker by
+     * {@code GET .../inputs/{name}}; empty (404) when the job has no such input. Runs as the owner, in a read
+     * transaction of its own; the returned input is written after it ended.
+     */
+    default Optional<JobInput> openInput(JobRef job, String name) {
+        return Optional.empty();
+    }
+
+    /**
+     * The worker reported the job done; {@code result} is what it sent (an empty object when it sent none). The
+     * files the worker sent back are adopted here, with {@link Jobs#adoptOutput}; any it does not adopt are removed
+     * once the job ended. A result that cannot be recorded throws {@link JobResultInvalid}.
+     */
     void completed(JobRef job, JsonNode result);
 
     /** The job ended failed: its last attempt failed or lapsed. {@code code} is the reported or the backend's code. */

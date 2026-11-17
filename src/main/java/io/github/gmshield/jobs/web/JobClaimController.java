@@ -74,6 +74,8 @@ class JobClaimController {
     record JobOutcome(
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, allowableValues = {"done", "failed"}) String outcome,
             @Schema(description = "For failed only: category.reason in lower case") String code,
+            @Schema(description = "For failed only: false ends the job at once, without another attempt (an input no"
+                    + " attempt can change); absent or true lets the backend retry while attempts remain") Boolean retry,
             @Schema(description = "For done only: the result for the job's handler") Map<String, Object> result) {
     }
 
@@ -100,14 +102,15 @@ class JobClaimController {
 
     @PostMapping(path = "/{claimId}/outcome", consumes = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    @Operation(operationId = "reportJobOutcome", summary = "Report how the claimed attempt ended (403 job.grant_refused)")
+    @Operation(operationId = "reportJobOutcome", summary = "Report how the claimed attempt ended (403 job.grant_refused,"
+            + " 400 job.result_invalid when the job's handler cannot record the result)")
     ResponseEntity<Void> outcome(@PathVariable UUID jobId, @PathVariable UUID claimId,
                                  @Parameter(in = ParameterIn.HEADER, name = GRANT_HEADER, required = true,
                                          description = "The claim's grant")
                                  @RequestHeader(name = GRANT_HEADER, required = false) String grant,
                                  @RequestBody JobOutcome body) {
         JsonNode result = body.result() == null ? null : JSON.valueToTree(body.result());
-        claims.report(jobId, claimId, grant, body.outcome(), body.code(), result);
+        claims.report(jobId, claimId, grant, body.outcome(), body.code(), body.retry(), result);
         return ResponseEntity.noContent().build();
     }
 }

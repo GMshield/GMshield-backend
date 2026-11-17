@@ -1,5 +1,6 @@
 package io.github.gmshield.jobs.service;
 
+import io.github.gmshield.jobs.data.JobOutputRow;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.JobStorage;
 import io.github.gmshield.shared.service.Ids;
@@ -7,6 +8,8 @@ import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import java.time.Instant;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,5 +86,30 @@ public class Jobs {
         JobTrace.run(traceId, () -> log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("kind", kind)
                 .addKeyValue("lane", lane.code()).addKeyValue("ownerId", owner).log("job.created"));
         return job;
+    }
+
+    /**
+     * Adopts a file the worker sent back for {@code job} (Story 1.15), inside the caller's transaction (a handler's
+     * {@link JobHandler#completed}): the output's row goes, so the jobs sweep never removes the file, which from
+     * now on belongs to the caller. Empty when {@code fileId} is not a whole output of this job (unknown, another
+     * job's, still being written, or adopted already); the caller decides what that means.
+     */
+    public Optional<JobOutput> adoptOutput(JobRef job, UUID fileId) {
+        Objects.requireNonNull(job, "job");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("jobs.transaction_required");
+        }
+        if (fileId == null) {
+            return Optional.empty();
+        }
+        Optional<JobOutputRow> found = storage.joined().findOutput(fileId)
+                .filter(row -> row.jobId().equals(job.id()) && row.ownerId().equals(job.ownerId())
+                        && JobOutputRow.STORED.equals(row.state()));
+        if (found.isEmpty() || !storage.joined().adoptOutput(fileId, job.id())) {
+            return Optional.empty();
+        }
+        JobOutputRow row = found.get();
+        log.atDebug().addKeyValue("jobId", job.id()).addKeyValue("fileId", fileId).log("job.output_adopted");
+        return Optional.of(new JobOutput(row.id(), row.sizeBytes(), row.pieceCount()));
     }
 }

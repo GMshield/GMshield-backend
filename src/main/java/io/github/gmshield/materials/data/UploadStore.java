@@ -47,6 +47,15 @@ public interface UploadStore {
     /** An open upload past its expiry, with no live lease, becomes {@code removing}. */
     boolean removeExpired(UUID id, Instant now);
 
+    /** The complete upload of {@code owner} for this version (Story 1.15: the raw file ingestion starts from). */
+    Optional<UploadRow> completeForVersion(UUID owner, UUID versionId);
+
+    /**
+     * A complete upload becomes {@code removing} (Story 1.15: its file was cleaned and stored again, or it needs a
+     * password); the upload sweep finishes the removal.
+     */
+    boolean removeComplete(UUID id, Instant now);
+
     /** Deletes the row, whatever its state (a refused format, in the transaction that deletes its version). */
     boolean delete(UUID id);
 

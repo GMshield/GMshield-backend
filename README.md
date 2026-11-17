@@ -249,6 +249,35 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - Each item is `{id, name, state, kind?, upload?}`; `upload` (`{id, offset, length, expiresAt}`, from the open
     `upload` row by its `(owner_id, version_id)` index) is there only while the newest version is `uploading`.
     Every answer is `no-store`. Nothing logs a name, a kind or where a material belongs.
+- **Cleaning an upload and splitting it into pages (`materials` and `jobs`, Story 1.15, AD-17).** Completing a PDF
+  upload creates, in the same transaction, the version's first ingestion step: a job of kind `ingestion` (ingestion
+  lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Other formats stay `waiting` until
+  their own stories. `materials.service.IngestionSteps` is the kind's `JobHandler`:
+  - its `input()` (the claim's transaction) moves a `waiting` version to `processing` and gives the worker the
+    stage, the format, the page range and the input's name (`source`);
+  - its `openInput()` streams the step's input file (the raw upload, or one of the version's files) piece by piece;
+  - `completed()` records one step report, which it never interprets beyond recording: `pipelineVersion` (the first
+    report's is kept; another fails the version with `ingestion.pipeline_changed`), `pageTotal`, `original` and
+    `batches` (adopted from the job's outputs into `version_file`), and `next` steps (new `ingestion` jobs). A
+    report whose next steps would take the version past `GMSHIELD_INGESTION_STEPS_PER_PAGE` x pages + 1 steps fails
+    it with `ingestion.too_many_steps`. Once an original is recorded the raw upload is marked `removing` in the same
+    transaction; its pieces and row go after the commit (the upload sweep finishes what is left). A result that
+    cannot be recorded answers `job.result_invalid` (400) and changes nothing;
+  - `failed()` fails the version with the code (`failure_code`; a code outside `ingestion.` is recorded as
+    `ingestion.step_failed`); for `ingestion.password_required` the raw upload and every version file go too, and
+    the material stays so the GM sees why.
+  - Generic job files (internal contract 1.2.0, `jobs.service.JobFiles`): `GET
+    /internal/v1/jobs/{jobId}/claims/{claimId}/inputs/{name}` streams what the handler opens; `POST .../outputs`
+    streams a body into the file store in 4 MiB pieces sealed under a backend-minted id and answers `{fileId, size,
+    sha256}`. Both need the live claim's grant (`job.grant_refused`, 403), checked again before every piece and,
+    with the job's row locked, when the output is recorded; an output is capped at `GMSHIELD_JOB_OUTPUT_MAX_BYTES`
+    and a claim's outputs at `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` (`job.output_too_large`, 413). A handler adopts an
+    output with `Jobs.adoptOutput`; the jobs sweep removes every `job_output` no `done` report adopted once its job
+    ended. A failed outcome may say `retry: false`, which ends the job at once.
+  - `V8__job_output.sql` (`job_output`, not a library table) and `V9__ingestion.sql` (`material_version.page_total`,
+    `pipeline_version`, `failure_code`; the library tables `ingestion_step` and `version_file`, owner-scoped as in
+    V4 and V7). The public read (contract 1.6.0) adds `pages: {done, total}` once the total is known (`done` is 0
+    until Story 1.16) and `failure` (the code) when the state is `failed`.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -328,6 +357,9 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_REOFFER_AFTER` | an offer nobody claimed is made again after this long (default `2m`; less than an hour) |
 | `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
+| `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
+| `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
+| `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |
 | `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
 | `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
 | `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |
