@@ -2,6 +2,7 @@ package io.github.gmshield.materials.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
@@ -138,10 +139,11 @@ class MaterialsTest {
                 new Uploads.Details(null, "", null, null));
         List<ApiException> problems = new ArrayList<>();
         for (Uploads.Details details : refused) {
-            assertThatThrownBy(() -> as(owner, () -> service.create(10, "a.pdf", details)))
+            Throwable thrown = catchThrowable(() -> as(owner, () -> service.create(10, "a.pdf", details)));
+            assertThat(thrown)
                     .as(details.kind() + " " + details.language() + " " + details.campaign() + " " + details.system())
-                    .satisfies(problem("upload.metadata_invalid", 400))
-                    .satisfies(thrown -> problems.add((ApiException) thrown));
+                    .satisfies(problem("upload.metadata_invalid", 400));
+            problems.add((ApiException) thrown);
         }
         // The answer is the same whichever detail was wrong.
         assertThat(problems.stream().map(ApiException::problem).distinct()).hasSize(1);
