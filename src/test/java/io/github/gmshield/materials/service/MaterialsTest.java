@@ -61,6 +61,7 @@ class MaterialsTest {
     private Library library;
     private Uploads service;
     private Materials reads;
+    private final List<VersionRow> started = new java.util.ArrayList<>();
 
     @BeforeEach
     void wire() {
@@ -71,7 +72,8 @@ class MaterialsTest {
         library = TestLibraries.library(libraryStore, vault, beans.getBeanProvider(PlatformTransactionManager.class),
                 beans.getBeanProvider(Clock.class));
         service = new Uploads(materials, uploads, vault, files, library,
-                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
+                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
+                (version, upload) -> started.add(version));
         reads = new Materials(materials, uploads, vault, beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
@@ -224,6 +226,32 @@ class MaterialsTest {
     }
 
     @Test
+    void pagesShowOnceThePageTotalIsKnownAndAFailureOnlyWhileTheVersionIsFailed() {
+        UUID processing = create(owner, "processing.pdf", Uploads.Details.NONE);
+        UUID failed = create(owner, "failed.pdf", Uploads.Details.NONE);
+        UUID unknown = create(owner, "unknown.pdf", Uploads.Details.NONE);
+        setState(processing, "processing");
+        setState(unknown, "processing");
+        write(() -> materials.recordIngestion(versionOf(processing).id(), "1", 320, clock.instant()));
+        write(() -> materials.failVersion(versionOf(failed).id(), "ingestion.password_required", clock.instant()));
+
+        Materials.Material reading = as(owner, () -> reads.find(processing)).orElseThrow();
+        assertThat(reading.pages()).isEqualTo(new Materials.Pages(0, 320));
+        assertThat(reading.failure()).isNull();
+        Materials.Material refused = as(owner, () -> reads.find(failed)).orElseThrow();
+        assertThat(refused.state()).isEqualTo("failed");
+        assertThat(refused.failure()).isEqualTo("ingestion.password_required");
+        assertThat(refused.pages()).isNull();
+        assertThat(as(owner, () -> reads.find(unknown)).orElseThrow().pages()).isNull();
+        // A failure code kept on a version that is no longer failed is never shown.
+        setState(failed, "processing");
+        assertThat(as(owner, () -> reads.find(failed)).orElseThrow().failure()).isNull();
+        assertThat(as(owner, () -> reads.list(List.of("processing"), null, 20)).items())
+                .filteredOn(item -> item.id().equals(processing)).singleElement()
+                .satisfies(item -> assertThat(item.pages().total()).isEqualTo(320));
+    }
+
+    @Test
     void theCursorAndTheLimitPageThroughTheList() {
         List<UUID> created = new ArrayList<>();
         for (int i = 0; i < 5; i++) {
@@ -293,6 +321,11 @@ class MaterialsTest {
         VersionRow version = materials.versions.values().stream().filter(row -> row.materialId().equals(material))
                 .findFirst().orElseThrow();
         write(() -> materials.changeVersion(version.id(), state, "pdf", 10L, clock.instant()));
+    }
+
+    private VersionRow versionOf(UUID material) {
+        return materials.versions.values().stream().filter(row -> row.materialId().equals(material)).findFirst()
+                .orElseThrow();
     }
 
     private void addVersion(UUID material, String state) {

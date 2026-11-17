@@ -198,6 +198,74 @@ class JdbcJobStorage implements JobStorage {
                     .query((rs, n) -> 1).list();
         }
 
+        private static final String OUTPUT_COLUMNS = "select o.id, o.job_id, o.owner_id, o.claim_id, o.state, o.size_bytes,"
+                + " o.piece_count, o.created_at, o.updated_at from job_output o ";
+
+        @Override
+        public void insertOutput(JobOutputRow row) {
+            jdbc.get().sql("insert into job_output (id, job_id, owner_id, claim_id, state, size_bytes, piece_count,"
+                            + " created_at, updated_at) values (:id, :job, :owner, :claim, :state, :size, :pieces,"
+                            + " :createdAt, :updatedAt)")
+                    .param("id", row.id())
+                    .param("job", row.jobId())
+                    .param("owner", row.ownerId())
+                    .param("claim", row.claimId())
+                    .param("state", row.state())
+                    .param("size", row.sizeBytes())
+                    .param("pieces", row.pieceCount())
+                    .param("createdAt", time(row.createdAt()))
+                    .param("updatedAt", time(row.updatedAt()))
+                    .update();
+        }
+
+        @Override
+        public Optional<JobOutputRow> findOutput(UUID id) {
+            return jdbc.get().sql(OUTPUT_COLUMNS + "where o.id = :id").param("id", id).query(Sql::output).optional();
+        }
+
+        @Override
+        public boolean finishOutput(UUID id, long sizeBytes, int pieceCount, Instant now) {
+            return jdbc.get().sql("update job_output set state = 'stored', size_bytes = :size, piece_count = :pieces,"
+                            + " updated_at = :now where id = :id and state = 'writing'")
+                    .param("size", sizeBytes).param("pieces", pieceCount).param("now", time(now)).param("id", id)
+                    .update() == 1;
+        }
+
+        @Override
+        public long claimOutputBytes(UUID jobId, UUID claimId) {
+            Long total = jdbc.get().sql("select coalesce(sum(size_bytes), 0) from job_output"
+                            + " where job_id = :job and claim_id = :claim and state = 'stored'")
+                    .param("job", jobId).param("claim", claimId).query(Long.class).optional().orElse(0L);
+            return total == null ? 0 : total;
+        }
+
+        @Override
+        public boolean deleteOutput(UUID id) {
+            return jdbc.get().sql("delete from job_output where id = :id").param("id", id).update() == 1;
+        }
+
+        @Override
+        public boolean adoptOutput(UUID id, UUID jobId) {
+            return jdbc.get().sql("delete from job_output where id = :id and job_id = :job and state = 'stored'")
+                    .param("id", id).param("job", jobId).update() == 1;
+        }
+
+        @Override
+        public List<JobOutputRow> orphanOutputs(Instant writingEndedBefore, int limit) {
+            return jdbc.get().sql(OUTPUT_COLUMNS + "join job j on j.id = o.job_id"
+                            + " where j.state in ('done', 'failed', 'cancelled')"
+                            + " and (o.state = 'stored' or j.updated_at <= :before)"
+                            + " order by o.created_at, o.id limit :limit")
+                    .param("before", time(writingEndedBefore)).param("limit", limit).query(Sql::output).list();
+        }
+
+        private static JobOutputRow output(ResultSet rs, int n) throws SQLException {
+            return new JobOutputRow(rs.getObject("id", UUID.class), rs.getObject("job_id", UUID.class),
+                    rs.getObject("owner_id", UUID.class), rs.getObject("claim_id", UUID.class), rs.getString("state"),
+                    rs.getLong("size_bytes"), rs.getInt("piece_count"), instant(rs, "created_at"),
+                    instant(rs, "updated_at"));
+        }
+
         private static JobRow row(ResultSet rs, int n) throws SQLException {
             return new JobRow(rs.getObject("id", UUID.class), rs.getObject("owner_id", UUID.class), rs.getString("kind"),
                     rs.getString("lane"), rs.getString("state"), rs.getInt("attempt"), rs.getString("trace_id"),

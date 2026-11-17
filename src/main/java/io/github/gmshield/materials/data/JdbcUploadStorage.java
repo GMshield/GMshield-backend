@@ -186,6 +186,21 @@ class JdbcUploadStorage implements UploadStorage {
         }
 
         @Override
+        public Optional<UploadRow> completeForVersion(UUID owner, UUID versionId) {
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version and state = 'complete'"
+                            + " order by created_at, id limit 1")
+                    .param("owner", owner).param("version", versionId).query(Sql::row).optional();
+        }
+
+        @Override
+        public boolean removeComplete(UUID id, Instant now) {
+            return jdbc.get().sql("update upload set state = 'removing', busy_token = null, busy_until = null,"
+                            + " updated_at = :now where id = :id and state = 'complete'")
+                    .param("now", time(now)).param("id", id)
+                    .update() == 1;
+        }
+
+        @Override
         public boolean delete(UUID id) {
             return jdbc.get().sql("delete from upload where id = :id").param("id", id).update() == 1;
         }

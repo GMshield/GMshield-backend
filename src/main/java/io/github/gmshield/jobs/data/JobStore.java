@@ -42,4 +42,28 @@ public interface JobStore {
 
     /** Holds the lane's lock until the end of the transaction: one offer decision of the lane at a time. */
     void lockLane(String lane);
+
+    // --- job_output (Story 1.15)
+
+    void insertOutput(JobOutputRow row);
+
+    Optional<JobOutputRow> findOutput(UUID id);
+
+    /** A {@code writing} output becomes {@code stored} with its size and piece count; false when it is not writing. */
+    boolean finishOutput(UUID id, long sizeBytes, int pieceCount, Instant now);
+
+    /** The bytes of the {@code stored} outputs of one claim of a job. */
+    long claimOutputBytes(UUID jobId, UUID claimId);
+
+    /** Deletes an output's row whatever its state; false when there is none. */
+    boolean deleteOutput(UUID id);
+
+    /** Deletes a {@code stored} output of the job (its adoption); false when there is no such row. */
+    boolean adoptOutput(UUID id, UUID jobId);
+
+    /**
+     * Up to {@code limit} outputs whose job has ended ({@code done}, {@code failed} or {@code cancelled}): every
+     * {@code stored} one, and a {@code writing} one once its job ended at or before {@code writingEndedBefore}.
+     */
+    List<JobOutputRow> orphanOutputs(Instant writingEndedBefore, int limit);
 }

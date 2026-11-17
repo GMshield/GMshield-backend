@@ -46,7 +46,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       and a refused format leaves no row and no piece. The part streams through a SHA-256 into
  *       4 MiB pieces, each encrypted into the file store; it counts only when its checksum matches.</li>
  *   <li>{@link #complete}: the stored pieces are decrypted one at a time and hashed; a match makes the version
- *       {@code waiting}, a mismatch discards it and removes the pieces.</li>
+ *       {@code waiting} and, in the same transaction, starts its ingestion chain ({@link IngestionStart}, Story 1.15);
+ *       a mismatch discards it and removes the pieces.</li>
  * </ul>
  *
  * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name, a
@@ -85,9 +86,12 @@ public class Uploads {
     private final Library library;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
+    private final IngestionStart ingestion;
 
     Uploads(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Library library,
-            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock,
+            IngestionStart ingestion) {
+        this.ingestion = ingestion;
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
@@ -241,7 +245,9 @@ public class Uploads {
                     throw lost(row.id());
                 }
                 materials.changeVersion(row.versionId(), WAITING, row.format(), row.length(), now);
-                return materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
+                VersionRow waiting = materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
+                ingestion.start(waiting, row);
+                return waiting;
             });
             lease.released = true;
         } finally {

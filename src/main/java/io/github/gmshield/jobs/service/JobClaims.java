@@ -28,7 +28,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *   <li>A renewal or an outcome must present the live claim's grant, for that job and that claim, before it lapses;
  *       anything else is {@code job.grant_refused}, whichever part is wrong.</li>
  *   <li>A {@code failed} outcome sends the job back to waiting while attempts remain; otherwise the job ends
- *       {@code failed} with the reported code. Only the backend decides retries.</li>
+ *       {@code failed} with the reported code. With {@code retry: false} (Story 1.15: an input that no attempt can
+ *       change, such as a file that needs a password) it ends {@code failed} at once. Only the backend decides
+ *       retries.</li>
  * </ul>
  *
  * Every handler call runs as the job's owner ({@link OwnerWork}). Every line about a job carries the trace id of
@@ -159,17 +161,26 @@ public class JobClaims {
         return new Renewal(renewed.claimRenewAt(), renewed.claimLapsesAt());
     }
 
-    /**
-     * The worker's outcome: {@code done} with an optional result, or {@code failed} with an optional code. The job's
-     * change and the handler's call happen in one transaction as the owner.
-     */
+    /** {@link #report(UUID, UUID, String, String, String, Boolean, JsonNode)} without {@code retry}. */
     public void report(UUID jobId, UUID claimId, String grant, String outcome, String code, JsonNode result) {
+        report(jobId, claimId, grant, outcome, code, null, result);
+    }
+
+    /**
+     * The worker's outcome: {@code done} with an optional result, or {@code failed} with an optional code and an
+     * optional {@code retry} ({@code false} ends the job at once). The job's change and the handler's call happen in
+     * one transaction as the owner; a result the handler cannot record is {@code job.result_invalid} and changes
+     * nothing.
+     */
+    public void report(UUID jobId, UUID claimId, String grant, String outcome, String code, Boolean retry,
+                       JsonNode result) {
         boolean done = DONE.equals(outcome);
         if (!done && !FAILED.equals(outcome)
                 || code != null && (done || code.length() > MAX_CODE_LENGTH || !CODE.matcher(code).matches())
-                || result != null && !done) {
+                || result != null && !done || retry != null && done) {
             throw JobProblems.invalid();
         }
+        Reported reported = new Reported(done, Boolean.FALSE.equals(retry), code, result);
         Instant now = clock.now();
         byte[] presented = hashOf(grant);
         JobRow seen = storage.joined().find(jobId).orElse(null);
@@ -178,30 +189,15 @@ public class JobClaims {
             throw JobProblems.grantRefused();
         }
         Optional<JobHandler> handler = handlers.find(seen.kind());
-        JobRow ended = JobTrace.call(seen.traceId(), () -> owners.call(seen.ownerId(), () -> {
-            JobRow current = storage.joined().findForUpdate(jobId).orElse(null);
-            if (!grantMatches(current, claimId, presented, now)) {
-                throw JobProblems.grantRefused();
-            }
-            JobRow next;
-            if (done) {
-                next = current.released(JobState.DONE, null, now);
-            } else if (current.attempt() < settings.maxAttempts()) {
-                next = current.released(JobState.WAITING, code == null ? JobProblems.FAILED : code, now);
-            } else {
-                next = current.released(JobState.FAILED, code == null ? JobProblems.FAILED : code, now);
-            }
-            if (!storage.joined().replace(current, next)) {
-                throw JobProblems.grantRefused();
-            }
-            JobRef job = ref(current);
-            if (done) {
-                handler.ifPresent(h -> h.completed(job, result == null ? JsonNodeFactory.instance.objectNode() : result));
-            } else if (JobState.FAILED.equals(next.state())) {
-                handler.ifPresent(h -> h.failed(job, next.outcomeCode()));
-            }
-            return next;
-        }));
+        JobRow ended;
+        try {
+            ended = JobTrace.call(seen.traceId(), () -> owners.call(seen.ownerId(), () ->
+                    end(jobId, claimId, presented, now, reported, handler)));
+        } catch (JobResultInvalid invalid) {
+            JobTrace.run(seen.traceId(), () -> log.atWarn().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
+                    .addKeyValue("reason", invalid.getMessage()).log("job.result_invalid"));
+            throw JobProblems.resultInvalid();
+        }
         JobTrace.run(ended.traceId(), () -> log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
                 .addKeyValue("attempt", ended.attempt()).addKeyValue("state", ended.state())
                 .addKeyValue("code", ended.outcomeCode() == null ? "none" : ended.outcomeCode())
@@ -212,6 +208,39 @@ public class JobClaims {
         } else if (lane == Lane.INGESTION) {
             offers.offerNextIngestion();
         }
+    }
+
+    /** What the worker reported, once checked. */
+    private record Reported(boolean done, boolean lastAttempt, String code, JsonNode result) {
+    }
+
+    /** The job's change and the handler's call, inside the owner's transaction of {@link #report}. */
+    private JobRow end(UUID jobId, UUID claimId, byte[] presented, Instant now, Reported reported,
+                       Optional<JobHandler> handler) {
+        JobRow current = storage.joined().findForUpdate(jobId).orElse(null);
+        if (!grantMatches(current, claimId, presented, now)) {
+            throw JobProblems.grantRefused();
+        }
+        String code = reported.code() == null ? JobProblems.FAILED : reported.code();
+        JobRow next;
+        if (reported.done()) {
+            next = current.released(JobState.DONE, null, now);
+        } else if (!reported.lastAttempt() && current.attempt() < settings.maxAttempts()) {
+            next = current.released(JobState.WAITING, code, now);
+        } else {
+            next = current.released(JobState.FAILED, code, now);
+        }
+        if (!storage.joined().replace(current, next)) {
+            throw JobProblems.grantRefused();
+        }
+        JobRef job = ref(current);
+        if (reported.done()) {
+            JsonNode result = reported.result() == null ? JsonNodeFactory.instance.objectNode() : reported.result();
+            handler.ifPresent(h -> h.completed(job, result));
+        } else if (JobState.FAILED.equals(next.state())) {
+            handler.ifPresent(h -> h.failed(job, next.outcomeCode()));
+        }
+        return next;
     }
 
     /** The handler's input could not be had (it threw, or it is not a JSON object). Its message names nothing. */
@@ -270,17 +299,22 @@ public class JobClaims {
     }
 
     /** The live claim's grant, for this job and this claim, not lapsed: compared in constant time. */
-    private static boolean grantMatches(JobRow row, UUID claimId, byte[] presented, Instant now) {
+    static boolean grantMatches(JobRow row, UUID claimId, byte[] presented, Instant now) {
         return row != null && presented != null && JobState.RUNNING.equals(row.state()) && claimId != null
                 && claimId.equals(row.claimId()) && row.claimLapsesAt() != null && row.claimLapsesAt().isAfter(now)
                 && sameBytes(row.grantHash(), presented);
     }
 
     private byte[] hashOf(String grant) {
+        return hashOf(vault, grant);
+    }
+
+    /** The vault token hash of a presented grant; null for anything that is not a grant as minted. */
+    static byte[] hashOf(Vault vault, String grant) {
         return grant == null || !GRANT.matcher(grant).matches() ? null : vault.tokenHash(GRANT_PURPOSE, grant);
     }
 
-    private static void refusedGrant(UUID jobId) {
+    static void refusedGrant(UUID jobId) {
         log.atInfo().addKeyValue("jobId", jobId).addKeyValue("reason", "job.grant_refused").log("request.refused");
     }
 

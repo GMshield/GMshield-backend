@@ -119,6 +119,18 @@ public class InMemoryUploadStorage implements UploadStorage {
         }
 
         @Override
+        public Optional<UploadRow> completeForVersion(UUID owner, UUID versionId) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
+                    && row.state().equals(UploadRow.COMPLETE)).min(Comparator.comparing(UploadRow::createdAt));
+        }
+
+        @Override
+        public boolean removeComplete(UUID id, Instant now) {
+            return update(id, row -> row.state().equals(UploadRow.COMPLETE),
+                    row -> with(row, row.offset(), row.pieceCount(), row.format(), null, null, UploadRow.REMOVING, now));
+        }
+
+        @Override
         public boolean delete(UUID id) {
             synchronized (InMemoryUploadStorage.this) {
                 UploadRow before = rows.remove(id);

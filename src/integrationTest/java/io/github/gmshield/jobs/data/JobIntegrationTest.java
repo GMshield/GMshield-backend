@@ -118,6 +118,7 @@ class JobIntegrationTest {
 
     @BeforeEach
     void cleanSlate() {
+        jdbc.sql("delete from job_output").update();
         jdbc.sql("delete from job_probe").update();
         jdbc.sql("delete from job").update();
         redis.execute((RedisCallback<Object>) connection -> {

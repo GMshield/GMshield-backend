@@ -1,8 +1,10 @@
 package io.github.gmshield.jobs.service;
 
+import io.github.gmshield.jobs.data.JobOutputRow;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.JobStorage;
 import io.github.gmshield.jobs.data.JobStream;
+import io.github.gmshield.vault.service.FileStore;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -20,6 +22,8 @@ import org.springframework.stereotype.Service;
  *       {@code failed} with {@code job.attempts_exhausted};</li>
  *   <li>offers again every job offered longer than the re-offer delay without a claim (Redis lost the message);</li>
  *   <li>offers waiting jobs (an earlier offer failed, or a job just went back to waiting);</li>
+ *   <li>removes the outputs no handler adopted once their job ended (Story 1.15): the file's pieces, then its row;
+ *       an output still being written only once its job ended more than {@link #WRITING_GRACE} ago;</li>
  *   <li>trims each stream to the last hour ({@code XTRIM MINID}): an older message was answered or superseded.</li>
  * </ol>
  *
@@ -30,6 +34,8 @@ import org.springframework.stereotype.Service;
 public class JobSweep {
 
     static final int BATCH = 100;
+    /** How long after its job ended an output still marked as being written is left to its writer. */
+    static final java.time.Duration WRITING_GRACE = java.time.Duration.ofMinutes(10);
     private static final Logger log = LoggerFactory.getLogger(JobSweep.class);
 
     private final JobStorage storage;
@@ -39,9 +45,10 @@ public class JobSweep {
     private final OwnerWork owners;
     private final JobSettings settings;
     private final JobClock clock;
+    private final FileStore files;
 
     JobSweep(JobStorage storage, JobStream stream, JobOffers offers, JobHandlers handlers, OwnerWork owners,
-             JobSettings settings, JobClock clock) {
+             JobSettings settings, JobClock clock, FileStore files) {
         this.storage = storage;
         this.stream = stream;
         this.offers = offers;
@@ -49,6 +56,7 @@ public class JobSweep {
         this.owners = owners;
         this.settings = settings;
         this.clock = clock;
+        this.files = files;
     }
 
     /** One sweep. Never throws: each failed step is logged by error type and retried at the next sweep. */
@@ -57,6 +65,7 @@ public class JobSweep {
         step("lapses", this::takeBackLapsed);
         step("reoffers", this::reofferLost);
         step("offers", offers::offerWaiting);
+        step("outputs", this::removeOrphanOutputs);
         trimStreams();
     }
 
@@ -125,6 +134,22 @@ public class JobSweep {
         List<JobRow> lost = storage.separately(store -> store.unclaimed(offeredBefore, BATCH));
         for (JobRow row : lost) {
             offers.reoffer(row);
+        }
+    }
+
+    /** Removes the files and rows of outputs no handler adopted, once their job ended. */
+    void removeOrphanOutputs() {
+        Instant writingEndedBefore = clock.now().minus(WRITING_GRACE);
+        for (JobOutputRow output : storage.separately(store -> store.orphanOutputs(writingEndedBefore, BATCH))) {
+            try {
+                files.deleteFile(output.ownerId(), output.id());
+                storage.separately(store -> store.deleteOutput(output.id()));
+                log.atInfo().addKeyValue("jobId", output.jobId()).addKeyValue("fileId", output.id())
+                        .log("job.output_removed");
+            } catch (RuntimeException failure) {
+                log.atWarn().addKeyValue("jobId", output.jobId()).addKeyValue("fileId", output.id())
+                        .addKeyValue("errorType", failure.getClass().getName()).log("job.output_not_removed");
+            }
         }
     }
 

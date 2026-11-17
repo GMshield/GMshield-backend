@@ -62,6 +62,8 @@ class UploadsTest {
     private FileStore files;
     private Uploads service;
     private UploadSweep sweep;
+    /** The ingestion starts the completions asked for: the version's id and the upload's. */
+    private final List<UUID[]> started = new java.util.ArrayList<>();
 
     @BeforeEach
     void wire() {
@@ -72,7 +74,8 @@ class UploadsTest {
         service = new Uploads(materials, uploads, vault, files,
                 TestLibraries.library(new InMemoryLibraryStore(), vault,
                         beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class)),
-                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
+                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
+                (version, upload) -> started.add(new UUID[] {version.id(), upload.id()}));
         sweep = new UploadSweep(uploads, materials, service, beans.getBeanProvider(PlatformTransactionManager.class),
                 beans.getBeanProvider(Clock.class));
     }
@@ -313,10 +316,38 @@ class UploadsTest {
         assertThat(uploads.row(id).state()).isEqualTo(UploadRow.COMPLETE);
         // The pieces stay as the raw upload for the first ingestion step.
         assertThat(readBack(id, uploads.row(id).pieceCount())).isEqualTo(content);
+        // Story 1.15: the completion starts the version's ingestion once, with the version and its raw upload.
+        assertThat(started).singleElement().satisfies(start -> assertThat(start).containsExactly(version.id(), id));
         // The same call again (its answer was lost) gives the same answer; no further part is taken.
         assertThat(complete(id, content)).isEqualTo(completed);
+        assertThat(started).hasSize(1);
         assertThat(as(owner, () -> service.head(id)).offset()).isEqualTo(content.length);
         assertThatThrownBy(() -> patch(id, 0, content)).satisfies(problem("upload.offset_conflict", 409));
+    }
+
+    @Test
+    void anIngestionStartThatFailsLeavesTheUploadOpenAndTheVersionUploading() throws Exception {
+        StaticListableBeanFactory beans = new StaticListableBeanFactory();
+        beans.addBean("transactions", transactions);
+        beans.addBean("clock", clock);
+        Uploads failing = new Uploads(materials, uploads, vault, files,
+                TestLibraries.library(new InMemoryLibraryStore(), vault,
+                        beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class)),
+                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
+                (version, upload) -> {
+                    throw new IllegalStateException("jobs down");
+                });
+        byte[] content = pdf(MIB);
+        UUID id = create(content.length, "book.pdf");
+        patch(id, 0, content);
+
+        assertThatThrownBy(() -> as(owner, () -> failing.complete(id, sha256(content))))
+                .isInstanceOf(IllegalStateException.class);
+
+        // One transaction: no waiting version without its first step; the same completion can be sent again.
+        assertThat(uploads.row(id).state()).isEqualTo(UploadRow.OPEN);
+        assertThat(materials.versions.get(uploads.row(id).versionId()).state()).isEqualTo("uploading");
+        assertThat(complete(id, content).state()).isEqualTo("waiting");
     }
 
     @Test
@@ -333,6 +364,7 @@ class UploadsTest {
         assertThat(uploads.rows).doesNotContainKey(id);
         assertThat(files.fileExists(owner, id)).isFalse();
         assertThatThrownBy(() -> as(owner, () -> service.head(id))).satisfies(problem("request.not_found", 404));
+        assertThat(started).isEmpty();
     }
 
     // --- expiry and removal ---

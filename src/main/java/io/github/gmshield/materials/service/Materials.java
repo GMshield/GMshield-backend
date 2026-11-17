@@ -24,7 +24,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The owner's materials as the interface shows them (Story 1.14): each with its name, decrypted, and the state of its
- * newest version, which is the material's state; while that version is {@code uploading}, the upload's progress too.
+ * newest version, which is the material's state; while that version is {@code uploading}, the upload's progress too;
+ * from Story 1.15, its pages once the page total is known and the failure code of a failed version.
  * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
  * Nothing here logs a name.
  */
@@ -34,6 +35,7 @@ public class Materials {
     /** Every state a version may be in, as the tables write them. */
     public static final Set<String> STATES = Set.of("uploading", "waiting", "processing", "needs_review", "ready",
             "superseded", "failed", "discarded");
+    static final String FAILED = "failed";
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
 
@@ -54,8 +56,16 @@ public class Materials {
     public record Upload(UUID id, long offset, long length, Instant expiresAt) {
     }
 
-    /** A material: {@code kind} may be null, and {@code upload} is there only while the state is {@code uploading}. */
-    public record Material(UUID id, String name, String state, String kind, Upload upload) {
+    /** Pages read of the version's page total (Story 1.15; {@code done} stays 0 until Story 1.16). */
+    public record Pages(int done, int total) {
+    }
+
+    /**
+     * A material: {@code kind} may be null, {@code upload} is there only while the state is {@code uploading},
+     * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed}.
+     */
+    public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
+                           String failure) {
         @Override
         public String toString() {
             return "Material[id=" + id + ", state=" + state + "]";
@@ -95,11 +105,14 @@ public class Materials {
                 .collect(Collectors.toMap(UploadRow::versionId, Function.identity(), (first, second) -> first));
         return rows.stream().map(row -> {
             UploadRow upload = Uploads.UPLOADING.equals(row.version().state()) ? open.get(row.version().id()) : null;
+            Integer total = row.version().pageTotal();
             return new Material(row.material().id(),
                     vault.decryptText(new Binding(Uploads.MATERIAL, Uploads.FIELD_NAME, row.material().id(),
                             row.material().ownerId()), row.material().name()),
                     row.version().state(), row.material().kind(),
-                    upload == null ? null : new Upload(upload.id(), upload.offset(), upload.length(), upload.expiresAt()));
+                    upload == null ? null : new Upload(upload.id(), upload.offset(), upload.length(), upload.expiresAt()),
+                    total == null ? null : new Pages(0, total),
+                    FAILED.equals(row.version().state()) ? row.version().failureCode() : null);
         }).toList();
     }
 

@@ -36,6 +36,15 @@ class MaterialVersionEntity {
     @Column(name = "size_bytes")
     private Long sizeBytes;
 
+    @Column(name = "page_total")
+    private Integer pageTotal;
+
+    @Column(name = "pipeline_version")
+    private String pipelineVersion;
+
+    @Column(name = "failure_code")
+    private String failureCode;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -53,6 +62,9 @@ class MaterialVersionEntity {
         this.state = row.state();
         this.format = row.format();
         this.sizeBytes = row.sizeBytes();
+        this.pageTotal = row.pageTotal();
+        this.pipelineVersion = row.pipelineVersion();
+        this.failureCode = row.failureCode();
         this.createdAt = row.createdAt();
         this.updatedAt = row.updatedAt();
     }
@@ -64,7 +76,32 @@ class MaterialVersionEntity {
         this.updatedAt = now;
     }
 
+    /** Only the state (Story 1.15: {@code waiting} to {@code processing}), nothing else of the version. */
+    void changeState(String newState, Instant now) {
+        this.state = newState;
+        this.updatedAt = now;
+    }
+
+    /** What a step reported: the pipeline version and the page total, each only when given. */
+    void record(String newPipelineVersion, Integer newPageTotal, Instant now) {
+        if (newPipelineVersion != null) {
+            this.pipelineVersion = newPipelineVersion;
+        }
+        if (newPageTotal != null) {
+            this.pageTotal = newPageTotal;
+        }
+        this.updatedAt = now;
+    }
+
+    /** The version ended {@code failed} with a code. */
+    void fail(String code, Instant now) {
+        this.state = "failed";
+        this.failureCode = code;
+        this.updatedAt = now;
+    }
+
     VersionRow row() {
-        return new VersionRow(id, ownerId, materialId, state, format, sizeBytes, createdAt, updatedAt);
+        return new VersionRow(id, ownerId, materialId, state, format, sizeBytes, createdAt, updatedAt, pageTotal,
+                pipelineVersion, failureCode);
     }
 }

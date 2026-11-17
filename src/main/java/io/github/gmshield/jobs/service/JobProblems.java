@@ -10,6 +10,8 @@ public final class JobProblems {
     static final ApiProblem CLAIMED = ApiProblem.of(409, CATEGORY, "claimed", "Job already claimed");
     static final ApiProblem NOT_OFFERED = ApiProblem.of(409, CATEGORY, "not_offered", "Job not offered");
     static final ApiProblem GRANT_REFUSED = ApiProblem.of(403, CATEGORY, "grant_refused", "Job grant refused");
+    static final ApiProblem OUTPUT_TOO_LARGE = ApiProblem.of(413, CATEGORY, "output_too_large", "Job output too large");
+    static final ApiProblem RESULT_INVALID = ApiProblem.of(400, CATEGORY, "result_invalid", "Job result invalid");
     /** The code of a job whose attempts all lapsed. */
     public static final String ATTEMPTS_EXHAUSTED = "job.attempts_exhausted";
     /** The code of a failed outcome that named none. */
@@ -32,6 +34,14 @@ public final class JobProblems {
 
     static ApiException grantRefused() {
         return new ApiException(GRANT_REFUSED);
+    }
+
+    static ApiException outputTooLarge(long limit) {
+        return new ApiException(OUTPUT_TOO_LARGE.withParams(java.util.Map.of("limit", limit)));
+    }
+
+    static ApiException resultInvalid() {
+        return new ApiException(RESULT_INVALID);
     }
 
     static ApiException notFound() {

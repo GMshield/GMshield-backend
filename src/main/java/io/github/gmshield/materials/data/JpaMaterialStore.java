@@ -108,6 +108,81 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public boolean changeVersionState(UUID id, String state, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.changeState(state, now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
+    public boolean recordIngestion(UUID id, String pipelineVersion, Integer pageTotal, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.record(pipelineVersion, pageTotal, now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
+    public boolean failVersion(UUID id, String code, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.fail(code, now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
+    public void insertStep(StepRow row) {
+        EntityManager em = em();
+        em.persist(new IngestionStepEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public Optional<StepRow> findStepByJob(UUID jobId) {
+        return em().createQuery("select s from IngestionStep s where s.jobId = :job", IngestionStepEntity.class)
+                .setParameter("job", jobId).getResultList().stream().findFirst().map(IngestionStepEntity::row);
+    }
+
+    @Override
+    public long countSteps(UUID versionId) {
+        return em().createQuery("select count(s) from IngestionStep s where s.versionId = :version", Long.class)
+                .setParameter("version", versionId).getSingleResult();
+    }
+
+    @Override
+    public void insertVersionFile(VersionFileRow row) {
+        EntityManager em = em();
+        em.persist(new VersionFileEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public List<VersionFileRow> versionFiles(UUID versionId) {
+        return versionFileEntities(versionId).stream().map(VersionFileEntity::row).toList();
+    }
+
+    @Override
+    public List<VersionFileRow> deleteVersionFiles(UUID versionId) {
+        List<VersionFileEntity> found = versionFileEntities(versionId);
+        found.forEach(em()::remove);
+        em().flush();
+        return found.stream().map(VersionFileEntity::row).toList();
+    }
+
+    private List<VersionFileEntity> versionFileEntities(UUID versionId) {
+        return em().createQuery("select f from VersionFile f where f.versionId = :version"
+                        + " order by f.role desc, f.firstPage, f.id", VersionFileEntity.class)
+                .setParameter("version", versionId).getResultList();
+    }
+
+    @Override
     public boolean deleteVersion(UUID id) {
         Optional<MaterialVersionEntity> version = version(id);
         version.ifPresent(entity -> {
