@@ -1135,6 +1135,9 @@ class IngestionFlowTest {
         assertThat(stored).extracting(PassageRow::ordinal, PassageRow::page)
                 .containsExactly(tuple(0, 19), tuple(1, 21), tuple(2, 21));
         assertThat(stored).allSatisfy(row -> assertThat(row.ownerId()).isEqualTo(gm.id()));
+        // Only an accepted version's passages are read (Story 1.20).
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(stored.get(1).id()))).isEmpty();
+        accept(gm, uploaded);
         Materials.Passage vorpal = OwnerContext.callAs(gm.id(), () -> reads.passage(stored.get(1).id())).orElseThrow();
         assertThat(vorpal.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
         assertThat(vorpal.page()).isEqualTo(21);
@@ -1275,10 +1278,11 @@ class IngestionFlowTest {
         String titles = ("\"" + "T".repeat(1000) + "\",").repeat(31) + "\"" + "T".repeat(1000) + "\"";
         report(passages, claim, passagesReport("{\"page\":3,\"sectionPath\":[" + titles + "],\"text\":\"" + limit
                 + "\",\"boxes\":[[0,0,1,1]]}"));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        accept(gm, uploaded);
         assertThat(passages(uploaded.versionId())).singleElement()
                 .satisfies(row -> assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
                         .orElseThrow().text()).isEqualTo(limit));
-        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
     }
 
     @Test
@@ -1327,13 +1331,15 @@ class IngestionFlowTest {
 
         List<PassageRow> stored = passages(uploaded.versionId());
         assertThat(stored).extracting(PassageRow::ordinal).containsExactly(0, 1, 2);
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        accept(gm, uploaded);
         assertThat(stored).extracting(row -> OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
                 .orElseThrow().sectionPath()).containsOnly(List.of("B"));
         assertThat(materials.outlines.values()).filteredOn(row -> row.versionId().equals(uploaded.versionId()))
                 .hasSize(1);
         assertThat(OwnerContext.callAs(gm.id(), () -> reads.outline(uploaded.versionId()))).hasValue(
                 List.of(new Materials.Section(1, "B", 1)));
-        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(state(gm, uploaded)).isEqualTo("ready");
     }
 
     @Test
@@ -1399,6 +1405,7 @@ class IngestionFlowTest {
         report(passages, claim(passages.jobId()), passagesReport(passage(1, "Segredo", "Capítulo"))
                 .replace("\"outline\":[]", "\"outline\":[" + section(1, "Capítulo", 1) + "]"));
         PassageRow theirs = passages(uploaded.versionId()).getFirst();
+        accept(a, uploaded);
 
         // Matrix row "Two owners": B asks for A's passage id and A's outline.
         OwnerContext.runAs(b.id(), () -> {
@@ -1610,8 +1617,16 @@ class IngestionFlowTest {
         assertThat(blank.path("picture").path("width").asInt()).isEqualTo(1545);
         assertThat(blank.path("lines").size()).isZero();
         assertThat(pictureOf(gm, uploaded, 7, "review").statusCode()).isEqualTo(200);
-        // Matrix row "Crashed page": no view, so neither the page nor its picture.
-        assertThat(pageOf(gm, uploaded, 9, "review").statusCode()).isEqualTo(404);
+        // Matrix row "Crashed page": no view, so no picture; from Story 1.20 the page answers as unreadable, empty.
+        HttpResponse<String> crashed = pageOf(gm, uploaded, 9, "review");
+        assertThat(crashed.statusCode()).isEqualTo(200);
+        assertThat(json(crashed).path("picture").isNull()).isTrue();
+        assertThat(json(crashed).path("text").isNull()).isTrue();
+        assertThat(json(crashed).path("lines").size()).isZero();
+        assertThat(json(crashed).path("passages").size()).isZero();
+        assertThat(json(crashed).path("outcome").asString()).isEqualTo("unreadable");
+        assertThat(blank.path("outcome").asString()).isEqualTo("unreadable");
+        assertThat(json(pageOf(gm, uploaded, 10, "review")).path("outcome").asString()).isEqualTo("read_by_ocr");
         assertThat(pictureOf(gm, uploaded, 9, "review").statusCode()).isEqualTo(404);
         // Matrix row "Retried batch": one view per page, the retry's.
         assertThat(pageViews(uploaded.versionId())).extracting(PageViewRow::page)
@@ -1864,6 +1879,453 @@ class IngestionFlowTest {
     private List<PageViewRow> pageViews(UUID versionId) {
         return materials.pageViews.values().stream().filter(row -> row.versionId().equals(versionId))
                 .sorted(Comparator.comparingInt(PageViewRow::page)).toList();
+    }
+
+    // --- Story 1.20: the quality report and the GM's actions
+
+    @Test
+    void acceptMakesTheVersionReadyOnceAndOnlyThenAreItsPassagesRead() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 2);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Texto", "A"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 1) + "]"));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        UUID passageId = passages(uploaded.versionId()).getFirst().id();
+
+        // Matrix row "Nothing to reprocess": no page is unreadable, so no reprocess, and a post of it is refused.
+        assertThat(actions(gm, uploaded)).containsExactly("accept", "discard");
+        refused(act(gm, uploaded, "reprocess"), "material.action_unavailable");
+        refused(act(gm, uploaded, "retry"), "material.action_unavailable");
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        // Matrix row "Passage gate": a version that needs review gives no passage.
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isEmpty();
+
+        // Matrix row "Accept".
+        HttpResponse<String> accepted = act(gm, uploaded, "accept");
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+        assertThat(accepted.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(accepted).path("state").asString()).isEqualTo("ready");
+        assertThat(json(accepted).path("actions").size()).isZero();
+        assertThat(json(accepted).path("id").asString()).isEqualTo(uploaded.materialId());
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isPresent();
+        // The report stays readable, and so do the pages.
+        assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(200);
+
+        // Matrix row "Accept twice"; and a ready version is never reprocessed nor discarded in place (AD-15).
+        for (String action : List.of("accept", "reprocess", "retry", "discard")) {
+            refused(act(gm, uploaded, action), "material.action_unavailable");
+        }
+        assertThat(state(gm, uploaded)).isEqualTo("ready");
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Texto")
+                || String.valueOf(event.getKeyValuePairs()).contains("Texto"));
+    }
+
+    @Test
+    void acceptingANewerVersionSupersedesTheReadyOneBeforeIt() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 1, "2");
+        readUntilReview(gm, uploaded, List.of(), List.of());
+        accept(gm, uploaded);
+        // A newer version of the same material that needs review (only Story 3.x creates one through the API).
+        UUID newer = UUID.randomUUID();
+        Instant later = materials.versions.get(uploaded.versionId()).createdAt().plusSeconds(60);
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                materials.insertVersion(new VersionRow(newer, gm.id(), UUID.fromString(uploaded.materialId()),
+                        "needs_review", "pdf", 1L, later, later, 1, "2", null))));
+        assertThat(actions(gm, uploaded)).containsExactly("accept", "discard");
+
+        accept(gm, uploaded);
+
+        assertThat(materials.versions.get(newer).state()).isEqualTo("ready");
+        assertThat(materials.versions.get(uploaded.versionId()).state()).isEqualTo("superseded");
+    }
+
+    @Test
+    void reprocessReadsTheUnreadablePagesAgainByCopiesOfTheStepsThatReadThem() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        List<UUID> batches = cleanIn(uploaded, 45, true, 30, 45);
+        readUntilReview(gm, uploaded, List.of(9, 40, 41), List.of(8, 9));
+        assertThat(actions(gm, uploaded)).containsExactly("accept", "reprocess", "discard");
+        UUID pictureOf9 = pageViews(uploaded.versionId()).stream().filter(view -> view.page() == 9).findFirst()
+                .orElseThrow().pictureFileId();
+
+        // The report: the outline, the unreadable pages as runs, and the facts.
+        HttpResponse<String> answer = get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report");
+        assertThat(answer.statusCode()).isEqualTo(200);
+        assertThat(answer.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(answer).toString()).isEqualTo("{\"outline\":[{\"level\":1,\"title\":\"A\",\"page\":1}],"
+                + "\"unreadable\":[{\"firstPage\":9,\"lastPage\":9},{\"firstPage\":40,\"lastPage\":41}],"
+                + "\"warnings\":[{\"code\":\"report.pages_unreadable\",\"count\":3},"
+                + "{\"code\":\"report.pages_unopened\",\"count\":2}]}");
+        int stepsBefore = steps(uploaded.versionId()).size();
+
+        // Matrix row "Reprocess": pages 9 and 40-41, read by two layout steps, give two new steps.
+        HttpResponse<String> reprocessed = act(gm, uploaded, "reprocess");
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(200);
+        assertThat(json(reprocessed).path("state").asString()).isEqualTo("processing");
+        assertThat(json(reprocessed).path("actions").size()).isZero();
+        List<StepRow> added = steps(uploaded.versionId()).stream().filter(step -> step.endedAt() == null)
+                .sorted(Comparator.comparing(StepRow::firstPage)).toList();
+        assertThat(steps(uploaded.versionId())).hasSize(stepsBefore + 3);
+        assertThat(added).extracting(StepRow::stage, StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId,
+                        StepRow::inputTexts)
+                .containsExactly(tuple("passages", 1, 45, null, true), tuple("layout", 9, 9, batches.get(0), false),
+                        tuple("layout", 40, 41, batches.get(1), false));
+        assertThat(added.getFirst().jobId()).isNull();
+        // Its unreadable outcomes go, with those pages' views and pictures, and the passages and outline (held).
+        assertThat(outcomes(uploaded.versionId())).noneMatch(range -> range.value().equals("unreadable"));
+        assertThat(pageViews(uploaded.versionId())).extracting(PageViewRow::page).containsExactly(8);
+        assertThat(materials.files.values()).noneMatch(file -> file.fileId().equals(pictureOf9));
+        assertThat(files.fileExists(gm.id(), pictureOf9)).isFalse();
+        assertThat(passages(uploaded.versionId())).isEmpty();
+        assertThat(materials.outlines.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
+        assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(404);
+
+        // The copies read the pages in one child (attempt 1), and the chain's end brings the version back.
+        StepRow nine = offeredStep(uploaded.versionId());
+        JsonNode nineClaim = claim(nine.jobId());
+        assertThat(nineClaim.path("attempt").asInt()).isEqualTo(1);
+        assertThat(nineClaim.path("input").path("firstPage").asInt()).isEqualTo(9);
+        assertThat(nineClaim.path("input").path("inputFileId").asString()).isEqualTo(batches.get(0).toString());
+        report(nine, nineClaim, withViews(layout(nine, nineClaim, 9, 9, List.of()),
+                List.of(pictureView(nine, nineClaim, 9, webp(1000), "Nove"))));
+        readUntilReview(gm, uploaded, List.of(), List.of());
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report")).path("unreadable").size())
+                .isZero();
+        assertThat(actions(gm, uploaded)).containsExactly("accept", "discard");
+        assertThat(json(pageOf(gm, uploaded, 9, "review")).path("lines").get(0).path("text").asString())
+                .isEqualTo("Nove");
+        assertThat(passages(uploaded.versionId())).hasSize(1);
+    }
+
+    @Test
+    void reprocessAfterATriageCrashCopiesTheTriageStep() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Scan.pdf", null);
+        Cleaned cleaned = clean(uploaded, 10, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        // The retried triage read page by page, and page 7's child crashed: no layer, unreadable.
+        report(triage, claim(triage.jobId()), "{\"pipelineVersion\":\"2\",\"layers\":[" + range(1, 6, "layer", "text")
+                + "," + range(8, 10, "layer", "text") + "],\"pages\":[" + range(7, 7, "outcome", "unreadable") + "],"
+                + "\"next\":[" + nextStep(triage, "layout", 1, 6) + "," + nextStep(triage, "layout", 8, 10) + "]}");
+        readUntilReview(gm, uploaded, List.of(), List.of());
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report")).path("warnings").toString())
+                .isEqualTo("[{\"code\":\"report.pages_unreadable\",\"count\":1},"
+                        + "{\"code\":\"report.pages_unopened\",\"count\":1},"
+                        + "{\"code\":\"report.outline_empty\",\"count\":0}]");
+
+        // Matrix row "Reprocess, triage crash": page 7 has no layer, so only triage covers it.
+        assertThat(act(gm, uploaded, "reprocess").statusCode()).isEqualTo(200);
+
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).singleElement()
+                .satisfies(step -> {
+                    assertThat(step.stage()).isEqualTo("triage");
+                    assertThat(step.firstPage()).isEqualTo(7);
+                    assertThat(step.lastPage()).isEqualTo(7);
+                    assertThat(step.inputFileId()).isEqualTo(cleaned.batches().getFirst());
+                });
+        readUntilReview(gm, uploaded, List.of(), List.of());
+        assertThat(layers(uploaded.versionId())).extracting(PageRangeRow::firstPage).contains(7);
+        assertThat(actions(gm, uploaded)).containsExactly("accept", "discard");
+    }
+
+    @Test
+    void aBlankPageComesBackUnreadableAndReprocessPastTheStepCapIsRefusedAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Branco.pdf", null);
+        clean(uploaded, 1, "2");
+        readUntilReview(gm, uploaded, List.of(1), List.of());
+        // One page: at most 4 x 1 + 1 = 5 steps. Clean, triage and layout are 3; each reprocess adds one.
+        for (int round = 0; round < 2; round++) {
+            assertThat(act(gm, uploaded, "reprocess").statusCode()).isEqualTo(200);
+            readUntilReview(gm, uploaded, List.of(1), List.of());
+            assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report")).path("unreadable")
+                    .toString()).isEqualTo("[{\"firstPage\":1,\"lastPage\":1}]");
+        }
+        assertThat(steps(uploaded.versionId())).hasSize(5);
+
+        HttpResponse<String> answer = act(gm, uploaded, "reprocess");
+
+        refused(answer, "ingestion.too_many_steps");
+        assertThat(steps(uploaded.versionId())).hasSize(5);
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(outcomes(uploaded.versionId())).extracting(PageRangeRow::value).containsExactly("unreadable");
+    }
+
+    @Test
+    void retryStartsAFailedVersionAgainFromItsOriginal() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 25, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, triage.firstPage(), triage.lastPage(), List.of()));
+        StepRow next = offeredStep(uploaded.versionId());
+        assertThat(outcome(next.jobId(), claim(next.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(state(gm, uploaded)).isEqualTo("failed");
+        assertThat(actions(gm, uploaded)).containsExactly("retry", "discard");
+        assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(404);
+
+        // Matrix row "Retry": processing, from the original.
+        HttpResponse<String> retried = act(gm, uploaded, "retry");
+
+        assertThat(retried.statusCode()).as(retried.body()).isEqualTo(200);
+        assertThat(json(retried).path("state").asString()).isEqualTo("processing");
+        assertThat(json(retried).path("actions").size()).isZero();
+        assertThat(json(retried).has("failure")).isFalse();
+        StepRow first = offeredStep(uploaded.versionId());
+        assertThat(first.stage()).isEqualTo("clean");
+        assertThat(first.inputFileId()).isEqualTo(cleaned.original());
+        assertThat(layers(uploaded.versionId())).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())))
+                .extracting(VersionFileRow::role).containsExactly("original");
+        assertThat(materials.versions.get(uploaded.versionId()).pipelineVersion()).isNull();
+        JsonNode claim = claim(first.jobId());
+        assertThat(claim.path("input").path("inputFileId").asString()).isEqualTo(cleaned.original().toString());
+        cleanReport(first.jobId(), claim, 25, "3");
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        refused(act(gm, uploaded, "retry"), "material.action_unavailable");
+    }
+
+    @Test
+    void retryWithoutAnOriginalStartsAgainFromTheRawUpload() throws Exception {
+        Gm gm = signUp();
+        byte[] content = pdf(MIB + 5);
+        Uploaded uploaded = upload(gm, content, "Livro.pdf", null);
+        assertThat(outcome(uploaded.jobId(), claim(uploaded.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(actions(gm, uploaded)).containsExactly("retry", "discard");
+
+        HttpResponse<String> retried = act(gm, uploaded, "retry");
+        assertThat(retried.statusCode()).as(retried.body()).isEqualTo(200);
+
+        StepRow first = offeredStep(uploaded.versionId());
+        assertThat(first.stage()).isEqualTo("clean");
+        assertThat(first.inputFileId()).isEqualTo(uploaded.uploadId());
+        JsonNode claim = claim(first.jobId());
+        HttpResponse<byte[]> source = input(first.jobId(), claim, "source");
+        assertThat(source.statusCode()).isEqualTo(200);
+        assertThat(source.body()).isEqualTo(content);
+    }
+
+    @Test
+    void aVersionThatNeedsAPasswordCanOnlyBeDiscarded() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Fechado.pdf", null);
+        assertThat(outcome(uploaded.jobId(), claim(uploaded.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.password_required\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+
+        // Matrix row "Retry impossible": nothing remains to start from.
+        assertThat(actions(gm, uploaded)).containsExactly("discard");
+        refused(act(gm, uploaded, "retry"), "material.action_unavailable");
+        assertThat(state(gm, uploaded)).isEqualTo("failed");
+
+        HttpResponse<String> discarded = act(gm, uploaded, "discard");
+        assertThat(discarded.statusCode()).isEqualTo(200);
+        assertThat(json(discarded).path("state").asString()).isEqualTo("discarded");
+        assertThat(json(discarded).path("actions").size()).isZero();
+    }
+
+    @Test
+    void discardRemovesEverythingTheVersionHeldButItsSteps() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 3, "2", true);
+        readUntilReview(gm, uploaded, List.of(3), List.of(1, 2, 3));
+        List<VersionFileRow> stored = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()));
+        assertThat(stored).extracting(VersionFileRow::role).contains("original", "batch", "text", "picture");
+        UUID passageId = passages(uploaded.versionId()).getFirst().id();
+        int steps = steps(uploaded.versionId()).size();
+
+        // Matrix row "Discard": nothing of the version is left but its row and its steps.
+        HttpResponse<String> discarded = act(gm, uploaded, "discard");
+
+        assertThat(discarded.statusCode()).as(discarded.body()).isEqualTo(200);
+        assertThat(json(discarded).path("state").asString()).isEqualTo("discarded");
+        assertNothingLeft(gm, uploaded, stored);
+        assertThat(steps(uploaded.versionId())).hasSize(steps);
+        // Matrix row "Passage gate": empty after discard.
+        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isEmpty();
+        assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(404);
+        assertThat(pageOf(gm, uploaded, 1, "review").statusCode()).isEqualTo(404);
+        for (String action : List.of("accept", "reprocess", "retry", "discard")) {
+            refused(act(gm, uploaded, action), "material.action_unavailable");
+        }
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Livro")
+                || String.valueOf(event.getKeyValuePairs()).contains("Livro"));
+    }
+
+    @Test
+    void discardingAFailedVersionRemovesItsRawUpload() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        assertThat(outcome(uploaded.jobId(), claim(uploaded.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(files.fileExists(gm.id(), uploaded.uploadId())).isTrue();
+
+        assertThat(act(gm, uploaded, "discard").statusCode()).isEqualTo(200);
+
+        assertThat(uploads.rows).doesNotContainKey(uploaded.uploadId());
+        assertThat(files.fileExists(gm.id(), uploaded.uploadId())).isFalse();
+        assertThat(materials.versions.get(uploaded.versionId()).removalPending()).isFalse();
+    }
+
+    @Test
+    void aDiscardInterruptedBeforeItsRemovalIsFinishedByTheSweep() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 2, "2", true);
+        readUntilReview(gm, uploaded, List.of(), List.of(1, 2));
+        List<VersionFileRow> stored = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()));
+        // The discard's transaction committed, and the backend stopped before the removal ran.
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                materials.discardVersion(uploaded.versionId(), Instant.now())));
+        assertThat(materials.versions.get(uploaded.versionId()).removalPending()).isTrue();
+        assertThat(pageViews(uploaded.versionId())).hasSize(2);
+        assertThat(state(gm, uploaded)).isEqualTo("discarded");
+
+        // Matrix row "Discard interrupted": the sweep finishes it, once.
+        assertThat(removals.sweep()).isEqualTo(1);
+
+        assertNothingLeft(gm, uploaded, stored);
+        assertThat(removals.sweep()).isZero();
+    }
+
+    @Test
+    void anotherOwnerCannotActOnAMaterialNorReadItsReport() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        Uploaded uploaded = upload(a, pdf(MIB), "Segredo.pdf", null);
+        clean(uploaded, 2, "2");
+        // Matrix row "Report state": a version still processing has no report.
+        assertThat(get(a, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(404);
+        readUntilReview(a, uploaded, List.of(2), List.of());
+        JsonNode expected = json(get(b, "/api/v1/materials/" + UUID.randomUUID() + "/report"));
+
+        // Matrix row "Two owners": B posts each action on A's material, and reads A's report: not found, as an
+        // unknown or a malformed id; nothing changes.
+        for (String material : List.of(uploaded.materialId(), UUID.randomUUID().toString(), "not-a-uuid")) {
+            for (String path : List.of("/report", "/accept", "/reprocess", "/retry", "/discard")) {
+                HttpResponse<String> answer = send(path.equals("/report") ? "GET" : "POST",
+                        "/api/v1/materials/" + material + path, null, session(b));
+                assertThat(answer.statusCode()).as(material + path).isEqualTo(404);
+                assertThat(json(answer).path("code").asString()).isEqualTo(expected.path("code").asString())
+                        .isEqualTo("request.not_found");
+                assertThat(answer.body()).doesNotContain(uploaded.materialId()).doesNotContain("Segredo")
+                        .doesNotContain(uploaded.versionId().toString());
+            }
+        }
+        assertThat(state(a, uploaded)).isEqualTo("needs_review");
+        assertThat(actions(a, uploaded)).containsExactly("accept", "reprocess", "discard");
+        assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
+        OwnerContext.runAs(b.id(), () -> assertThat(reads.report(UUID.fromString(uploaded.materialId()))).isEmpty());
+    }
+
+    // --- Story 1.20 helpers
+
+    @Autowired
+    private io.github.gmshield.materials.service.VersionRemovalSweep removals;
+
+    private HttpResponse<String> act(Gm gm, Uploaded uploaded, String action) throws Exception {
+        return send("POST", "/api/v1/materials/" + uploaded.materialId() + "/" + action, null, session(gm));
+    }
+
+    private void accept(Gm gm, Uploaded uploaded) throws Exception {
+        HttpResponse<String> accepted = act(gm, uploaded, "accept");
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+    }
+
+    private List<String> actions(Gm gm, Uploaded uploaded) throws Exception {
+        List<String> found = new ArrayList<>();
+        json(get(gm, "/api/v1/materials/" + uploaded.materialId())).path("actions")
+                .forEach(action -> found.add(action.asString()));
+        return found;
+    }
+
+    private static void refused(HttpResponse<String> answer, String code) {
+        assertThat(answer.statusCode()).as(answer.body()).isEqualTo(409);
+        assertThat(json(answer).path("code").asString()).isEqualTo(code);
+    }
+
+    /** No page view, passage, outline, range, version file (row or pieces) or raw upload of the version is left. */
+    private void assertNothingLeft(Gm gm, Uploaded uploaded, List<VersionFileRow> stored) {
+        UUID version = uploaded.versionId();
+        assertThat(materials.versions.get(version).state()).isEqualTo("discarded");
+        assertThat(materials.versions.get(version).removalPending()).isFalse();
+        assertThat(pageViews(version)).isEmpty();
+        assertThat(passages(version)).isEmpty();
+        assertThat(materials.outlines.values()).noneMatch(row -> row.versionId().equals(version));
+        assertThat(layers(version)).isEmpty();
+        assertThat(outcomes(version)).isEmpty();
+        assertThat(materials.files.values()).noneMatch(file -> file.versionId().equals(version));
+        assertThat(stored).isNotEmpty().allSatisfy(file -> assertThat(files.fileExists(gm.id(), file.fileId()))
+                .as(file.role()).isFalse());
+        assertThat(uploads.rows.values()).noneMatch(row -> row.versionId().equals(version));
+        assertThat(files.fileExists(gm.id(), uploaded.uploadId())).isFalse();
+    }
+
+    /** A clean report of {@code total} pages in batches ending at {@code lasts}, a triage step per batch: the batches. */
+    private List<UUID> cleanIn(Uploaded uploaded, int total, boolean passages, int... lasts) throws Exception {
+        JsonNode claim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), claim, pdf(4000));
+        List<UUID> batches = new ArrayList<>();
+        List<String> batchJson = new ArrayList<>();
+        List<String> next = new ArrayList<>();
+        int first = 1;
+        for (int last : lasts) {
+            UUID batch = output(uploaded.jobId(), claim, pdf(3000));
+            batches.add(batch);
+            batchJson.add("{\"fileId\":\"" + batch + "\",\"firstPage\":" + first + ",\"lastPage\":" + last + "}");
+            next.add("{\"stage\":\"triage\",\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"input\":\""
+                    + batch + "\"}");
+            first = last + 1;
+        }
+        if (passages) {
+            next.add(passagesStep(total));
+        }
+        report(steps(uploaded.versionId()).getFirst(), claim, "{\"pipelineVersion\":\"2\",\"pageTotal\":" + total
+                + ",\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[" + String.join(",", batchJson)
+                + "],\"next\":[" + String.join(",", next) + "]}");
+        return batches;
+    }
+
+    /**
+     * Runs the version's offered steps until it needs review: triage finds every page a text page, layout reads every
+     * page but {@code unreadable}, with a picture view of each page of {@code views}, and passages reports one passage
+     * on page 1 and one section.
+     */
+    private void readUntilReview(Gm gm, Uploaded uploaded, List<Integer> unreadable, List<Integer> views)
+            throws Exception {
+        for (int round = 0; round < 20 && !state(gm, uploaded).equals("needs_review"); round++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            String result;
+            if (step.stage().equals("triage")) {
+                result = triage(step, step.firstPage(), step.lastPage(), List.of());
+            } else if (step.stage().equals("layout")) {
+                List<String> pictures = new ArrayList<>();
+                for (int page : views) {
+                    if (page >= step.firstPage() && page <= step.lastPage()) {
+                        pictures.add(pictureView(step, claim, page, webp(1000), "Linha " + page));
+                    }
+                }
+                result = withViews(layout(step, claim, step.firstPage(), step.lastPage(), unreadable.stream()
+                        .filter(page -> page >= step.firstPage() && page <= step.lastPage()).toList()), pictures);
+            } else {
+                assertThat(step.stage()).isEqualTo("passages");
+                result = passagesReport(passage(1, "Um", "A")).replace("\"outline\":[]", "\"outline\":["
+                        + section(1, "A", 1) + "]");
+            }
+            report(step, claim, result);
+        }
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
     }
 
     // --- owners

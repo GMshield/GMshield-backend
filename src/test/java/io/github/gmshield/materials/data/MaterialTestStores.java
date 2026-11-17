@@ -16,6 +16,12 @@ public class MaterialTestStores {
 
     @Bean
     @Primary
+    InMemoryPendingRemovals inMemoryPendingRemovals(InMemoryMaterialStore materials) {
+        return new InMemoryPendingRemovals(materials);
+    }
+
+    @Bean
+    @Primary
     InMemoryUploadStorage inMemoryUploads() {
         return new InMemoryUploadStorage();
     }

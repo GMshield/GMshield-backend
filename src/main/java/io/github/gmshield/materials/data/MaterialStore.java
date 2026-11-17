@@ -184,6 +184,26 @@ public interface MaterialStore {
     /** The current owner's passages on a page of a version, in reading order (Story 1.19). */
     List<PassageRow> passagesOnPage(UUID versionId, int page);
 
+    // --- review (Story 1.20)
+
+    /** The current owner's versions of a material, oldest first; empty for an unknown material or another owner's. */
+    List<VersionRow> versionsOf(UUID materialId);
+
+    /** Every step of the current owner's version, ended or not, oldest first. */
+    List<StepRow> steps(UUID versionId);
+
+    /** Deletes the current owner's outcome ranges of a version that have this outcome; answers how many went. */
+    int deleteOutcomes(UUID versionId, String outcome);
+
+    /** The pages from {@code firstPage} to {@code lastPage} of the current owner's version that have a page view. */
+    List<Integer> pagesWithView(UUID versionId, int firstPage, int lastPage);
+
+    /** The current owner's version becomes {@code discarded} with its removal pending; false when there is none. */
+    boolean discardVersion(UUID id, Instant now);
+
+    /** The removal of the current owner's discarded version has finished; false when there is no such version. */
+    boolean clearRemovalPending(UUID id, Instant now);
+
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);
 

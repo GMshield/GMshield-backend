@@ -12,6 +12,7 @@ import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.PendingRemovals;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.shared.service.ApiException;
@@ -54,13 +55,14 @@ import tools.jackson.databind.json.JsonMapper;
  * job, its text inputs, passages and the outline stored encrypted and replaced by a second report, a failure ending
  * the held step, and the cross-owner tests of {@code passage} and {@code version_outline}. Story 1.19: V12, page views
  * stored encrypted with their pictures and served on the review ground, a restart removing them before their pictures,
- * and the cross-owner tests of {@code page_view}.
+ * and the cross-owner tests of {@code page_view}. Story 1.20: V13, reprocess and accept through their JPQL, the
+ * passage gate, a discard that leaves no row or file of its version, and the sweep finishing an interrupted one.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads the library tables with
- * native SQL.
+ * native SQL, but for the removal sweep's list of the ids of versions whose removal is pending.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-    "gmshield.materials.upload-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
+    "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
 @ActiveProfiles("test-mode")
 class IngestionIntegrationTest {
 
@@ -538,6 +540,10 @@ class IngestionIntegrationTest {
                 .query(byte[].class).single();
         assertThat(new String(outline, StandardCharsets.ISO_8859_1)).doesNotContain("Magic").doesNotContain("Vorpal");
         UUID id = (UUID) rows.get(1).get("id");
+        // Story 1.20: a passage is read only once its version is accepted.
+        assertThat(as(chain.owner(), () -> materials.passage(id))).isEmpty();
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
         Materials.Passage passage = as(chain.owner(), () -> materials.passage(id)).orElseThrow();
         assertThat(passage.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
         assertThat(passage.text()).isEqualTo("Vorpal blade 3");
@@ -822,6 +828,192 @@ class IngestionIntegrationTest {
     }
 
     /** A passage of the chain's version, encrypted as a report stores it. */
+    // --- Story 1.20: the review on Postgres
+
+    @Test
+    void reprocessAndAcceptRunTheirJpqlAndOnlyTheAcceptedVersionsPassagesAreReadOnPostgres() throws Exception {
+        Chain chain = reviewed(4, List.of(2));
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().actions())
+                .containsExactly("accept", "reprocess", "discard");
+        Materials.Report report = as(chain.owner(), () -> materials.report(chain.materialId())).orElseThrow();
+        assertThat(report.unreadable()).containsExactly(new Materials.PageRun(2, 2));
+        assertThat(report.outline()).extracting(Materials.Section::title).containsExactly("Capítulo", "Seção");
+        assertThat(report.warnings()).containsExactly(new Materials.Warning("report.pages_unreadable", 1));
+        UUID passage = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1")
+                .param(chain.versionId()).query(UUID.class).single();
+        assertThat(as(chain.owner(), () -> materials.passage(passage))).isEmpty();
+        UUID batch = jdbc.sql("select file_id from version_file where version_id = ? and role = 'batch'")
+                .param(chain.versionId()).query(UUID.class).single();
+
+        as(chain.owner(), () -> actions.act(chain.materialId(), "reprocess"));
+
+        assertThat(state(chain.versionId())).isEqualTo("processing");
+        assertThat(jdbc.sql("select stage, first_page, last_page, input_file_id, input_texts, job_id is null as held"
+                        + " from ingestion_step where version_id = ? and ended_at is null order by input_texts")
+                .param(chain.versionId()).query().listOfRows()).satisfiesExactly(
+                        reread -> assertThat(reread).containsEntry("stage", "layout").containsEntry("first_page", 2)
+                                .containsEntry("last_page", 2).containsEntry("input_file_id", batch)
+                                .containsEntry("held", false),
+                        held -> assertThat(held).containsEntry("stage", "passages").containsEntry("first_page", 1)
+                                .containsEntry("last_page", 4).containsEntry("input_texts", true)
+                                .containsEntry("held", true));
+        assertThat(jdbc.sql("select count(*) from page_outcome where version_id = ? and outcome = 'unreadable'")
+                .param(chain.versionId()).query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select page from page_view where version_id = ? order by page").param(chain.versionId())
+                .query(Integer.class).list()).containsExactly(1, 3, 4);
+        assertThat(jdbc.sql("select count(*) from version_file where version_id = ? and role = 'picture'")
+                .param(chain.versionId()).query(Long.class).single()).isEqualTo(3);
+        assertThat(jdbc.sql("select count(*) from passage where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isZero();
+
+        JobClaims.Claim reread = claimOffered(chain);
+        assertThat(reread.attempt()).isEqualTo(1);
+        layoutReport(chain, reread, 2, 2, List.of(), List.of(2));
+        passagesStep(chain);
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        assertThat(as(chain.owner(), () -> materials.find(chain.materialId())).orElseThrow().actions())
+                .containsExactly("accept", "discard");
+
+        Materials.Material accepted = as(chain.owner(), () -> actions.act(chain.materialId(), "accept")).orElseThrow();
+
+        assertThat(accepted.state()).isEqualTo("ready");
+        UUID newPassage = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1")
+                .param(chain.versionId()).query(UUID.class).single();
+        assertThat(as(chain.owner(), () -> materials.passage(newPassage))).isPresent();
+        assertThatThrownBy(() -> as(chain.owner(), () -> actions.act(chain.materialId(), "accept")))
+                .isInstanceOfSatisfying(ApiException.class, refused -> assertThat(refused.problem().code())
+                        .isEqualTo("material.action_unavailable"));
+        // Another owner: not found, and nothing changes.
+        assertThat(as(Ids.newId(), () -> actions.act(chain.materialId(), "discard"))).isEmpty();
+        assertThat(as(Ids.newId(), () -> materials.report(chain.materialId()))).isEmpty();
+        assertThat(state(chain.versionId())).isEqualTo("ready");
+    }
+
+    @Test
+    void aDiscardLeavesNoRowOrFileOfItsVersionAndTheSweepFinishesAnInterruptedOneOnPostgres() throws Exception {
+        Chain chain = reviewed(3, List.of(3));
+        List<UUID> stored = jdbc.sql("select file_id from version_file where version_id = ?").param(chain.versionId())
+                .query(UUID.class).list();
+        assertThat(stored).hasSizeGreaterThan(4);
+        long steps = jdbc.sql("select count(*) from ingestion_step where version_id = ?").param(chain.versionId())
+                .query(Long.class).single();
+
+        Materials.Material discarded = as(chain.owner(), () -> actions.act(chain.materialId(), "discard"))
+                .orElseThrow();
+
+        assertThat(discarded.state()).isEqualTo("discarded");
+        assertThat(discarded.actions()).isEmpty();
+        assertNothingLeft(chain, stored);
+        assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(steps);
+
+        // Interrupted: the discard committed, and the backend stopped before the removal.
+        Chain other = reviewed(3, List.of());
+        List<UUID> otherFiles = jdbc.sql("select file_id from version_file where version_id = ?")
+                .param(other.versionId()).query(UUID.class).list();
+        write(other.owner(), () -> store.discardVersion(other.versionId(), Instant.now()));
+        assertThat(pending.list(1000)).contains(new PendingRemovals.Pending(other.owner(), other.versionId()));
+        assertThat(jdbc.sql("select count(*) from page_view where version_id = ?").param(other.versionId())
+                .query(Long.class).single()).isEqualTo(3);
+
+        assertThat(removals.sweep()).isGreaterThanOrEqualTo(1);
+
+        assertNothingLeft(other, otherFiles);
+        assertThat(pending.list(1000)).doesNotContain(new PendingRemovals.Pending(other.owner(), other.versionId()));
+    }
+
+    @Autowired
+    private MaterialActions actions;
+    @Autowired
+    private VersionRemovalSweep removals;
+    @Autowired
+    private PendingRemovals pending;
+
+    private void assertNothingLeft(Chain chain, List<UUID> stored) {
+        Map<String, Object> version = jdbc.sql("select state, removal_pending from material_version where id = ?")
+                .param(chain.versionId()).query().singleRow();
+        assertThat(version).containsEntry("state", "discarded").containsEntry("removal_pending", false);
+        for (String table : List.of("page_view", "passage", "version_outline", "page_layer", "page_outcome",
+                "version_file", "upload")) {
+            assertThat(jdbc.sql("select count(*) from " + table + " where version_id = ?").param(chain.versionId())
+                    .query(Long.class).single()).as(table).isZero();
+        }
+        assertThat(stored).allSatisfy(file -> assertThat(files.fileExists(chain.owner(), file)).isFalse());
+        assertThat(files.fileExists(chain.owner(), chain.uploadId())).isFalse();
+    }
+
+    /**
+     * A PDF of {@code total} pages (at least 3: the passages are on pages 1 and 3) in one batch, cleaned with a held
+     * passages step, read by one layout step per two pages with a picture view of each page, {@code unreadable} pages
+     * unreadable, then its passages: it needs review.
+     */
+    private Chain reviewed(int total, List<Integer> unreadable) throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        StringBuilder next = new StringBuilder();
+        for (int first = 1; first <= total; first += 2) {
+            next.append(layoutStep(first, Math.min(total, first + 1), batch.fileId())).append(',');
+        }
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\""
+                        + original.fileId() + "\"},\"batches\":[{\"fileId\":\"" + batch.fileId()
+                        + "\",\"firstPage\":1,\"lastPage\":" + total + "}],\"next\":[" + next
+                        + "{\"stage\":\"passages\",\"firstPage\":1,\"lastPage\":" + total + ",\"input\":\"texts\"}]}"));
+        for (int first = 1; first <= total; first += 2) {
+            JobClaims.Claim layout = claimOffered(chain);
+            int last = layout.input().path("lastPage").asInt();
+            int from = layout.input().path("firstPage").asInt();
+            List<Integer> views = new ArrayList<>();
+            for (int page = from; page <= last; page++) {
+                views.add(page);
+            }
+            layoutReport(chain, layout, from, last, unreadable.stream().filter(page -> page >= from && page <= last)
+                    .toList(), views);
+        }
+        passagesStep(chain);
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        return chain;
+    }
+
+    /** Reports a layout claim: pages read but {@code unreadable}, a text file of the read ones, a view of {@code views}. */
+    private void layoutReport(Chain chain, JobClaims.Claim layout, int first, int last, List<Integer> unreadable,
+                              List<Integer> views) throws Exception {
+        StringBuilder pages = new StringBuilder();
+        StringBuilder texts = new StringBuilder();
+        for (int page = first; page <= last; page++) {
+            boolean lost = unreadable.contains(page);
+            pages.append(pages.isEmpty() ? "" : ",").append(range(page, page, "outcome",
+                    lost ? "unreadable" : "read_directly"));
+            if (!lost) {
+                UUID text = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                        new ByteArrayInputStream("{\"pages\":[]}".getBytes(StandardCharsets.UTF_8))).fileId();
+                texts.append(texts.isEmpty() ? "" : ",").append("{\"fileId\":\"").append(text)
+                        .append("\",\"firstPage\":").append(page).append(",\"lastPage\":").append(page).append('}');
+            }
+        }
+        StringBuilder pageViews = new StringBuilder();
+        for (int page : views) {
+            UUID picture = jobFiles.store(layout.jobId(), layout.claimId(), layout.grant(), -1,
+                    new ByteArrayInputStream(webp(3000 + page))).fileId();
+            pageViews.append(pageViews.isEmpty() ? "" : ",").append("{\"page\":").append(page)
+                    .append(",\"picture\":{\"fileId\":\"").append(picture).append("\",\"width\":10,\"height\":10},")
+                    .append("\"lines\":[]}");
+        }
+        claims.report(layout.jobId(), layout.claimId(), layout.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pages\":[" + pages + "],\"texts\":[" + texts + "],\"pageViews\":["
+                        + pageViews + "],\"next\":[]}"));
+    }
+
+    /** Claims the offered passages step and reports its passages and outline. */
+    private void passagesStep(Chain chain) throws Exception {
+        JobClaims.Claim passages = claimOffered(chain);
+        claims.report(passages.jobId(), passages.claimId(), passages.grant(), "done", null, null,
+                JSON.readTree(passagesReport("Texto", "Capítulo", "Seção").replace("\"pipelineVersion\":\"4\"",
+                        "\"pipelineVersion\":\"5\"")));
+    }
+
     private PassageRow passageRow(Chain chain, UUID id, int ordinal, int page, Instant now) {
         return new PassageRow(id, chain.owner(), chain.versionId(), ordinal, page,
                 vault.encryptText(Passages.text(id, chain.owner()), "Passagem " + ordinal),
