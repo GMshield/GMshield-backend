@@ -11,4 +11,9 @@ public final class TestVaults {
     public static Vault vault() {
         return VaultFixtures.vault(new InMemoryDataKeyStore(), VaultFixtures.keys());
     }
+
+    /** The encrypted file store of {@code vault} under {@code root}. */
+    public static FileStore files(Vault vault, java.nio.file.Path root) {
+        return VaultFixtures.files(vault, root);
+    }
 }

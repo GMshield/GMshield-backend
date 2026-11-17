@@ -54,7 +54,8 @@ import tools.jackson.databind.json.JsonMapper;
  * robin. The sweep is driven by the test, on a clock the test moves.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false"})
+        properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
+            "gmshield.materials.upload-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class JobIntegrationTest {
 

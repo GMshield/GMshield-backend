@@ -76,6 +76,10 @@ gmshield:
     max-attempts: ${GMSHIELD_JOB_MAX_ATTEMPTS:3}
     reoffer-after: ${GMSHIELD_JOB_REOFFER_AFTER:2m}
     sweep-every: ${GMSHIELD_JOB_SWEEP_EVERY:10s}
+  # Materials (materials module, Story 1.13), a Spring duration: how often unfinished uploads past their 6 hours are
+  # discarded, and removals that stopped half way are finished.
+  materials:
+    upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
 
 server:
   port: 8080

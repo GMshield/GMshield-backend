@@ -98,6 +98,28 @@ class FileStoreTest {
     }
 
     @Test
+    void deletingAFileRemovesEveryPieceAndItsFolderAndCanBeRepeated() throws IOException {
+        FileStore files = VaultFixtures.files(vault, root);
+        files.writePiece(owner, file, 0, PAGE);
+        files.writePiece(owner, file, 1, PAGE);
+        UUID other = Ids.newId();
+        files.writePiece(owner, other, 0, PAGE);
+        Path folder = files.piece(owner, file, 0).getParent();
+        Files.writeString(folder.resolve(".2." + Ids.newId() + ".tmp"), "a temporary name left by a cut write");
+        assertThat(files.fileExists(owner, file)).isTrue();
+
+        files.deleteFile(owner, file);
+
+        assertThat(folder).doesNotExist();
+        assertThat(files.fileExists(owner, file)).isFalse();
+        assertThat(files.readPiece(owner, other, 0)).isEqualTo(PAGE);
+        // Again, and for a file that never existed: nothing to do, no failure.
+        files.deleteFile(owner, file);
+        files.deleteFile(Ids.newId(), Ids.newId());
+        assertThatThrownBy(() -> files.readPiece(owner, file, 0)).isInstanceOf(UncheckedIOException.class);
+    }
+
+    @Test
     void missingPieceOrNegativeIndexIsRefused() {
         FileStore files = VaultFixtures.files(vault, root);
 
