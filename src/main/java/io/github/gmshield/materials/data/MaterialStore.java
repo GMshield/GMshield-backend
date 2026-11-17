@@ -111,6 +111,12 @@ public interface MaterialStore {
     /** The version's layer ranges, by first page. */
     List<PageRangeRow> pageLayers(UUID versionId);
 
+    /** The layer ranges of all these versions, in one read, by version and first page (Story 1.17). */
+    List<PageRangeRow> pageLayers(Collection<UUID> versionIds);
+
+    /** The outcome ranges of all these versions, in one read, by version and first page (Story 1.17). */
+    List<PageRangeRow> pageOutcomes(Collection<UUID> versionIds);
+
     /** How many pages of each version have an outcome; a version with none is left out. */
     Map<UUID, Long> pagesDone(Collection<UUID> versionIds);
 

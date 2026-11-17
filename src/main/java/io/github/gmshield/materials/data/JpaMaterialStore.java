@@ -273,6 +273,26 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<PageRangeRow> pageLayers(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from PageLayer r where r.versionId in :versions"
+                        + " order by r.versionId, r.firstPage", PageLayerEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(PageLayerEntity::row).toList();
+    }
+
+    @Override
+    public List<PageRangeRow> pageOutcomes(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from PageOutcome r where r.versionId in :versions"
+                        + " order by r.versionId, r.firstPage", PageOutcomeEntity.class)
+                .setParameter("versions", versionIds).getResultList().stream().map(PageOutcomeEntity::row).toList();
+    }
+
+    @Override
     public Map<UUID, Long> pagesDone(Collection<UUID> versionIds) {
         Map<UUID, Long> done = new HashMap<>();
         if (versionIds.isEmpty()) {

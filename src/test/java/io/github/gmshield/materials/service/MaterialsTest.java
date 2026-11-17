@@ -13,6 +13,7 @@ import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.UploadRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.data.InMemoryTransactionManager;
@@ -249,6 +250,84 @@ class MaterialsTest {
         assertThat(as(owner, () -> reads.list(List.of("processing"), null, 20)).items())
                 .filteredOn(item -> item.id().equals(processing)).singleElement()
                 .satisfies(item -> assertThat(item.pages().total()).isEqualTo(320));
+    }
+
+    // --- page counts (Story 1.17)
+
+    @Test
+    void theCountsOfAMixedPdfComeFromItsRecordedLayersAndOutcomes() {
+        UUID mixed = create(owner, "mixed.pdf", Uploads.Details.NONE);
+        setState(mixed, "processing");
+        UUID version = versionOf(mixed).id();
+        write(() -> materials.recordIngestion(version, "3", 25, clock.instant()));
+        layer(version, 1, 5, PageRangeRow.TEXT);
+        layer(version, 6, 7, PageRangeRow.IMAGE);
+        layer(version, 8, 20, PageRangeRow.TEXT);
+        layer(version, 21, 25, PageRangeRow.IMAGE);
+        outcome(version, 1, 5, PageRangeRow.READ_DIRECTLY);
+        outcome(version, 6, 6, PageRangeRow.READ_BY_OCR);
+        outcome(version, 7, 7, PageRangeRow.UNREADABLE);
+
+        Materials.Pages pages = as(owner, () -> reads.find(mixed)).orElseThrow().pages();
+
+        assertThat(pages).isEqualTo(new Materials.Pages(7, 25, new Materials.Count(5, 18), new Materials.Count(2, 7),
+                5, 1, 1));
+        // Another owner's ranges never count.
+        assertThat(as(other, () -> materials.pageLayers(List.of(version)))).isEmpty();
+    }
+
+    @Test
+    void anOutcomeAcrossLayersCountsForEachAndTheTrayProgressRowReadsTextFirst() {
+        List<PageRangeRow> layers = List.of(range(1, 364, PageRangeRow.TEXT), range(365, 444, PageRangeRow.IMAGE));
+        assertThat(Materials.pages(444, layers, List.of(range(1, 40, PageRangeRow.READ_DIRECTLY))))
+                .isEqualTo(new Materials.Pages(40, 444, new Materials.Count(40, 364), new Materials.Count(0, 80),
+                        40, 0, 0));
+        List<PageRangeRow> split = List.of(range(1, 5, PageRangeRow.TEXT), range(6, 10, PageRangeRow.IMAGE),
+                range(11, 12, PageRangeRow.TEXT));
+        List<PageRangeRow> outcomes = List.of(range(3, 7, PageRangeRow.UNREADABLE), range(9, 11,
+                PageRangeRow.READ_BY_OCR));
+        assertThat(Materials.pages(12, split, outcomes)).isEqualTo(new Materials.Pages(8, 12,
+                new Materials.Count(4, 7), new Materials.Count(4, 5), 0, 3, 5));
+        assertThat(Materials.pages(5, List.of(), List.of(range(1, 5, PageRangeRow.READ_DIRECTLY))))
+                .isEqualTo(new Materials.Pages(5, 5, Materials.Count.NONE, Materials.Count.NONE, 5, 0, 0));
+    }
+
+    @Test
+    void aListReadsEachKindOfRangeOnceForAllItsVersions() {
+        for (int i = 0; i < 3; i++) {
+            UUID material = create(owner, "scan" + i + ".pdf", Uploads.Details.NONE);
+            setState(material, "processing");
+            UUID version = versionOf(material).id();
+            write(() -> materials.recordIngestion(version, "3", 10, clock.instant()));
+            layer(version, 1, 10, PageRangeRow.IMAGE);
+            outcome(version, 1, i + 1, PageRangeRow.READ_BY_OCR);
+        }
+        materials.rangeReads.set(0);
+
+        List<Materials.Material> items = as(owner, () -> reads.list(List.of("processing"), null, 20)).items();
+
+        assertThat(materials.rangeReads.get()).isEqualTo(2);
+        assertThat(items).extracting(item -> item.pages().image().done()).containsExactlyInAnyOrder(1, 2, 3);
+    }
+
+    private void layer(UUID version, int first, int last, String value) {
+        write(() -> {
+            materials.insertPageLayer(new PageRangeRow(Ids.newId(), owner, version, first, last, value,
+                    clock.instant()));
+            return true;
+        });
+    }
+
+    private void outcome(UUID version, int first, int last, String value) {
+        write(() -> {
+            materials.insertPageOutcome(new PageRangeRow(Ids.newId(), owner, version, first, last, value,
+                    clock.instant()));
+            return true;
+        });
+    }
+
+    private PageRangeRow range(int first, int last, String value) {
+        return new PageRangeRow(Ids.newId(), owner, Ids.newId(), first, last, value, clock.instant());
     }
 
     @Test
