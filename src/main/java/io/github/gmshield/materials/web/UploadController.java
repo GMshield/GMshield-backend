@@ -87,7 +87,8 @@ class UploadController {
     @PostMapping(path = UPLOADS)
     @Operation(operationId = "createUpload", summary = "tus 1.0.0 creation: a material, its version in uploading and an"
             + " upload that expires after 6 hours. upload.too_large (413) outside 1 byte to 2 GiB;"
-            + " upload.metadata_invalid (400) without a valid filename; upload.tus_version (412) without"
+            + " upload.metadata_invalid (400) without a valid filename; request.invalid (400) for a missing or"
+            + " malformed Upload-Length; upload.tus_version (412) without"
             + " Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
@@ -121,7 +122,8 @@ class UploadController {
 
     @RequestMapping(path = UPLOAD, method = RequestMethod.HEAD)
     @Operation(operationId = "getUploadOffset", summary = "tus 1.0.0 offset: how many bytes are verified and stored."
-            + " request.not_found (404) for any other id; upload.expired (410) after 6 hours;" + SESSION_SUMMARY,
+            + " request.not_found (404) for any other id; upload.expired (410) after 6 hours; upload.tus_version"
+            + " (412) without Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -154,7 +156,10 @@ class UploadController {
             + " upload.part_checksum_mismatch (460) and a cut body leave the offset unchanged; upload.offset_conflict"
             + " (409) when Upload-Offset is not the stored offset; upload.busy (423) while another part is written;"
             + " upload.too_large (413) over 90 MiB or past Upload-Length; upload.expired (410) after 6 hours;"
-            + " request.not_found (404) for any other id;" + SESSION_SUMMARY,
+            + " request.invalid (400) for a missing or malformed Upload-Offset or Upload-Checksum, a cut body or a"
+            + " first part shorter than its first 4 KiB (or the whole file); request.unsupported_media_type (415)"
+            + " for a body that is not application/offset+octet-stream; request.not_found (404) for any other id;"
+            + " upload.tus_version (412) without Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -196,7 +201,10 @@ class UploadController {
     @Operation(operationId = "completeUpload", summary = "Checks the whole file's SHA-256 once every byte is stored: the"
             + " version becomes waiting. upload.incomplete (409) before the last byte; upload.file_checksum_mismatch"
             + " (422) discards the version and its pieces; upload.busy (423) while a part is written; upload.expired"
-            + " (410) after 6 hours; request.not_found (404) for any other id;" + SESSION_SUMMARY,
+            + " (410) after 6 hours; request.invalid (400) for a body without a 64-hex sha256;"
+            + " request.unsupported_media_type (415) for a body that is not JSON;"
+            + " request.not_found (404) for any other id; upload.tus_version (412) without Tus-Resumable: 1.0.0;"
+            + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),

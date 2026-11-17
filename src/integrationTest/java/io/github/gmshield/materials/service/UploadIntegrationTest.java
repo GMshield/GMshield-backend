@@ -251,11 +251,11 @@ class UploadIntegrationTest {
     @Test
     void theSweepDiscardsAnExpiredUploadAndFinishesARemovalStoppedAfterAnyStep() throws Exception {
         UUID owner = Ids.newId();
-        byte[] part = "%PDF-1.7\nhalf of a file".getBytes(StandardCharsets.US_ASCII);
+        byte[] part = pdf(4096);   // the first 4 KiB of a 5000-byte file: enough to tell its format
         UUID[] ids = new UUID[3];
         UUID[] versions = new UUID[3];
         for (int i = 0; i < 3; i++) {
-            UUID id = as(owner, () -> uploads.create(1000, "book.pdf")).uploadId();
+            UUID id = as(owner, () -> uploads.create(5000, "book.pdf")).uploadId();
             as(owner, () -> uploads.patch(id, 0, part.length, sha256(part), new ByteArrayInputStream(part)));
             ids[i] = id;
             versions[i] = (UUID) row("select version_id from upload where id = ?", id).get("version_id");

@@ -206,8 +206,9 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `PATCH /api/v1/uploads/{id}` (`application/offset+octet-stream`, `Upload-Offset`, `Upload-Checksum:
     sha256 <Base64>`, at most 90 MiB and never past the length, else 413 before anything is written). One
     part at a time: a conditional update takes a 2-minute lease (`busy_token`, `busy_until`), renewed before
-    each piece; a second part answers `upload.busy` (423). The first part's first 4 KiB decide the format
-    from content alone (PDF, JPEG, PNG, WebP, TIFF, HEIC by signature, then UTF-8 text without control
+    each piece; a second part answers `upload.busy` (423). The first part's first 4 KiB (the whole file
+    when it is shorter) decide the format from content alone; a first part shorter than that is
+    `request.invalid` and changes nothing (PDF, JPEG, PNG, WebP, TIFF, HEIC by signature, then UTF-8 text without control
     characters, Markdown when the name ends in `.md` or `.markdown`, then BMP); anything else is
     `upload.format_refused` (415, `params.accepted`) and the same transaction deletes the upload, version and
     material rows. The body streams through `Vault.sha256()` into 4 MiB pieces, each encrypted into the file

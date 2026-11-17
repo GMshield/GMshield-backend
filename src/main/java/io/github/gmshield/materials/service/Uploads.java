@@ -36,8 +36,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <ul>
  *   <li>{@link #create}: a material (its name encrypted), a version in {@code uploading} and an upload, in one
  *       transaction. The upload expires 6 hours after its creation, whatever happens meanwhile.</li>
- *   <li>{@link #patch}: one part at a time, under a lease. The first part's first 4 KiB decide the format before
- *       anything is written; a refused format leaves no row and no piece. The part streams through a SHA-256 into
+ *   <li>{@link #patch}: one part at a time, under a lease. The first part's first 4 KiB (the whole file when it is
+ *       shorter) decide the format before anything is written: a first part shorter than that is refused as invalid,
+ *       and a refused format leaves no row and no piece. The part streams through a SHA-256 into
  *       4 MiB pieces, each encrypted into the file store; it counts only when its checksum matches.</li>
  *   <li>{@link #complete}: the stored pieces are decrypted one at a time and hashed; a match makes the version
  *       {@code waiting}, a mismatch discards it and removes the pieces.</li>
@@ -229,13 +230,15 @@ public class Uploads {
             if (filled > allowed) {
                 throw UploadProblems.tooLarge(MAX_PART);
             }
-            if (filled > 0) {
-                format = FormatSniffer.sniff(buffer, filled, filled < row.length(), name(row))
-                        .map(Format::code).orElse(null);
-                if (format == null) {
-                    refuse(row, owner);
-                    throw UploadProblems.formatRefused();
-                }
+            if (filled < Math.min(FormatSniffer.SAMPLE_BYTES, row.length())) {
+                // Too few bytes to tell the format: nothing is written or deleted, the upload stays as it was.
+                throw UploadProblems.invalid();
+            }
+            format = FormatSniffer.sniff(buffer, filled, filled < row.length(), name(row))
+                    .map(Format::code).orElse(null);
+            if (format == null) {
+                refuse(row, owner);
+                throw UploadProblems.formatRefused();
             }
         }
         long received = filled;

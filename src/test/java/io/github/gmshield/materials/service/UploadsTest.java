@@ -149,12 +149,20 @@ class UploadsTest {
     }
 
     @Test
-    void theFormatIsDecidedOnceFromTheFirstPartAndAnEmptyFirstPartDecidesNothing() {
+    void theFormatIsDecidedOnceFromTheFirstPartAndAFirstPartTooShortToTellIsInvalid() {
         byte[] pdf = pdf(10_000);
         UUID id = create(pdf.length, "book.pdf");
 
-        assertThat(patch(id, 0, new byte[0]).offset()).isZero();
-        assertThat(uploads.row(id).format()).isNull();
+        // "%PD" alone would read as text: a first part shorter than 4 KiB (or than the file) decides nothing.
+        for (byte[] tooShort : new byte[][] {new byte[0], java.util.Arrays.copyOf(pdf, 3), java.util.Arrays.copyOf(pdf, 4095)}) {
+            assertThatThrownBy(() -> patch(id, 0, tooShort)).satisfies(problem("request.invalid", 400));
+        }
+        UploadRow untouched = uploads.row(id);
+        assertThat(untouched.offset()).isZero();
+        assertThat(untouched.format()).isNull();
+        assertThat(untouched.busyToken()).isNull();
+        assertThat(materials.versions.get(untouched.versionId()).state()).isEqualTo("uploading");
+        assertThat(files.fileExists(owner, id)).isFalse();
         patch(id, 0, java.util.Arrays.copyOf(pdf, 6000));
         assertThat(uploads.row(id).format()).isEqualTo("pdf");
         // The second part is not sniffed: binary bytes in the middle of a PDF are fine.
@@ -202,14 +210,14 @@ class UploadsTest {
 
     @Test
     void anOffsetOtherThanTheStoredOneWritesNothing() {
-        byte[] content = pdf(1000);
+        byte[] content = pdf(10_000);
         UUID id = create(content.length, "book.pdf");
 
         assertThatThrownBy(() -> patch(id, 10, content)).satisfies(problem("upload.offset_conflict", 409));
         assertThat(files.fileExists(owner, id)).isFalse();
-        patch(id, 0, java.util.Arrays.copyOf(content, 500));
+        patch(id, 0, java.util.Arrays.copyOf(content, 5000));
         assertThatThrownBy(() -> patch(id, 0, content)).satisfies(problem("upload.offset_conflict", 409));
-        assertThat(uploads.row(id).offset()).isEqualTo(500);
+        assertThat(uploads.row(id).offset()).isEqualTo(5000);
     }
 
     @Test
@@ -246,11 +254,11 @@ class UploadsTest {
 
     @Test
     void aPartOverNinetyMebibytesOrPastTheLengthIsTooLargeBeforeAnythingIsWritten() {
-        byte[] content = pdf(1000);
+        byte[] content = pdf(5000);
         UUID id = create(Uploads.MAX_LENGTH, "book.pdf");
         assertThatThrownBy(() -> as(owner, () -> service.patch(id, 0, 90L * MIB + 1, sha256(content),
                 new ByteArrayInputStream(content)))).satisfies(problem("upload.too_large", 413));
-        UUID small = create(500, "small.pdf");
+        UUID small = create(4500, "small.pdf");
         assertThatThrownBy(() -> patch(small, 0, content)).satisfies(problem("upload.too_large", 413));
         assertThat(files.fileExists(owner, id)).isFalse();
         assertThat(files.fileExists(owner, small)).isFalse();
@@ -260,7 +268,7 @@ class UploadsTest {
         assertThat(uploads.row(small).offset()).isZero();
         assertThat(uploads.row(small).busyToken()).isNull();
         assertThat(as(owner, () -> service.patch(id, 0, -1, sha256(content), new ByteArrayInputStream(content))).offset())
-                .isEqualTo(1000);
+                .isEqualTo(5000);
     }
 
     @Test
@@ -349,11 +357,11 @@ class UploadsTest {
 
     @Test
     void theSweepWaitsForALiveLeaseAndFinishesARemovalThatStoppedAfterAnyStep() {
-        UUID leased = create(100, "a.txt");
-        patch(leased, 0, "half".getBytes(StandardCharsets.UTF_8));
+        UUID leased = create(5000, "a.txt");
+        patch(leased, 0, text(4096));
         UUID token = UUID.randomUUID();
         clock.advance(Duration.ofHours(6).minusMinutes(1));
-        assertThat(uploads.joined().takeLease(leased, owner, 4, token, clock.instant().plus(Duration.ofMinutes(2)),
+        assertThat(uploads.joined().takeLease(leased, owner, 4096, token, clock.instant().plus(Duration.ofMinutes(2)),
                 clock.instant())).isTrue();
         clock.advance(Duration.ofMinutes(1));
         assertThat(sweep.sweep()).isZero();
@@ -363,14 +371,14 @@ class UploadsTest {
         assertThat(uploads.rows).doesNotContainKey(leased);
 
         // Stopped after step 1: the version is discarded, the upload removing, the pieces still there.
-        UUID afterOne = create(100, "b.txt");
-        patch(afterOne, 0, "half".getBytes(StandardCharsets.UTF_8));
+        UUID afterOne = create(5000, "b.txt");
+        patch(afterOne, 0, text(4096));
         clock.advance(Duration.ofHours(7));
         assertThat(sweep.start(uploads.row(afterOne), clock.instant())).isTrue();
         assertThat(files.fileExists(owner, afterOne)).isTrue();
         // Stopped after step 2: the pieces are gone, the row is still there.
-        UUID afterTwo = create(100, "c.txt");
-        patch(afterTwo, 0, "half".getBytes(StandardCharsets.UTF_8));
+        UUID afterTwo = create(5000, "c.txt");
+        patch(afterTwo, 0, text(4096));
         clock.advance(Duration.ofHours(7));
         assertThat(sweep.start(uploads.row(afterTwo), clock.instant())).isTrue();
         files.deleteFile(owner, afterTwo);
@@ -379,6 +387,86 @@ class UploadsTest {
         assertThat(uploads.rows).isEmpty();
         assertThat(storedFiles()).isEmpty();
         assertThat(materials.versions.values()).allMatch(version -> version.state().equals("discarded"));
+    }
+
+    @Test
+    void oneUploadWhoseFilesCannotBeRemovedDoesNotStopTheOthersAndIsFinishedNextTime() throws IOException {
+        UUID failing = create(5000, "a.txt");
+        UUID other = create(5000, "b.txt");
+        patch(failing, 0, text(4096));
+        patch(other, 0, text(4096));
+        // A folder inside the upload's folder makes the file store's removal fail for that upload only.
+        Path blocker = root.resolve(owner.toString()).resolve(failing.toString()).resolve("blocker");
+        Files.createDirectories(blocker);
+        Files.writeString(blocker.resolve("x"), "x");
+        clock.advance(Duration.ofHours(6));
+
+        assertThat(sweep.sweep()).isEqualTo(1);
+
+        assertThat(uploads.rows).doesNotContainKey(other);
+        assertThat(files.fileExists(owner, other)).isFalse();
+        assertThat(uploads.row(failing).state()).isEqualTo(UploadRow.REMOVING);
+        assertThat(materials.versions.get(uploads.row(failing).versionId()).state()).isEqualTo("discarded");
+
+        Files.delete(blocker.resolve("x"));
+        Files.delete(blocker);
+        assertThat(sweep.sweep()).isEqualTo(1);
+        assertThat(uploads.rows).isEmpty();
+        assertThat(storedFiles()).isEmpty();
+    }
+
+    @Test
+    void aWriterThatLosesItsLeaseMidPartWritesNoFurtherPieceAndTheTakeOverStands() {
+        byte[] content = pdf(9 * MIB);
+        UUID id = create(content.length, "book.pdf");
+        java.util.concurrent.atomic.AtomicReference<Uploads.Progress> second = new java.util.concurrent.atomic.AtomicReference<>();
+        // The first writer's bytes differ after its first piece, so a piece it wrote late would show in the read-back.
+        byte[] first = content.clone();
+        first[5 * MIB] ^= 1;
+        // It stalls after its first piece, past the lease; meanwhile a second writer takes the lease over.
+        InputStream stalling = new ByteArrayInputStream(first) {
+            private boolean stalled;
+
+            @Override
+            public synchronized int read(byte[] buffer, int offset, int length) {
+                if (!stalled && pos >= 4 * MIB) {
+                    stalled = true;
+                    assertThat(files.fileExists(owner, id)).isTrue();
+                    clock.advance(Uploads.LEASE.plusSeconds(1));
+                    second.set(service.patch(id, 0, content.length, sha256(content), new ByteArrayInputStream(content)));
+                }
+                return super.read(buffer, offset, length);
+            }
+        };
+
+        assertThatThrownBy(() -> as(owner, () -> service.patch(id, 0, first.length, sha256(first), stalling)))
+                .satisfies(problem("upload.busy", 423));
+
+        assertThat(second.get().offset()).isEqualTo(content.length);
+        UploadRow row = uploads.row(id);
+        assertThat(row.offset()).isEqualTo(content.length);
+        assertThat(row.pieceCount()).isEqualTo(3);
+        assertThat(row.busyToken()).isNull();
+        assertThat(readBack(id, 3)).isEqualTo(content);
+        assertThat(storedFiles()).hasSize(3);
+        assertThat(complete(id, content).state()).isEqualTo("waiting");
+    }
+
+    @Test
+    void aTextWhoseCharacterStraddlesTheSampleEdgeIsAcceptedOnItsFirstPart() {
+        byte[] content = new byte[6000];
+        java.util.Arrays.fill(content, (byte) 'a');
+        byte[] cedilla = "ç".getBytes(StandardCharsets.UTF_8);
+        content[FormatSniffer.SAMPLE_BYTES - 1] = cedilla[0];   // byte 4095
+        content[FormatSniffer.SAMPLE_BYTES] = cedilla[1];       // byte 4096: outside the sample
+        UUID txt = create(content.length, "regras.txt");
+        UUID md = create(content.length, "regras.md");
+
+        patch(txt, 0, content);
+        patch(md, 0, content);
+
+        assertThat(uploads.row(txt).format()).isEqualTo("txt");
+        assertThat(uploads.row(md).format()).isEqualTo("markdown");
     }
 
     // --- owners ---
@@ -464,6 +552,13 @@ class UploadsTest {
         for (int i = head.length; i < size; i++) {
             content[i] = (byte) (i * 31 + (i >>> 11));
         }
+        return content;
+    }
+
+    /** {@code length} bytes of plain text. */
+    private static byte[] text(int length) {
+        byte[] content = new byte[length];
+        java.util.Arrays.fill(content, (byte) 'x');
         return content;
     }
 
