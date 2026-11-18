@@ -2686,6 +2686,39 @@ class IngestionFlowTest {
         assertThat(jobs.row(removal.jobId()).state()).isEqualTo("done");
     }
 
+    @Test
+    void anIndexChangeOfAVersionSupersededWhileItsSetIsPendingStillRunsAndCompletes() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = reviewedWithPassages(gm, 3);
+        accept(gm, uploaded);
+        IndexChangeRow change = indexChanges(uploaded.versionId()).getFirst();
+        assertThat(jobs.row(change.jobId()).state()).isEqualTo("offered");
+        // A newer version of the material, under review (no route makes one yet), is accepted: the first is superseded.
+        VersionRow first = materials.versions.get(uploaded.versionId());
+        UUID newer = UUID.randomUUID();
+        Instant later = first.createdAt().plusSeconds(60);
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                materials.insertVersion(new VersionRow(newer, gm.id(), first.materialId(), "needs_review", "pdf",
+                        first.sizeBytes(), later, later, 1, "2", null))));
+        accept(gm, uploaded);
+        assertThat(materials.versions.get(uploaded.versionId()).state()).isEqualTo("superseded");
+        assertThat(materials.versions.get(newer).state()).isEqualTo("ready");
+        // A superseded version keeps its points: no removal, and its pending change still runs.
+        assertThat(index.removals.values()).noneMatch(row -> row.versionId().equals(uploaded.versionId()));
+
+        JsonNode claim = claim(change.jobId());
+        assertThat(claim.path("input").path("source").asString()).isEqualTo(uploaded.versionId().toString());
+        assertThat(claim.path("input").path("passages").asString()).isEqualTo("passages");
+        HttpResponse<byte[]> opened = input(change.jobId(), claim, "passages");
+        assertThat(opened.statusCode()).isEqualTo(200);
+        assertThat(new String(opened.body(), StandardCharsets.UTF_8).lines().map(JSON::readTree)
+                .map(line -> line.path("text").asString())).containsExactly("Texto 0", "Texto 1", "Texto 2");
+        report(change, claim, "{\"indexRecipe\":\"1\"}");
+
+        assertThat(jobs.row(change.jobId()).state()).isEqualTo("done");
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo("1");
+    }
+
     /** A PDF of one page read until review, with {@code count} passages: passage i in section "Seção i". */
     private Uploaded reviewedWithPassages(Gm gm, int count) throws Exception {
         Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);

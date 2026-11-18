@@ -52,7 +52,8 @@ public class IndexReconcile {
     @EventListener
     void stated(IndexRecipeStated event) {
         synchronized (this) {
-            queued = queued.thenRunAsync(() -> reconcile(event.recipe()), runner);
+            // Whatever the previous reconcile did, this one runs: a failed stage never ends the chain.
+            queued = queued.handle((ignored, failure) -> null).thenRunAsync(() -> reconcile(event.recipe()), runner);
         }
     }
 

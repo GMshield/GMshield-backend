@@ -1067,6 +1067,8 @@ class IngestionIntegrationTest {
         assertThat(versionRecipe(chain)).isNull();
         reconcile.reconcile("it-3");
         assertThat(indexChanges(chain)).isEqualTo(again);
+        // The new set (and every other owner's the reconciles made) would hold the shared ingestion lane.
+        freeTheIngestionLane();
     }
 
     @Test
@@ -1085,6 +1087,7 @@ class IngestionIntegrationTest {
         claims.report(claim.jobId(), claim.claimId(), claim.grant(), "done", null, null, JSON.readTree("{}"));
         assertThat(jdbc.sql("select state from job where id = ?").param(claim.jobId()).query(String.class).single())
                 .isEqualTo("done");
+        freeTheIngestionLane();
     }
 
     private List<Map<String, Object>> indexChanges(Chain chain) {

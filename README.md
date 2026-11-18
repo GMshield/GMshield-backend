@@ -435,8 +435,10 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     owner, version, first and last ordinal). At the claim the input is `{source, owner, kind, language, tokenKey,
     passages: "passages"}`: the version's id, its owner, the material's kind and language (null when not given),
     and Base64 of `Vault.ownerTokenKey(owner)` (HKDF of the index key under `("index-token", owner)`, 32 bytes,
-    never logged or stored). `GET …/inputs/passages` streams the run as JSON Lines `{id, ordinal, page, title,
-    text}` (`title`: the last element of the section path, or empty), decrypted for that run only. The result must
+    never logged or stored). `GET …/inputs/passages` serves the run as JSON Lines `{id, ordinal, page, title,
+    text}` (`title`: the last element of the section path, or empty), decrypted for that run only. Unlike a file
+    input, the run is not streamed piece by piece: it is decrypted and buffered whole in the input's read transaction
+    (at most 200 passages of at most 16,384 code points) and served from memory. The result must
     carry `indexRecipe` (`[A-Za-z0-9._-]{1,32}`, else `job.result_invalid`); it is kept on the row, and when no
     index change of the version is left unended and every row of its set reports one recipe,
     `material_version.index_recipe` records it. A superseded version keeps its points and its jobs run on.
@@ -454,7 +456,16 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `V15__index_jobs.sql`: `material_version.index_recipe`, `index_change` and `index_removal` (library tables, every
     key with the owner; `index_removal` has no reference to the version so it outlives a deleted one). This release
     writes them at once (Dalton, 2026-11-18: no earlier release holds an index row). **A backend rolled back below
-    this release must first cancel every unended `index.change` and `index.removal` job.**
+    this release must first cancel every unended `index.change` and `index.removal` job**, as `Jobs.cancel` ends a
+    job (the grant and claim times cleared, the claim id kept), with the backend stopped, as `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind in ('index.change', 'index.removal') and state in ('waiting', 'offered', 'running');
+    ```
+
+    Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

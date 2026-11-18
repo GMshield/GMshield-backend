@@ -44,7 +44,7 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #input}: at the claim, for a {@code ready} or {@code superseded} version (a superseded version keeps its
  *       points), the worker gets {@code source} (the version's id), {@code owner}, the material's {@code kind} and
  *       {@code language} (null when not given), {@code tokenKey} (Base64 of {@link Vault#ownerTokenKey}, never logged
- *       or stored) and {@code passages}, the name of its input, which {@link #openInput} streams.</li>
+ *       or stored) and {@code passages}, the name of its input, which {@link #openInput} serves.</li>
  *   <li>{@link #openInput}: the run's passages as JSON Lines {@code {id, ordinal, page, title, text}}, decrypted for
  *       that run only; the title is the last element of the passage's section path, or empty.</li>
  *   <li>{@link #completed}: the result's {@code indexRecipe} is recorded on the row, with the version locked; when no
@@ -247,6 +247,6 @@ public class IndexChanges implements JobHandler {
     @Override
     public void failed(JobRef job, String code) {
         // The version keeps no recipe: the next reconcile (a backend start, or a new recipe) indexes it again.
-        log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("code", code).log("index.change_failed");
+        log.atWarn().addKeyValue("jobId", job.id()).addKeyValue("code", code).log("index.change_failed");
     }
 }
