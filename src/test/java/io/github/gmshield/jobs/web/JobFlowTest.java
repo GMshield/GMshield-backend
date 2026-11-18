@@ -72,6 +72,11 @@ class JobFlowTest extends HttpTestSupport {
         }
 
         @org.springframework.context.annotation.Bean
+        StatedRecipes statedRecipes() {
+            return new StatedRecipes();
+        }
+
+        @org.springframework.context.annotation.Bean
         io.github.gmshield.jobs.service.JobHandler arrayInputHandler() {
             return new io.github.gmshield.jobs.service.JobHandler() {
                 @Override
@@ -102,11 +107,23 @@ class JobFlowTest extends HttpTestSupport {
         }
     }
 
+    /** The index recipes published as stated at a claim (Story 2.1). */
+    static class StatedRecipes {
+        final List<String> stated = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @org.springframework.context.event.EventListener
+        void on(io.github.gmshield.jobs.service.IndexRecipeStated event) {
+            stated.add(event.recipe());
+        }
+    }
+
     static final String PROBES = "/internal/v1/test-mode/probe-jobs";
     static final String INTERACTIVE = "gmshield:work:interactive";
     static final String INGESTION = "gmshield:work:ingestion";
     static final Instant START = Instant.parse("2026-11-16T12:00:00Z");
 
+    @Autowired
+    StatedRecipes recipes;
     @Autowired
     InMemoryJobStorage storage;
     @Autowired
@@ -197,6 +214,37 @@ class JobFlowTest extends HttpTestSupport {
     }
 
     // ---- claim
+
+    @Test
+    void aClaimMayStateTheIndexRecipeAndEachNewOneIsPublishedOnceWhateverTheClaimsAnswer() throws Exception {
+        String recipe = "r" + UUID.randomUUID().toString().substring(0, 8);
+        UUID first = createProbe("interactive", 0, 0, null);
+        UUID second = createProbe("interactive", 0, 0, null);
+        UUID third = createProbe("interactive", 0, 0, null);
+        recipes.stated.clear();
+
+        // A worker before contract 1.7.0 sends no body: its claim works and states nothing.
+        assertThat(claim(first).statusCode()).isEqualTo(201);
+        assertThat(recipes.stated).isEmpty();
+        // A recipe that is not one is refused before the claim: the job stays offered.
+        for (String body : List.of("{\"indexRecipe\":\"two words\"}", "{\"indexRecipe\":\"\"}",
+                "{\"indexRecipe\":\"" + "x".repeat(33) + "\"}")) {
+            assertProblem(sendAsWorker("POST", "/internal/v1/jobs/" + second + "/claims", body), 400, "request.invalid");
+        }
+        assertThat(storage.row(second).state()).isEqualTo("offered");
+        assertThat(recipes.stated).isEmpty();
+
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + second + "/claims", "{\"indexRecipe\":\"" + recipe
+                + "\"}").statusCode()).isEqualTo(201);
+        assertThat(recipes.stated).containsExactly(recipe);
+        // The same recipe again, on any claim: nothing more. Another one, even on a refused claim: published.
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + third + "/claims", "{\"indexRecipe\":\"" + recipe
+                + "\"}").statusCode()).isEqualTo(201);
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + third + "/claims", "{\"indexRecipe\":\"" + recipe
+                + "-2\"}").statusCode()).isEqualTo(409);
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + third + "/claims", "{}").statusCode()).isEqualTo(409);
+        assertThat(recipes.stated).containsExactly(recipe, recipe + "-2");
+    }
 
     @Test
     void aClaimRunsTheJobAndAnswersAttemptGrantTimesInputAndTraceparent() throws Exception {

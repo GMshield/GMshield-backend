@@ -26,13 +26,15 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <ul>
  *   <li>{@value Materials#ACCEPT}: {@code needs_review} becomes {@code ready}, and a {@code ready} version of the same
- *       material before it becomes {@code superseded};</li>
+ *       material before it becomes {@code superseded} (it keeps its points); from Story 2.1 the version's passages get
+ *       their index changes ({@link IndexChanges#start}) in the same transaction;</li>
  *   <li>{@value Materials#REPROCESS}: the unreadable pages of a {@code needs_review} version are read again
  *       ({@link IngestionSteps#reprocess});</li>
  *   <li>{@value Materials#RETRY}: a {@code failed} version starts again ({@link IngestionSteps#retry});</li>
  *   <li>{@value Materials#DISCARD}: a {@code needs_review} or {@code failed} version becomes {@code discarded} with its
- *       removal pending, its unended steps cancelled; after the commit {@link VersionRemoval} runs once, and the
- *       {@link VersionRemovalSweep} finishes it if it stops.</li>
+ *       removal pending, its unended steps cancelled; from Story 2.1 its unended index changes are cancelled and the
+ *       removal of its points is created ({@link IndexRemovals#start}); after the commit {@link VersionRemoval} runs
+ *       once, and the {@link VersionRemovalSweep} finishes it if it stops.</li>
  * </ul>
  *
  * Each answers the material as {@link Materials#find} reads it after the action; empty for an unknown material or
@@ -47,14 +49,18 @@ public class MaterialActions {
     private final UploadStorage uploads;
     private final IngestionSteps ingestion;
     private final VersionRemoval removal;
+    private final IndexChanges indexChanges;
+    private final IndexRemovals indexRemovals;
     private final Materials reads;
     private final IngestionSettings settings;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
     MaterialActions(MaterialStore materials, UploadStorage uploads, IngestionSteps ingestion, VersionRemoval removal,
-                    Materials reads, IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions,
-                    ObjectProvider<Clock> clock) {
+                    IndexChanges indexChanges, IndexRemovals indexRemovals, Materials reads, IngestionSettings settings,
+                    ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+        this.indexChanges = indexChanges;
+        this.indexRemovals = indexRemovals;
         this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
@@ -122,13 +128,16 @@ public class MaterialActions {
             }
         }
         materials.changeVersionState(version.id(), Materials.READY, now);
+        indexChanges.start(version);
     }
 
     private void discard(VersionRow version) {
         int cancelled = ingestion.cancelSteps(version.id());
+        int indexCancelled = indexChanges.cancel(version.id());
         materials.discardVersion(version.id(), now());
+        indexRemovals.start(version.id());
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("cancelled", cancelled)
-                .log("material.discarded");
+                .addKeyValue("indexCancelled", indexCancelled).log("material.discarded");
     }
 
     /** The removal, once, after the commit: a failure is the sweep's to finish, never the GM's. */

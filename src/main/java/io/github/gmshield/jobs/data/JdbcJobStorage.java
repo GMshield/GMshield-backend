@@ -181,6 +181,16 @@ class JdbcJobStorage implements JobStorage {
         }
 
         @Override
+        public List<UUID> unended(Collection<UUID> ids, UUID owner) {
+            if (ids.isEmpty()) {
+                return List.of();
+            }
+            return jdbc.get().sql("select id from job where owner_id = :owner"
+                            + " and state in ('waiting', 'offered', 'running') and id in (:ids)")
+                    .param("owner", owner).param("ids", List.copyOf(ids)).query(UUID.class).list();
+        }
+
+        @Override
         public boolean busy(String lane) {
             // Boolean.TRUE.equals never unboxes: an absent or null answer reads as "not busy" (java:S2259).
             return Boolean.TRUE.equals(jdbc.get()

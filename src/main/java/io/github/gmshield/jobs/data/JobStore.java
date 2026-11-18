@@ -35,6 +35,12 @@ public interface JobStore {
     /** Those of {@code ids} that are jobs of {@code owner} now {@code offered} or {@code running} (Story 1.17). */
     List<UUID> inProgress(Collection<UUID> ids, UUID owner);
 
+    /**
+     * Those of {@code ids} that are jobs of {@code owner} that have not ended: {@code waiting}, {@code offered} or
+     * {@code running} (Story 2.1).
+     */
+    List<UUID> unended(Collection<UUID> ids, UUID owner);
+
     /** Whether a job of the lane is {@code offered} or {@code running}. */
     boolean busy(String lane);
 

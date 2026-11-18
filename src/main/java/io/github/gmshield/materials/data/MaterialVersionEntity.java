@@ -48,6 +48,9 @@ class MaterialVersionEntity {
     @Column(name = "removal_pending", nullable = false)
     private boolean removalPending;
 
+    @Column(name = "index_recipe")
+    private String indexRecipe;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -69,6 +72,7 @@ class MaterialVersionEntity {
         this.pipelineVersion = row.pipelineVersion();
         this.failureCode = row.failureCode();
         this.removalPending = row.removalPending();
+        this.indexRecipe = row.indexRecipe();
         this.createdAt = row.createdAt();
         this.updatedAt = row.updatedAt();
     }
@@ -123,8 +127,16 @@ class MaterialVersionEntity {
         this.updatedAt = now;
     }
 
+    /**
+     * The index recipe of the version's current set of index jobs (Story 2.1), or null; the version's update time
+     * stays: nothing the GM sees changes.
+     */
+    void recordIndexRecipe(String recipe) {
+        this.indexRecipe = recipe;
+    }
+
     VersionRow row() {
         return new VersionRow(id, ownerId, materialId, state, format, sizeBytes, createdAt, updatedAt, pageTotal,
-                pipelineVersion, failureCode, removalPending);
+                pipelineVersion, failureCode, removalPending, indexRecipe);
     }
 }

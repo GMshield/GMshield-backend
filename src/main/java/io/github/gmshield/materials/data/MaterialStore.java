@@ -149,6 +149,12 @@ public interface MaterialStore {
     /** The current owner's passages of a version, in reading order. */
     List<PassageRow> passages(UUID versionId);
 
+    /** The ordinals of the current owner's passages of a version, ascending (Story 2.1). */
+    List<Integer> passageOrdinals(UUID versionId);
+
+    /** The current owner's passages of a version from ordinal {@code first} to {@code last}, in order (Story 2.1). */
+    List<PassageRow> passages(UUID versionId, int first, int last);
+
     /** Deletes the current owner's passages of a version; answers how many went. */
     int deletePassages(UUID versionId);
 
@@ -203,6 +209,14 @@ public interface MaterialStore {
 
     /** The removal of the current owner's discarded version has finished; false when there is no such version. */
     boolean clearRemovalPending(UUID id, Instant now);
+
+    // --- the index (Story 2.1)
+
+    /** Records the index recipe of the current owner's version, or clears it with null; false when there is none. */
+    boolean recordIndexRecipe(UUID id, String recipe);
+
+    /** The current owner's {@code ready} versions whose index recipe is not {@code recipe} (null counts as not). */
+    List<VersionRow> readyOutside(String recipe);
 
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);
