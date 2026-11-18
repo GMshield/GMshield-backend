@@ -93,6 +93,8 @@ class IngestionIntegrationTest {
     private Jobs jobs;
     @Autowired
     private Vault vault;
+    @Autowired
+    private ImageSets imageSets;
     @Value("${gmshield.files.dir}")
     private Path filesDir;
 
@@ -169,6 +171,71 @@ class IngestionIntegrationTest {
                 .isEqualTo(new Materials.Pages(0, 23));
         sweep.sweep();
         assertThat(files.fileExists(chain.owner(), batch1.fileId())).isTrue();
+    }
+
+    @Test
+    void aSetsImagesStepReadsEachImageInOrderAndItsReportRemovesEveryImagesRawUpload() throws Exception {
+        UUID owner = Ids.newId();
+        byte[] first = image(0xd8, 70_000);
+        byte[] second = image(0x50, 9000);
+        ImageSets.Created set = as(owner, () -> imageSets.create("Ficha", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("b.jpg", first.length), new ImageSets.Image("a.png", second.length))));
+        UUID one = set.images().get(0).uploadId();
+        UUID two = set.images().get(1).uploadId();
+        as(owner, () -> uploads.patch(two, 0, second.length, sha(second), new java.io.ByteArrayInputStream(second)));
+        as(owner, () -> uploads.complete(two, sha(second)));
+        as(owner, () -> uploads.patch(one, 0, first.length, sha(first), new java.io.ByteArrayInputStream(first)));
+        assertThat(as(owner, () -> uploads.complete(one, sha(first))).state()).isEqualTo("waiting");
+        UUID jobId = jdbc.sql("select job_id from ingestion_step where version_id = ?").param(set.setId())
+                .query(UUID.class).single();
+        Chain chain = new Chain(owner, set.materialId(), set.setId(), one, jobId);
+
+        JobClaims.Claim claim = claims.claim(jobId);
+        assertThat(claim.input().path("stage").asString()).isEqualTo("images");
+        assertThat(claim.input().path("format").asString()).isEqualTo("images");
+        assertThat(claim.input().path("inputs")).extracting(item -> item.path("name").asString())
+                .containsExactly("image-" + one, "image-" + two);
+        for (Object[] expected : List.of(new Object[] {one, first}, new Object[] {two, second})) {
+            ByteArrayOutputStream read = new ByteArrayOutputStream();
+            jobFiles.open(jobId, claim.claimId(), claim.grant(), "image-" + expected[0]).input().writeTo(read);
+            assertThat(read.toByteArray()).isEqualTo((byte[]) expected[1]);
+        }
+        JobFiles.Stored original = store(chain, claim, pdf(6000));
+        JobFiles.Stored batch = store(chain, claim, pdf(5000));
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"6\",\"pageTotal\":2,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
+                        + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":2}],"
+                        + "\"pages\":[{\"firstPage\":2,\"lastPage\":2,\"outcome\":\"unreadable\"}],"
+                        + "\"next\":[{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":1,\"input\":\""
+                        + batch.fileId() + "\"}]}"));
+        assertThat(jdbc.sql("select count(*) from upload where version_id = ?").param(set.setId()).query(Long.class)
+                .single()).isZero();
+        assertThat(files.fileExists(owner, one)).isFalse();
+        assertThat(files.fileExists(owner, two)).isFalse();
+        assertThat(jdbc.sql("select state, page_total from material_version where id = ?").param(set.setId()).query()
+                .singleRow()).containsEntry("state", "processing").containsEntry("page_total", 2);
+        assertThat(jdbc.sql("select stage, first_page, last_page from ingestion_step where version_id = ?"
+                + " and stage = 'triage'").param(set.setId()).query().singleRow())
+                .containsEntry("first_page", 1).containsEntry("last_page", 1);
+    }
+
+    private static byte[] image(int second, int size) {
+        byte[] content = new byte[size];
+        content[0] = (byte) (second == 0xd8 ? 0xff : 0x89);
+        content[1] = (byte) second;
+        if (second == 0xd8) {
+            content[2] = (byte) 0xff;
+        } else {
+            System.arraycopy(new byte[] {'N', 'G', '\r', '\n', 0x1a, '\n'}, 0, content, 2, 6);
+        }
+        for (int i = 8; i < size; i++) {
+            content[i] = (byte) (i * 11);
+        }
+        return content;
+    }
+
+    private static byte[] sha(byte[] content) throws Exception {
+        return MessageDigest.getInstance("SHA-256").digest(content);
     }
 
     @Test

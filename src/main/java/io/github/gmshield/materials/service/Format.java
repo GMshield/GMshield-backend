@@ -17,6 +17,14 @@ public enum Format {
 
     /** Every accepted format's code, in the order the refusal names them. */
     public static final List<String> CODES = java.util.Arrays.stream(values()).map(Format::code).toList();
+    /** The formats a member of an image set may have (Story 1.21), in the same order. */
+    public static final List<String> IMAGE_CODES = List.of(JPEG.code, PNG.code, WEBP.code, TIFF.code, BMP.code,
+            HEIC.code);
+    /**
+     * The version format of an image material (Story 1.21): its images, assembled into one PDF by the first stage. An
+     * internal code, never an accepted upload format.
+     */
+    public static final String IMAGES = "images";
 
     private final String code;
 
@@ -26,6 +34,11 @@ public enum Format {
 
     public String code() {
         return code;
+    }
+
+    /** Whether a format code is an image's (Story 1.21). */
+    public static boolean image(String code) {
+        return code != null && IMAGE_CODES.contains(code);
     }
 
     /** A text file's format: Markdown when its name ends in {@code .md} or {@code .markdown}, else plain text. */

@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -47,8 +48,15 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       4 MiB pieces, each encrypted into the file store; it counts only when its checksum matches.</li>
  *   <li>{@link #complete}: the stored pieces are decrypted one at a time and hashed; a match makes the version
  *       {@code waiting} and, in the same transaction, starts its ingestion chain ({@link IngestionStart}, Story 1.15);
- *       a mismatch discards it and removes the pieces.</li>
+ *       a mismatch discards it and removes the pieces. From Story 1.21 an image's version has the format
+ *       {@value Format#IMAGES}: an image alone is a set of one.</li>
  * </ul>
+ *
+ * <p>From Story 1.21, a member of an image set ({@link ImageSets}) is an upload like any other, with three
+ * differences: its format must be an image's; a refused format, a whole-file mismatch or an expiry fails the member
+ * alone (its pieces go, its row stays {@code failed} with the reason) and never the set's version; and a verified
+ * member starts the set's chain only once no member is open or failed ({@link #startIfReady}), with the version
+ * locked so that two members completing at once start it once.
  *
  * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name, a
  * hash, a kind or where a material belongs; the file is never held whole in memory.
@@ -69,6 +77,8 @@ public class Uploads {
     static final String UPLOADING = "uploading";
     static final String WAITING = "waiting";
     static final String DISCARDED = "discarded";
+    /** The most images an image set may hold (Story 1.21); its bytes in all are at most {@link #MAX_LENGTH}. */
+    public static final int MAX_IMAGES = 500;
     /** The longest name a material may have, in characters. */
     static final int MAX_NAME = 255;
     /** What a material may be (Story 1.14). */
@@ -117,7 +127,7 @@ public class Uploads {
     }
 
     /** The details once checked: the language null when left to detection. */
-    private record Checked(String kind, String language, UUID campaign, UUID system) {
+    record Checked(String kind, String language, UUID campaign, UUID system) {
     }
 
     /** A new upload: its id and when it expires. */
@@ -155,13 +165,7 @@ public class Uploads {
         UUID uploadId = Ids.newId();
         Instant expiresAt = now.plus(LIFETIME);
         inTransaction(() -> {
-            materials.insertMaterial(new MaterialRow(materialId, owner,
-                    vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), material), now,
-                    checked.kind(), checked.language(), checked.campaign()));
-            if (checked.system() != null) {
-                materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, checked.system(), now));
-            }
-            materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
+            insertMaterial(owner, materialId, versionId, material, checked, now);
             uploads.joined().insert(new UploadRow(uploadId, owner, versionId, length, 0, 0, null, expiresAt, null, null,
                     UploadRow.OPEN, now, now));
             return null;
@@ -169,6 +173,20 @@ public class Uploads {
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", uploadId).addKeyValue("materialId", materialId)
                 .addKeyValue("versionId", versionId).addKeyValue("length", length).log("upload.created");
         return new Created(uploadId, expiresAt);
+    }
+
+    /**
+     * The material (its name encrypted, its details) and its version in {@code uploading}, in the caller's transaction
+     * (Stories 1.13, 1.14 and 1.21).
+     */
+    void insertMaterial(UUID owner, UUID materialId, UUID versionId, String name, Checked checked, Instant now) {
+        materials.insertMaterial(new MaterialRow(materialId, owner,
+                vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), name), now,
+                checked.kind(), checked.language(), checked.campaign()));
+        if (checked.system() != null) {
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, checked.system(), now));
+        }
+        materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
     }
 
     /** The verified offset of the owner's upload. */
@@ -226,6 +244,10 @@ public class Uploads {
         try {
             boolean matches = wholeFileMatches(lease, row, owner, sha256);
             Instant now = now();
+            if (!matches && row.member()) {
+                failMember(lease, row, owner, UploadProblems.FILE_CHECKSUM_MISMATCH_CODE, now);
+                throw UploadProblems.fileChecksumMismatch();
+            }
             if (!matches) {
                 inTransaction(() -> {
                     if (!uploads.joined().removeHeld(row.id(), lease.token, now)) {
@@ -241,10 +263,17 @@ public class Uploads {
                 throw UploadProblems.fileChecksumMismatch();
             }
             version = inTransaction(() -> {
+                // A member's set is decided with its version locked: two members completing at once start it once.
+                Optional<VersionRow> locked = row.member() ? materials.lockVersion(row.versionId()) : Optional.empty();
                 if (!uploads.joined().complete(row.id(), lease.token, now)) {
                     throw lost(row.id());
                 }
-                materials.changeVersion(row.versionId(), WAITING, row.format(), row.length(), now);
+                if (row.member()) {
+                    return startIfReady(locked.orElseThrow(UploadProblems::notFound), now);
+                }
+                // An image alone is a set of one (Story 1.21).
+                String format = Format.image(row.format()) ? Format.IMAGES : row.format();
+                materials.changeVersion(row.versionId(), WAITING, format, row.length(), now);
                 VersionRow waiting = materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
                 ingestion.start(waiting, row);
                 return waiting;
@@ -256,6 +285,59 @@ public class Uploads {
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", row.id())
                 .addKeyValue("versionId", version.id()).addKeyValue("format", row.format()).log("upload.completed");
         return new Completed(version.materialId(), version.id(), version.state());
+    }
+
+    /**
+     * Starts an image set (Story 1.21) once it is whole, in the caller's transaction with {@code version} locked: when
+     * the version is still {@code uploading}, no member is open or failed and one at least is complete, it becomes
+     * {@code waiting} with the format {@value Format#IMAGES} and the size of its members, and its first step reads them
+     * in order. Answers the version as it is now.
+     */
+    VersionRow startIfReady(VersionRow version, Instant now) {
+        if (!UPLOADING.equals(version.state())) {
+            return version;
+        }
+        List<UploadRow> members = uploads.joined().ofVersion(version.ownerId(), version.id());
+        if (members.isEmpty() || members.stream().anyMatch(member -> !UploadRow.COMPLETE.equals(member.state()))) {
+            return version;
+        }
+        long size = members.stream().mapToLong(UploadRow::length).sum();
+        materials.changeVersion(version.id(), WAITING, Format.IMAGES, size, now);
+        VersionRow waiting = materials.findVersion(version.id()).orElseThrow(UploadProblems::notFound);
+        ingestion.start(waiting, members.getFirst());
+        log.atInfo().addKeyValue("ownerId", version.ownerId()).addKeyValue("versionId", version.id())
+                .addKeyValue("images", members.size()).addKeyValue("length", size).log("upload.set_started");
+        return waiting;
+    }
+
+    /**
+     * A held member fails (Story 1.21) with {@code code}: the row stays {@code failed}, its pieces go, and the set's
+     * version is kept.
+     */
+    private void failMember(Lease lease, UploadRow row, UUID owner, String code, Instant now) {
+        inTransaction(() -> {
+            if (!uploads.joined().failHeld(row.id(), lease.token, code, now)) {
+                throw lost(row.id());
+            }
+            return null;
+        });
+        lease.released = true;
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", row.id())
+                .addKeyValue("versionId", row.versionId()).addKeyValue("code", code).log("upload.image_failed");
+        removePieces(row);
+    }
+
+    /**
+     * The pieces of a failed member go (Story 1.21); a failure here leaves them to the removal of its row (replaced,
+     * left out or swept), which removes them again.
+     */
+    void removePieces(UploadRow row) {
+        try {
+            files.deleteFile(row.ownerId(), row.id());
+        } catch (RuntimeException failure) {
+            log.atWarn().addKeyValue("uploadId", row.id()).addKeyValue("errorType", failure.getClass().getName())
+                    .log("upload.pieces_removal_deferred");
+        }
     }
 
     /**
@@ -288,6 +370,11 @@ public class Uploads {
             }
             format = FormatSniffer.sniff(buffer, filled, filled < row.length(), name(row))
                     .map(Format::code).orElse(null);
+            if (row.member() && !Format.image(format)) {
+                // A member of an image set must be an image: it alone fails, and the set waits for the GM.
+                failMember(lease, row, owner, UploadProblems.FORMAT_REFUSED_CODE, now());
+                throw UploadProblems.imageFormatRefused();
+            }
             if (format == null) {
                 refuse(row, owner);
                 throw UploadProblems.formatRefused();
@@ -355,13 +442,24 @@ public class Uploads {
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", row.id()).log("upload.format_refused");
     }
 
-    /** The material's name, decrypted: it tells Markdown from plain text, and nothing else. */
+    /**
+     * The file's name, decrypted: it tells Markdown from plain text, and nothing else. A member's own name (Story 1.21),
+     * else the material's.
+     */
     private String name(UploadRow row) {
+        if (row.member()) {
+            return vault.decryptText(memberName(row.id(), row.ownerId()), row.name());
+        }
         return reading(() -> materials.findVersion(row.versionId())
                 .flatMap(version -> materials.findMaterial(version.materialId())))
                 .map(material -> vault.decryptText(new Binding(MATERIAL, FIELD_NAME, material.id(), material.ownerId()),
                         material.name()))
                 .orElseThrow(UploadProblems::notFound);
+    }
+
+    /** The vault binding of a member's name (Story 1.21): the upload row's own. */
+    static Binding memberName(UUID uploadId, UUID owner) {
+        return new Binding(UploadRow.ENTITY, UploadRow.FIELD_NAME, uploadId, owner);
     }
 
     // --- the whole file ---
@@ -380,12 +478,12 @@ public class Uploads {
 
     // --- rows, leases and transactions ---
 
-    /** The owner's upload that a request may use: open and unexpired, or complete. */
+    /** The owner's upload that a request may use: open and unexpired, or complete; never a failed member. */
     private UploadRow usable(UUID id) {
         UUID owner = OwnerContext.require();
         UploadRow row = uploads.joined().find(id)
                 .filter(found -> found.ownerId().equals(owner))
-                .filter(found -> !UploadRow.REMOVING.equals(found.state()))
+                .filter(found -> !UploadRow.REMOVING.equals(found.state()) && !UploadRow.FAILED.equals(found.state()))
                 .orElseThrow(UploadProblems::notFound);
         if (UploadRow.OPEN.equals(row.state()) && !now().isBefore(row.expiresAt())) {
             throw UploadProblems.expired();
@@ -448,7 +546,7 @@ public class Uploads {
         }
     }
 
-    private <T> T inTransaction(Supplier<T> work) {
+    <T> T inTransaction(Supplier<T> work) {
         return new TransactionTemplate(transactions.getObject()).execute(status -> work.get());
     }
 
@@ -458,7 +556,7 @@ public class Uploads {
         return template.execute(status -> read.get());
     }
 
-    private Instant now() {
+    Instant now() {
         return clock.getIfAvailable(Clock::systemUTC).instant().truncatedTo(ChronoUnit.MICROS);
     }
 
@@ -467,7 +565,7 @@ public class Uploads {
      * reads like an unknown one). The check comes before the transaction; the database's owner-scoped keys still hold
      * should the item go meanwhile.
      */
-    private Checked checked(Details details) {
+    Checked checked(Details details) {
         if (details.kind() != null && !KINDS.contains(details.kind())) {
             throw UploadProblems.metadataInvalid();
         }

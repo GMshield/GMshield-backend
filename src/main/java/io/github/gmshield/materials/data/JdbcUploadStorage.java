@@ -78,7 +78,10 @@ class JdbcUploadStorage implements UploadStorage {
     static final class Sql implements UploadStore {
 
         private static final String COLUMNS = "select id, owner_id, version_id, length, upload_offset, piece_count, format,"
-                + " expires_at, busy_token, busy_until, state, created_at, updated_at from upload ";
+                + " expires_at, busy_token, busy_until, state, created_at, updated_at, position, name, failure_code"
+                + " from upload ";
+        /** A set's members in order; an upload outside a set first. */
+        private static final String IN_ORDER = " order by position nulls first, created_at, id";
         /** A lease nobody holds, or one that lapsed. */
         private static final String LEASE_FREE = " (busy_until is null or busy_until <= :now) ";
 
@@ -91,9 +94,9 @@ class JdbcUploadStorage implements UploadStorage {
         @Override
         public void insert(UploadRow row) {
             jdbc.get().sql("insert into upload (id, owner_id, version_id, length, upload_offset, piece_count, format,"
-                            + " expires_at, busy_token, busy_until, state, created_at, updated_at) values (:id, :owner,"
-                            + " :version, :length, :offset, :pieces, :format, :expiresAt, :token, :until, :state,"
-                            + " :createdAt, :updatedAt)")
+                            + " expires_at, busy_token, busy_until, state, created_at, updated_at, position, name,"
+                            + " failure_code) values (:id, :owner, :version, :length, :offset, :pieces, :format,"
+                            + " :expiresAt, :token, :until, :state, :createdAt, :updatedAt, :position, :name, :failure)")
                     .param("id", row.id())
                     .param("owner", row.ownerId())
                     .param("version", row.versionId())
@@ -107,6 +110,9 @@ class JdbcUploadStorage implements UploadStorage {
                     .param("state", row.state())
                     .param("createdAt", time(row.createdAt()))
                     .param("updatedAt", time(row.updatedAt()))
+                    .param("position", row.position(), Types.INTEGER)
+                    .param("name", row.name(), Types.BINARY)
+                    .param("failure", row.failureCode(), Types.VARCHAR)
                     .update();
         }
 
@@ -188,7 +194,7 @@ class JdbcUploadStorage implements UploadStorage {
         @Override
         public Optional<UploadRow> completeForVersion(UUID owner, UUID versionId) {
             return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version and state = 'complete'"
-                            + " order by created_at, id limit 1")
+                            + IN_ORDER + " limit 1")
                     .param("owner", owner).param("version", versionId).query(Sql::row).optional();
         }
 
@@ -223,12 +229,87 @@ class JdbcUploadStorage implements UploadStorage {
                     .param("limit", limit).query(Sql::row).list();
         }
 
+        // --- image sets (Story 1.21)
+
+        @Override
+        public List<UploadRow> ofVersion(UUID owner, UUID versionId) {
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version and state <> 'removing'"
+                            + IN_ORDER)
+                    .param("owner", owner).param("version", versionId).query(Sql::row).list();
+        }
+
+        @Override
+        public List<UploadRow> membersOf(UUID owner, Collection<UUID> versionIds) {
+            if (versionIds.isEmpty()) {
+                return List.of();
+            }
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id in (:versions)"
+                            + " and position is not null and state in ('open', 'complete', 'failed')"
+                            + " order by version_id, position, created_at, id")
+                    .param("owner", owner).param("versions", List.copyOf(versionIds)).query(Sql::row).list();
+        }
+
+        @Override
+        public List<UploadRow> completeOfVersion(UUID owner, UUID versionId) {
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version and state = 'complete'"
+                            + IN_ORDER)
+                    .param("owner", owner).param("version", versionId).query(Sql::row).list();
+        }
+
+        @Override
+        public boolean failHeld(UUID id, UUID token, String code, Instant now) {
+            return jdbc.get().sql("update upload set state = 'failed', failure_code = :code, busy_token = null,"
+                            + " busy_until = null, updated_at = :now where id = :id and busy_token = :token"
+                            + " and state = 'open'")
+                    .param("code", code).param("now", time(now)).param("id", id).param("token", token)
+                    .update() == 1;
+        }
+
+        @Override
+        public boolean failExpired(UUID id, String code, Instant now) {
+            return jdbc.get().sql("update upload set state = 'failed', failure_code = :code, busy_token = null,"
+                            + " busy_until = null, updated_at = :now where id = :id and state = 'open'"
+                            + " and position is not null and expires_at <= :now and" + LEASE_FREE)
+                    .param("code", code).param("now", time(now)).param("id", id)
+                    .update() == 1;
+        }
+
+        @Override
+        public boolean removeFailed(UUID id, Instant now) {
+            return jdbc.get().sql("update upload set state = 'removing', updated_at = :now where id = :id"
+                            + " and state = 'failed'")
+                    .param("now", time(now)).param("id", id)
+                    .update() == 1;
+        }
+
+        @Override
+        public int closeGap(UUID owner, UUID versionId, int position, Instant now) {
+            return jdbc.get().sql("update upload set position = position - 1, updated_at = :now where owner_id = :owner"
+                            + " and version_id = :version and position > :position and state <> 'removing'")
+                    .param("now", time(now)).param("owner", owner).param("version", versionId)
+                    .param("position", position)
+                    .update();
+        }
+
+        @Override
+        public List<UploadRow> abandonedSets(Instant now, int limit) {
+            return jdbc.get().sql(COLUMNS + "where id in (select distinct on (failed.owner_id, failed.version_id)"
+                            + " failed.id from upload failed where failed.state = 'failed' and failed.position is not null"
+                            + " and not exists (select 1 from upload other where other.owner_id = failed.owner_id"
+                            + " and other.version_id = failed.version_id and (other.state in ('open', 'complete')"
+                            + " or (other.state = 'failed' and other.expires_at > :now)))"
+                            + " order by failed.owner_id, failed.version_id, failed.id)"
+                            + " order by expires_at, id limit :limit")
+                    .param("now", time(now)).param("limit", limit).query(Sql::row).list();
+        }
+
         private static UploadRow row(ResultSet rs, int n) throws SQLException {
             return new UploadRow(rs.getObject("id", UUID.class), rs.getObject("owner_id", UUID.class),
                     rs.getObject("version_id", UUID.class), rs.getLong("length"), rs.getLong("upload_offset"),
                     rs.getInt("piece_count"), rs.getString("format"), instant(rs, "expires_at"),
                     rs.getObject("busy_token", UUID.class), instant(rs, "busy_until"), rs.getString("state"),
-                    instant(rs, "created_at"), instant(rs, "updated_at"));
+                    instant(rs, "created_at"), instant(rs, "updated_at"), rs.getObject("position", Integer.class),
+                    rs.getBytes("name"), rs.getString("failure_code"));
         }
 
         private static Instant instant(ResultSet rs, String column) throws SQLException {

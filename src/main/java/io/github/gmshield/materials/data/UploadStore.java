@@ -47,7 +47,10 @@ public interface UploadStore {
     /** An open upload past its expiry, with no live lease, becomes {@code removing}. */
     boolean removeExpired(UUID id, Instant now);
 
-    /** The complete upload of {@code owner} for this version (Story 1.15: the raw file ingestion starts from). */
+    /**
+     * The complete upload of {@code owner} for this version (Story 1.15: the raw file ingestion starts from); from Story
+     * 1.21, the first of a set's complete members.
+     */
     Optional<UploadRow> completeForVersion(UUID owner, UUID versionId);
 
     /**
@@ -67,4 +70,39 @@ public interface UploadStore {
 
     /** Uploads whose removal has started and not finished. */
     List<UploadRow> removing(int limit);
+
+    // --- image sets (Story 1.21)
+
+    /** The uploads of {@code owner}'s version that are not being removed: members by position. */
+    List<UploadRow> ofVersion(UUID owner, UUID versionId);
+
+    /** The members (open, complete or failed) of the sets of {@code owner}'s versions, by version and position. */
+    List<UploadRow> membersOf(UUID owner, Collection<UUID> versionIds);
+
+    /**
+     * Every complete upload of {@code owner}'s version, in order: a set's members by position, else the one raw
+     * upload.
+     */
+    List<UploadRow> completeOfVersion(UUID owner, UUID versionId);
+
+    /**
+     * A held open upload becomes {@code failed} with {@code code} (its whole-file check or its format failed), and the
+     * lease is given back; only while the lease is the request's.
+     */
+    boolean failHeld(UUID id, UUID token, String code, Instant now);
+
+    /** An open member past its expiry, with no live lease, becomes {@code failed} with {@code code}. */
+    boolean failExpired(UUID id, String code, Instant now);
+
+    /** A failed member becomes {@code removing} (replaced, dropped, or its set discarded). */
+    boolean removeFailed(UUID id, Instant now);
+
+    /** The members of {@code owner}'s version after {@code position} move up by one place; answers how many. */
+    int closeGap(UUID owner, UUID versionId, int position, Instant now);
+
+    /**
+     * One failed member of each set whose members are all failed, the last of them past its expiry: sets nobody can
+     * finish any more, oldest expiry first.
+     */
+    List<UploadRow> abandonedSets(Instant now, int limit);
 }

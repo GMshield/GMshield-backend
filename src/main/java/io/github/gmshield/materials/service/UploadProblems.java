@@ -24,6 +24,18 @@ public final class UploadProblems {
             ApiProblem.of(422, CATEGORY, "file_checksum_mismatch", "File checksum mismatch");
     static final ApiProblem EXPIRED = ApiProblem.of(410, CATEGORY, "expired", "Upload expired");
     static final ApiProblem METADATA_INVALID = ApiProblem.of(400, CATEGORY, "metadata_invalid", "Upload metadata invalid");
+    /** Story 1.21: an image set past 500 images or 2 GiB in all. */
+    static final ApiProblem SET_TOO_LARGE = ApiProblem.of(413, CATEGORY, "set_too_large", "Image set too large")
+            .withParams(Map.of("maxImages", Uploads.MAX_IMAGES, "maxBytes", Uploads.MAX_LENGTH));
+    /** Story 1.21: a member of an image set must be an image. */
+    static final ApiProblem IMAGE_FORMAT_REFUSED = ApiProblem.of(415, CATEGORY, "format_refused", "Format not accepted")
+            .withParams(Map.of("accepted", Format.IMAGE_CODES));
+    /** Story 1.21: only a failed image of a set is replaced or left out. */
+    static final ApiProblem IMAGE_NOT_FAILED = ApiProblem.of(409, CATEGORY, "image_not_failed", "Image not failed");
+    /** The reasons a member of an image set failed, as its row records them (Story 1.21). */
+    public static final String EXPIRED_CODE = "upload.expired";
+    public static final String FORMAT_REFUSED_CODE = "upload.format_refused";
+    public static final String FILE_CHECKSUM_MISMATCH_CODE = "upload.file_checksum_mismatch";
 
     private UploadProblems() {
     }
@@ -58,6 +70,18 @@ public final class UploadProblems {
 
     static ApiException expired() {
         return new ApiException(EXPIRED);
+    }
+
+    static ApiException setTooLarge() {
+        return new ApiException(SET_TOO_LARGE);
+    }
+
+    static ApiException imageFormatRefused() {
+        return new ApiException(IMAGE_FORMAT_REFUSED);
+    }
+
+    static ApiException imageNotFailed() {
+        return new ApiException(IMAGE_NOT_FAILED);
     }
 
     public static ApiException metadataInvalid() {
