@@ -14,7 +14,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * The JDK primitives the vault uses, and nothing else: AES-256-GCM with a random 96-bit nonce,
- * HMAC-SHA256, and HKDF-SHA256 (RFC 5869) for subkeys. A failed check returns null; callers turn
+ * HMAC-SHA256, SHA-256, and HKDF-SHA256 (RFC 5869) for subkeys. A failed check returns null; callers turn
  * it into one {@link IntegrityException}.
  */
 final class VaultCrypto {
@@ -48,13 +48,25 @@ final class VaultCrypto {
 
     /** nonce ‖ ciphertext ‖ tag, under a new random nonce. */
     static byte[] seal(SecretKey key, byte[] aad, byte[] plaintext) {
+        return seal(key, aad, new byte[0], plaintext);
+    }
+
+    /**
+     * prefix ‖ nonce ‖ ciphertext ‖ tag, under a new random nonce, written into one array: a file piece of 4 MiB costs
+     * one allocation of its size, not three.
+     */
+    static byte[] seal(SecretKey key, byte[] aad, byte[] prefix, byte[] plaintext) {
         byte[] nonce = randomBytes(NONCE_BYTES);
         try {
             Cipher cipher = Cipher.getInstance(AES_GCM);
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(TAG_BYTES * 8, nonce));
             cipher.updateAAD(aad);
-            byte[] sealed = cipher.doFinal(plaintext);
-            return ByteBuffer.allocate(NONCE_BYTES + sealed.length).put(nonce).put(sealed).array();
+            byte[] sealed = new byte[prefix.length + NONCE_BYTES + cipher.getOutputSize(plaintext.length)];
+            System.arraycopy(prefix, 0, sealed, 0, prefix.length);
+            System.arraycopy(nonce, 0, sealed, prefix.length, NONCE_BYTES);
+            int written = cipher.doFinal(plaintext, 0, plaintext.length, sealed, prefix.length + NONCE_BYTES);
+            int length = prefix.length + NONCE_BYTES + written;
+            return length == sealed.length ? sealed : java.util.Arrays.copyOf(sealed, length);
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("AES-GCM is not available", e);
         }
@@ -84,6 +96,19 @@ final class VaultCrypto {
             return mac.doFinal(message);
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("HMAC-SHA256 is not available", e);
+        }
+    }
+
+    static byte[] sha256(byte[] message) {
+        return newSha256().digest(message);
+    }
+
+    /** A new SHA-256 digest, for content hashed as it streams ({@link Sha256}). */
+    static java.security.MessageDigest newSha256() {
+        try {
+            return java.security.MessageDigest.getInstance("SHA-256");
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("SHA-256 is not available", e);
         }
     }
 

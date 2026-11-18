@@ -29,7 +29,7 @@ data (database, Redis file, Qdrant storage).
 
 | Service | Address on the workstation | Throwaway credential |
 |---|---|---|
-| Backend | http://127.0.0.1:8080 (`/actuator/health`, `/api/v1/version`) | none yet |
+| Backend | http://127.0.0.1:8080 (`/actuator/health`; `/api/v1/*` only with `Authorization: Bearer gmshield-dev-frontend-credential-throwaway`) | the frontend's service credential, same value |
 | PostgreSQL | 127.0.0.1:5432, database `gmshield` | user `gmshield`, password `gmshield-dev` |
 | Redis | 127.0.0.1:6379 | password `gmshield-dev` |
 | Qdrant | http://127.0.0.1:6333 | API key `gmshield-dev` |
@@ -40,6 +40,8 @@ Every port is bound to 127.0.0.1: nothing is reachable from another machine. The
 for development on this machine only. A port that is taken can be moved for one start, for example
 `GMSHIELD_DEV_BACKEND_PORT=18080 dev/start` (also `GMSHIELD_DEV_POSTGRES_PORT`,
 `GMSHIELD_DEV_REDIS_PORT`, `GMSHIELD_DEV_QDRANT_PORT`, `GMSHIELD_DEV_FRONTEND_PORT`).
+To keep overrides, and the real Google client and model key, without exporting them in the shell,
+copy [`.env.example`](.env.example) to `dev/.env` (git-ignored): Docker Compose reads it on every start.
 
 The backend, the frontend and the worker run here as they do in production: outside test mode,
 with their settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with
@@ -49,7 +51,24 @@ The worker refuses to start without `GMSHIELD_ANTHROPIC_API_KEY`. `compose.yaml`
 of that variable from the shell that runs `dev/start`, or the placeholder `not-a-real-key` when it
 is unset. Nothing calls the model yet, so the placeholder is enough; to try a real key for one
 start, `GMSHIELD_ANTHROPIC_API_KEY=... dev/start` (never write it into a file of this repository).
-The worker does not use Redis yet: Story 1.12 adds its Redis account and service credential.
+The backend refuses to start without a Google OAuth client. `compose.yaml` passes
+`GMSHIELD_GOOGLE_CLIENT_ID` and `GMSHIELD_GOOGLE_CLIENT_SECRET` from the shell that runs `dev/start`,
+or placeholders: the backend then starts, and Google refuses a sign-in. To sign in for real, create a
+Google OAuth client whose redirect URI is `http://localhost:3000/auth/google/callback` (or the port
+in `GMSHIELD_DEV_FRONTEND_PORT`) and pass both for one start, never writing them into a file of this
+repository. `GMSHIELD_PUBLIC_URL` is set to that frontend address.
+
+The backend answers `/api/v1/*` only with the frontend's service credential (Story 1.10):
+`compose.yaml` gives the backend and the frontend the same throwaway value. To call the backend by
+hand, `curl -H 'Authorization: Bearer gmshield-dev-frontend-credential-throwaway' http://127.0.0.1:8080/api/v1/version`.
+The session timings default to 15 minutes before renewal, 60 seconds of overlap, 24 hours idle and
+7 days in total; to watch a rotation, shorten them for one start, for example
+`GMSHIELD_SESSION_RENEW_AFTER=20s GMSHIELD_SESSION_OVERLAP=5s GMSHIELD_SESSION_IDLE_TIMEOUT=2m dev/start`.
+
+The worker reads the work streams in Redis (Story 1.12) as the `default` account with the same
+throwaway password, without TLS, and calls `/internal/v1` with the worker's credential:
+`compose.yaml` gives the backend and the worker the same throwaway value. To call the internal API by
+hand, `curl -H 'Authorization: Bearer gmshield-dev-worker-credential-throwaway' http://127.0.0.1:8080/internal/v1/version`.
 
 ## It never runs on its own
 

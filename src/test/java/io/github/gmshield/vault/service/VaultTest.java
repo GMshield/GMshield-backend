@@ -222,4 +222,58 @@ class VaultTest {
         assertThatThrownBy(() -> new Binding("e", "f", null, owner)).isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> new Binding("e", "f", row, null)).isInstanceOf(NullPointerException.class);
     }
+
+    @Test
+    void sealVerifiesOnlyTheSameRowAndValues() {
+        byte[] seal = vault.seal("account", row, "ordinary", "active", "true", "1");
+
+        vault.verifySeal("account", row, seal, "ordinary", "active", "true", "1");
+        assertThat(vault.seal("account", row, "ordinary", "active", "true", "1")).isEqualTo(seal).hasSize(32);
+        for (Runnable tampered : List.<Runnable>of(
+                () -> vault.verifySeal("account", row, seal, "privileged", "active", "true", "1"),
+                () -> vault.verifySeal("account", row, seal, "ordinary", "active", "true", "2"),
+                () -> vault.verifySeal("account", row, seal, "ordinary", "active", "true"),
+                () -> vault.verifySeal("account", row, seal, "ordinaryactive", "", "true", "1"),
+                () -> vault.verifySeal("account", Ids.newId(), seal, "ordinary", "active", "true", "1"),
+                () -> vault.verifySeal("other", row, seal, "ordinary", "active", "true", "1"),
+                () -> vault.verifySeal("account", row, Arrays.copyOf(seal, 31), "ordinary", "active", "true", "1"),
+                () -> vault.verifySeal("account", row, null, "ordinary", "active", "true", "1"))) {
+            assertThatThrownBy(tampered::run).isInstanceOf(IntegrityException.class).hasMessage("integrity.failed");
+        }
+        byte[] flipped = seal.clone();
+        flipped[0] ^= 1;
+        assertThatThrownBy(() -> vault.verifySeal("account", row, flipped, "ordinary", "active", "true", "1"))
+                .isInstanceOf(IntegrityException.class);
+    }
+
+    @Test
+    void sealDependsOnTheIndexKeyAndDiffersFromAFingerprintAndATokenHash() {
+        Vault other = VaultFixtures.vault(new InMemoryDataKeyStore(), VaultFixtures.keys());
+        byte[] seal = vault.seal("account", row, "ordinary");
+
+        assertThat(other.seal("account", row, "ordinary")).isNotEqualTo(seal);
+        assertThat(seal).isNotEqualTo(vault.fingerprint("account", "seal", "ordinary"))
+                .isNotEqualTo(vault.tokenHash("account", "ordinary"));
+    }
+
+    @Test
+    void failedSealLogsTheEntityAndRowOnly() {
+        byte[] seal = vault.seal("account", row, SECRET_TEXT);
+
+        assertThatThrownBy(() -> vault.verifySeal("account", row, seal, SECRET_TEXT + "."))
+                .isInstanceOf(IntegrityException.class);
+
+        JsonLineLogFormatter formatter = new JsonLineLogFormatter();
+        String lines = String.join("", logged.list.stream().map(formatter::format).toList());
+        assertThat(lines).contains("vault.seal_failed", row.toString(), "\"entity\":\"account\"")
+                .doesNotContain(SECRET_TEXT)
+                .doesNotContain(HexFormat.of().formatHex(seal));
+    }
+
+    @Test
+    void pkceChallengeIsTheRfc7636Example() {
+        // RFC 7636, appendix B.
+        assertThat(vault.pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
+                .isEqualTo("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
 }

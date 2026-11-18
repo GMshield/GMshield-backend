@@ -46,6 +46,23 @@ public final class TraceContext {
         return Optional.of(traceId);
     }
 
+    /**
+     * A {@code traceparent} header value for an outgoing message of this trace (version 00, sampled): the trace id
+     * and a new span id. The worker sends it back, so its calls about a job log under the job's trace id.
+     */
+    public static String traceparent(String traceId) {
+        if (traceId == null || !traceId.matches("[0-9a-f]{32}") || traceId.equals(NONE)) {
+            throw new IllegalArgumentException("not a trace id");
+        }
+        byte[] span = new byte[8];
+        String spanId;
+        do {
+            RANDOM.nextBytes(span);
+            spanId = HexFormat.of().formatHex(span);
+        } while (spanId.equals(NO_PARENT));
+        return "00-" + traceId + "-" + spanId + "-01";
+    }
+
     public static String newTraceId() {
         byte[] bytes = new byte[16];
         String traceId;

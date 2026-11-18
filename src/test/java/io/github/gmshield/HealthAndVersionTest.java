@@ -52,7 +52,7 @@ class HealthAndVersionTest extends HttpTestSupport {
 
     @Test
     void internalVersionIsTheVersionOfTheInternalDocument() throws Exception {
-        HttpResponse<String> response = get("/internal/v1/version");
+        HttpResponse<String> response = getAsWorker("/internal/v1/version");
 
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(json(response).path("version").asString())

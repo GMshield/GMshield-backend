@@ -11,6 +11,9 @@ public interface DataKeyStore {
 
     Optional<WrappedDataKey> find(UUID ownerId, int version);
 
-    /** Stores the key unless that owner and version exist already (another request may have won). */
+    /**
+     * Stores the key unless that owner and version exist already (another request may have won). Commits in
+     * its own transaction, whatever the caller's transaction does afterwards.
+     */
     void insertIfAbsent(WrappedDataKey key);
 }

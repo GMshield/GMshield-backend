@@ -32,4 +32,24 @@ class TestModeSettingsTest {
         assertThat(environment.getProperty("spring.data.redis.username")).isEmpty();
         assertThat(environment.getProperty("spring.data.redis.ssl.enabled")).isEqualTo("false");
     }
+
+    @Test
+    void testModesServiceCredentialIsTheFixedOneTheFrontendKnows() throws Exception {
+        org.springframework.beans.factory.config.YamlPropertiesFactoryBean yaml =
+                new org.springframework.beans.factory.config.YamlPropertiesFactoryBean();
+        yaml.setResources(new org.springframework.core.io.ClassPathResource("application-test-mode.yaml"));
+
+        assertThat(yaml.getObject().getProperty("gmshield.frontend-credential"))
+                .isEqualTo(io.github.gmshield.shared.service.StartupSettings.TEST_MODE_FRONTEND_CREDENTIAL)
+                .isEqualTo("gmshield-test-mode-frontend-credential-not-a-secret");
+        assertThat(environment.getProperty("gmshield.frontend-credential"))
+                .isEqualTo(io.github.gmshield.shared.service.StartupSettings.TEST_MODE_FRONTEND_CREDENTIAL);
+    }
+
+    @Test
+    void sessionTimingsAreTheDefaultsOfStartupSettings(
+            @Autowired io.github.gmshield.shared.service.StartupSettings.SessionTimings timings) {
+        assertThat(timings).isEqualTo(io.github.gmshield.shared.service.StartupSettings.sessionTimings(java.util.Map.of())
+                .orElseThrow());
+    }
 }

@@ -2,7 +2,11 @@ package io.github.gmshield.vault.service;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.SecretKey;
 import org.slf4j.Logger;
@@ -18,7 +22,9 @@ import org.springframework.stereotype.Service;
  * unknown version fails with one {@link IntegrityException}.
  *
  * <p>Exact lookups use keyed fingerprints and tokens are stored as keyed hashes: HMAC-SHA256 under
- * subkeys derived by HKDF from the index key, separated by purpose and by entity and field.
+ * subkeys derived by HKDF from the index key, separated by purpose and by entity and field. Fields that
+ * grant power are sealed (AD-20): an HMAC-SHA256 over the row id and the sealed values, under a subkey of
+ * the entity, checked on every load.
  */
 @Service
 public class Vault {
@@ -40,7 +46,7 @@ public class Vault {
     public byte[] encrypt(Binding binding, byte[] plaintext) {
         DataKeys.Current key = dataKeys.current(binding.ownerId());
         byte[] header = ByteBuffer.allocate(HEADER_BYTES).put(FORMAT).putInt(key.version()).array();
-        return VaultCrypto.concat(header, VaultCrypto.seal(key.key(), aad(binding, header), plaintext));
+        return VaultCrypto.seal(key.key(), aad(binding, header), header, plaintext);
     }
 
     public byte[] encryptText(Binding binding, String plaintext) {
@@ -86,6 +92,52 @@ public class Vault {
     /** The keyed hash under which a token (a session, a grant) is stored; never equal to a fingerprint. */
     public byte[] tokenHash(String purpose, String token) {
         return VaultCrypto.hmac(subkey("token", purpose), token.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * The seal of a row (AD-20): a keyed signature over the entity, the row id and the sealed values, in
+     * order. A change to any of them, or the seal moved to another row, fails {@link #verifySeal}.
+     */
+    public byte[] seal(String entity, UUID rowId, String... values) {
+        return VaultCrypto.hmac(subkey("seal", entity), sealed(entity, rowId, values));
+    }
+
+    /**
+     * Checks a row's seal against its values, in constant time. A mismatch logs the entity and the row id
+     * (never a value) and throws {@link IntegrityException}: a failed seal grants nothing.
+     */
+    public void verifySeal(String entity, UUID rowId, byte[] seal, String... values) {
+        byte[] expected = seal(entity, rowId, values);
+        if (seal == null || !MessageDigest.isEqual(expected, seal)) {
+            log.atWarn().addKeyValue("entity", entity).addKeyValue("rowId", rowId).log("vault.seal_failed");
+            throw new IntegrityException();
+        }
+    }
+
+    /** The PKCE code challenge of a verifier (RFC 7636, method S256): Base64url of its SHA-256, unpadded. */
+    public String pkceChallenge(String verifier) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                VaultCrypto.sha256(verifier.getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    /**
+     * An incremental SHA-256 of content that streams through in parts (Story 1.13: a tus part and a whole upload),
+     * never held whole. The digest is the content's, unkeyed: it is compared with a checksum the browser sent, and
+     * is never stored or logged.
+     */
+    public Sha256 sha256() {
+        return new Sha256(VaultCrypto.newSha256());
+    }
+
+    private static byte[] sealed(String entity, UUID rowId, String... values) {
+        Objects.requireNonNull(rowId, "rowId");
+        String[] parts = new String[values.length + 2];
+        parts[0] = "gmshield/vault/seal/v1";
+        parts[1] = rowId.toString();
+        for (int i = 0; i < values.length; i++) {
+            parts[i + 2] = Objects.requireNonNull(values[i], "a sealed value");
+        }
+        return VaultCrypto.lengthPrefixed(parts);
     }
 
     private SecretKey subkey(String... domain) {
