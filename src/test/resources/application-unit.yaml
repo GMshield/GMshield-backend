@@ -15,3 +15,22 @@ gmshield:
     index-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
   files:
     dir: ${java.io.tmpdir}/gmshield-unit-files
+  # A Google client that exists nowhere: outside test mode the unit tests never reach Google.
+  google:
+    client-id: unit-client.apps.example
+    client-secret: unit-client-secret
+  public-url: http://localhost:3000
+  # The service credential the Spring tests send (HttpTestSupport), the same as test mode's.
+  frontend-credential: gmshield-test-mode-frontend-credential-not-a-secret
+  # The worker's credential the Spring tests send (HttpTestSupport), the same as test mode's.
+  worker-credential: gmshield-test-mode-worker-credential-not-a-secret
+  # No Redis or Postgres here: the job sweep never runs on its own; the tests call it.
+  jobs:
+    sweep:
+      enabled: false
+  # Nor does the upload sweep (Story 1.13), nor the version removal sweep (Story 1.20): the tests call them.
+  materials:
+    upload-sweep:
+      enabled: false
+    version-removal-sweep:
+      enabled: false

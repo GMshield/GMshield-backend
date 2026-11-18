@@ -3,7 +3,10 @@ package io.github.gmshield.shared.service;
 import java.security.SecureRandom;
 import java.util.UUID;
 
-/** Every id the backend mints: a UUID version 7 (time-ordered, 74 random bits, RFC 9562). */
+/**
+ * Every id the backend mints: a UUID version 7 (RFC 9562), a millisecond timestamp followed by 74 random
+ * bits. Ids sort by the millisecond they were made in; ids made in the same millisecond sort randomly.
+ */
 public final class Ids {
 
     private static final SecureRandom RANDOM = new SecureRandom();

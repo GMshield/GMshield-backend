@@ -12,6 +12,11 @@ public record ApiProblem(int status, String category, String reason, String titl
 
     public static final String CATEGORY_REQUEST = "request";
     public static final String CATEGORY_SERVER = "server";
+    /**
+     * A request attribute a filter sets before {@code sendError}, so that the error answer names this problem
+     * rather than one guessed from the status (read by {@code shared.web}).
+     */
+    public static final String REQUEST_ATTRIBUTE = "io.github.gmshield.shared.web.ProblemResponses.problem";
 
     public ApiProblem {
         Objects.requireNonNull(category, "category");

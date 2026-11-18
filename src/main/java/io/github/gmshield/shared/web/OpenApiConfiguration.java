@@ -6,13 +6,18 @@ import io.swagger.v3.oas.models.OpenAPI;
 import io.swagger.v3.oas.models.info.Info;
 import io.swagger.v3.oas.models.media.Content;
 import io.swagger.v3.oas.models.media.IntegerSchema;
+import io.swagger.v3.oas.models.media.JsonSchema;
 import io.swagger.v3.oas.models.media.MediaType;
 import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.media.StringSchema;
 import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.security.SecurityRequirement;
+import io.swagger.v3.oas.models.security.SecurityScheme;
 import io.swagger.v3.oas.models.servers.Server;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.springdoc.core.customizers.OpenApiCustomizer;
 import org.springdoc.core.models.GroupedOpenApi;
 import org.springframework.context.annotation.Bean;
@@ -36,24 +41,60 @@ public class OpenApiConfiguration {
 
     @Bean
     GroupedOpenApi publicApi() {
-        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API);
+        return group("public", "/api/v1/**", "GMshield public API", ContractVersions.PUBLIC_API, SERVICE_CREDENTIAL,
+                "The frontend's service credential (GMSHIELD_FRONTEND_CREDENTIAL); without it every"
+                        + " path answers service.unauthenticated (401)");
     }
 
     @Bean
     GroupedOpenApi internalApi() {
-        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API);
+        return group("internal", "/internal/v1/**", "GMshield internal API", ContractVersions.INTERNAL_API,
+                WORKER_CREDENTIAL, "The worker's credential (GMSHIELD_WORKER_CREDENTIAL); without it every path"
+                        + " answers service.unauthenticated (401)");
     }
 
-    private static GroupedOpenApi group(String name, String paths, String title, String version) {
+    /** The frontend's service credential (Story 1.10), required on every public operation. */
+    static final String SERVICE_CREDENTIAL = "serviceCredential";
+    /** The worker's credential (Story 1.12), required on every internal operation. */
+    static final String WORKER_CREDENTIAL = "workerCredential";
+
+    private static GroupedOpenApi group(String name, String paths, String title, String version, String credential,
+                                        String credentialDescription) {
         OpenApiCustomizer contract = api -> {
             api.info(new Info().title(title).version(version));
             api.schema(PROBLEM_SCHEMA, problemSchema());
+            nullableReferences(api);
+            api.getComponents().addSecuritySchemes(credential, new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP).scheme("bearer").description(credentialDescription));
+            api.security(List.of(new SecurityRequirement().addList(credential)));
             if (api.getPaths() != null) {
                 api.getPaths().values().forEach(path -> path.readOperations().forEach(operation ->
                         operation.getResponses().addApiResponse("default", problemResponse())));
             }
         };
         return GroupedOpenApi.builder().group(name).pathsToMatch(paths).addOpenApiCustomizer(contract).build();
+    }
+
+    /**
+     * A property that is a reference to another schema or null (Story 1.19: a page's picture) is written by the
+     * annotations as {@code $ref} beside the type null, which code generators read as never null: it becomes
+     * {@code anyOf} the reference and null, with its description.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void nullableReferences(OpenAPI api) {
+        if (api.getComponents() == null || api.getComponents().getSchemas() == null) {
+            return;
+        }
+        for (Schema schema : api.getComponents().getSchemas().values()) {
+            Map<String, Schema> properties = schema.getProperties();
+            if (properties == null) {
+                continue;
+            }
+            properties.replaceAll((name, property) -> property.get$ref() == null || property.getTypes() == null
+                    || !property.getTypes().contains("null") ? property
+                    : new JsonSchema().anyOf(List.of(new JsonSchema().$ref(property.get$ref()),
+                            new JsonSchema().types(Set.of("null")))).description(property.getDescription()));
+        }
     }
 
     private static Schema<Object> problemSchema() {
