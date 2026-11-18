@@ -1,6 +1,8 @@
 package io.github.gmshield.jobs.service;
 
+import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import tools.jackson.databind.JsonNode;
 
 /**
@@ -30,6 +32,16 @@ public interface JobHandler {
      */
     default Optional<JobInput> openInput(JobRef job, String name) {
         return Optional.empty();
+    }
+
+    /**
+     * The passages with these ids (1 to 100, none null), for the job's live claim (Story 2.2), served to the worker by
+     * {@code POST .../passages}: the handler checks every id against what its job may read before anything is
+     * decrypted, and answers them in the order asked, each once. Runs as the owner, in a read transaction of its own. A
+     * kind whose jobs read no passage keeps this default: {@code job.passages_refused} (403).
+     */
+    default List<JobPassage> passages(JobRef job, List<UUID> ids) {
+        throw JobProblems.passagesRefused();
     }
 
     /**

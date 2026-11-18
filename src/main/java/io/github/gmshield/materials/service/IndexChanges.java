@@ -19,10 +19,12 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -105,7 +107,22 @@ public class IndexChanges implements JobHandler {
 
     /** Whether an index change of the owner's version has not ended. */
     boolean pending(UUID versionId) {
-        return !jobs.unended(jobIds(index.changes(versionId))).isEmpty();
+        return !unended(index, jobs::unended, versionId).isEmpty();
+    }
+
+    /**
+     * The owner's index changes of the version that have not ended, by first ordinal: the runs of passages whose index
+     * change is still pending (Story 2.2: {@link ScopeReads#pendingPassages}). {@code unendedJobs} answers which of
+     * these jobs of the owner have not ended ({@link Jobs#unended}).
+     */
+    static List<IndexChangeRow> unended(IndexStore index, Function<Collection<UUID>, Set<UUID>> unendedJobs,
+                                        UUID versionId) {
+        List<IndexChangeRow> rows = index.changes(versionId);
+        if (rows.isEmpty()) {
+            return List.of();
+        }
+        Set<UUID> open = unendedJobs.apply(jobIds(rows));
+        return rows.stream().filter(row -> open.contains(row.jobId())).toList();
     }
 
     /** Cancels the owner's unended index changes of the version, in the caller's transaction; answers how many. */

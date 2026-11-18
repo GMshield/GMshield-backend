@@ -26,4 +26,13 @@ class OwnerWork {
         return OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions.getObject())
                 .execute(status -> work.get()));
     }
+
+    /** {@link #call} in a read-only transaction (Story 2.2: a handler's passages). */
+    <T> T read(UUID owner, Supplier<T> work) {
+        return OwnerContext.callAs(owner, () -> {
+            TransactionTemplate template = new TransactionTemplate(transactions.getObject());
+            template.setReadOnly(true);
+            return template.execute(status -> work.get());
+        });
+    }
 }

@@ -619,6 +619,44 @@ public class InMemoryMaterialStore implements MaterialStore {
                 .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id)).toList();
     }
 
+    @Override
+    public List<VersionRow> readyOfCampaign(UUID campaignId) {
+        UUID owner = OwnerContext.require();
+        return readyOf(material -> material.ownerId().equals(owner) && campaignId != null
+                && campaignId.equals(material.campaignId()));
+    }
+
+    @Override
+    public List<VersionRow> readyOfSystem(UUID systemId) {
+        UUID owner = OwnerContext.require();
+        java.util.Set<UUID> attached = systems.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.systemId().equals(systemId))
+                .map(MaterialSystemRow::materialId).collect(java.util.stream.Collectors.toSet());
+        return readyOf(material -> material.ownerId().equals(owner) && attached.contains(material.id()));
+    }
+
+    private List<VersionRow> readyOf(java.util.function.Predicate<MaterialRow> material) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(row -> row.ownerId().equals(owner) && row.state().equals("ready"))
+                .filter(row -> {
+                    MaterialRow found = materials.get(row.materialId());
+                    return found != null && material.test(found);
+                })
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id)).toList();
+    }
+
+    @Override
+    public List<UUID> passageIds(UUID versionId, int first, int last) {
+        return passages(versionId, first, last).stream().map(PassageRow::id).toList();
+    }
+
+    @Override
+    public List<PassageRow> findPassages(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        return ids.stream().distinct().map(passages::get)
+                .filter(row -> row != null && row.ownerId().equals(owner)).toList();
+    }
+
     /** The owners of every {@code ready} version whose index recipe is not {@code recipe} (Story 2.1: the reconcile). */
     public List<UUID> staleOwners(String recipe) {
         return versions.values().stream().filter(row -> row.state().equals("ready")

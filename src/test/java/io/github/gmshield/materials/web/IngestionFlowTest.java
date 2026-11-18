@@ -39,6 +39,7 @@ import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.IndexReconcile;
 import io.github.gmshield.materials.service.Materials;
+import io.github.gmshield.materials.service.TestMaterials;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import io.github.gmshield.vault.data.DataKeyStore;
@@ -1165,9 +1166,10 @@ class IngestionFlowTest {
                 .containsExactly(tuple(0, 19), tuple(1, 21), tuple(2, 21));
         assertThat(stored).allSatisfy(row -> assertThat(row.ownerId()).isEqualTo(gm.id()));
         // Only an accepted version's passages are read (Story 1.20).
-        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(stored.get(1).id()))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, stored.get(1).id()))).isEmpty();
         accept(gm, uploaded);
-        Materials.Passage vorpal = OwnerContext.callAs(gm.id(), () -> reads.passage(stored.get(1).id())).orElseThrow();
+        Materials.Passage vorpal = OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, stored.get(1).id()))
+                .orElseThrow();
         assertThat(vorpal.sectionPath()).containsExactly("Magic Items", "Vorpal Sword");
         assertThat(vorpal.page()).isEqualTo(21);
         assertThat(vorpal.text()).isEqualTo("Vorpal Sword\nA legendary blade.");
@@ -1310,7 +1312,7 @@ class IngestionFlowTest {
         assertThat(state(gm, uploaded)).isEqualTo("needs_review");
         accept(gm, uploaded);
         assertThat(passages(uploaded.versionId())).singleElement()
-                .satisfies(row -> assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
+                .satisfies(row -> assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, row.id()))
                         .orElseThrow().text()).isEqualTo(limit));
     }
 
@@ -1362,7 +1364,7 @@ class IngestionFlowTest {
         assertThat(stored).extracting(PassageRow::ordinal).containsExactly(0, 1, 2);
         assertThat(state(gm, uploaded)).isEqualTo("needs_review");
         accept(gm, uploaded);
-        assertThat(stored).extracting(row -> OwnerContext.callAs(gm.id(), () -> reads.passage(row.id()))
+        assertThat(stored).extracting(row -> OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, row.id()))
                 .orElseThrow().sectionPath()).containsOnly(List.of("B"));
         assertThat(materials.outlines.values()).filteredOn(row -> row.versionId().equals(uploaded.versionId()))
                 .hasSize(1);
@@ -1438,14 +1440,14 @@ class IngestionFlowTest {
 
         // Matrix row "Two owners": B asks for A's passage id and A's outline.
         OwnerContext.runAs(b.id(), () -> {
-            assertThat(reads.passage(theirs.id())).isEmpty();
+            assertThat(TestMaterials.passage(reads, theirs.id())).isEmpty();
             assertThat(reads.outline(uploaded.versionId())).isEmpty();
             assertThat(materials.findPassage(theirs.id())).isEmpty();
             assertThat(materials.passages(uploaded.versionId())).isEmpty();
             assertThat(materials.findOutline(uploaded.versionId())).isEmpty();
         });
         OwnerContext.runAs(a.id(), () -> {
-            assertThat(reads.passage(theirs.id())).isPresent();
+            assertThat(TestMaterials.passage(reads, theirs.id())).isPresent();
             assertThat(reads.outline(uploaded.versionId())).isPresent();
         });
         // B cannot write a passage or an outline naming A's version, nor remove A's.
@@ -1928,7 +1930,7 @@ class IngestionFlowTest {
         refused(act(gm, uploaded, "retry"), "material.action_unavailable");
         assertThat(state(gm, uploaded)).isEqualTo("needs_review");
         // Matrix row "Passage gate": a version that needs review gives no passage.
-        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, passageId))).isEmpty();
 
         // Matrix row "Accept".
         HttpResponse<String> accepted = act(gm, uploaded, "accept");
@@ -1937,7 +1939,7 @@ class IngestionFlowTest {
         assertThat(json(accepted).path("state").asString()).isEqualTo("ready");
         assertThat(json(accepted).path("actions").size()).isZero();
         assertThat(json(accepted).path("id").asString()).isEqualTo(uploaded.materialId());
-        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isPresent();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, passageId))).isPresent();
         // The report stays readable, and so do the pages.
         assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(200);
 
@@ -2180,7 +2182,7 @@ class IngestionFlowTest {
         assertNothingLeft(gm, uploaded, stored);
         assertThat(steps(uploaded.versionId())).hasSize(steps);
         // Matrix row "Passage gate": empty after discard.
-        assertThat(OwnerContext.callAs(gm.id(), () -> reads.passage(passageId))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, passageId))).isEmpty();
         assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(404);
         assertThat(pageOf(gm, uploaded, 1, "review").statusCode()).isEqualTo(404);
         for (String action : List.of("accept", "reprocess", "retry", "discard")) {
