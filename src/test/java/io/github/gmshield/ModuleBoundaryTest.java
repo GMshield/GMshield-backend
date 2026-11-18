@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.belongToAnyOf;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAnyPackage;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
 import com.tngtech.archunit.core.domain.JavaClass;
@@ -25,6 +26,8 @@ import org.springframework.modulith.core.Violations;
 /**
  * Fails the build on a module-boundary violation: a class that uses another module's {@code web}
  * or {@code data} package, or a module its own module does not allow.
+ *
+ * From Story 2.2, {@code materials.service.ScopeReads} is used only by {@code materials} and {@code scope} (AD-9).
  *
  * <p>The fixtures (source set {@code boundaryFixtures}) prove that the same verification really
  * fails on each kind of violation, and passes on a tree without one.
@@ -134,6 +137,44 @@ class ModuleBoundaryTest {
                 io.github.gmshieldfixtures.cipher.vault.service.AllowedCipher.class,
                 io.github.gmshieldfixtures.cipher.notes.service.PlainNotes.class);
         assertThatCode(() -> cryptoOnlyInVault(FIXTURES + "cipher.vault").check(allowed)).doesNotThrowAnyException();
+    }
+
+    /**
+     * AD-9 (Story 2.2): {@code scope} is the one resolver of what a campaign may use. Outside {@code materials}, only
+     * {@code scope} may depend on {@code materials.service.ScopeReads} (or a type nested in it), the one public way to
+     * read library items for a campaign; any other class that does fails the build.
+     */
+    static ArchRule scopeReadsOnlyFromMaterialsAndScope(String base) {
+        return classes().that().haveNameMatching(java.util.regex.Pattern.quote(base + ".materials.service.ScopeReads")
+                        + "(\\$.+)?")
+                .should().onlyHaveDependentClassesThat().resideInAnyPackage(base + ".materials..", base + ".scope..")
+                .because("only the scope module reads library items for a campaign (AD-9)");
+    }
+
+    @Test
+    void onlyMaterialsAndScopeUseScopeReads() {
+        JavaClasses application = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages(GmshieldApplication.class.getPackageName());
+
+        assertThat(application.contain(io.github.gmshield.materials.service.ScopeReads.class)).isTrue();
+        scopeReadsOnlyFromMaterialsAndScope(GmshieldApplication.class.getPackageName()).check(application);
+    }
+
+    @Test
+    void anotherModuleThatUsesScopeReadsFails() {
+        JavaClasses fixtures = new ClassFileImporter().importPackages(FIXTURES + "scopereads");
+
+        assertThatThrownBy(() -> scopeReadsOnlyFromMaterialsAndScope(FIXTURES + "scopereads").check(fixtures))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("DirectRead")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("ScopeUse").doesNotContain("MaterialsUse"));
+        JavaClasses allowed = new ClassFileImporter().importClasses(
+                io.github.gmshieldfixtures.scopereads.materials.service.ScopeReads.class,
+                io.github.gmshieldfixtures.scopereads.materials.service.MaterialsUse.class,
+                io.github.gmshieldfixtures.scopereads.scope.service.ScopeUse.class);
+        assertThatCode(() -> scopeReadsOnlyFromMaterialsAndScope(FIXTURES + "scopereads").check(allowed))
+                .doesNotThrowAnyException();
     }
 
     @Test

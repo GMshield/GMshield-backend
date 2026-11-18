@@ -325,9 +325,10 @@ public class Materials {
 
     /**
      * The owner's passage with this id; empty for an unknown id or another owner's, and from Story 1.20 for a passage of
-     * a version that is not {@code ready}: nothing of a version the GM has not accepted reaches a later feature.
+     * a version that is not {@code ready}: nothing of a version the GM has not accepted reaches a later feature. From
+     * Story 2.2 it is not public: another module reads passages for a campaign only through {@link ScopeReads}.
      */
-    public Optional<Passage> passage(UUID id) {
+    Optional<Passage> passage(UUID id) {
         return reading(() -> materials.findPassage(id).flatMap(row -> materials.findVersion(row.versionId())
                 .filter(version -> READY.equals(version.state()))
                 .flatMap(version -> materials.findMaterial(version.materialId()))

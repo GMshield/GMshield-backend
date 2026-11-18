@@ -11,6 +11,12 @@
  * table without an owner are two lists of ids: the removal sweep's versions whose removal is pending
  * ({@code data.PendingRemovals}) and the reconcile's owners with a version indexed under another recipe
  * ({@code data.StaleIndexes}). Another owner's item is "not found", exactly like an unknown one.
+ *
+ * <p>From Story 2.2, {@code service.ScopeReads} is the one public read of library items for a campaign: the ready
+ * versions by campaign and by system, the pending passage ids of a set of versions, and checked passage reads by id,
+ * over the owner-scoped store queries {@code readyOfCampaign}, {@code readyOfSystem}, {@code passageIds} and
+ * {@code findPassages}. It is this module's only named interface, and only the {@code scope} module may use it
+ * ({@code ModuleBoundaryTest}).
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
         allowedDependencies = {"shared :: service", "vault :: service", "jobs :: service", "library :: service"})

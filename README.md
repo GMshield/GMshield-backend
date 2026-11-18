@@ -39,13 +39,15 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Seven modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Eight modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
-files, below; it may use `shared`, `vault` and `library`) and `accounts` (sign-in with Google, accounts and
-sessions, below; it may use `shared`, `vault`, `audit` and `library`).
+files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
+use `shared`, `library` and `materials`) and `accounts` (sign-in with Google, accounts and sessions, below; it may
+use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails the build when a class outside
+`materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below), and
@@ -466,6 +468,36 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     ```
 
     Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
+- **What a campaign may use (`scope`, Story 2.2, AD-9, internal contract 1.8.0).** The one resolver: no other module
+  reads library items for a campaign.
+  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge)`, a parameter of every resolve and stored
+    nowhere (Story 2.4 freezes it with a job, Story 3.5 stores it per campaign). `ScopeSettings.STARTING` is campaign
+    and system on, other and model knowledge off; `otherTier = true` is refused (`IllegalArgumentException`) until
+    Story 3.5.
+  - `Scopes.resolve(campaignId, settings)`, as the bound owner in one read transaction, answers a `ResolvedScope`
+    (made only by `Scopes`): the campaign tier is the `ready` version of each material whose `campaign_id` is the
+    campaign; the system tier the `ready` version of each material attached through `material_system` to the
+    campaign's system (one already in the campaign tier is left out); a tier switched off has none. A source is a
+    version id, the `source` of the Qdrant payload. `pending` is the ids of the in-scope passages whose ordinal falls
+    in the run of an `index.change` job that has not ended. A campaign not found (unknown, or another owner's) is
+    404 `request.not_found`.
+  - `Scopes.passages(scope, ids)` checks every id first: any id that is not a passage of an allowed source still
+    `ready` (unknown, another owner's, a version no longer `ready`, out of every tier) refuses the whole request with
+    403 `scope.passage_refused`, which names no id, before anything is decrypted. Otherwise it answers
+    `{id, tier, text, sectionPath, page}` in the order asked, each id once.
+  - It reads the library only through `materials.service.ScopeReads` (the ready versions by campaign and by system,
+    the pending passage ids of a set of versions, checked passage reads by id; JPQL, filtered by the owner, no
+    migration). `ScopeReads` and its `Passage` are the only types of `materials`' named interface `service`, and
+    `Materials.passage(UUID)` is package-private. Lines carry ids and counts, never a text or a title.
+  - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`jobs`), with `X-Job-Grant`: body `{ids: [uuid]}`, 1
+    to 100 non-null ids. A malformed body or an id that is not a UUID is 400 `request.invalid` before anything else;
+    then the grant is checked (403 `job.grant_refused`), then the ids (400 `job.passages_invalid` for none, more than
+    100 or a null one). As the job's owner, in a read-only transaction, the job's handler answers through
+    `JobHandler.passages(JobRef, ids)`, whose default is 403 `job.passages_refused`; through `Scopes`, a job whose
+    campaign is gone is 404 `request.not_found` and any id out of the scope 403 `scope.passage_refused`. The answer
+    is `{passages: [{id, tier, text, sectionPath, page}]}` (`JobPassage`), never cached. No production job kind
+    implements `passages` yet, so every real job is refused: the story that adds the interactive (answer) job kind
+    wires it through `Scopes`, and a test-only handler (`ScopedPassagesFlowTest`) proves the path meanwhile.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
