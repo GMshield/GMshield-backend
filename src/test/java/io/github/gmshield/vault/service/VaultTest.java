@@ -154,6 +154,26 @@ class VaultTest {
     }
 
     @Test
+    void ownerTokenKeyIsThirtyTwoBytesTheSameForItsOwnerAndAnotherForAnotherOwnerOrIndexKey() {
+        UUID other = Ids.newId();
+        byte[] key = vault.ownerTokenKey(owner);
+
+        // Story 2.1: deterministic per owner, so a re-index gives the same token numbers.
+        assertThat(key).hasSize(32).isEqualTo(vault.ownerTokenKey(owner));
+        assertThat(vault.ownerTokenKey(other)).hasSize(32).isNotEqualTo(key);
+        assertThat(VaultFixtures.vault(store, VaultFixtures.keys()).ownerTokenKey(owner)).isNotEqualTo(key);
+        // The HKDF of the index key under ("index-token", owner), never one of the vault's other subkeys.
+        assertThat(key).isEqualTo(VaultCrypto.hkdf(keys.index(), "gmshield/vault/index/v1".getBytes(
+                StandardCharsets.US_ASCII), VaultCrypto.lengthPrefixed("index-token", owner.toString())));
+        assertThat(key).isNotEqualTo(vault.tokenHash("index-token", owner.toString()));
+        // Each call answers its own copy.
+        Arrays.fill(key, (byte) 0);
+        assertThat(vault.ownerTokenKey(owner)).isNotEqualTo(key);
+        assertThatThrownBy(() -> vault.ownerTokenKey(null)).isInstanceOf(NullPointerException.class);
+        assertThat(logged.list).isEmpty();
+    }
+
+    @Test
     void hkdfMatchesRfc5869TestCase1() {
         HexFormat hex = HexFormat.of();
         byte[] okm = VaultCrypto.hkdf(hex.parseHex("0b".repeat(22)), hex.parseHex("000102030405060708090a0b0c"),

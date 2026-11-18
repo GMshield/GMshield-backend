@@ -8,6 +8,7 @@ import io.github.gmshield.jobs.service.JobFiles;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.StaleIndexes;
 import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.PageViewRow;
@@ -57,6 +58,8 @@ import tools.jackson.databind.json.JsonMapper;
  * stored encrypted with their pictures and served on the review ground, a restart removing them before their pictures,
  * and the cross-owner tests of {@code page_view}. Story 1.20: V13, reprocess and accept through their JPQL, the
  * passage gate, a discard that leaves no row or file of its version, and the sweep finishing an interrupted one.
+ * Story 2.1: V15, an accept's index changes in its transaction (none when it rolls back), their claim input and
+ * passages, the recipe recorded once all are done, the reconcile under another recipe, and a discard's removal.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads the library tables with
  * native SQL, but for the removal sweep's list of the ids of versions whose removal is pending.
@@ -977,7 +980,9 @@ class IngestionIntegrationTest {
         assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ?").param(chain.versionId())
                 .query(Long.class).single()).isEqualTo(steps);
 
-        // Interrupted: the discard committed, and the backend stopped before the removal.
+        // Interrupted: the discard committed, and the backend stopped before the removal. (The discard's index removal,
+        // Story 2.1, holds the ingestion lane: it goes first.)
+        freeTheIngestionLane();
         Chain other = reviewed(3, List.of());
         List<UUID> otherFiles = jdbc.sql("select file_id from version_file where version_id = ?")
                 .param(other.versionId()).query(UUID.class).list();
@@ -990,6 +995,110 @@ class IngestionIntegrationTest {
 
         assertNothingLeft(other, otherFiles);
         assertThat(pending.list(1000)).doesNotContain(new PendingRemovals.Pending(other.owner(), other.versionId()));
+    }
+
+    // --- Story 2.1: the index on Postgres
+
+    @Autowired
+    private StaleIndexes staleIndexes;
+    @Autowired
+    private IndexReconcile reconcile;
+
+    @Test
+    void anAcceptsIndexChangesAreWrittenInItsTransactionAndRecordTheirRecipeOnPostgres() throws Exception {
+        Chain chain = reviewed(4, List.of());
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(chain.owner(), () -> store.insertPassages(java.util.stream.IntStream.rangeClosed(2, 200)
+                .mapToObj(ordinal -> passageRow(chain, Ids.newId(), ordinal, 4, now)).toList()));
+
+        // Matrix row "Accept": rolled back with its transaction, the accept leaves no job and no index change.
+        assertThatThrownBy(() -> as(chain.owner(), () -> new TransactionTemplate(transactions).execute(status -> {
+            actions.act(chain.materialId(), "accept");
+            throw new IllegalStateException("rolled back");
+        }))).hasMessage("rolled back");
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+        assertThat(jdbc.sql("select count(*) from index_change where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select count(*) from job where owner_id = ? and kind = 'index.change'")
+                .param(chain.owner()).query(Long.class).single()).isZero();
+
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+
+        List<Map<String, Object>> changes = indexChanges(chain);
+        assertThat(changes).satisfiesExactly(
+                first -> assertThat(first).containsEntry("first_ordinal", 0).containsEntry("last_ordinal", 199)
+                        .containsEntry("recipe", null).containsEntry("owner_id", chain.owner())
+                        .containsEntry("kind", "index.change").containsEntry("lane", "ingestion"),
+                second -> assertThat(second).containsEntry("first_ordinal", 200).containsEntry("last_ordinal", 200));
+        assertThat(staleIndexes.owners("it-1")).contains(chain.owner());
+
+        for (Map<String, Object> change : changes) {
+            JobClaims.Claim claim = claims.claim((UUID) change.get("job_id"));
+            assertThat(claim.input().path("source").asString()).isEqualTo(chain.versionId().toString());
+            assertThat(claim.input().path("tokenKey").asString()).isEqualTo(java.util.Base64.getEncoder()
+                    .encodeToString(vault.ownerTokenKey(chain.owner())));
+            ByteArrayOutputStream read = new ByteArrayOutputStream();
+            JobFiles.Opened opened = jobFiles.open(claim.jobId(), claim.claimId(), claim.grant(), "passages");
+            opened.input().writeTo(read);
+            List<tools.jackson.databind.JsonNode> lines = read.toString(StandardCharsets.UTF_8).lines()
+                    .map(JSON::readTree).toList();
+            assertThat(lines).hasSize((int) change.get("last_ordinal") - (int) change.get("first_ordinal") + 1);
+            assertThat(lines.getFirst().path("ordinal").asInt()).isEqualTo(change.get("first_ordinal"));
+            if ((int) change.get("first_ordinal") == 0) {
+                assertThat(lines).extracting(line -> line.path("title").asString()).startsWith("Capítulo", "Seção", "A");
+                assertThat(lines.getFirst().path("text").asString()).isEqualTo("Texto 1");
+            }
+            assertThat(versionRecipe(chain)).isNull();
+            claims.report(claim.jobId(), claim.claimId(), claim.grant(), "done", null, null,
+                    JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+        }
+
+        assertThat(versionRecipe(chain)).isEqualTo("it-1");
+        assertThat(indexChanges(chain)).extracting(row -> row.get("recipe")).containsOnly("it-1");
+        assertThat(staleIndexes.owners("it-1")).doesNotContain(chain.owner());
+
+        // Matrix row "Recipe change": a new set under the new recipe, once.
+        assertThat(reconcile.reconcile("it-2")).isPositive();
+        List<Map<String, Object>> again = indexChanges(chain);
+        assertThat(again).extracting(row -> row.get("first_ordinal"), row -> row.get("recipe"))
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(0, null), org.assertj.core.groups.Tuple.tuple(200, null));
+        assertThat(again).extracting(row -> row.get("job_id")).doesNotContainAnyElementsOf(
+                changes.stream().map(row -> row.get("job_id")).toList());
+        assertThat(versionRecipe(chain)).isNull();
+        reconcile.reconcile("it-3");
+        assertThat(indexChanges(chain)).isEqualTo(again);
+        // The new set (and every other owner's the reconciles made) would hold the shared ingestion lane.
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void aDiscardCreatesTheRemovalOfItsVersionsPointsOnPostgres() throws Exception {
+        Chain chain = reviewed(3, List.of());
+
+        as(chain.owner(), () -> actions.act(chain.materialId(), "discard"));
+
+        Map<String, Object> removal = jdbc.sql("select r.job_id, r.owner_id, j.kind, j.lane, j.state from index_removal r"
+                + " join job j on j.id = r.job_id where r.version_id = ?").param(chain.versionId()).query().singleRow();
+        assertThat(removal).containsEntry("owner_id", chain.owner()).containsEntry("kind", "index.removal")
+                .containsEntry("lane", "ingestion").containsEntry("state", "offered");
+        JobClaims.Claim claim = claims.claim((UUID) removal.get("job_id"));
+        assertThat(claim.input().path("source").asString()).isEqualTo(chain.versionId().toString());
+        assertThat(claim.input().path("owner").asString()).isEqualTo(chain.owner().toString());
+        claims.report(claim.jobId(), claim.claimId(), claim.grant(), "done", null, null, JSON.readTree("{}"));
+        assertThat(jdbc.sql("select state from job where id = ?").param(claim.jobId()).query(String.class).single())
+                .isEqualTo("done");
+        freeTheIngestionLane();
+    }
+
+    private List<Map<String, Object>> indexChanges(Chain chain) {
+        return jdbc.sql("select c.job_id, c.owner_id, c.first_ordinal, c.last_ordinal, c.recipe, j.kind, j.lane"
+                + " from index_change c join job j on j.id = c.job_id where c.version_id = ? order by c.first_ordinal")
+                .param(chain.versionId()).query().listOfRows();
+    }
+
+    private String versionRecipe(Chain chain) {
+        return jdbc.sql("select index_recipe from material_version where id = ?").param(chain.versionId())
+                .query((rs, row) -> rs.getString(1)).list().getFirst();
     }
 
     @Autowired

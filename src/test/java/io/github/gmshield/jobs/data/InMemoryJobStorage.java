@@ -135,6 +135,13 @@ public class InMemoryJobStorage implements JobStorage {
         }
 
         @Override
+        public List<UUID> unended(Collection<UUID> ids, UUID owner) {
+            return ids.stream().map(rows::get).filter(Objects::nonNull).filter(row -> row.ownerId().equals(owner)
+                    && (row.state().equals("waiting") || row.state().equals("offered")
+                    || row.state().equals("running"))).map(JobRow::id).toList();
+        }
+
+        @Override
         public boolean busy(String lane) {
             return rows.values().stream().anyMatch(row -> row.lane().equals(lane)
                     && (row.state().equals("offered") || row.state().equals("running")));

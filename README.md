@@ -428,6 +428,44 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `V14__image_sets.sql`: `upload.position`, `upload.name` (encrypted), `upload.failure_code`, the state `failed`,
     and the version format `images`. Rolling back past V14 is safe only while no failed upload or `images` version
     exists.
+- **Index an accepted material (`materials`, Story 2.1, AD-10, internal contract 1.7.0).** The worker alone writes
+  Qdrant; the backend records index jobs and their inputs, never a vector.
+  - `IndexChanges`, kind `index.change` on the ingestion lane. The accept (`MaterialActions`) gives the version one
+    job per run of at most 200 passages by ordinal, in the accept's transaction (an `index_change` row per job:
+    owner, version, first and last ordinal). At the claim the input is `{source, owner, kind, language, tokenKey,
+    passages: "passages"}`: the version's id, its owner, the material's kind and language (null when not given),
+    and Base64 of `Vault.ownerTokenKey(owner)` (HKDF of the index key under `("index-token", owner)`, 32 bytes,
+    never logged or stored). `GET …/inputs/passages` serves the run as JSON Lines `{id, ordinal, page, title,
+    text}` (`title`: the last element of the section path, or empty), decrypted for that run only. Unlike a file
+    input, the run is not streamed piece by piece: it is decrypted and buffered whole in the input's read transaction
+    (at most 200 passages of at most 16,384 code points) and served from memory. The result must
+    carry `indexRecipe` (`[A-Za-z0-9._-]{1,32}`, else `job.result_invalid`); it is kept on the row, and when no
+    index change of the version is left unended and every row of its set reports one recipe,
+    `material_version.index_recipe` records it. A superseded version keeps its points and its jobs run on.
+  - The recipe (AD-10): `POST …/claims` takes an optional body `{indexRecipe}` (400 `request.invalid` for one that is
+    not a recipe). A recipe other than the last one stated since the start (the first one always) publishes
+    `jobs.service.IndexRecipeStated` after the claim, whatever its answer. `IndexReconcile` then runs off the
+    request, one reconcile at a time: for each owner with a `ready` version under another recipe or none
+    (`StaleIndexes`, the other read of a library table without an owner: ids only), in a transaction of its own as
+    that owner, each such version with no unended index change gets a new set (its earlier rows go and its recipe
+    is cleared). A claim without a body (a worker before 1.7.0) states nothing. A failed change leaves the version
+    without a recipe, so the next start's reconcile indexes it again.
+  - `IndexRemovals`, kind `index.removal` on the ingestion lane: a discard cancels the version's unended index
+    changes and creates one in its transaction (Story 3.4's delete will reuse it); its input is `{source, owner}`,
+    and the worker deletes the points by a filter on both.
+  - `V15__index_jobs.sql`: `material_version.index_recipe`, `index_change` and `index_removal` (library tables, every
+    key with the owner; `index_removal` has no reference to the version so it outlives a deleted one). This release
+    writes them at once (Dalton, 2026-11-18: no earlier release holds an index row). **A backend rolled back below
+    this release must first cancel every unended `index.change` and `index.removal` job**, as `Jobs.cancel` ends a
+    job (the grant and claim times cleared, the claim id kept), with the backend stopped, as `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind in ('index.change', 'index.removal') and state in ('waiting', 'offered', 'running');
+    ```
+
+    Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

@@ -128,6 +128,16 @@ public class Jobs {
     }
 
     /**
+     * Those of {@code jobIds} that are jobs of the bound owner that have not ended ({@code waiting}, {@code offered} or
+     * {@code running}; Story 2.1), in one read joined to the caller's transaction: another owner's job, an unknown one
+     * or an ended one is left out.
+     */
+    public Set<UUID> unended(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().unended(Set.copyOf(jobIds), owner));
+    }
+
+    /**
      * Cancels a job of the bound owner (Story 1.16), inside the caller's transaction: a {@code waiting},
      * {@code offered} or {@code running} job becomes {@code cancelled}. A running job's claim ends with it, so its
      * later renewal, output or report gets the refusal of any ended claim ({@code job.grant_refused}); its outputs go

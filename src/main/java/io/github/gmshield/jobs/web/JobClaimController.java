@@ -64,6 +64,14 @@ class JobClaimController {
         }
     }
 
+    @Schema(description = "What the worker states when it claims (contract 1.7.0). Every field is optional; a claim may"
+            + " send no body at all.")
+    record JobClaimRequest(
+            @Schema(description = "The worker's index recipe (AD-10): when it differs from the last one stated, the"
+                    + " backend re-indexes every ready version recorded under another one", pattern = "^[A-Za-z0-9._-]{1,32}$",
+                    maxLength = 32) String indexRecipe) {
+    }
+
     @Schema(description = "The live claim's new times.")
     record JobRenewal(
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) Instant renewAt,
@@ -81,9 +89,11 @@ class JobClaimController {
 
     @PostMapping(produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
-    @Operation(operationId = "claimJob", summary = "Claim an offered job (409 job.claimed, 409 job.not_offered)")
-    ResponseEntity<JobClaim> claim(@PathVariable UUID jobId) {
-        JobClaims.Claim claim = claims.claim(jobId);
+    @Operation(operationId = "claimJob", summary = "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for"
+            + " an index recipe that is not one)")
+    ResponseEntity<JobClaim> claim(@PathVariable UUID jobId,
+                                   @RequestBody(required = false) JobClaimRequest body) {
+        JobClaims.Claim claim = claims.claim(jobId, body == null ? null : body.indexRecipe());
         return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
                 .body(new JobClaim(claim.claimId(), claim.attempt(), claim.renewAt(), claim.lapsesAt(), claim.grant(),
                         claim.kind(), JSON.convertValue(claim.input(), OBJECT), claim.traceparent()));

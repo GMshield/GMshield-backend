@@ -10,9 +10,11 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.JsonNodeFactory;
@@ -31,6 +33,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       {@code failed} with the reported code. With {@code retry: false} (Story 1.15: an input that no attempt can
  *       change, such as a file that needs a password) it ends {@code failed} at once. Only the backend decides
  *       retries.</li>
+ *   <li>From Story 2.1 a claim may state the worker's index recipe ({@code [A-Za-z0-9._-]{1,32}}; anything else is
+ *       refused before the claim). One that differs from the last one stated since this backend started, the first one
+ *       included, is published as {@link IndexRecipeStated} once the claim ended, whatever its answer. A claim without
+ *       one changes nothing.</li>
  * </ul>
  *
  * Every handler call runs as the job's owner ({@link OwnerWork}). Every line about a job carries the trace id of
@@ -49,6 +55,8 @@ public class JobClaims {
     static final int MAX_CODE_LENGTH = 64;
     static final String DONE = "done";
     static final String FAILED = "failed";
+    /** An index recipe as the worker states it (AD-10). */
+    static final Pattern RECIPE = Pattern.compile("[A-Za-z0-9._-]{1,32}");
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final Logger log = LoggerFactory.getLogger(JobClaims.class);
 
@@ -59,9 +67,12 @@ public class JobClaims {
     private final JobSettings settings;
     private final JobClock clock;
     private final Vault vault;
+    private final ApplicationEventPublisher events;
+    /** The index recipe the worker stated last since this backend started; null before the first. */
+    private final AtomicReference<String> statedRecipe = new AtomicReference<>();
 
     JobClaims(JobStorage storage, JobHandlers handlers, JobOffers offers, OwnerWork owners, JobSettings settings,
-              JobClock clock, Vault vault) {
+              JobClock clock, Vault vault, ApplicationEventPublisher events) {
         this.storage = storage;
         this.handlers = handlers;
         this.offers = offers;
@@ -69,6 +80,7 @@ public class JobClaims {
         this.settings = settings;
         this.clock = clock;
         this.vault = vault;
+        this.events = events;
     }
 
     /** A claim as the worker receives it. The grant is the only copy there will ever be. */
@@ -84,7 +96,37 @@ public class JobClaims {
     public record Renewal(Instant renewAt, Instant lapsesAt) {
     }
 
+    /** {@link #claim(UUID, String)} without an index recipe (a worker before contract 1.7.0). */
     public Claim claim(UUID jobId) {
+        return claim(jobId, null);
+    }
+
+    /** Claims the job, the worker stating its index recipe ({@code null}: none); see the class. */
+    public Claim claim(UUID jobId, String indexRecipe) {
+        if (indexRecipe != null && !RECIPE.matcher(indexRecipe).matches()) {
+            throw JobProblems.invalid();
+        }
+        boolean newRecipe = indexRecipe != null && !indexRecipe.equals(statedRecipe.getAndSet(indexRecipe));
+        try {
+            return offeredClaim(jobId);
+        } finally {
+            if (newRecipe) {
+                stated(indexRecipe);
+            }
+        }
+    }
+
+    /** Publishes the stated recipe; a listener's failure is never the claim's, and the next claim publishes it again. */
+    private void stated(String recipe) {
+        try {
+            events.publishEvent(new IndexRecipeStated(recipe));
+        } catch (RuntimeException failure) {
+            statedRecipe.compareAndSet(recipe, null);
+            log.atWarn().addKeyValue("errorType", failure.getClass().getName()).log("job.recipe_unpublished");
+        }
+    }
+
+    private Claim offeredClaim(UUID jobId) {
         Instant now = clock.now();
         JobRow seen = storage.joined().find(jobId).orElseThrow(JobProblems::notFound);
         // A waiting job may be in the middle of its offer (the message added, the commit not yet done): the locked
