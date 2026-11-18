@@ -29,7 +29,8 @@ import org.springframework.stereotype.Service;
  *       ({@code upload.set_too_large}, 413).</li>
  *   <li>A member that fails (its format, its whole-file check, its expiry) fails alone; the GM then either
  *       {@link #replace}s it (a new open upload at the same place, checked again) or {@link #drop}s it (the places
- *       after it move up by one; the last one dropped discards the version).</li>
+ *       after it move up by one; the last one dropped discards the version). Once no member is open and every failed
+ *       one has expired, the upload sweep discards the set, its complete members included ({@link UploadSweep}).</li>
  *   <li>The set starts by itself once no member is open or failed and one at least is complete
  *       ({@link Uploads#startIfReady}), after a member's completion or a drop.</li>
  * </ul>

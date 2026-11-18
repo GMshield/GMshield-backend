@@ -422,8 +422,9 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     or retry from the assembled original) gets `source` as before. `START_STAGES` maps `images` to the `images`
     stage, for the start, a restart, a retry and Reprocessar. The first report's `original` (the assembled PDF) marks
     every member `removing`, as a PDF's raw upload is; a discard removes them all.
-  - The upload sweep fails an expired member alone (`upload.expired`, its pieces removed) and discards a set whose
-    members have all failed, the last of them past its expiry (version `discarded`, every member removed).
+  - The upload sweep fails an expired member alone (`upload.expired`, its pieces removed) and discards a set nobody
+    can finish any more: no member open, one at least failed, and every failed member past its expiry (version
+    `discarded`, every member removed, complete ones included), so after 6 hours an unfinished set is gone.
   - `V14__image_sets.sql`: `upload.position`, `upload.name` (encrypted), `upload.failure_code`, the state `failed`,
     and the version format `images`. Rolling back past V14 is safe only while no failed upload or `images` version
     exists.

@@ -122,6 +122,8 @@ class UploadIntegrationTest {
     private TestClock clock;
     @Autowired
     private ImageSets sets;
+    @Autowired
+    private Materials materials;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -405,6 +407,14 @@ class UploadIntegrationTest {
         sendWhole(owner, set.images().get(2).uploadId(), images.get(2));
         assertThat(state(set.setId())).isEqualTo("uploading");
 
+        // The material's view, from Postgres: the set's images in order, the failed one with its reason and name.
+        Materials.ImageSet listed = as(owner, () -> materials.find(set.materialId())).orElseThrow().imageSet();
+        assertThat(listed.id()).isEqualTo(set.setId());
+        assertThat(listed.images()).extracting(Materials.SetImage::position, Materials.SetImage::state,
+                        Materials.SetImage::failure, Materials.SetImage::name)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(1, "complete", null, null),
+                        org.assertj.core.groups.Tuple.tuple(2, "failed", "upload.file_checksum_mismatch", "b.jpg"),
+                        org.assertj.core.groups.Tuple.tuple(3, "complete", null, null));
         Uploads.Completed dropped = as(owner, () -> sets.drop(set.setId(), 2));
         assertThat(dropped.state()).isEqualTo("waiting");
         assertThat(count("select count(*) from upload where id = ?", second)).isZero();
@@ -414,37 +424,47 @@ class UploadIntegrationTest {
     }
 
     @Test
-    void theSweepFailsAnExpiredImageAloneAndDiscardsASetWhoseImagesHaveAllFailedAndExpired() throws Exception {
+    void theSweepFailsAnExpiredImageAloneAndDiscardsASetNobodyCanFinishItsCompleteImagesIncluded() throws Exception {
         UUID owner = Ids.newId();
         ImageSets.Created kept = as(owner, () -> sets.create("Ficha", Uploads.Details.NONE, List.of(
                 new ImageSets.Image("a.jpg", 9000), new ImageSets.Image("b.jpg", 9000))));
         UUID first = kept.images().get(0).uploadId();
+        UUID second = kept.images().get(1).uploadId();
         byte[] start = Arrays.copyOf(jpeg(9000), 4096);
         as(owner, () -> uploads.patch(first, 0, start.length, sha256(start), new ByteArrayInputStream(start)));
-        sendWhole(owner, kept.images().get(1).uploadId(), jpeg(9000));
+        sendWhole(owner, second, jpeg(9000));
         ImageSets.Created lost = as(owner, () -> sets.create("Perdida", Uploads.Details.NONE, List.of(
                 new ImageSets.Image("c.jpg", 9000), new ImageSets.Image("d.jpg", 9000))));
         assertThat(files.fileExists(owner, first)).isTrue();
+        assertThat(files.fileExists(owner, second)).isTrue();
         clock.advance(Duration.ofHours(6).plusSeconds(1));
 
         sweep.sweep();
 
-        // An image left open fails alone: its pieces go, and the complete one keeps its set waiting for the GM.
-        assertThat(row("select state, failure_code from upload where id = ?", first))
-                .containsEntry("state", "failed").containsEntry("failure_code", "upload.expired");
+        // The tab was closed mid-set: the open image expired and failed, and with no image open and every failed one
+        // expired, the set is discarded, its complete image included: no row and no piece is left.
+        assertThat(state(kept.setId())).isEqualTo("discarded");
+        assertThat(count("select count(*) from upload where version_id = ?", kept.setId())).isZero();
         assertThat(files.fileExists(owner, first)).isFalse();
-        assertThat(state(kept.setId())).isEqualTo("uploading");
-        assertThat(row("select state from upload where id = ?", kept.images().get(1).uploadId()))
-                .containsEntry("state", "complete");
-        // A set whose images have all failed and expired is discarded, with nothing of it left.
+        assertThat(files.fileExists(owner, second)).isFalse();
         assertThat(state(lost.setId())).isEqualTo("discarded");
         assertThat(count("select count(*) from upload where version_id = ?", lost.setId())).isZero();
+
+        // A set with an image still open within its six hours is kept, its expired image failed alone.
+        ImageSets.Created waiting = as(owner, () -> sets.create("Espera", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("e.jpg", 9000), new ImageSets.Image("f.jpg", 9000))));
+        UUID expired = waiting.images().get(0).uploadId();
+        jdbc.sql("update upload set expires_at = now() - interval '1 minute' where id = ?").param(expired).update();
+        clock.now.set(Instant.now());
+        sweep.sweep();
+        assertThat(state(waiting.setId())).isEqualTo("uploading");
+        assertThat(row("select state, failure_code from upload where id = ?", expired))
+                .containsEntry("state", "failed").containsEntry("failure_code", "upload.expired");
         // V14: a failed row always has its reason, an open one never.
-        assertThatThrownBy(() -> jdbc.sql("update upload set failure_code = 'x' where id = ?")
-                .param(kept.images().get(1).uploadId()).update())
+        UUID open = waiting.images().get(1).uploadId();
+        assertThatThrownBy(() -> jdbc.sql("update upload set failure_code = 'x' where id = ?").param(open).update())
                 .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
-        assertThatThrownBy(() -> jdbc.sql("update upload set state = 'failed' where id = ?")
-                .param(kept.images().get(1).uploadId()).update())
+        assertThatThrownBy(() -> jdbc.sql("update upload set state = 'failed' where id = ?").param(open).update())
                 .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
     }
 

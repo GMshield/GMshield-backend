@@ -296,7 +296,7 @@ class JdbcUploadStorage implements UploadStorage {
             return jdbc.get().sql(COLUMNS + "where id in (select distinct on (failed.owner_id, failed.version_id)"
                             + " failed.id from upload failed where failed.state = 'failed' and failed.position is not null"
                             + " and not exists (select 1 from upload other where other.owner_id = failed.owner_id"
-                            + " and other.version_id = failed.version_id and (other.state in ('open', 'complete')"
+                            + " and other.version_id = failed.version_id and (other.state = 'open'"
                             + " or (other.state = 'failed' and other.expires_at > :now)))"
                             + " order by failed.owner_id, failed.version_id, failed.id)"
                             + " order by expires_at, id limit :limit")

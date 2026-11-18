@@ -232,9 +232,11 @@ public class InMemoryUploadStorage implements UploadStorage {
                     .filter(row -> !row.state().equals(UploadRow.REMOVING))
                     .collect(java.util.stream.Collectors.groupingBy(row -> List.of(row.ownerId(), row.versionId())));
             return sets.values().stream()
-                    .filter(members -> members.stream().allMatch(row -> row.state().equals(UploadRow.FAILED)
-                            && !row.expiresAt().isAfter(now)))
-                    .map(members -> members.stream().min(Comparator.comparing(UploadRow::id)).orElseThrow())
+                    .filter(members -> members.stream().noneMatch(row -> row.state().equals(UploadRow.OPEN)
+                            || (row.state().equals(UploadRow.FAILED) && row.expiresAt().isAfter(now))))
+                    .filter(members -> members.stream().anyMatch(row -> row.state().equals(UploadRow.FAILED)))
+                    .map(members -> members.stream().filter(row -> row.state().equals(UploadRow.FAILED))
+                            .min(Comparator.comparing(UploadRow::id)).orElseThrow())
                     .sorted(Comparator.comparing(UploadRow::expiresAt).thenComparing(UploadRow::id)).limit(limit)
                     .toList();
         }

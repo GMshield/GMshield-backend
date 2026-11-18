@@ -2711,20 +2711,21 @@ class IngestionFlowTest {
         assertThat(input(step.jobId(), claim, "source").statusCode()).isEqualTo(404);
         assertThat(input(step.jobId(), claim, "image-" + UUID.randomUUID()).statusCode()).isEqualTo(404);
 
-        // Its report: the assembled PDF is the original, a page may be given its outcome with it, and every image's
-        // raw upload goes.
-        Images assembled = imagesReport(step.jobId(), claim, 3, List.of(2));
+        // Its report, as the worker sends it: the assembled PDF is the original, triage over the batch, the held
+        // passages step; every image's raw upload goes.
+        Images assembled = imagesReport(step.jobId(), claim, 3);
         assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(set.versionId())))
                 .extracting(VersionFileRow::role).containsExactly("original", "batch");
-        assertThat(outcomes(set.versionId())).extracting(PageRangeRow::firstPage, PageRangeRow::lastPage,
-                PageRangeRow::value).containsExactly(tuple(2, 2, "unreadable"));
+        assertThat(outcomes(set.versionId())).isEmpty();
         assertThat(set.uploadIds()).allSatisfy(id -> {
             assertThat(uploads.rows).doesNotContainKey(id);
             assertThat(files.fileExists(gm.id(), id)).isFalse();
         });
         assertThat(steps(set.versionId())).filteredOn(found -> found.stage().equals("triage"))
                 .extracting(StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
-                .containsExactlyInAnyOrder(tuple(1, 1, assembled.batch()), tuple(3, 3, assembled.batch()));
+                .containsExactly(tuple(1, 3, assembled.batch()));
+        assertThat(steps(set.versionId())).filteredOn(StepRow::held).singleElement()
+                .satisfies(held -> assertThat(held.stage()).isEqualTo("passages"));
         assertThat(materials.versions.get(set.versionId()).pageTotal()).isEqualTo(3);
     }
 
@@ -2794,6 +2795,7 @@ class IngestionFlowTest {
                 .containsExactly("image-" + set.uploadIds().get(0), "image-" + last, "image-" + set.uploadIds().get(2));
         // A place whose image has not failed is neither replaced nor left out.
         SetMade other = createSet(gm, "Outra", List.of(jpeg(9000)), List.of("x.jpg"));
+        assertReplaceOverTwoGibibytesIsRefused(gm);
         refused(setRequest(gm, "POST", "/api/v1/image-sets/" + other.versionId() + "/images/1",
                 "{\"name\":\"y.jpg\",\"length\":9000}"), "upload.image_not_failed");
         refused(setRequest(gm, "DELETE", "/api/v1/image-sets/" + other.versionId() + "/images/1", null),
@@ -2860,11 +2862,13 @@ class IngestionFlowTest {
     }
 
     @Test
-    void anImageLeftOpenPastItsSixHoursFailsAloneAndASetWhoseImagesAllFailedIsDiscardedOnceTheyExpire()
+    void anImageLeftOpenPastItsSixHoursFailsAloneAndASetNobodyCanFinishIsDiscardedWithItsCompleteImages()
             throws Exception {
         Gm gm = signUp();
-        SetMade set = createSet(gm, "Ficha", List.of(jpeg(9000), png(9000)), List.of("a.jpg", "b.png"));
-        sendImage(gm, set.uploadIds().getFirst(), jpeg(9000));
+        SetMade set = createSet(gm, "Ficha", List.of(jpeg(9000), png(9000), jpeg(9000)),
+                List.of("a.jpg", "b.png", "c.jpg"));
+        UUID complete = set.uploadIds().getFirst();
+        sendImage(gm, complete, jpeg(9000));
         UUID open = set.uploadIds().get(1);
         patch(gm, open, 0, png(9000));
         assertThat(files.fileExists(gm.id(), open)).isTrue();
@@ -2874,10 +2878,18 @@ class IngestionFlowTest {
         assertThat(uploads.row(open).state()).isEqualTo("failed");
         assertThat(uploads.row(open).failureCode()).isEqualTo("upload.expired");
         assertThat(files.fileExists(gm.id(), open)).isFalse();
+        // The third image is still open within its own six hours: the set waits.
         assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
-        // The complete image keeps the set: nothing more goes.
+        assertThat(uploads.row(complete).state()).isEqualTo("complete");
+
+        // The tab was closed: the third image expires too. No image is open and every failed one has expired, so
+        // the set goes, its complete image included, rows and pieces.
+        uploads.change(set.uploadIds().get(2), row -> expiring(row, past));
         uploadSweep.sweep();
-        assertThat(uploads.row(set.uploadIds().getFirst()).state()).isEqualTo("complete");
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("discarded");
+        assertThat(uploads.rows.values()).noneMatch(row -> row.versionId().equals(set.versionId()));
+        assertThat(set.uploadIds()).allSatisfy(id -> assertThat(files.fileExists(gm.id(), id)).isFalse());
+        assertThat(steps(set.versionId())).isEmpty();
 
         // Every image failed and expired: nobody can finish the set any more.
         SetMade lost = createSet(gm, "Perdida", List.of(jpeg(9000), png(9000)), List.of("a.jpg", "b.png"));
@@ -2986,7 +2998,7 @@ class IngestionFlowTest {
         assertThat(claim.path("input").path("input").asString()).isEqualTo("images");
         assertThat(claim.path("input").path("inputs")).hasSize(2);
         assertThat(input(retried.jobId(), claim, "image-" + set.uploadIds().get(1)).body()).isEqualTo(images.get(1));
-        Images assembled = imagesReport(retried.jobId(), claim, 2, List.of());
+        Images assembled = imagesReport(retried.jobId(), claim, 2);
 
         // A pipeline change restarts the chain from the assembled original, through the same first stage.
         StepRow triage = offeredStep(set.versionId());
@@ -3002,6 +3014,24 @@ class IngestionFlowTest {
         assertThat(restarted.path("input").has("inputs")).isFalse();
         assertThat(input(restart.jobId(), restarted, "source").statusCode()).isEqualTo(200);
         assertThat(input(restart.jobId(), restarted, "image-" + set.uploadIds().get(1)).statusCode()).isEqualTo(404);
+    }
+
+    /** A replacement whose length with the set's other images passes 2 GiB is refused, and no upload is created. */
+    private void assertReplaceOverTwoGibibytesIsRefused(Gm gm) throws Exception {
+        HttpResponse<String> created = setRequest(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Grandes\",\"images\":["
+                + "{\"name\":\"a.jpg\",\"length\":2000000000},{\"name\":\"b.jpg\",\"length\":9000}]}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID setId = UUID.fromString(json(created).path("id").asString());
+        UUID second = UUID.fromString(json(created).path("images").get(1).path("uploadId").asString());
+        assertThat(patch(gm, second, 0, pdf(9000)).statusCode()).isEqualTo(415);
+        long before = uploads.rows.values().stream().filter(row -> row.versionId().equals(setId)).count();
+        HttpResponse<String> tooBig = setRequest(gm, "POST", "/api/v1/image-sets/" + setId + "/images/2",
+                "{\"name\":\"b.jpg\",\"length\":200000000}");
+        assertThat(tooBig.statusCode()).isEqualTo(413);
+        assertThat(json(tooBig).path("code").asString()).isEqualTo("upload.set_too_large");
+        assertThat(uploads.rows.values().stream().filter(row -> row.versionId().equals(setId)).count())
+                .isEqualTo(before);
+        assertThat(uploads.row(second).state()).isEqualTo("failed");
     }
 
     /** An image set as created: its material, version (its id) and images' uploads in order. */
@@ -3065,32 +3095,17 @@ class IngestionFlowTest {
     }
 
     /**
-     * An images step's done report over {@code total} pages in one batch: the assembled original, the batch, the pages
-     * whose image did not decode as unreadable, a triage step per run of the others and the held passages step.
+     * An images step's done report over {@code total} pages in one batch, as the worker sends it: the assembled
+     * original, the batch, a triage step over the batch and the held passages step.
      */
-    private Images imagesReport(UUID jobId, JsonNode claim, int total, List<Integer> unreadable) throws Exception {
+    private Images imagesReport(UUID jobId, JsonNode claim, int total) throws Exception {
         UUID original = output(jobId, claim, pdf(5000));
         UUID batch = output(jobId, claim, pdf(4000));
-        List<String> next = new ArrayList<>();
-        List<String> pages = new ArrayList<>();
-        int start = 1;
-        for (int page = 1; page <= total + 1; page++) {
-            if (page > total || unreadable.contains(page)) {
-                if (page > start) {
-                    next.add("{\"stage\":\"triage\",\"firstPage\":" + start + ",\"lastPage\":" + (page - 1)
-                            + ",\"input\":\"" + batch + "\"}");
-                }
-                if (page <= total) {
-                    pages.add("{\"firstPage\":" + page + ",\"lastPage\":" + page + ",\"outcome\":\"unreadable\"}");
-                }
-                start = page + 1;
-            }
-        }
-        next.add(passagesStep(total));
         HttpResponse<String> reported = outcome(jobId, claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":"
                 + "\"6\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[{"
-                + "\"fileId\":\"" + batch + "\",\"firstPage\":1,\"lastPage\":" + total + "}],\"pages\":["
-                + String.join(",", pages) + "],\"next\":[" + String.join(",", next) + "]}}");
+                + "\"fileId\":\"" + batch + "\",\"firstPage\":1,\"lastPage\":" + total + "}],\"next\":[{\"stage\":"
+                + "\"triage\",\"firstPage\":1,\"lastPage\":" + total + ",\"input\":\"" + batch + "\"},"
+                + passagesStep(total) + "]}}");
         assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
         return new Images(original, batch);
     }

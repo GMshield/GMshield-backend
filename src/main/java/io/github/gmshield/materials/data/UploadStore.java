@@ -101,8 +101,8 @@ public interface UploadStore {
     int closeGap(UUID owner, UUID versionId, int position, Instant now);
 
     /**
-     * One failed member of each set whose members are all failed, the last of them past its expiry: sets nobody can
-     * finish any more, oldest expiry first.
+     * One failed member of each set with no open member and whose failed members are all past their expiry: sets
+     * nobody can finish any more (their complete members included), oldest expiry first.
      */
     List<UploadRow> abandonedSets(Instant now, int limit);
 }

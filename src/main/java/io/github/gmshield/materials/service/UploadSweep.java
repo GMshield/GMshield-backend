@@ -30,9 +30,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * </ol>
  *
  * From Story 1.21 an expired member of an image set fails alone instead ({@code upload.expired}: its pieces go, its row
- * and its set's version stay, for the GM to replace or leave out), and a set whose members have all failed, the last
- * of them past its expiry, is discarded: its version {@code discarded} and every member {@code removing}, together,
- * then finished as above.
+ * and its set's version stay, for the GM to replace or leave out). A set that nobody can finish any more is discarded:
+ * no member open, one at least failed, and every failed member past its expiry (complete members do not keep it). Its
+ * version becomes {@code discarded} and every member, complete ones included, {@code removing}, together, then
+ * finished as above: after 6 hours an unfinished upload is gone.
  *
  * <p>The sweep first finishes every {@code removing} row, then starts on the expired ones, then on abandoned sets. It reads and deletes rows in
  * transactions of its own ({@link UploadStorage#separately}): it has no owner, so it cannot open the application's
@@ -129,8 +130,9 @@ public class UploadSweep {
 
     /**
      * A set nobody can finish any more (Story 1.21), as its owner, in one transaction with its version locked: when its
-     * version is still uploading and every member has failed and expired, the version becomes {@code discarded} and
-     * every member {@code removing}. Answers those members, whose removal is then finished.
+     * version is still uploading, no member is open, one at least has failed and every failed member has expired, the
+     * version becomes {@code discarded} and every member, complete ones included, {@code removing}. Answers those
+     * members, whose removal is then finished.
      */
     private List<UploadRow> abandon(UploadRow row, Instant now) {
         try {
@@ -139,13 +141,13 @@ public class UploadSweep {
                         Optional<VersionRow> version = materials.lockVersion(row.versionId())
                                 .filter(found -> Uploads.UPLOADING.equals(found.state()));
                         List<UploadRow> found = uploads.joined().ofVersion(row.ownerId(), row.versionId());
-                        if (version.isEmpty() || found.isEmpty() || found.stream().anyMatch(member ->
-                                !UploadRow.FAILED.equals(member.state()) || member.expiresAt().isAfter(now))) {
+                        if (version.isEmpty() || !abandoned(found, now)) {
                             return List.<UploadRow>of();
                         }
                         materials.changeVersion(row.versionId(), Uploads.DISCARDED, null, null, now);
-                        return found.stream().filter(member -> uploads.joined().removeFailed(member.id(), now))
-                                .toList();
+                        return found.stream().filter(member -> UploadRow.FAILED.equals(member.state())
+                                ? uploads.joined().removeFailed(member.id(), now)
+                                : uploads.joined().removeComplete(member.id(), now)).toList();
                     }));
             if (!members.isEmpty()) {
                 log.atInfo().addKeyValue("ownerId", row.ownerId()).addKeyValue("versionId", row.versionId())
@@ -157,6 +159,13 @@ public class UploadSweep {
                     .log("upload.removal_failed");
             return List.of();
         }
+    }
+
+    /** No member open, one at least failed, every failed one past its expiry. */
+    private static boolean abandoned(List<UploadRow> members, Instant now) {
+        return members.stream().noneMatch(member -> UploadRow.OPEN.equals(member.state())
+                || (UploadRow.FAILED.equals(member.state()) && member.expiresAt().isAfter(now)))
+                && members.stream().anyMatch(member -> UploadRow.FAILED.equals(member.state()));
     }
 
     /** Steps 2 and 3. */

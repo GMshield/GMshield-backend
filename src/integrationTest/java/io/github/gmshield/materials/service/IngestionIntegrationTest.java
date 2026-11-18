@@ -205,9 +205,9 @@ class IngestionIntegrationTest {
         claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null, JSON.readTree(
                 "{\"pipelineVersion\":\"6\",\"pageTotal\":2,\"original\":{\"fileId\":\"" + original.fileId() + "\"},"
                         + "\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":2}],"
-                        + "\"pages\":[{\"firstPage\":2,\"lastPage\":2,\"outcome\":\"unreadable\"}],"
-                        + "\"next\":[{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":1,\"input\":\""
-                        + batch.fileId() + "\"}]}"));
+                        + "\"next\":[{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":2,\"input\":\""
+                        + batch.fileId() + "\"},{\"stage\":\"passages\",\"firstPage\":1,\"lastPage\":2,"
+                        + "\"input\":\"texts\"}]}"));
         assertThat(jdbc.sql("select count(*) from upload where version_id = ?").param(set.setId()).query(Long.class)
                 .single()).isZero();
         assertThat(files.fileExists(owner, one)).isFalse();
@@ -216,7 +216,9 @@ class IngestionIntegrationTest {
                 .singleRow()).containsEntry("state", "processing").containsEntry("page_total", 2);
         assertThat(jdbc.sql("select stage, first_page, last_page from ingestion_step where version_id = ?"
                 + " and stage = 'triage'").param(set.setId()).query().singleRow())
-                .containsEntry("first_page", 1).containsEntry("last_page", 1);
+                .containsEntry("first_page", 1).containsEntry("last_page", 2);
+        assertThat(jdbc.sql("select input_texts from ingestion_step where version_id = ? and stage = 'passages'")
+                .param(set.setId()).query(Boolean.class).single()).isTrue();
     }
 
     private static byte[] image(int second, int size) {
