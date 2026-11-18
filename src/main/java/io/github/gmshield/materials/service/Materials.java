@@ -83,6 +83,7 @@ public class Materials {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final JobsInProgress inProgress;
     private final FileStore files;
+    private final IngestionSettings settings;
 
     /** Those of these jobs of the bound owner that are offered or running ({@link Jobs#inProgress}). */
     @FunctionalInterface
@@ -92,12 +93,13 @@ public class Materials {
 
     @Autowired
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs,
-              ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, files, jobs::inProgress, transactions);
+              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+        this(materials, uploads, vault, files, jobs::inProgress, settings, transactions);
     }
 
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
-              ObjectProvider<PlatformTransactionManager> transactions) {
+              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+        this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
@@ -457,15 +459,15 @@ public class Materials {
                     upload == null ? null : new Upload(upload.id(), upload.offset(), upload.length(), upload.expiresAt()),
                     pages, FAILED.equals(row.version().state()) ? row.version().failureCode() : null,
                     actions(row.version().state(), pages == null ? 0 : pages.unreadable(),
-                            FAILED.equals(row.version().state())
-                                    && IngestionSteps.retryInput(materials, uploads, row.version()).isPresent()));
+                            IngestionSteps.retryCheck(materials, uploads, settings,
+                                    row.version()) == IngestionSteps.RetryCheck.ALLOWED));
         }).toList();
     }
 
     /**
      * The GM's actions a version allows now (Story 1.20), in {@link #ACTIONS} order: {@value #ACCEPT} while it needs
      * review, {@value #REPROCESS} while it needs review with an unreadable page, {@value #RETRY} while it is failed and
-     * can start again ({@code retryable}: a cleaned original or a complete raw upload remains), and {@value #DISCARD}
+     * would be retried ({@code retryable}: {@link IngestionSteps#retryCheck}), and {@value #DISCARD}
      * while it needs review or is failed. A {@code ready} version is never reprocessed nor discarded in place (AD-15).
      */
     static List<String> actions(String state, int unreadable, boolean retryable) {

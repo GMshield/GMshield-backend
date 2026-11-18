@@ -62,7 +62,9 @@ import tools.jackson.databind.json.JsonMapper;
  * native SQL, but for the removal sweep's list of the ids of versions whose removal is pending.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-    "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
+    "gmshield.materials.upload-sweep.enabled=false",
+    "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
 @ActiveProfiles("test-mode")
 class IngestionIntegrationTest {
 
@@ -827,7 +829,6 @@ class IngestionIntegrationTest {
         });
     }
 
-    /** A passage of the chain's version, encrypted as a report stores it. */
     // --- Story 1.20: the review on Postgres
 
     @Test
@@ -1014,6 +1015,7 @@ class IngestionIntegrationTest {
                         "\"pipelineVersion\":\"5\"")));
     }
 
+    /** A passage of the chain's version, encrypted as a report stores it. */
     private PassageRow passageRow(Chain chain, UUID id, int ordinal, int page, Instant now) {
         return new PassageRow(id, chain.owner(), chain.versionId(), ordinal, page,
                 vault.encryptText(Passages.text(id, chain.owner()), "Passagem " + ordinal),

@@ -37,7 +37,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * {@code material_version} or {@code material_system} with native SQL.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-    "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-material-it"})
+    "gmshield.materials.upload-sweep.enabled=false",
+    "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.files.dir=${java.io.tmpdir}/gmshield-material-it"})
 @ActiveProfiles("test-mode")
 class MaterialIntegrationTest {
 

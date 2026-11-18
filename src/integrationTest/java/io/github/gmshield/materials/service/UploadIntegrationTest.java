@@ -60,7 +60,9 @@ import tools.jackson.databind.json.JsonMapper;
 // Both sweeps are off: the tests drive the upload sweep, and JobIntegrationTest the job sweep.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-            "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-upload-it"})
+            "gmshield.materials.upload-sweep.enabled=false",
+            "gmshield.materials.version-removal-sweep.enabled=false",
+            "gmshield.files.dir=${java.io.tmpdir}/gmshield-upload-it"})
 @ActiveProfiles("test-mode")
 class UploadIntegrationTest {
 

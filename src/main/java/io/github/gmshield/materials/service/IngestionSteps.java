@@ -483,7 +483,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * What a failed version would start again from: its cleaned original, else its complete raw upload; empty when it
      * has neither, or when its format has no chain. The caller has the version's owner bound.
      */
-    static Optional<UUID> retryInput(MaterialStore materials, UploadStorage uploads, VersionRow version) {
+    private static Optional<UUID> retryInput(MaterialStore materials, UploadStorage uploads, VersionRow version) {
         if (version.format() == null || !START_STAGES.containsKey(version.format())) {
             return Optional.empty();
         }
@@ -491,6 +491,33 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 .map(VersionFileRow::fileId)
                 .or(() -> uploads.joined().completeForVersion(OwnerContext.require(), version.id())
                         .map(UploadRow::id));
+    }
+
+    /** Whether a failed version would be retried now: {@link #retryCheck}. */
+    enum RetryCheck {
+        /** Not failed, or nothing remains to start from (or its format has no chain). */
+        NO_INPUT,
+        /** An input remains, but one more step would pass the step cap of its known page total. */
+        PAST_CAP,
+        /** {@link #retry} would accept it. */
+        ALLOWED
+    }
+
+    /**
+     * The one check behind a failed version's {@code retry}, in its {@code actions} and in the locked action (Story
+     * 1.20): an input remains ({@link #retryInput}) and either its page total is not known yet (its first step failed:
+     * each retry is the GM's own) or one more step stays within the step cap. The caller has the owner bound.
+     */
+    static RetryCheck retryCheck(MaterialStore materials, UploadStorage uploads, IngestionSettings settings,
+                                 VersionRow version) {
+        if (!Materials.FAILED.equals(version.state()) || retryInput(materials, uploads, version).isEmpty()) {
+            return RetryCheck.NO_INPUT;
+        }
+        if (version.pageTotal() != null
+                && materials.countSteps(version.id()) + 1 > settings.stepCap(version.pageTotal())) {
+            return RetryCheck.PAST_CAP;
+        }
+        return RetryCheck.ALLOWED;
     }
 
     /**
@@ -502,16 +529,17 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * the GM's own.
      */
     public void retry(VersionRow version) {
-        Optional<UUID> input = retryInput(materials, uploads, version);
-        if (!Materials.FAILED.equals(version.state()) || input.isEmpty()) {
+        RetryCheck check = retryCheck(materials, uploads, settings, version);
+        if (check == RetryCheck.NO_INPUT) {
             throw MaterialProblems.actionUnavailable();
         }
-        if (version.pageTotal() != null && pastCap(version, 1)) {
+        if (check == RetryCheck.PAST_CAP) {
             throw MaterialProblems.tooManySteps();
         }
+        Optional<UUID> input = retryInput(materials, uploads, version);
         Instant now = now();
         String stage = START_STAGES.get(version.format());
-        StartedOver started = startOver(version, stage, input.get(), now);
+        StartedOver started = startOver(version, stage, input.orElseThrow(), now);
         materials.changeVersionState(version.id(), PROCESSING, now);
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("newJobId", started.jobId())
                 .addKeyValue("stage", stage).addKeyValue("ranges", started.ranges())
@@ -525,13 +553,14 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     /**
      * Reprocesses the unreadable pages of a {@code needs_review} version, locked by the caller, in its transaction.
      * For each unreadable page, the narrowest recorded step with a page range that covers it (the latest of equally
-     * narrow ones; never a step over every text file) is copied, its stage and input file, narrowed to each run of
-     * consecutive pages it covers: the backend never names a stage (AD-15). The version's {@code unreadable} outcomes
+     * narrow ones; never a step over every text file, nor one whose input is no longer a file of the version) is
+     * copied, its stage and input file, narrowed to each run of consecutive pages it covers: the backend never names a
+     * stage (AD-15). The version's {@code unreadable} outcomes
      * go, with those pages' page views and pictures, and its passages and outline; a held copy of its latest step over
      * every text file is added; the version becomes {@code processing}, and the chain's end brings it back to
      * {@code needs_review}. Refused with {@code material.action_unavailable} when no page is unreadable or one has no
-     * covering step whose input is still a file of the version, and with {@value #TOO_MANY_STEPS} when the new steps
-     * would pass the step cap; a refusal changes nothing.
+     * such covering step, and with {@value #TOO_MANY_STEPS} when the new steps would pass the step cap; a refusal
+     * changes nothing.
      */
     public void reprocess(VersionRow version) {
         if (!NEEDS_REVIEW.equals(version.state())) {
@@ -544,15 +573,12 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             throw MaterialProblems.actionUnavailable();
         }
         List<StepRow> steps = materials.steps(version.id());
-        List<Reread> rereads = rereads(unreadable, steps.stream().filter(step -> step.firstPage() != null
-                && step.lastPage() != null && !step.inputTexts() && step.inputFileId() != null).toList());
+        // Only steps whose input is still a file of the version: a restart or a retry removed the batches that the
+        // steps of an earlier chain read, and those steps stay recorded.
         Set<UUID> inputs = new HashSet<>();
-        rereads.forEach(reread -> inputs.add(reread.step().inputFileId()));
-        for (UUID input : inputs) {
-            if (materials.versionFile(version.id(), input).filter(file -> STEP_FILES.contains(file.role())).isEmpty()) {
-                throw MaterialProblems.actionUnavailable();
-            }
-        }
+        materials.versionFiles(version.id(), STEP_FILES).forEach(file -> inputs.add(file.fileId()));
+        List<Reread> rereads = rereads(unreadable, steps.stream().filter(step -> step.firstPage() != null
+                && step.lastPage() != null && !step.inputTexts() && inputs.contains(step.inputFileId())).toList());
         Optional<StepRow> passages = steps.stream().filter(StepRow::inputTexts).reduce((first, second) -> second);
         if (pastCap(version, rereads.size() + (passages.isPresent() ? 1 : 0))) {
             throw MaterialProblems.tooManySteps();

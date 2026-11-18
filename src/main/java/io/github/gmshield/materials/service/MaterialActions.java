@@ -48,12 +48,14 @@ public class MaterialActions {
     private final IngestionSteps ingestion;
     private final VersionRemoval removal;
     private final Materials reads;
+    private final IngestionSettings settings;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
     MaterialActions(MaterialStore materials, UploadStorage uploads, IngestionSteps ingestion, VersionRemoval removal,
-                    Materials reads, ObjectProvider<PlatformTransactionManager> transactions,
+                    Materials reads, IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions,
                     ObjectProvider<Clock> clock) {
+        this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
         this.ingestion = ingestion;
@@ -76,7 +78,11 @@ public class MaterialActions {
             }
             VersionRow version = materials.lockVersion(newest.get().version().id())
                     .orElseThrow(MaterialProblems::actionUnavailable);
-            if (!allowed(version).contains(action)) {
+            IngestionSteps.RetryCheck retry = IngestionSteps.retryCheck(materials, uploads, settings, version);
+            if (Materials.RETRY.equals(action) && retry == IngestionSteps.RetryCheck.PAST_CAP) {
+                throw MaterialProblems.tooManySteps();
+            }
+            if (!allowed(version, retry).contains(action)) {
                 throw MaterialProblems.actionUnavailable();
             }
             switch (action) {
@@ -99,15 +105,13 @@ public class MaterialActions {
     }
 
     /** The actions the locked version allows now, by the rule the material's view states. */
-    private List<String> allowed(VersionRow version) {
+    private List<String> allowed(VersionRow version, IngestionSteps.RetryCheck retry) {
         int unreadable = IngestionSteps.NEEDS_REVIEW.equals(version.state())
                 ? materials.pageOutcomes(List.of(version.id())).stream()
                         .filter(range -> PageRangeRow.UNREADABLE.equals(range.value()))
                         .mapToInt(PageRangeRow::pages).sum()
                 : 0;
-        boolean retryable = Materials.FAILED.equals(version.state())
-                && IngestionSteps.retryInput(materials, uploads, version).isPresent();
-        return Materials.actions(version.state(), unreadable, retryable);
+        return Materials.actions(version.state(), unreadable, retry == IngestionSteps.RetryCheck.ALLOWED);
     }
 
     private void accept(VersionRow version) {

@@ -47,6 +47,8 @@ import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -2226,6 +2228,130 @@ class IngestionFlowTest {
         assertThat(actions(a, uploaded)).containsExactly("accept", "reprocess", "discard");
         assertThat(steps(uploaded.versionId())).allSatisfy(step -> assertThat(step.endedAt()).isNotNull());
         OwnerContext.runAs(b.id(), () -> assertThat(reads.report(UUID.fromString(uploaded.materialId()))).isEmpty());
+    }
+
+    @Test
+    void aFailedVersionAtItsStepCapCanOnlyBeDiscardedAndARetryIsRefusedChangingNothing() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        clean(uploaded, 1, "2");
+        StepRow triage = offeredStep(uploaded.versionId());
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        assertThat(actions(gm, uploaded)).containsExactly("retry", "discard");
+        // One page: at most 4 x 1 + 1 = 5 steps. Clean and triage are 2; three more ended steps reach the cap.
+        endedSteps(gm, uploaded, 3, 1, 1, UUID.randomUUID(), Instant.now());
+        assertThat(steps(uploaded.versionId())).hasSize(5);
+        Map<UUID, JobRow> jobsBefore = Map.copyOf(jobs.rows);
+
+        assertThat(actions(gm, uploaded)).containsExactly("discard");
+        refused(act(gm, uploaded, "retry"), "ingestion.too_many_steps");
+
+        assertThat(state(gm, uploaded)).isEqualTo("failed");
+        assertThat(steps(uploaded.versionId())).hasSize(5);
+        assertThat(jobs.rows).isEqualTo(jobsBefore);
+    }
+
+    @Test
+    void reprocessCopiesTheNewerCoveringStepWhenANarrowerOnesInputIsGone() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = clean(uploaded, 20, "2");
+        readUntilReview(gm, uploaded, List.of(9), List.of());
+        // A step of an earlier chain over page 9 alone, whose input batch a restart removed: never copied.
+        endedSteps(gm, uploaded, 1, 9, 9, UUID.randomUUID(), Instant.parse("2026-01-01T00:00:00Z"));
+
+        HttpResponse<String> reprocessed = act(gm, uploaded, "reprocess");
+
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(200);
+        assertThat(steps(uploaded.versionId())).filteredOn(step -> step.endedAt() == null).singleElement()
+                .satisfies(step -> {
+                    assertThat(step.stage()).isEqualTo("layout");
+                    assertThat(step.firstPage()).isEqualTo(9);
+                    assertThat(step.lastPage()).isEqualTo(9);
+                    assertThat(step.inputFileId()).isEqualTo(cleaned.batches().getFirst());
+                });
+    }
+
+    @Test
+    void aDiscardWhoseRemovalFailsStillAnswersDiscardedAndTheSweepFinishesIt() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 3, "2", true);
+        readUntilReview(gm, uploaded, List.of(), List.of(1, 2));
+        List<VersionFileRow> stored = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()));
+        Path blocker = block(gm, stored.getFirst());
+
+        HttpResponse<String> discarded = act(gm, uploaded, "discard");
+
+        assertThat(discarded.statusCode()).as(discarded.body()).isEqualTo(200);
+        assertThat(json(discarded).path("state").asString()).isEqualTo("discarded");
+        assertThat(materials.versions.get(uploaded.versionId()).removalPending()).isTrue();
+        assertThat(materials.files.values()).anyMatch(file -> file.versionId().equals(uploaded.versionId()));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().contains("material.removal_deferred"));
+
+        unblock(blocker);
+        removals.sweep();
+
+        assertNothingLeft(gm, uploaded, stored);
+    }
+
+    @Test
+    void aSweepOverTwoPendingVersionsRemovesOneWhenTheOtherFails() throws Exception {
+        Gm gm = signUp();
+        Uploaded failing = upload(gm, pdf(MIB), "Um.pdf", null);
+        cleanReport(failing.jobId(), claim(failing.jobId()), 3, "2", true);
+        readUntilReview(gm, failing, List.of(), List.of(1));
+        Uploaded removed = upload(gm, pdf(MIB), "Dois.pdf", null);
+        cleanReport(removed.jobId(), claim(removed.jobId()), 3, "2", true);
+        readUntilReview(gm, removed, List.of(), List.of(1));
+        List<VersionFileRow> failingFiles = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(failing.versionId()));
+        List<VersionFileRow> removedFiles = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(removed.versionId()));
+        // Both discards committed, and the backend stopped before either removal.
+        for (Uploaded uploaded : List.of(failing, removed)) {
+            OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                    materials.discardVersion(uploaded.versionId(), Instant.now())));
+        }
+        Path blocker = block(gm, failingFiles.getFirst());
+
+        removals.sweep();
+
+        assertNothingLeft(gm, removed, removedFiles);
+        assertThat(materials.versions.get(failing.versionId()).removalPending()).isTrue();
+        assertThat(materials.files.values()).anyMatch(file -> file.versionId().equals(failing.versionId()));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().contains("material.removal_failed"));
+
+        unblock(blocker);
+        removals.sweep();
+
+        assertNothingLeft(gm, failing, failingFiles);
+    }
+
+    @Value("${gmshield.files.dir}")
+    private Path filesDir;
+
+    /** {@code count} ended steps of the version over pages {@code first} to {@code last} of {@code input}. */
+    private void endedSteps(Gm gm, Uploaded uploaded, int count, int first, int last, UUID input, Instant at) {
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            for (int i = 0; i < count; i++) {
+                materials.insertStep(new StepRow(UUID.randomUUID(), gm.id(), uploaded.versionId(), UUID.randomUUID(),
+                        "ocr", first, last, input, at, at));
+            }
+        }));
+    }
+
+    /** A folder with a file inside the stored file's folder: the file store cannot remove it until it is unblocked. */
+    private Path block(Gm gm, VersionFileRow file) throws Exception {
+        Path blocker = filesDir.resolve(gm.id().toString()).resolve(file.fileId().toString()).resolve("blocker");
+        Files.createDirectories(blocker);
+        Files.write(blocker.resolve("x"), new byte[] {1});
+        return blocker;
+    }
+
+    private static void unblock(Path blocker) throws Exception {
+        Files.delete(blocker.resolve("x"));
+        Files.delete(blocker);
     }
 
     // --- Story 1.20 helpers

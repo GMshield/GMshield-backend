@@ -55,7 +55,9 @@ import tools.jackson.databind.json.JsonMapper;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-            "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false", "gmshield.files.dir=${java.io.tmpdir}/gmshield-job-it",
+            "gmshield.materials.upload-sweep.enabled=false",
+            "gmshield.materials.version-removal-sweep.enabled=false",
+            "gmshield.files.dir=${java.io.tmpdir}/gmshield-job-it",
             "gmshield.jobs.output-max-bytes=6MB", "gmshield.jobs.output-claim-max-bytes=10MB"})
 @ActiveProfiles("test-mode")
 class JobIntegrationTest {
