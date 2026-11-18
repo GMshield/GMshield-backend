@@ -321,7 +321,8 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     `version_outline` (one encrypted JSON outline per version), owner-scoped as in V10.
   - `Materials.passage(id)` gives the material's id and name, the version id, the section path, the page and the
     text; `Materials.outline(versionId)` the sections (level, title, page); both empty for an unknown id or another
-    owner's. No public route reads them yet (Story 1.20).
+    owner's. From Story 1.20 `passage(id)` answers only passages of a `ready` version; no public route reads a
+    passage, and the outline reaches the GM through the quality report.
 - **Page pictures with a text layer (`materials`, Story 1.19, internal contract 1.5.0, public contract 1.8.0).** A
   reading report may add `pageViews`: for a PDF page `{page, picture: {fileId, width, height}, lines: [{text,
   box}]}`, for a text page `{page, text}`. It is refused with `job.result_invalid` (detail code
@@ -345,6 +346,47 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     version in any other state, a page outside 1 to the page total, a page with no view, and a picture of a page
     with none are the same `request.not_found` (404); a missing or other ground is `page.ground_unknown` (400).
     Grounds are a parameter (`Materials.Ground`) so that Epics 2 and 3 add theirs without a new path.
+- **The quality report and the GM's review (`materials`, Story 1.20, public contract 1.9.0).** Each `Material` view
+  gains `actions`: those of `accept`, `reprocess`, `retry` and `discard` its newest version allows now, in that order
+  (`Materials.actions`, the one place of the rule): `accept` and `discard` while it is `needs_review`, `reprocess` too
+  when a page is unreadable; `retry` (when a cleaned original or a complete raw upload remains, and its format has a
+  chain) and `discard` while it is `failed`; none in any other state (a `ready` version is never reprocessed nor
+  discarded in place). The frontend shows only those.
+  - `POST /api/v1/materials/{id}/{accept|reprocess|retry|discard}` takes no body and answers the `Material` view
+    (`no-store`). `materials.service.MaterialActions` locks the newest version and acts only from its allowed state,
+    in one transaction; anything else is `material.action_unavailable` (409). Another owner's material, an unknown or
+    a malformed id are `request.not_found` (404), and nothing changes.
+    - accept: `needs_review` becomes `ready`, and a `ready` version of the material before it `superseded`.
+    - reprocess (`IngestionSteps.reprocess`): for each unreadable page, the narrowest recorded step with a page range
+      that covers it (the latest of equally narrow ones; never a step over every text file) is copied, stage and
+      input file, narrowed to each run of consecutive pages under it; the backend never names a stage. In the same
+      transaction the `unreadable` outcomes go, with those pages' page views and pictures (removed after the commit),
+      the passages and the outline; a held copy of the version's latest `texts` step is added; the version becomes
+      `processing`, and the chain's end brings it back to `needs_review`. New steps past the step cap answer
+      `ingestion.too_many_steps` (409) and change nothing. A new job starts at attempt 1, so each run is read in
+      one child. A blank page comes back unreadable, and the report says so again.
+    - retry (`IngestionSteps.retry`): from the cleaned original as a pipeline restart does (the restart's job-free
+      core, `startOver`), or without one from the complete raw upload as the first step does; the version becomes
+      `processing`. Past the step cap of a known page total: `ingestion.too_many_steps` (409).
+    - discard: the version becomes `discarded` with `material_version.removal_pending` set, and its unended steps
+      are cancelled. After the commit `VersionRemoval` runs once, as the owner, in three parts each safe to repeat:
+      the page views, passages, outline, layers and outcomes (one transaction); the pieces of every version file;
+      the `version_file` rows, the complete raw upload (`removing`, finished by the upload sweep) and the flag (one
+      transaction). Step rows and the version row stay; they hold no content. `VersionRemovalSweep` (every
+      `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY`, 10 min, the first right after the start) finishes every version still
+      flagged, each as its owner; its list of flagged versions (`data.PendingRemovals`, `JdbcClient`) is the one read
+      of a library table without an owner, and it reads ids only.
+  - `GET /api/v1/materials/{id}/report` answers `{outline: [{level, title, page}], unreadable: [{firstPage,
+    lastPage}], warnings: [{code, count}]}` (`no-store`) while the newest version is `needs_review` or `ready`, and
+    `request.not_found` (404) in any other state. `unreadable` holds runs of consecutive pages; the warnings are facts
+    the backend derives: `report.pages_unreadable` (the unreadable pages), `report.pages_unopened` (those with no
+    page view: their reading crashed) and `report.outline_empty` (count 0), each only when it holds. The three counts
+    are the material's `pages` (`done`, `readByOcr`, `unreadable`).
+  - The page answer gains `outcome` (`read_directly`, `read_by_ocr`, `unreadable`, or null). An unreadable page with
+    no page view now answers `{picture: null, lines: [], text: null, passages: [], outcome: "unreadable"}` instead
+    of 404; its picture is still 404.
+  - `V13__version_removal.sql`: `material_version.removal_pending boolean not null default false`, and a partial
+    index on `(updated_at, id) where removal_pending`.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -424,6 +466,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_REOFFER_AFTER` | an offer nobody claimed is made again after this long (default `2m`; less than an hour) |
 | `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
+| `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |

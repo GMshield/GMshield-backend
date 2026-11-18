@@ -52,7 +52,7 @@ import tools.jackson.databind.json.JsonMapper;
 // likewise the upload sweep (UploadIntegrationTest drives it).
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-            "gmshield.materials.upload-sweep.enabled=false"})
+            "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class LibraryIntegrationTest {
 

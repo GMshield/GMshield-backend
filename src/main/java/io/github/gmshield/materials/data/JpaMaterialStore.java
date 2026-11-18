@@ -501,6 +501,58 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> versionsOf(UUID materialId) {
+        return em().createQuery("select v from MaterialVersion v where v.materialId = :id order by v.createdAt, v.id",
+                        MaterialVersionEntity.class).setParameter("id", materialId).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
+    public List<StepRow> steps(UUID versionId) {
+        return em().createQuery("select s from IngestionStep s where s.versionId = :version order by s.createdAt, s.id",
+                        IngestionStepEntity.class)
+                .setParameter("version", versionId).getResultList().stream().map(IngestionStepEntity::row).toList();
+    }
+
+    @Override
+    public int deleteOutcomes(UUID versionId, String outcome) {
+        List<PageOutcomeEntity> found = em().createQuery("select r from PageOutcome r where r.versionId = :version"
+                        + " and r.outcome = :outcome", PageOutcomeEntity.class)
+                .setParameter("version", versionId).setParameter("outcome", outcome).getResultList();
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
+    }
+
+    @Override
+    public List<Integer> pagesWithView(UUID versionId, int firstPage, int lastPage) {
+        return em().createQuery("select p.page from PageView p where p.versionId = :version"
+                        + " and p.page between :first and :last order by p.page", Integer.class)
+                .setParameter("version", versionId).setParameter("first", firstPage).setParameter("last", lastPage)
+                .getResultList();
+    }
+
+    @Override
+    public boolean discardVersion(UUID id, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.discard(now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
+    public boolean clearRemovalPending(UUID id, Instant now) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.clearRemovalPending(now);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
     public boolean deleteVersion(UUID id) {
         Optional<MaterialVersionEntity> version = version(id);
         version.ifPresent(entity -> {

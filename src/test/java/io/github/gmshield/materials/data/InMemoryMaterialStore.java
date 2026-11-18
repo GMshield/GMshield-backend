@@ -120,7 +120,8 @@ public class InMemoryMaterialStore implements MaterialStore {
         found.ifPresent(before -> {
             ownerFor(before.ownerId());
             versions.put(id, new VersionRow(before.id(), before.ownerId(), before.materialId(), state, format, sizeBytes,
-                    before.createdAt(), now, before.pageTotal(), before.pipelineVersion(), before.failureCode()));
+                    before.createdAt(), now, before.pageTotal(), before.pipelineVersion(), before.failureCode(),
+                    before.removalPending()));
             RollbackUndo.onRollback(() -> versions.put(id, before));
         });
         return found.isPresent();
@@ -130,7 +131,7 @@ public class InMemoryMaterialStore implements MaterialStore {
     public synchronized boolean changeVersionState(UUID id, String state, Instant now) {
         return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(), state,
                 before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(), before.pipelineVersion(),
-                before.failureCode()));
+                before.failureCode(), before.removalPending()));
     }
 
     @Override
@@ -138,7 +139,8 @@ public class InMemoryMaterialStore implements MaterialStore {
         return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(),
                 before.state(), before.format(), before.sizeBytes(), before.createdAt(), now,
                 pageTotal == null ? before.pageTotal() : pageTotal,
-                pipelineVersion == null ? before.pipelineVersion() : pipelineVersion, before.failureCode()));
+                pipelineVersion == null ? before.pipelineVersion() : pipelineVersion, before.failureCode(),
+                before.removalPending()));
     }
 
     @Override
@@ -150,14 +152,14 @@ public class InMemoryMaterialStore implements MaterialStore {
     public synchronized boolean clearPipelineVersion(UUID id, Instant now) {
         return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(),
                 before.state(), before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(), null,
-                before.failureCode()));
+                before.failureCode(), before.removalPending()));
     }
 
     @Override
     public synchronized boolean failVersion(UUID id, String code, Instant now) {
         return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(), "failed",
                 before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(), before.pipelineVersion(),
-                code));
+                code, before.removalPending()));
     }
 
     private boolean replaceVersion(UUID id, java.util.function.UnaryOperator<VersionRow> change) {
@@ -541,6 +543,62 @@ public class InMemoryMaterialStore implements MaterialStore {
     @Override
     public List<PassageRow> passagesOnPage(UUID versionId, int page) {
         return passages(versionId).stream().filter(row -> row.page() == page).toList();
+    }
+
+    @Override
+    public List<VersionRow> versionsOf(UUID materialId) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && row.materialId().equals(materialId))
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id)).toList();
+    }
+
+    @Override
+    public List<StepRow> steps(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return steps.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId))
+                .sorted(Comparator.comparing(StepRow::createdAt).thenComparing(StepRow::id)).toList();
+    }
+
+    @Override
+    public synchronized int deleteOutcomes(UUID versionId, String outcome) {
+        List<PageRangeRow> found = rangesOf(outcomes, versionId, 1, Integer.MAX_VALUE).stream()
+                .filter(row -> row.value().equals(outcome)).toList();
+        for (PageRangeRow row : found) {
+            ownerFor(row.ownerId());
+            outcomes.remove(row.id());
+            RollbackUndo.onRollback(() -> outcomes.put(row.id(), row));
+        }
+        return found.size();
+    }
+
+    @Override
+    public List<Integer> pagesWithView(UUID versionId, int firstPage, int lastPage) {
+        UUID owner = OwnerContext.require();
+        return pageViews.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && row.versionId().equals(versionId) && row.page() >= firstPage && row.page() <= lastPage)
+                .map(PageViewRow::page).sorted().toList();
+    }
+
+    @Override
+    public synchronized boolean discardVersion(UUID id, Instant now) {
+        return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(),
+                "discarded", before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(),
+                before.pipelineVersion(), before.failureCode(), true));
+    }
+
+    @Override
+    public synchronized boolean clearRemovalPending(UUID id, Instant now) {
+        return replaceVersion(id, before -> new VersionRow(before.id(), before.ownerId(), before.materialId(),
+                before.state(), before.format(), before.sizeBytes(), before.createdAt(), now, before.pageTotal(),
+                before.pipelineVersion(), before.failureCode(), false));
+    }
+
+    /** The versions of every owner whose removal is pending, by last change (Story 1.20: the removal sweep's list). */
+    public List<VersionRow> removalPending(int limit) {
+        return versions.values().stream().filter(VersionRow::removalPending)
+                .sorted(Comparator.comparing(VersionRow::updatedAt).thenComparing(VersionRow::id)).limit(limit)
+                .toList();
     }
 
     @Override

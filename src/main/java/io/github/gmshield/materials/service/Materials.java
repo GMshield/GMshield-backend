@@ -47,7 +47,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * names no phase: the frontend chooses the words. From Story 1.18, a passage with its material, section path, page
  * and text ({@link #passage}), and a version's outline ({@link #outline}), decrypted, for their owner only. From Story
  * 1.19, one page of a material on a {@link Ground} ({@link #page}): its picture's size, its lines or text, and its
- * passages' places, and the picture itself ({@link #picture}), streamed piece by piece.
+ * passages' places, and the picture itself ({@link #picture}), streamed piece by piece. From Story 1.20, each
+ * material's {@code actions} (those of {@value #ACCEPT}, {@value #REPROCESS}, {@value #RETRY} and {@value #DISCARD}
+ * its newest version allows now: {@link #actions}, the one place of that rule), the quality report of a version that
+ * needs review or is ready ({@link #report}), each page's outcome, an unreadable page with no view answered as one with
+ * nothing on it, and only passages of a {@code ready} version.
  * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
  * Nothing here logs a name.
  */
@@ -58,6 +62,18 @@ public class Materials {
     public static final Set<String> STATES = Set.of("uploading", "waiting", "processing", "needs_review", "ready",
             "superseded", "failed", "discarded");
     static final String FAILED = "failed";
+    static final String READY = "ready";
+    static final String SUPERSEDED = "superseded";
+    /** The GM's actions on a material's newest version (Story 1.20), in the order the interface shows them. */
+    public static final String ACCEPT = "accept";
+    public static final String REPROCESS = "reprocess";
+    public static final String RETRY = "retry";
+    public static final String DISCARD = "discard";
+    public static final List<String> ACTIONS = List.of(ACCEPT, REPROCESS, RETRY, DISCARD);
+    /** The report's warnings (Story 1.20): facts the backend derives, each with a count. */
+    public static final String PAGES_UNREADABLE = "report.pages_unreadable";
+    public static final String PAGES_UNOPENED = "report.pages_unopened";
+    public static final String OUTLINE_EMPTY = "report.outline_empty";
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
 
@@ -67,6 +83,7 @@ public class Materials {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final JobsInProgress inProgress;
     private final FileStore files;
+    private final IngestionSettings settings;
 
     /** Those of these jobs of the bound owner that are offered or running ({@link Jobs#inProgress}). */
     @FunctionalInterface
@@ -76,12 +93,13 @@ public class Materials {
 
     @Autowired
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs,
-              ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, files, jobs::inProgress, transactions);
+              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+        this(materials, uploads, vault, files, jobs::inProgress, settings, transactions);
     }
 
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
-              ObjectProvider<PlatformTransactionManager> transactions) {
+              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+        this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
@@ -121,10 +139,11 @@ public class Materials {
 
     /**
      * A material: {@code kind} may be null, {@code upload} is there only while the state is {@code uploading},
-     * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed}.
+     * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed};
+     * {@code actions}, the GM's actions its newest version allows now (Story 1.20), in {@link #ACTIONS} order.
      */
     public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
-                           String failure) {
+                           String failure, List<String> actions) {
         @Override
         public String toString() {
             return "Material[id=" + id + ", state=" + state + "]";
@@ -200,10 +219,12 @@ public class Materials {
     /**
      * One page of a version (Story 1.19): its number and the version's page total, its picture's size and its lines
      * (a PDF page), or its text (a text page: {@code picture} and {@code text} null otherwise, {@code lines} empty),
-     * and the places of the passages on it, in reading order. {@code toString} names numbers only.
+     * and the places of the passages on it, in reading order; from Story 1.20 its outcome (null when it has none). An
+     * unreadable page with no view has no picture, no lines, no text and no passages. {@code toString} names numbers
+     * only.
      */
     public record VersionPage(int page, int pageTotal, PictureSize picture, List<Line> lines, String text,
-                              List<PagePassage> passages) {
+                              List<PagePassage> passages, String outcome) {
         @Override
         public String toString() {
             return "VersionPage[page=" + page + ", pageTotal=" + pageTotal + "]";
@@ -240,6 +261,25 @@ public class Materials {
         }
     }
 
+    /** A run of pages, {@code firstPage} to {@code lastPage} inclusive. */
+    public record PageRun(int firstPage, int lastPage) {
+    }
+
+    /** A fact of the quality report (Story 1.20): its code ({@link #PAGES_UNREADABLE}, ...) and its count. */
+    public record Warning(String code, int count) {
+    }
+
+    /**
+     * The quality report of a version (Story 1.20): its outline in reading order, its unreadable pages as runs, and
+     * its warnings. The counts are the material's {@link Pages}.
+     */
+    public record Report(List<Section> outline, List<PageRun> unreadable, List<Warning> warnings) {
+        @Override
+        public String toString() {
+            return "Report[sections=" + outline.size() + ", unreadable=" + unreadable.size() + "]";
+        }
+    }
+
     /** One page of materials, and the cursor of the next one (null when this is the last). */
     public record Page(List<Material> items, UUID nextCursor) {
     }
@@ -265,9 +305,13 @@ public class Materials {
         return reading(() -> materials.newest(id).map(found -> views(List.of(found)).getFirst()));
     }
 
-    /** The owner's passage with this id; empty for an unknown id or another owner's. */
+    /**
+     * The owner's passage with this id; empty for an unknown id or another owner's, and from Story 1.20 for a passage of
+     * a version that is not {@code ready}: nothing of a version the GM has not accepted reaches a later feature.
+     */
     public Optional<Passage> passage(UUID id) {
         return reading(() -> materials.findPassage(id).flatMap(row -> materials.findVersion(row.versionId())
+                .filter(version -> READY.equals(version.state()))
                 .flatMap(version -> materials.findMaterial(version.materialId()))
                 .map(material -> passage(row, material))));
     }
@@ -292,12 +336,68 @@ public class Materials {
     }
 
     /**
+     * The quality report of the owner's material (Story 1.20): its newest version's, while that version needs review
+     * or is ready; empty for an unknown material, another owner's, or a version in any other state. The warnings:
+     * {@value #PAGES_UNREADABLE} (the unreadable pages), {@value #PAGES_UNOPENED} (those of them with no page view: their
+     * reading crashed) and {@value #OUTLINE_EMPTY} (no section was found), each only when it holds.
+     */
+    public Optional<Report> report(UUID materialId) {
+        return reading(() -> materials.newest(materialId).map(NewestVersion::version)
+                .filter(version -> REVIEWED.contains(version.state())).map(version -> {
+                    List<Section> outline = materials.findOutline(version.id()).map(row -> Passages.outline(
+                                    vault.decrypt(Passages.outline(row.id(), row.ownerId()), row.outline())).stream()
+                            .map(entry -> new Section(entry.level(), entry.title(), entry.page())).toList())
+                            .orElse(List.of());
+                    List<PageRun> unreadable = runs(materials.pageOutcomes(List.of(version.id())).stream()
+                            .filter(range -> PageRangeRow.UNREADABLE.equals(range.value()))
+                            .sorted(Comparator.comparingInt(PageRangeRow::firstPage)).toList());
+                    int pages = unreadable.stream().mapToInt(run -> run.lastPage() - run.firstPage() + 1).sum();
+                    int opened = unreadable.stream().mapToInt(run -> materials.pagesWithView(version.id(),
+                            run.firstPage(), run.lastPage()).size()).sum();
+                    List<Warning> warnings = new java.util.ArrayList<>();
+                    if (pages > 0) {
+                        warnings.add(new Warning(PAGES_UNREADABLE, pages));
+                    }
+                    if (pages > opened) {
+                        warnings.add(new Warning(PAGES_UNOPENED, pages - opened));
+                    }
+                    if (outline.isEmpty()) {
+                        warnings.add(new Warning(OUTLINE_EMPTY, 0));
+                    }
+                    return new Report(outline, unreadable, List.copyOf(warnings));
+                }));
+    }
+
+    /** The states whose report and pages the GM reads (Story 1.20). */
+    static final Set<String> REVIEWED = Set.of(IngestionSteps.NEEDS_REVIEW, READY);
+
+    /** Ranges by first page as runs of consecutive pages: adjacent or overlapping ranges become one. */
+    static List<PageRun> runs(List<PageRangeRow> ranges) {
+        List<PageRun> runs = new java.util.ArrayList<>();
+        for (PageRangeRow range : ranges) {
+            PageRun last = runs.isEmpty() ? null : runs.getLast();
+            if (last != null && last.lastPage() >= range.firstPage() - 1) {
+                runs.set(runs.size() - 1, new PageRun(last.firstPage(), Math.max(last.lastPage(), range.lastPage())));
+            } else {
+                runs.add(new PageRun(range.firstPage(), range.lastPage()));
+            }
+        }
+        return List.copyOf(runs);
+    }
+
+    /**
      * Page {@code page} of the owner's material on {@code ground}: empty for an unknown material or another owner's,
-     * a current version the ground does not serve, a page outside 1 to the page total, or a page with no page view.
+     * a current version the ground does not serve, a page outside 1 to the page total, or a page with no page view
+     * unless it is unreadable (its reading crashed: Story 1.20), which is a page with nothing on it.
      */
     public Optional<VersionPage> page(UUID materialId, int page, Ground ground) {
-        return reading(() -> served(materialId, page, ground).flatMap(version -> materials
-                .findPageView(version.id(), page).map(view -> versionPage(version, view))));
+        return reading(() -> served(materialId, page, ground).flatMap(version -> {
+            String outcome = materials.outcomesWithin(version.id(), page, page).stream().findFirst()
+                    .map(PageRangeRow::value).orElse(null);
+            return materials.findPageView(version.id(), page).map(view -> versionPage(version, view, outcome))
+                    .or(() -> PageRangeRow.UNREADABLE.equals(outcome) ? Optional.of(new VersionPage(page,
+                            version.pageTotal(), null, List.of(), null, List.of(), outcome)) : Optional.empty());
+        }));
     }
 
     /** The picture of that page, as {@link #page} finds it; empty also for a page with no picture. */
@@ -314,7 +414,7 @@ public class Materials {
                 .filter(version -> version.pageTotal() != null && page >= 1 && page <= version.pageTotal());
     }
 
-    private VersionPage versionPage(VersionRow version, PageViewRow view) {
+    private VersionPage versionPage(VersionRow version, PageViewRow view, String outcome) {
         PageViews.Content content = PageViews.content(vault.decrypt(PageViews.content(view.id(), view.ownerId()),
                 view.content()));
         List<PagePassage> passages = materials.passagesOnPage(version.id(), view.page()).stream().map(row -> {
@@ -324,7 +424,7 @@ public class Materials {
         List<Line> lines = content.lines().stream().map(line -> new Line(line.text(), line.box())).toList();
         return new VersionPage(view.page(), version.pageTotal(),
                 view.hasPicture() ? new PictureSize(view.width(), view.height()) : null, lines, content.text(),
-                passages);
+                passages, outcome);
     }
 
     private List<Material> views(List<NewestVersion> rows) {
@@ -349,16 +449,35 @@ public class Materials {
         return rows.stream().map(row -> {
             UploadRow upload = Uploads.UPLOADING.equals(row.version().state()) ? open.get(row.version().id()) : null;
             Integer total = row.version().pageTotal();
+            Pages pages = total == null ? null : pages(total, layers.getOrDefault(row.version().id(), List.of()),
+                    outcomes.getOrDefault(row.version().id(), List.of()),
+                    current.getOrDefault(row.version().id(), List.of()));
             return new Material(row.material().id(),
                     vault.decryptText(new Binding(Uploads.MATERIAL, Uploads.FIELD_NAME, row.material().id(),
                             row.material().ownerId()), row.material().name()),
                     row.version().state(), row.material().kind(),
                     upload == null ? null : new Upload(upload.id(), upload.offset(), upload.length(), upload.expiresAt()),
-                    total == null ? null : pages(total, layers.getOrDefault(row.version().id(), List.of()),
-                            outcomes.getOrDefault(row.version().id(), List.of()),
-                            current.getOrDefault(row.version().id(), List.of())),
-                    FAILED.equals(row.version().state()) ? row.version().failureCode() : null);
+                    pages, FAILED.equals(row.version().state()) ? row.version().failureCode() : null,
+                    actions(row.version().state(), pages == null ? 0 : pages.unreadable(),
+                            IngestionSteps.retryCheck(materials, uploads, settings,
+                                    row.version()) == IngestionSteps.RetryCheck.ALLOWED));
         }).toList();
+    }
+
+    /**
+     * The GM's actions a version allows now (Story 1.20), in {@link #ACTIONS} order: {@value #ACCEPT} while it needs
+     * review, {@value #REPROCESS} while it needs review with an unreadable page, {@value #RETRY} while it is failed and
+     * would be retried ({@code retryable}: {@link IngestionSteps#retryCheck}), and {@value #DISCARD}
+     * while it needs review or is failed. A {@code ready} version is never reprocessed nor discarded in place (AD-15).
+     */
+    static List<String> actions(String state, int unreadable, boolean retryable) {
+        if (IngestionSteps.NEEDS_REVIEW.equals(state)) {
+            return unreadable > 0 ? List.of(ACCEPT, REPROCESS, DISCARD) : List.of(ACCEPT, DISCARD);
+        }
+        if (FAILED.equals(state)) {
+            return retryable ? List.of(RETRY, DISCARD) : List.of(DISCARD);
+        }
+        return List.of();
     }
 
     private static Map<UUID, List<PageRangeRow>> byVersion(List<PageRangeRow> ranges) {

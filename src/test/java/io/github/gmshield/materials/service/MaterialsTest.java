@@ -81,7 +81,8 @@ class MaterialsTest {
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
         reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
-                .collect(java.util.stream.Collectors.toSet()), beans.getBeanProvider(PlatformTransactionManager.class));
+                .collect(java.util.stream.Collectors.toSet()), new IngestionSettings(4),
+                beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
                 library.createStarter(Language.EN);
@@ -379,7 +380,7 @@ class MaterialsTest {
         Materials watched = new Materials(materials, uploads, vault, files, ids -> {
             asked.add(List.copyOf(ids));
             return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
-        }, beansFor(transactions));
+        }, new IngestionSettings(4), beansFor(transactions));
 
         assertThat(as(owner, () -> watched.find(material)).orElseThrow().pages().reading()).isEqualTo("text");
         assertThat(asked).singleElement().satisfies(ids -> assertThat(ids).containsExactly(layout));
@@ -408,6 +409,12 @@ class MaterialsTest {
         UUID version = versionOf(material).id();
         UUID first = passage(version, 0, 21, List.of("Magic Items", "Vorpal Sword"), "Vorpal Sword\nA legendary blade.");
         UUID second = passage(version, 1, 22, List.of(), "Prefácio");
+        // Story 1.20: only a ready version's passages are read; until then none is.
+        for (String state : List.of("processing", "needs_review", "failed", "superseded", "discarded")) {
+            setState(material, state);
+            assertThat(as(owner, () -> reads.passage(first))).as(state).isEmpty();
+        }
+        setState(material, "ready");
 
         Materials.Passage found = as(owner, () -> reads.passage(first)).orElseThrow();
 
@@ -436,6 +443,7 @@ class MaterialsTest {
         UUID version = versionOf(material).id();
         UUID first = passage(version, 0, 1, List.of("A"), "Primeiro");
         UUID second = passage(version, 1, 2, List.of("B"), "Segundo");
+        setState(material, "ready");
         io.github.gmshield.materials.data.PassageRow original = materials.passages.get(second);
         materials.passages.put(second, new io.github.gmshield.materials.data.PassageRow(second, owner, version, 1, 2,
                 materials.passages.get(first).text(), original.place(), original.createdAt()));

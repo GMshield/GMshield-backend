@@ -81,9 +81,11 @@ gmshield:
     output-max-bytes: ${GMSHIELD_JOB_OUTPUT_MAX_BYTES:3GB}
     output-claim-max-bytes: ${GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES:8GB}
   # Materials (materials module, Story 1.13), a Spring duration: how often unfinished uploads past their 6 hours are
-  # discarded, and removals that stopped half way are finished.
+  # discarded, and removals that stopped half way are finished. From Story 1.20, how often the removals of discarded
+  # versions that stopped half way (a restart, a failure) are finished.
   materials:
     upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
+    version-removal-sweep-every: ${GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY:10m}
   # Ingestion (materials module, Story 1.15): a version may have at most steps-per-page x its pages + 1 steps; a report
   # whose next steps would pass that fails the version with ingestion.too_many_steps. IngestionSettings refuses a
   # start unless 1 <= steps-per-page <= 100.

@@ -45,6 +45,9 @@ class MaterialVersionEntity {
     @Column(name = "failure_code")
     private String failureCode;
 
+    @Column(name = "removal_pending", nullable = false)
+    private boolean removalPending;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -65,6 +68,7 @@ class MaterialVersionEntity {
         this.pageTotal = row.pageTotal();
         this.pipelineVersion = row.pipelineVersion();
         this.failureCode = row.failureCode();
+        this.removalPending = row.removalPending();
         this.createdAt = row.createdAt();
         this.updatedAt = row.updatedAt();
     }
@@ -106,8 +110,21 @@ class MaterialVersionEntity {
         this.updatedAt = now;
     }
 
+    /** Discarded (Story 1.20): the state {@code discarded}, and its removal pending until it has finished. */
+    void discard(Instant now) {
+        this.state = "discarded";
+        this.removalPending = true;
+        this.updatedAt = now;
+    }
+
+    /** The removal of a discarded version has finished (Story 1.20). */
+    void clearRemovalPending(Instant now) {
+        this.removalPending = false;
+        this.updatedAt = now;
+    }
+
     VersionRow row() {
         return new VersionRow(id, ownerId, materialId, state, format, sizeBytes, createdAt, updatedAt, pageTotal,
-                pipelineVersion, failureCode);
+                pipelineVersion, failureCode, removalPending);
     }
 }

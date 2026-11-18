@@ -5,7 +5,10 @@
  * that holds no content, read and written through JDBC. The file itself goes to the {@code vault} file store,
  * encrypted piece by piece as it arrives. From Story 1.15 a completed PDF starts its ingestion chain, a job of the
  * {@code jobs} module per step; the steps ({@code ingestion_step}) and the files they store for the version
- * ({@code version_file}) are library tables too. Another owner's item is "not found", exactly like an unknown one.
+ * ({@code version_file}) are library tables too. From Story 1.20 the GM accepts, reprocesses, retries or discards a
+ * version; a discarded version is removed by a recorded process, and the one read of a library table without an owner
+ * is the removal sweep's list of the ids of versions whose removal is pending ({@code data.PendingRemovals}). Another
+ * owner's item is "not found", exactly like an unknown one.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
         allowedDependencies = {"shared :: service", "vault :: service", "jobs :: service", "library :: service"})

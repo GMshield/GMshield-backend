@@ -86,6 +86,10 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>A restart (Story 1.16), in one transaction: the version's other unended step jobs are cancelled (held steps
  *       end), its layers, outcomes, batches and {@code texts} files, passages and outline, page views and pictures go,
  *       its pipeline version is cleared (its page total stays), and a new first step reads the stored original.</li>
+ *   <li>The GM's review (Story 1.20), each in the caller's transaction with the version locked: {@link #reprocess}
+ *       reads the unreadable pages of a {@code needs_review} version again, by copies of the steps that read them;
+ *       {@link #retry} starts a {@code failed} version again, from its original as a restart does or from its raw
+ *       upload as {@link #start} does; {@link #cancelSteps} ends a discarded version's steps.</li>
  * </ul>
  *
  * Every step row gets {@code ended_at} when its job is completed, finally fails or is cancelled here. Every call runs
@@ -414,24 +418,41 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     }
 
     /**
-     * Restarts the chain from the stored original (Story 1.16): the other unended steps are cancelled; the layers,
-     * outcomes, batches and {@code texts} files go, and the passages, outline, page views and pictures; the pipeline
-     * version is cleared and the page total kept; a new first step reads the original. Without an original, or past
+     * Restarts the chain from the stored original (Story 1.16): see {@link #startOver}. Without an original, or past
      * the step cap, the version fails instead.
      */
     private void restart(JobRef job, VersionRow version, Instant now) {
-        Optional<VersionFileRow> original = materials.versionFiles(version.id(), Set.of(VersionFileRow.ORIGINAL))
-                .stream().findFirst();
+        Optional<VersionFileRow> original = original(version.id());
         String stage = START_STAGES.get(version.format());
         if (original.isEmpty() || stage == null) {
             fail(job, version, PIPELINE_CHANGED, now);
             return;
         }
-        int total = version.pageTotal() == null ? 0 : version.pageTotal();
-        if (materials.countSteps(version.id()) + 1 > settings.stepCap(total)) {
+        if (pastCap(version, 1)) {
             fail(job, version, TOO_MANY_STEPS, now);
             return;
         }
+        StartedOver started = startOver(version, stage, original.get().fileId(), now);
+        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("jobId", job.id())
+                .addKeyValue("newJobId", started.jobId()).addKeyValue("stage", stage)
+                .addKeyValue("cancelled", started.cancelled()).addKeyValue("ranges", started.ranges())
+                .addKeyValue("passages", started.passages()).addKeyValue("outline", started.outline())
+                .addKeyValue("pageViews", started.pageViews()).log("ingestion.restarted");
+    }
+
+    /** What {@link #startOver} removed, and its new first step's job. */
+    private record StartedOver(UUID jobId, int cancelled, int ranges, int passages, boolean outline, int pageViews) {
+    }
+
+    /**
+     * The chain of the version starts over, needing no job (Stories 1.16 and 1.20), in the caller's transaction as the
+     * version's owner: the other unended steps are cancelled (held steps end); the layers, outcomes, batches and
+     * {@code texts} files go, and the passages, outline, page views and pictures; the pipeline version is cleared and
+     * the page total kept; a new first step of {@code stage} reads {@code input} (the stored original, or the raw
+     * upload of a version that has none).
+     */
+    private StartedOver startOver(VersionRow version, String stage, UUID input, Instant now) {
+        UUID owner = OwnerContext.require();
         int cancelled = cancelUnended(version.id(), now);
         int ranges = materials.deletePageRanges(version.id());
         int passages = materials.deletePassages(version.id());
@@ -441,13 +462,213 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         removeFilesAfterCommit(materials.deleteVersionFiles(version.id(),
                 Set.of(VersionFileRow.BATCH, VersionFileRow.TEXT, VersionFileRow.PICTURE)));
         materials.clearPipelineVersion(version.id(), now);
-        UUID input = original.get().fileId();
-        JobRef first = jobs.create(KIND, created -> materials.insertStep(new StepRow(Ids.newId(), job.ownerId(),
+        JobRef first = jobs.create(KIND, created -> materials.insertStep(new StepRow(Ids.newId(), owner,
                 version.id(), created.id(), stage, null, null, input, now)));
-        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("jobId", job.id())
-                .addKeyValue("newJobId", first.id()).addKeyValue("stage", stage).addKeyValue("cancelled", cancelled)
-                .addKeyValue("ranges", ranges).addKeyValue("passages", passages).addKeyValue("outline", outline)
-                .addKeyValue("pageViews", pageViews).log("ingestion.restarted");
+        return new StartedOver(first.id(), cancelled, ranges, passages, outline, pageViews);
+    }
+
+    private Optional<VersionFileRow> original(UUID versionId) {
+        return materials.versionFiles(versionId, Set.of(VersionFileRow.ORIGINAL)).stream().findFirst();
+    }
+
+    /** Whether {@code added} more steps would take the version past its step cap. */
+    private boolean pastCap(VersionRow version, int added) {
+        int total = version.pageTotal() == null ? 0 : version.pageTotal();
+        return materials.countSteps(version.id()) + added > settings.stepCap(total);
+    }
+
+    // --- the GM's review (Story 1.20)
+
+    /**
+     * What a failed version would start again from: its cleaned original, else its complete raw upload; empty when it
+     * has neither, or when its format has no chain. The caller has the version's owner bound.
+     */
+    private static Optional<UUID> retryInput(MaterialStore materials, UploadStorage uploads, VersionRow version) {
+        if (version.format() == null || !START_STAGES.containsKey(version.format())) {
+            return Optional.empty();
+        }
+        return materials.versionFiles(version.id(), Set.of(VersionFileRow.ORIGINAL)).stream().findFirst()
+                .map(VersionFileRow::fileId)
+                .or(() -> uploads.joined().completeForVersion(OwnerContext.require(), version.id())
+                        .map(UploadRow::id));
+    }
+
+    /** Whether a failed version would be retried now: {@link #retryCheck}. */
+    enum RetryCheck {
+        /** Not failed, or nothing remains to start from (or its format has no chain). */
+        NO_INPUT,
+        /** An input remains, but one more step would pass the step cap of its known page total. */
+        PAST_CAP,
+        /** {@link #retry} would accept it. */
+        ALLOWED
+    }
+
+    /**
+     * The one check behind a failed version's {@code retry}, in its {@code actions} and in the locked action (Story
+     * 1.20): an input remains ({@link #retryInput}) and either its page total is not known yet (its first step failed:
+     * each retry is the GM's own) or one more step stays within the step cap. The caller has the owner bound.
+     */
+    static RetryCheck retryCheck(MaterialStore materials, UploadStorage uploads, IngestionSettings settings,
+                                 VersionRow version) {
+        if (!Materials.FAILED.equals(version.state()) || retryInput(materials, uploads, version).isEmpty()) {
+            return RetryCheck.NO_INPUT;
+        }
+        if (version.pageTotal() != null
+                && materials.countSteps(version.id()) + 1 > settings.stepCap(version.pageTotal())) {
+            return RetryCheck.PAST_CAP;
+        }
+        return RetryCheck.ALLOWED;
+    }
+
+    /**
+     * Retries a {@code failed} version, locked by the caller, in its transaction: from its cleaned original as a
+     * restart does ({@link #startOver}), or without one from its complete raw upload as {@link #start} does; the
+     * version becomes {@code processing}. Refused with {@code material.action_unavailable} when it has neither, and
+     * with {@value #TOO_MANY_STEPS} when the new first step would pass the step cap of its known page total (nothing
+     * changes). A version whose page total is not known yet (its first step failed) has no cap to pass: each retry is
+     * the GM's own.
+     */
+    public void retry(VersionRow version) {
+        RetryCheck check = retryCheck(materials, uploads, settings, version);
+        if (check == RetryCheck.NO_INPUT) {
+            throw MaterialProblems.actionUnavailable();
+        }
+        if (check == RetryCheck.PAST_CAP) {
+            throw MaterialProblems.tooManySteps();
+        }
+        Optional<UUID> input = retryInput(materials, uploads, version);
+        Instant now = now();
+        String stage = START_STAGES.get(version.format());
+        StartedOver started = startOver(version, stage, input.orElseThrow(), now);
+        materials.changeVersionState(version.id(), PROCESSING, now);
+        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("newJobId", started.jobId())
+                .addKeyValue("stage", stage).addKeyValue("ranges", started.ranges())
+                .addKeyValue("pageViews", started.pageViews()).log("ingestion.retried");
+    }
+
+    /** A new step that reads again a run of unreadable pages, as {@code step} read them. */
+    private record Reread(StepRow step, int firstPage, int lastPage) {
+    }
+
+    /**
+     * Reprocesses the unreadable pages of a {@code needs_review} version, locked by the caller, in its transaction.
+     * For each unreadable page, the narrowest recorded step with a page range that covers it (the latest of equally
+     * narrow ones; never a step over every text file, nor one whose input is no longer a file of the version) is
+     * copied, its stage and input file, narrowed to each run of consecutive pages it covers: the backend never names a
+     * stage (AD-15). The version's {@code unreadable} outcomes
+     * go, with those pages' page views and pictures, and its passages and outline; a held copy of its latest step over
+     * every text file is added; the version becomes {@code processing}, and the chain's end brings it back to
+     * {@code needs_review}. Refused with {@code material.action_unavailable} when no page is unreadable or one has no
+     * such covering step, and with {@value #TOO_MANY_STEPS} when the new steps would pass the step cap; a refusal
+     * changes nothing.
+     */
+    public void reprocess(VersionRow version) {
+        if (!NEEDS_REVIEW.equals(version.state())) {
+            throw MaterialProblems.actionUnavailable();
+        }
+        List<PageRangeRow> unreadable = materials.pageOutcomes(List.of(version.id())).stream()
+                .filter(range -> PageRangeRow.UNREADABLE.equals(range.value()))
+                .sorted(Comparator.comparingInt(PageRangeRow::firstPage)).toList();
+        if (unreadable.isEmpty()) {
+            throw MaterialProblems.actionUnavailable();
+        }
+        List<StepRow> steps = materials.steps(version.id());
+        // Only steps whose input is still a file of the version: a restart or a retry removed the batches that the
+        // steps of an earlier chain read, and those steps stay recorded.
+        Set<UUID> inputs = new HashSet<>();
+        materials.versionFiles(version.id(), STEP_FILES).forEach(file -> inputs.add(file.fileId()));
+        List<Reread> rereads = rereads(unreadable, steps.stream().filter(step -> step.firstPage() != null
+                && step.lastPage() != null && !step.inputTexts() && inputs.contains(step.inputFileId())).toList());
+        Optional<StepRow> passages = steps.stream().filter(StepRow::inputTexts).reduce((first, second) -> second);
+        if (pastCap(version, rereads.size() + (passages.isPresent() ? 1 : 0))) {
+            throw MaterialProblems.tooManySteps();
+        }
+        UUID owner = OwnerContext.require();
+        Instant now = now();
+        int outcomes = materials.deleteOutcomes(version.id(), PageRangeRow.UNREADABLE);
+        List<PageViewRow> views = new ArrayList<>();
+        for (int[] run : merged(unreadable)) {
+            views.addAll(materials.deletePageViews(version.id(), run[0], run[1]));
+        }
+        removeFilesAfterCommit(views.stream().filter(PageViewRow::hasPicture)
+                .flatMap(view -> materials.deleteVersionFile(version.id(), view.pictureFileId()).stream()).toList());
+        int removedPassages = materials.deletePassages(version.id());
+        materials.deleteOutline(version.id());
+        passages.ifPresent(held -> materials.insertStep(StepRow.held(Ids.newId(), owner, version.id(), held.stage(),
+                held.firstPage(), held.lastPage(), now)));
+        materials.changeVersionState(version.id(), PROCESSING, now);
+        for (Reread reread : rereads) {
+            jobs.create(KIND, created -> materials.insertStep(new StepRow(Ids.newId(), owner, version.id(),
+                    created.id(), reread.step().stage(), reread.firstPage(), reread.lastPage(),
+                    reread.step().inputFileId(), now)));
+        }
+        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("steps", rereads.size())
+                .addKeyValue("outcomes", outcomes).addKeyValue("pageViews", views.size())
+                .addKeyValue("passages", removedPassages).addKeyValue("held", passages.isPresent())
+                .log("ingestion.reprocessed");
+    }
+
+    /**
+     * The steps that read the unreadable pages again: for each page, the narrowest of {@code steps} that covers it (the
+     * latest of equally narrow ones), consecutive pages under the same step grouped into one run. Refused with
+     * {@code material.action_unavailable} when a page has none.
+     */
+    private static List<Reread> rereads(List<PageRangeRow> unreadable, List<StepRow> steps) {
+        List<Reread> rereads = new ArrayList<>();
+        for (PageRangeRow range : unreadable) {
+            List<StepRow> overlapping = steps.stream().filter(step -> step.firstPage() <= range.lastPage()
+                    && step.lastPage() >= range.firstPage()).toList();
+            for (int page = range.firstPage(); page <= range.lastPage(); page++) {
+                StepRow narrowest = narrowest(overlapping, page);
+                if (narrowest == null) {
+                    throw MaterialProblems.actionUnavailable();
+                }
+                Reread last = rereads.isEmpty() ? null : rereads.getLast();
+                if (last != null && last.step().id().equals(narrowest.id()) && last.lastPage() == page - 1) {
+                    rereads.set(rereads.size() - 1, new Reread(narrowest, last.firstPage(), page));
+                } else {
+                    rereads.add(new Reread(narrowest, page, page));
+                }
+            }
+        }
+        return rereads;
+    }
+
+    /** The narrowest step that covers the page, the latest of equally narrow ones (steps are oldest first); or null. */
+    private static StepRow narrowest(List<StepRow> steps, int page) {
+        StepRow found = null;
+        for (StepRow step : steps) {
+            if (step.firstPage() <= page && page <= step.lastPage()
+                    && (found == null || width(step) <= width(found))) {
+                found = step;
+            }
+        }
+        return found;
+    }
+
+    private static int width(StepRow step) {
+        return step.lastPage() - step.firstPage();
+    }
+
+    /** Ranges by first page as inclusive runs of consecutive pages, each {@code [first, last]}. */
+    private static List<int[]> merged(List<PageRangeRow> ranges) {
+        List<int[]> runs = new ArrayList<>();
+        for (PageRangeRow range : ranges) {
+            if (!runs.isEmpty() && runs.getLast()[1] >= range.firstPage() - 1) {
+                runs.getLast()[1] = Math.max(runs.getLast()[1], range.lastPage());
+            } else {
+                runs.add(new int[] {range.firstPage(), range.lastPage()});
+            }
+        }
+        return runs;
+    }
+
+    /**
+     * A discarded version's steps that have not ended (Story 1.20): their jobs are cancelled and they end, in the
+     * caller's transaction. Answers how many.
+     */
+    public int cancelSteps(UUID versionId) {
+        return cancelUnended(versionId, now());
     }
 
     /**
@@ -626,8 +847,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         return row;
     }
 
-    /** The raw upload of the version becomes {@code removing}; its pieces and its row go after the commit. */
-    private void removeRawUpload(UUID owner, UUID versionId, Instant now) {
+    /**
+     * The raw upload of the version becomes {@code removing}; its pieces and its row go after the commit, and the
+     * upload sweep finishes whatever is left (Story 1.20: a discarded version's removal uses it too).
+     */
+    void removeRawUpload(UUID owner, UUID versionId, Instant now) {
         Optional<UploadRow> upload = uploads.joined().completeForVersion(owner, versionId);
         if (upload.isEmpty() || !uploads.joined().removeComplete(upload.get().id(), now)) {
             return;

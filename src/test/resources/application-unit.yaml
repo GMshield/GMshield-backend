@@ -28,7 +28,9 @@ gmshield:
   jobs:
     sweep:
       enabled: false
-  # Nor does the upload sweep (Story 1.13): the tests call it.
+  # Nor does the upload sweep (Story 1.13), nor the version removal sweep (Story 1.20): the tests call them.
   materials:
     upload-sweep:
+      enabled: false
+    version-removal-sweep:
       enabled: false

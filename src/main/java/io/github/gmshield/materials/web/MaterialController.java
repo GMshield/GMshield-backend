@@ -1,6 +1,7 @@
 package io.github.gmshield.materials.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import io.github.gmshield.materials.service.MaterialActions;
 import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.materials.service.PageProblems;
 import io.github.gmshield.shared.service.ApiException;
@@ -27,6 +28,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -36,7 +38,10 @@ import org.springframework.web.bind.annotation.RestController;
  * here takes an owner from the request. Another owner's id, an unknown id and a malformed id are the same
  * {@code request.not_found} (404). Every answer is {@code no-store}. From Story 1.19, one page of a material on a
  * ground ({@code ?ground=review}: the owner reviewing its current version), as JSON, and its picture, streamed as
- * WebP; a missing or unknown ground is {@code page.ground_unknown} (400).
+ * WebP; a missing or unknown ground is {@code page.ground_unknown} (400). From Story 1.20, the quality report of a
+ * material's newest version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
+ * {@code discard}), each answering the material; an action its state does not allow is
+ * {@code material.action_unavailable} (409).
  */
 @RestController
 @Tag(name = "materials")
@@ -46,6 +51,11 @@ class MaterialController {
     static final String MATERIAL = "/api/v1/materials/{id}";
     static final String PAGE = "/api/v1/materials/{id}/pages/{page}";
     static final String PICTURE = "/api/v1/materials/{id}/pages/{page}/picture";
+    static final String REPORT = "/api/v1/materials/{id}/report";
+    static final String ACCEPT = "/api/v1/materials/{id}/accept";
+    static final String REPROCESS = "/api/v1/materials/{id}/reprocess";
+    static final String RETRY = "/api/v1/materials/{id}/retry";
+    static final String DISCARD = "/api/v1/materials/{id}/discard";
     static final String WEBP = "image/webp";
     /** A page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is a page nowhere. */
     private static final Pattern PAGE_NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
@@ -55,9 +65,11 @@ class MaterialController {
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
 
     private final Materials materials;
+    private final MaterialActions actions;
 
-    MaterialController(Materials materials) {
+    MaterialController(Materials materials, MaterialActions actions) {
         this.materials = materials;
+        this.actions = actions;
     }
 
     @Schema(name = "MaterialUpload", requiredProperties = {"id", "offset", "length", "expiresAt"})
@@ -109,7 +121,7 @@ class MaterialController {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "Material", requiredProperties = {"id", "name", "state"})
+    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions"})
     record MaterialView(
             @Schema(description = "The material's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
@@ -122,13 +134,18 @@ class MaterialController {
             @Schema(description = "The unfinished upload, only while the state is uploading") UploadView upload,
             @Schema(description = "Pages done of the total, once the total is known") PagesView pages,
             @Schema(description = "Why the version failed (category.reason), only when the state is failed",
-                    example = "ingestion.password_required") String failure) {
+                    example = "ingestion.password_required") String failure,
+            @ArraySchema(arraySchema = @Schema(description = "The actions the newest version allows now, in this"
+                    + " order: accept and discard while it needs review, reprocess too when a page is unreadable;"
+                    + " retry (when it can start again) and discard while it is failed; none otherwise"),
+                    schema = @Schema(type = "string", allowableValues = {"accept", "reprocess", "retry", "discard"}))
+            List<String> actions) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
                     material.upload() == null ? null : UploadView.of(material.upload()),
                     material.pages() == null ? null : PagesView.of(material.pages()),
-                    material.failure());
+                    material.failure(), material.actions());
         }
 
         @Override
@@ -243,7 +260,7 @@ class MaterialController {
     }
 
     @Schema(name = "MaterialPageView", requiredProperties = {"page", "pageTotal", "picture", "lines", "text",
-        "passages"})
+        "passages", "outcome"})
     record PageContentView(
             @Schema(description = "The page's number", format = "int32", example = "13") int page,
             @Schema(description = "The version's page total", format = "int32", example = "364") int pageTotal,
@@ -254,13 +271,16 @@ class MaterialController {
             @Schema(description = "A text page's text; null for a picture page", types = {"string", "null"})
             String text,
             @ArraySchema(arraySchema = @Schema(description = "The page's passages, in reading order"),
-                    schema = @Schema(implementation = PassageView.class)) List<PassageView> passages) {
+                    schema = @Schema(implementation = PassageView.class)) List<PassageView> passages,
+            @Schema(description = "How the page was read: read_directly, read_by_ocr or unreadable; null when it has"
+                    + " no outcome. An unreadable page whose reading crashed has no picture, lines, text or passages",
+                    types = {"string", "null"}, example = "read_directly") String outcome) {
 
         static PageContentView of(Materials.VersionPage page) {
             return new PageContentView(page.page(), page.pageTotal(), page.picture() == null ? null
                     : new PictureView(page.picture().width(), page.picture().height()),
                     page.lines().stream().map(LineView::of).toList(), page.text(),
-                    page.passages().stream().map(PassageView::of).toList());
+                    page.passages().stream().map(PassageView::of).toList(), page.outcome());
         }
 
         @Override
@@ -271,7 +291,8 @@ class MaterialController {
 
     private static final String PAGE_SUMMARY = " page.ground_unknown (400) without a ground or for another one;"
             + " request.not_found (404) for another owner's material or an unknown one, a version the ground does not"
-            + " serve, a page outside 1 to the page total or a page with no view;" + SESSION_SUMMARY;
+            + " serve, a page outside 1 to the page total or a page with no view (unless the page is unreadable);"
+            + SESSION_SUMMARY;
 
     @GetMapping(path = PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getMaterialPage", summary = "One page of one of the account's materials on a ground:"
@@ -300,7 +321,7 @@ class MaterialController {
     @GetMapping(path = PICTURE)
     @Operation(operationId = "getMaterialPagePicture", summary = "The picture of one page of one of the account's"
             + " materials on a ground, as WebP, streamed. request.not_found (404) also for a page with no picture (a"
-            + " text page)." + PAGE_SUMMARY,
+            + " text page, or an unreadable page with no view)." + PAGE_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -327,6 +348,133 @@ class MaterialController {
         try (OutputStream out = response.getOutputStream()) {
             picture.writeTo(out);
         }
+    }
+
+    @Schema(name = "ReportSection", requiredProperties = {"level", "title", "page"})
+    record SectionView(
+            @Schema(description = "The heading's level, from 0 (the outermost)", format = "int32", example = "1")
+            int level,
+            @Schema(description = "The heading's title, as read", example = "Equipment") String title,
+            @Schema(description = "The page the section starts on", format = "int32", example = "92") int page) {
+
+        @Override
+        public String toString() {
+            return "SectionView[level=" + level + ", page=" + page + "]";
+        }
+    }
+
+    @Schema(name = "ReportPageRun", requiredProperties = {"firstPage", "lastPage"})
+    record RunView(
+            @Schema(description = "The run's first page", format = "int32", example = "40") int firstPage,
+            @Schema(description = "The run's last page (inclusive)", format = "int32", example = "41") int lastPage) {
+    }
+
+    @Schema(name = "ReportWarning", requiredProperties = {"code", "count"})
+    record WarningView(
+            @Schema(description = "What the backend found: report.pages_unreadable (pages that could not be read),"
+                    + " report.pages_unopened (of those, pages whose reading crashed, with no view) or"
+                    + " report.outline_empty (no section was found; count 0)", example = "report.pages_unreadable",
+                    allowableValues = {"report.pages_unreadable", "report.pages_unopened", "report.outline_empty"})
+            String code,
+            @Schema(description = "How many", format = "int32", example = "12") int count) {
+    }
+
+    @Schema(name = "MaterialReport", requiredProperties = {"outline", "unreadable", "warnings"})
+    record ReportView(
+            @ArraySchema(arraySchema = @Schema(description = "The sections in reading order"),
+                    schema = @Schema(implementation = SectionView.class)) List<SectionView> outline,
+            @ArraySchema(arraySchema = @Schema(description = "The unreadable pages, as runs of consecutive pages in"
+                    + " page order"), schema = @Schema(implementation = RunView.class)) List<RunView> unreadable,
+            @ArraySchema(arraySchema = @Schema(description = "Facts about the version, each with a count"),
+                    schema = @Schema(implementation = WarningView.class)) List<WarningView> warnings) {
+
+        static ReportView of(Materials.Report report) {
+            return new ReportView(report.outline().stream()
+                    .map(section -> new SectionView(section.level(), section.title(), section.page())).toList(),
+                    report.unreadable().stream().map(run -> new RunView(run.firstPage(), run.lastPage())).toList(),
+                    report.warnings().stream().map(warning -> new WarningView(warning.code(), warning.count()))
+                            .toList());
+        }
+
+        @Override
+        public String toString() {
+            return "ReportView[sections=" + outline.size() + ", unreadable=" + unreadable.size() + "]";
+        }
+    }
+
+    @GetMapping(path = REPORT, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getMaterialReport", summary = "The quality report of one of the account's materials:"
+            + " its newest version's outline, unreadable pages and warnings, while that version needs review or is"
+            + " ready (the counts are the material's pages). request.not_found (404) for another owner's material,"
+            + " an unknown or malformed id, or a version in any other state;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<ReportView> report(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return parse(id).flatMap(materials::report).map(ReportView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    private static final String ACTION_SUMMARY = " Takes no body and answers the material."
+            + " material.action_unavailable (409) when the newest version's state does not allow it now (see the"
+            + " material's actions); request.not_found (404) for another owner's material or an unknown or malformed"
+            + " id, and nothing changes;" + SESSION_SUMMARY;
+    private static final String SESSION_HEADER = "X-Session-Token";
+
+    @PostMapping(path = ACCEPT, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "acceptMaterial", summary = "Accepts the newest version of one of the account's materials:"
+            + " needs_review becomes ready, and a ready version of it before becomes superseded." + ACTION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> accept(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return act(id, Materials.ACCEPT);
+    }
+
+    @PostMapping(path = REPROCESS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "reprocessMaterial", summary = "Reads again the unreadable pages of the newest version of"
+            + " one of the account's materials, which needs review: it becomes processing, and needs review again"
+            + " once they are read. ingestion.too_many_steps (409) when the new steps would pass the version's step"
+            + " cap." + ACTION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> reprocess(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return act(id, Materials.REPROCESS);
+    }
+
+    @PostMapping(path = RETRY, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "retryMaterial", summary = "Starts again the failed newest version of one of the account's"
+            + " materials, from its cleaned original or its uploaded file: it becomes processing."
+            + " ingestion.too_many_steps (409) when a new step would pass the version's step cap." + ACTION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> retry(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return act(id, Materials.RETRY);
+    }
+
+    @PostMapping(path = DISCARD, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "discardMaterial", summary = "Discards the newest version of one of the account's"
+            + " materials, which needs review or failed: it becomes discarded, and its pages, passages, outline and"
+            + " files are removed (a removal that resumes after a restart)." + ACTION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> discard(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return act(id, Materials.DISCARD);
+    }
+
+    private ResponseEntity<MaterialView> act(String id, String action) {
+        return parse(id).flatMap(material -> actions.act(material, action)).map(MaterialView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
     }
 
     private static Optional<Integer> pageNumber(String page) {
