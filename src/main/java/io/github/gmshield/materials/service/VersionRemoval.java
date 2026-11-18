@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
@@ -61,38 +62,41 @@ public class VersionRemoval {
     public boolean remove(UUID versionId) {
         UUID owner = OwnerContext.require();
         TransactionTemplate template = new TransactionTemplate(transactions.getObject());
-        List<VersionFileRow> stored = template.execute(status -> {
+        // Each part answers empty when the version is unknown, another owner's, or not pending (never null).
+        Optional<List<VersionFileRow>> first = template.execute(status -> {
             if (materials.lockVersion(versionId).filter(VersionRemoval::pending).isEmpty()) {
-                return null;
+                return Optional.empty();
             }
             // Page views first: each names its picture file.
             materials.deletePageViews(versionId);
             materials.deletePassages(versionId);
             materials.deleteOutline(versionId);
             materials.deletePageRanges(versionId);
-            return materials.versionFiles(versionId);
+            return Optional.of(materials.versionFiles(versionId));
         });
-        if (stored == null) {
+        if (first.isEmpty()) {
             return false;
         }
+        List<VersionFileRow> stored = first.get();
         for (VersionFileRow file : stored) {
             files.deleteFile(file.ownerId(), file.fileId());
         }
         Set<UUID> removed = new HashSet<>();
         stored.forEach(file -> removed.add(file.fileId()));
-        List<VersionFileRow> left = template.execute(status -> {
+        Optional<List<VersionFileRow>> last = template.execute(status -> {
             if (materials.lockVersion(versionId).filter(VersionRemoval::pending).isEmpty()) {
-                return null;
+                return Optional.empty();
             }
             Instant now = now();
             List<VersionFileRow> rows = materials.deleteVersionFiles(versionId);
             ingestion.removeRawUpload(owner, versionId, now);
             materials.clearRemovalPending(versionId, now);
-            return rows.stream().filter(file -> !removed.contains(file.fileId())).toList();
+            return Optional.of(rows.stream().filter(file -> !removed.contains(file.fileId())).toList());
         });
-        if (left == null) {
+        if (last.isEmpty()) {
             return false;
         }
+        List<VersionFileRow> left = last.get();
         // A file recorded after the first part (none is expected: a discarded version records no report).
         left.forEach(file -> files.deleteFile(file.ownerId(), file.fileId()));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", versionId)

@@ -93,7 +93,7 @@ public class MaterialActions {
             }
             return Optional.of(version);
         });
-        if (acted == null || acted.isEmpty()) {
+        if (acted.isEmpty()) {
             return Optional.empty();
         }
         log.atInfo().addKeyValue("materialId", materialId).addKeyValue("versionId", acted.get().id())
