@@ -251,8 +251,8 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     Every answer is `no-store`. Nothing logs a name, a kind or where a material belongs.
 - **Cleaning an upload and splitting it into pages (`materials` and `jobs`, Story 1.15, AD-17).** Completing a PDF
   upload creates, in the same transaction, the version's first ingestion step: a job of kind `ingestion` (ingestion
-  lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Other formats stay `waiting` until
-  their own stories. `materials.service.IngestionSteps` is the kind's `JobHandler`:
+  lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Text got its stage with Story 1.16
+  and images with Story 1.21. `materials.service.IngestionSteps` is the kind's `JobHandler`:
   - its `input()` (the claim's transaction) moves a `waiting` version to `processing` and gives the worker the
     stage, the format, the page range and the input's name (`source`);
   - its `openInput()` streams the step's input file (the raw upload, or one of the version's files) piece by piece;
@@ -279,7 +279,7 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     V4 and V7). The public read (contract 1.6.0) adds `pages: {done, total}` once the total is known (`done` is 0
     until Story 1.16) and `failure` (the code) when the state is `failed`.
 - **Reading pages (`materials` and `jobs`, Story 1.16, internal contract 1.3.0).** A completed TXT or Markdown upload
-  gets one step too (stage `text`); images still stay `waiting`. The claim input adds `attempt` and, when the step
+  gets one step too (stage `text`); images got theirs with Story 1.21. The claim input adds `attempt` and, when the step
   reads a file of the version, `inputFileId`, `inputFirstPage` and `inputLastPage`; it carries the chain's
   `pipelineVersion` from the second step on. A report may add, all optional and every range inclusive,
   `layers: [{firstPage, lastPage, layer: text|image}]`, `pages: [{firstPage, lastPage, outcome:
@@ -387,6 +387,47 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     of 404; its picture is still 404.
   - `V13__version_removal.sql`: `material_version.removal_pending boolean not null default false`, and a partial
     index on `(updated_at, id) where removal_pending`.
+- **Photos as the pages of one material (`materials`, Story 1.21, FR-13, public contract 1.10.0, internal contract
+  1.6.0).** Several images become one ordered set: one material, one version, one tus upload per image.
+  - `POST /api/v1/image-sets` (`ImageSetController`, `materials.service.ImageSets`) takes `{name, kind?, language?,
+    campaign? | system?, images: [{name, length}]}` and, in one transaction, creates the material (its name and
+    details as a plain upload's), its version in `uploading` and one open upload per image at its place
+    (`upload.position`, 1 to 500), each image's file name encrypted bound to its upload row (entity `upload`, field
+    `name`). It answers `201 {id, materialId, expiresAt, images: [{position, uploadId}]}`; the set's id is its
+    version's. The GM's "Enviar" confirms the order: there is no confirm route, and the order never changes. Past
+    500 images or 2 GiB in all (`Uploads.MAX_IMAGES`, `MAX_LENGTH`): `upload.set_too_large` (413, params `maxImages`
+    and `maxBytes`), nothing stored.
+  - Each image then goes through the tus routes at `/api/v1/uploads/{uploadId}`, with the usual part and whole-file
+    SHA-256 checks and its 6 hours. A member's first bytes must be an image's (`Format.IMAGE_CODES`), else
+    `upload.format_refused` (415, params `accepted` the image formats). A refused format, a whole-file mismatch
+    (`upload.file_checksum_mismatch`, 422) or an expiry (the upload sweep) fails that member alone: its pieces go, its
+    row stays `failed` with `failure_code`, and the version stays `uploading`. A failed member is "not found" to the
+    tus routes.
+  - The set starts by itself (`Uploads.startIfReady`, with the version locked so two members completing at once start
+    it once) when no member is open or failed and one at least is complete: the version becomes `waiting` with the
+    format `images` (internal, never an accepted upload format) and the members' size in all, and its first step
+    (stage `images`, input file the first member) is created. An image sent through the plain tus creation is a set
+    of one: it starts at its completion like a PDF.
+  - `POST /api/v1/image-sets/{id}/images/{position}` (`{name, length}`) replaces the failed image at that place with
+    a new open upload (`201 {position, uploadId, expiresAt}`); `DELETE` the same address leaves it out: the places
+    after it move up by one (`upload.closeGap`), and the set starts when it is now whole, or, the last image left out,
+    the version is `discarded` (`200 {materialId, versionId, state}`). An image that has not failed is
+    `upload.image_not_failed` (409); another owner's set, an unknown or malformed id, a set no longer uploading and a
+    place it does not have are `request.not_found` (404).
+  - The material view gains `imageSet: {id, images: [{position, uploadId, name?, state, offset, length, expiresAt,
+    failure?}]}` while a set uploads (then `upload` is absent); `name` only while the image is not complete.
+  - The images step's claim input (internal contract 1.6.0) is `input: "images"` and `inputs: [{name:
+    "image-<uploadId>", format}]`, the complete members in order; `openInput` streams each to that step only, checked
+    against the step's version and owner. A step of an image version whose input is a file of the version (a restart
+    or retry from the assembled original) gets `source` as before. `START_STAGES` maps `images` to the `images`
+    stage, for the start, a restart, a retry and Reprocessar. The first report's `original` (the assembled PDF) marks
+    every member `removing`, as a PDF's raw upload is; a discard removes them all.
+  - The upload sweep fails an expired member alone (`upload.expired`, its pieces removed) and discards a set nobody
+    can finish any more: no member open, one at least failed, and every failed member past its expiry (version
+    `discarded`, every member removed, complete ones included), so after 6 hours an unfinished set is gone.
+  - `V14__image_sets.sql`: `upload.position`, `upload.name` (encrypted), `upload.failure_code`, the state `failed`,
+    and the version format `images`. Rolling back past V14 is safe only while no failed upload or `images` version
+    exists.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

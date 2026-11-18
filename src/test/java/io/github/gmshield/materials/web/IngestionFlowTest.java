@@ -158,6 +158,8 @@ class IngestionFlowTest {
     private PlatformTransactionManager transactions;
     @Autowired
     private Materials reads;
+    @Autowired
+    private io.github.gmshield.materials.service.UploadSweep uploadSweep;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -244,7 +246,7 @@ class IngestionFlowTest {
     }
 
     @Test
-    void aTextOrMarkdownUploadGetsOneTextStepOverItsRawFileAndAnImageStaysWaiting() throws Exception {
+    void aTextOrMarkdownUploadGetsOneTextStepOverItsRawFileAndALoneImageIsASetOfOne() throws Exception {
         Gm gm = signUp();
         byte[] text = "Regras da casa\n".repeat(400).getBytes(StandardCharsets.UTF_8);
         for (String name : List.of("notas.txt", "notas.md")) {
@@ -258,10 +260,28 @@ class IngestionFlowTest {
             // One ingestion job at a time: this one ends before the next upload's is offered.
             jobs.rows.computeIfPresent(uploaded.jobId(), (id, row) -> row.released("cancelled", null, row.updatedAt()));
         }
-        Uploaded image = upload(gm, png(6000), "mapa.png", null);
-        assertThat(image.jobId()).isNull();
-        assertThat(steps(image.versionId())).isEmpty();
+        // Story 1.21: an image sent alone is a set of one, started at its completion like a PDF.
+        byte[] map = png(6000);
+        Uploaded image = upload(gm, map, "mapa.png", null);
+        assertThat(steps(image.versionId())).singleElement().satisfies(step -> {
+            assertThat(step.stage()).isEqualTo("images");
+            assertThat(step.firstPage()).isNull();
+            assertThat(step.inputFileId()).isEqualTo(image.uploadId());
+        });
         assertThat(state(gm, image)).isEqualTo("waiting");
+        VersionRow version = materials.versions.get(image.versionId());
+        assertThat(version.format()).isEqualTo("images");
+        assertThat(version.sizeBytes()).isEqualTo(map.length);
+        JsonNode claim = claim(image.jobId());
+        assertThat(claim.path("input").path("stage").asString()).isEqualTo("images");
+        assertThat(claim.path("input").path("format").asString()).isEqualTo("images");
+        assertThat(claim.path("input").path("input").asString()).isEqualTo("images");
+        assertThat(claim.path("input").path("inputs")).singleElement().satisfies(item -> {
+            assertThat(item.path("name").asString()).isEqualTo("image-" + image.uploadId());
+            assertThat(item.path("format").asString()).isEqualTo("png");
+        });
+        assertThat(input(image.jobId(), claim, "image-" + image.uploadId()).body()).isEqualTo(map);
+        assertThat(input(image.jobId(), claim, "source").statusCode()).isEqualTo(404);
     }
 
     // --- a done clean step
@@ -2625,6 +2645,492 @@ class IngestionFlowTest {
     private List<PageRangeRow> outcomes(UUID versionId) {
         return materials.outcomes.values().stream().filter(row -> row.versionId().equals(versionId))
                 .sorted(Comparator.comparing(PageRangeRow::firstPage)).toList();
+    }
+
+    // --- image sets (Story 1.21)
+
+    @Test
+    void anOrderedSetStartsOnlyOnceEveryImageIsCompleteAndItsStepReadsTheImagesInTheirOrder() throws Exception {
+        Gm gm = signUp();
+        List<byte[]> images = List.of(heic(70_000), jpeg(5 * MIB + 9), png(40_000));
+        SetMade set = createSet(gm, "Ficha", images, List.of("foto-3.heic", "foto-1.jpg", "foto-2.png"));
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
+        assertThat(set.uploadIds()).hasSize(3);
+
+        // Two of three complete, in another order than theirs: no step yet, the version still uploading.
+        assertThat(sendImage(gm, set.uploadIds().get(2), images.get(2)).statusCode()).isEqualTo(201);
+        HttpResponse<String> second = sendImage(gm, set.uploadIds().get(0), images.get(0));
+        assertThat(second.statusCode()).as(second.body()).isEqualTo(201);
+        assertThat(json(second).path("state").asString()).isEqualTo("uploading");
+        assertThat(steps(set.versionId())).isEmpty();
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
+        JsonNode listed = json(get(gm, "/api/v1/materials/" + set.materialId()));
+        assertThat(listed.path("state").asString()).isEqualTo("uploading");
+        assertThat(listed.path("name").asString()).isEqualTo("Ficha");
+        assertThat(listed.has("upload")).isFalse();
+        assertThat(listed.path("imageSet").path("id").asString()).isEqualTo(set.versionId().toString());
+        JsonNode members = listed.path("imageSet").path("images");
+        assertThat(members).hasSize(3);
+        assertThat(members.get(0).path("state").asString()).isEqualTo("complete");
+        assertThat(members.get(0).has("name")).isFalse();
+        assertThat(members.get(1).path("state").asString()).isEqualTo("open");
+        assertThat(members.get(1).path("name").asString()).isEqualTo("foto-1.jpg");
+        assertThat(members.get(1).path("uploadId").asString()).isEqualTo(set.uploadIds().get(1).toString());
+        assertThat(members.get(1).path("length").asLong()).isEqualTo(images.get(1).length);
+        assertThat(members.get(2).path("position").asInt()).isEqualTo(3);
+        // The names are stored only encrypted, bound to their upload rows.
+        UploadRow stored = uploads.row(set.uploadIds().get(1));
+        assertThat(new String(stored.name(), StandardCharsets.ISO_8859_1)).doesNotContain("foto");
+        assertThat(vault.decryptText(new Binding("upload", "name", stored.id(), gm.id()), stored.name()))
+                .isEqualTo("foto-1.jpg");
+
+        // The last one starts the set: one images step that reads every image in the confirmed order.
+        HttpResponse<String> last = sendImage(gm, set.uploadIds().get(1), images.get(1));
+        assertThat(last.statusCode()).as(last.body()).isEqualTo(201);
+        assertThat(json(last).path("state").asString()).isEqualTo("waiting");
+        VersionRow version = materials.versions.get(set.versionId());
+        assertThat(version.format()).isEqualTo("images");
+        assertThat(version.sizeBytes()).isEqualTo(images.stream().mapToLong(image -> image.length).sum());
+        StepRow step = steps(set.versionId()).getFirst();
+        assertThat(steps(set.versionId())).hasSize(1);
+        assertThat(step.stage()).isEqualTo("images");
+        assertThat(step.inputFileId()).isEqualTo(set.uploadIds().getFirst());
+        assertThat(json(get(gm, "/api/v1/materials/" + set.materialId())).has("imageSet")).isFalse();
+        JsonNode claim = claim(step.jobId());
+        assertThat(claim.path("input").path("input").asString()).isEqualTo("images");
+        assertThat(claim.path("input").path("inputs")).extracting(item -> item.path("name").asString(),
+                        item -> item.path("format").asString())
+                .containsExactly(tuple("image-" + set.uploadIds().get(0), "heic"),
+                        tuple("image-" + set.uploadIds().get(1), "jpeg"),
+                        tuple("image-" + set.uploadIds().get(2), "png"));
+        for (int index = 0; index < 3; index++) {
+            HttpResponse<byte[]> read = input(step.jobId(), claim, "image-" + set.uploadIds().get(index));
+            assertThat(read.statusCode()).isEqualTo(200);
+            assertThat(read.body()).isEqualTo(images.get(index));
+        }
+        assertThat(input(step.jobId(), claim, "source").statusCode()).isEqualTo(404);
+        assertThat(input(step.jobId(), claim, "image-" + UUID.randomUUID()).statusCode()).isEqualTo(404);
+
+        // Its report, as the worker sends it: the assembled PDF is the original, triage over the batch, the held
+        // passages step; every image's raw upload goes.
+        Images assembled = imagesReport(step.jobId(), claim, 3);
+        assertThat(OwnerContext.callAs(gm.id(), () -> materials.versionFiles(set.versionId())))
+                .extracting(VersionFileRow::role).containsExactly("original", "batch");
+        assertThat(outcomes(set.versionId())).isEmpty();
+        assertThat(set.uploadIds()).allSatisfy(id -> {
+            assertThat(uploads.rows).doesNotContainKey(id);
+            assertThat(files.fileExists(gm.id(), id)).isFalse();
+        });
+        assertThat(steps(set.versionId())).filteredOn(found -> found.stage().equals("triage"))
+                .extracting(StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
+                .containsExactly(tuple(1, 3, assembled.batch()));
+        assertThat(steps(set.versionId())).filteredOn(StepRow::held).singleElement()
+                .satisfies(held -> assertThat(held.stage()).isEqualTo("passages"));
+        assertThat(materials.versions.get(set.versionId()).pageTotal()).isEqualTo(3);
+    }
+
+    @Test
+    void twoImagesSentApartAreTwoSetsOfOneEachAMaterialOfOnePage() throws Exception {
+        Gm gm = signUp();
+        SetMade first = createSet(gm, "frente.jpg", List.of(jpeg(9000)), List.of("frente.jpg"));
+        SetMade second = createSet(gm, "verso.png", List.of(png(9000)), List.of("verso.png"));
+        assertThat(first.materialId()).isNotEqualTo(second.materialId());
+        assertThat(json(sendImage(gm, first.uploadIds().getFirst(), jpeg(9000))).path("state").asString())
+                .isEqualTo("waiting");
+        StepRow step = steps(first.versionId()).getFirst();
+        jobs.rows.computeIfPresent(step.jobId(), (id, row) -> row.released("cancelled", null, row.updatedAt()));
+        assertThat(json(sendImage(gm, second.uploadIds().getFirst(), png(9000))).path("state").asString())
+                .isEqualTo("waiting");
+        assertThat(steps(second.versionId())).singleElement().extracting(StepRow::stage).isEqualTo("images");
+        assertThat(materials.materials.values()).filteredOn(row -> row.ownerId().equals(gm.id())).hasSize(2);
+    }
+
+    @Test
+    void anImageThatFailsItsWholeFileCheckFailsAloneAndIsReplacedAtItsPlace() throws Exception {
+        Gm gm = signUp();
+        List<byte[]> images = List.of(jpeg(9000), png(9000), jpeg(12_000));
+        SetMade set = createSet(gm, "Ficha", images, List.of("a.jpg", "b.png", "c.jpg"));
+        assertThat(sendImage(gm, set.uploadIds().get(0), images.get(0)).statusCode()).isEqualTo(201);
+        // The second image's whole-file hash does not match.
+        UUID failed = set.uploadIds().get(1);
+        sendParts(gm, failed, images.get(1));
+        HttpResponse<String> mismatch = completeImage(gm, failed, png(9001));
+        assertThat(mismatch.statusCode()).isEqualTo(422);
+        assertThat(json(mismatch).path("code").asString()).isEqualTo("upload.file_checksum_mismatch");
+        assertThat(uploads.row(failed).state()).isEqualTo("failed");
+        assertThat(uploads.row(failed).failureCode()).isEqualTo("upload.file_checksum_mismatch");
+        assertThat(files.fileExists(gm.id(), failed)).isFalse();
+        assertThat(files.fileExists(gm.id(), set.uploadIds().get(0))).isTrue();
+        assertThat(sendImage(gm, set.uploadIds().get(2), images.get(2)).statusCode()).isEqualTo(201);
+        // The other images are kept, the version waits, and no step exists.
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
+        assertThat(steps(set.versionId())).isEmpty();
+        JsonNode member = json(get(gm, "/api/v1/materials/" + set.materialId())).path("imageSet").path("images").get(1);
+        assertThat(member.path("state").asString()).isEqualTo("failed");
+        assertThat(member.path("failure").asString()).isEqualTo("upload.file_checksum_mismatch");
+        assertThat(member.path("name").asString()).isEqualTo("b.png");
+        // A failed image is gone for the tus routes.
+        assertThat(send("HEAD", "/api/v1/uploads/" + failed, null, session(gm), "Tus-Resumable", TUS).statusCode())
+                .isEqualTo(404);
+
+        // Replaced: a new upload at place 2, checked again; once complete, the set starts.
+        byte[] replacement = png(10_000);
+        HttpResponse<String> replaced = setRequest(gm, "POST", "/api/v1/image-sets/" + set.versionId() + "/images/2",
+                "{\"name\":\"b2.png\",\"length\":" + replacement.length + "}");
+        assertThat(replaced.statusCode()).as(replaced.body()).isEqualTo(201);
+        assertThat(json(replaced).path("position").asInt()).isEqualTo(2);
+        UUID again = UUID.fromString(json(replaced).path("uploadId").asString());
+        assertThat(uploads.rows).doesNotContainKey(failed);
+        assertThat(uploads.row(again).position()).isEqualTo(2);
+        // The new file is checked again: a mismatch fails it alone once more.
+        sendParts(gm, again, replacement);
+        assertThat(completeImage(gm, again, new byte[] {1}).statusCode()).isEqualTo(422);
+        assertThat(steps(set.versionId())).isEmpty();
+        HttpResponse<String> third = setRequest(gm, "POST", "/api/v1/image-sets/" + set.versionId() + "/images/2",
+                "{\"name\":\"b3.png\",\"length\":" + replacement.length + "}");
+        UUID last = UUID.fromString(json(third).path("uploadId").asString());
+        assertThat(json(sendImage(gm, last, replacement)).path("state").asString()).isEqualTo("waiting");
+        JsonNode claim = claim(steps(set.versionId()).getFirst().jobId());
+        assertThat(claim.path("input").path("inputs")).extracting(item -> item.path("name").asString())
+                .containsExactly("image-" + set.uploadIds().get(0), "image-" + last, "image-" + set.uploadIds().get(2));
+        // A place whose image has not failed is neither replaced nor left out.
+        SetMade other = createSet(gm, "Outra", List.of(jpeg(9000)), List.of("x.jpg"));
+        assertReplaceOverTwoGibibytesIsRefused(gm);
+        refused(setRequest(gm, "POST", "/api/v1/image-sets/" + other.versionId() + "/images/1",
+                "{\"name\":\"y.jpg\",\"length\":9000}"), "upload.image_not_failed");
+        refused(setRequest(gm, "DELETE", "/api/v1/image-sets/" + other.versionId() + "/images/1", null),
+                "upload.image_not_failed");
+        assertThat(setRequest(gm, "DELETE", "/api/v1/image-sets/" + other.versionId() + "/images/2", null)
+                .statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void anImageWhoseFirstBytesAreNotAnImageFailsAloneWithItsReasonAndLeavesNoPiece() throws Exception {
+        Gm gm = signUp();
+        SetMade set = createSet(gm, "Ficha", List.of(jpeg(9000), pdf(9000)), List.of("a.jpg", "b.jpg"));
+        UUID refused = set.uploadIds().get(1);
+        HttpResponse<String> part = patch(gm, refused, 0, pdf(9000));
+        assertThat(part.statusCode()).isEqualTo(415);
+        assertThat(json(part).path("code").asString()).isEqualTo("upload.format_refused");
+        assertThat(json(part).path("params").path("accepted")).extracting(JsonNode::asString)
+                .containsExactly("jpeg", "png", "webp", "tiff", "bmp", "heic");
+        assertThat(uploads.row(refused).state()).isEqualTo("failed");
+        assertThat(uploads.row(refused).failureCode()).isEqualTo("upload.format_refused");
+        assertThat(uploads.row(refused).offset()).isZero();
+        assertThat(files.fileExists(gm.id(), refused)).isFalse();
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
+        assertThat(sendImage(gm, set.uploadIds().getFirst(), jpeg(9000)).statusCode()).isEqualTo(201);
+        assertThat(steps(set.versionId())).isEmpty();
+        JsonNode member = json(get(gm, "/api/v1/materials/" + set.materialId())).path("imageSet").path("images").get(1);
+        assertThat(member.path("failure").asString()).isEqualTo("upload.format_refused");
+    }
+
+    @Test
+    void continuingWithoutAFailedImageRenumbersThePagesAndStartsAndTheLastOneLeftOutDiscardsTheVersion()
+            throws Exception {
+        Gm gm = signUp();
+        List<byte[]> images = List.of(jpeg(9000), png(9000), jpeg(12_000));
+        SetMade set = createSet(gm, "Ficha", images, List.of("a.jpg", "b.png", "c.jpg"));
+        sendImage(gm, set.uploadIds().get(0), images.get(0));
+        sendImage(gm, set.uploadIds().get(2), images.get(2));
+        sendParts(gm, set.uploadIds().get(1), images.get(1));
+        assertThat(completeImage(gm, set.uploadIds().get(1), new byte[] {1}).statusCode()).isEqualTo(422);
+
+        HttpResponse<String> dropped = setRequest(gm, "DELETE", "/api/v1/image-sets/" + set.versionId() + "/images/2",
+                null);
+        assertThat(dropped.statusCode()).as(dropped.body()).isEqualTo(200);
+        assertThat(json(dropped).path("state").asString()).isEqualTo("waiting");
+        assertThat(json(dropped).path("materialId").asString()).isEqualTo(set.materialId());
+        assertThat(uploads.rows).doesNotContainKey(set.uploadIds().get(1));
+        assertThat(uploads.row(set.uploadIds().get(2)).position()).isEqualTo(2);
+        JsonNode claim = claim(steps(set.versionId()).getFirst().jobId());
+        assertThat(claim.path("input").path("inputs")).extracting(item -> item.path("name").asString())
+                .containsExactly("image-" + set.uploadIds().get(0), "image-" + set.uploadIds().get(2));
+        assertThat(materials.versions.get(set.versionId()).sizeBytes()).isEqualTo(images.get(0).length
+                + images.get(2).length);
+
+        // A set of one whose image failed: leaving it out discards the version.
+        SetMade alone = createSet(gm, "Só", List.of(jpeg(9000)), List.of("s.jpg"));
+        assertThat(patch(gm, alone.uploadIds().getFirst(), 0, pdf(9000)).statusCode()).isEqualTo(415);
+        HttpResponse<String> discarded = setRequest(gm, "DELETE",
+                "/api/v1/image-sets/" + alone.versionId() + "/images/1", null);
+        assertThat(json(discarded).path("state").asString()).isEqualTo("discarded");
+        assertThat(uploads.rows.values()).noneMatch(row -> row.versionId().equals(alone.versionId()));
+        assertThat(steps(alone.versionId())).isEmpty();
+        assertThat(setRequest(gm, "DELETE", "/api/v1/image-sets/" + alone.versionId() + "/images/1", null)
+                .statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void anImageLeftOpenPastItsSixHoursFailsAloneAndASetNobodyCanFinishIsDiscardedWithItsCompleteImages()
+            throws Exception {
+        Gm gm = signUp();
+        SetMade set = createSet(gm, "Ficha", List.of(jpeg(9000), png(9000), jpeg(9000)),
+                List.of("a.jpg", "b.png", "c.jpg"));
+        UUID complete = set.uploadIds().getFirst();
+        sendImage(gm, complete, jpeg(9000));
+        UUID open = set.uploadIds().get(1);
+        patch(gm, open, 0, png(9000));
+        assertThat(files.fileExists(gm.id(), open)).isTrue();
+        Instant past = Instant.now().minusSeconds(60);
+        uploads.change(open, row -> expiring(row, past));
+        uploadSweep.sweep();
+        assertThat(uploads.row(open).state()).isEqualTo("failed");
+        assertThat(uploads.row(open).failureCode()).isEqualTo("upload.expired");
+        assertThat(files.fileExists(gm.id(), open)).isFalse();
+        // The third image is still open within its own six hours: the set waits.
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("uploading");
+        assertThat(uploads.row(complete).state()).isEqualTo("complete");
+
+        // The tab was closed: the third image expires too. No image is open and every failed one has expired, so
+        // the set goes, its complete image included, rows and pieces.
+        uploads.change(set.uploadIds().get(2), row -> expiring(row, past));
+        uploadSweep.sweep();
+        assertThat(materials.versions.get(set.versionId()).state()).isEqualTo("discarded");
+        assertThat(uploads.rows.values()).noneMatch(row -> row.versionId().equals(set.versionId()));
+        assertThat(set.uploadIds()).allSatisfy(id -> assertThat(files.fileExists(gm.id(), id)).isFalse());
+        assertThat(steps(set.versionId())).isEmpty();
+
+        // Every image failed and expired: nobody can finish the set any more.
+        SetMade lost = createSet(gm, "Perdida", List.of(jpeg(9000), png(9000)), List.of("a.jpg", "b.png"));
+        assertThat(patch(gm, lost.uploadIds().get(0), 0, pdf(9000)).statusCode()).isEqualTo(415);
+        uploads.change(lost.uploadIds().get(1), row -> expiring(row, past));
+        uploadSweep.sweep();
+        // The refused image's own six hours have not passed: the GM can still replace it.
+        assertThat(materials.versions.get(lost.versionId()).state()).isEqualTo("uploading");
+        uploads.change(lost.uploadIds().get(0), row -> expiring(row, past));
+        uploadSweep.sweep();
+        assertThat(materials.versions.get(lost.versionId()).state()).isEqualTo("discarded");
+        assertThat(uploads.rows.values()).noneMatch(row -> row.versionId().equals(lost.versionId()));
+    }
+
+    @Test
+    void aSetOfMoreThan500ImagesOrMoreThanTwoGibibytesIsRefusedAndNothingIsStored() throws Exception {
+        Gm gm = signUp();
+        String many = IntStream.rangeClosed(1, 501).mapToObj(index -> "{\"name\":\"f" + index
+                + ".jpg\",\"length\":10}").reduce((first, second) -> first + "," + second).orElseThrow();
+        HttpResponse<String> tooMany = setRequest(gm, "POST", "/api/v1/image-sets",
+                "{\"name\":\"Muitas\",\"images\":[" + many + "]}");
+        assertThat(tooMany.statusCode()).isEqualTo(413);
+        assertThat(json(tooMany).path("code").asString()).isEqualTo("upload.set_too_large");
+        assertThat(json(tooMany).path("params").path("maxImages").asInt()).isEqualTo(500);
+        assertThat(json(tooMany).path("params").path("maxBytes").asLong()).isEqualTo(2147483648L);
+        HttpResponse<String> tooBig = setRequest(gm, "POST", "/api/v1/image-sets",
+                "{\"name\":\"Grandes\",\"images\":[{\"name\":\"a.jpg\",\"length\":2147483000},"
+                        + "{\"name\":\"b.jpg\",\"length\":1000}]}");
+        assertThat(tooBig.statusCode()).isEqualTo(413);
+        assertThat(json(tooBig).path("code").asString()).isEqualTo("upload.set_too_large");
+        String exactly = IntStream.rangeClosed(1, 500).mapToObj(index -> "{\"name\":\"f" + index
+                + ".jpg\",\"length\":10}").reduce((first, second) -> first + "," + second).orElseThrow();
+        assertThat(materials.materials.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        assertThat(uploads.rows.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        HttpResponse<String> fits = setRequest(gm, "POST", "/api/v1/image-sets",
+                "{\"name\":\"Quinhentas\",\"images\":[" + exactly + "]}");
+        assertThat(fits.statusCode()).isEqualTo(201);
+        assertThat(json(fits).path("images")).hasSize(500);
+        // A malformed request stores nothing either.
+        for (String body : List.of("{\"name\":\"Nada\",\"images\":[]}", "{\"name\":\"Nada\"}",
+                "{\"name\":\"Zero\",\"images\":[{\"name\":\"a.jpg\",\"length\":0}]}")) {
+            assertThat(setRequest(gm, "POST", "/api/v1/image-sets", body).statusCode()).as(body).isEqualTo(400);
+        }
+        for (String body : List.of("{\"name\":\" \",\"images\":[{\"name\":\"a.jpg\",\"length\":1}]}",
+                "{\"name\":\"Ok\",\"images\":[{\"name\":\"\",\"length\":1}]}",
+                "{\"name\":\"Ok\",\"kind\":\"poem\",\"images\":[{\"name\":\"a.jpg\",\"length\":1}]}")) {
+            HttpResponse<String> invalid = setRequest(gm, "POST", "/api/v1/image-sets", body);
+            assertThat(invalid.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(invalid).path("code").asString()).isEqualTo("upload.metadata_invalid");
+        }
+        assertThat(materials.materials.values()).filteredOn(row -> row.ownerId().equals(gm.id())).hasSize(1);
+    }
+
+    @Test
+    void anotherOwnersSetAnswersNotFoundOnEveryRouteAndIsNeverListed() throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        SetMade set = createSet(gm, "Ficha", List.of(jpeg(9000), png(9000)), List.of("a.jpg", "b.png"));
+        sendParts(gm, set.uploadIds().get(1), png(9000));
+        assertThat(completeImage(gm, set.uploadIds().get(1), new byte[] {1}).statusCode()).isEqualTo(422);
+        UUID image = set.uploadIds().getFirst();
+
+        HttpResponse<String> replace = setRequest(other, "POST", "/api/v1/image-sets/" + set.versionId() + "/images/2",
+                "{\"name\":\"b.png\",\"length\":9000}");
+        HttpResponse<String> drop = setRequest(other, "DELETE", "/api/v1/image-sets/" + set.versionId() + "/images/2",
+                null);
+        HttpResponse<String> unknown = setRequest(gm, "DELETE", "/api/v1/image-sets/" + UUID.randomUUID() + "/images/2",
+                null);
+        HttpResponse<String> malformed = setRequest(gm, "DELETE", "/api/v1/image-sets/nope/images/2", null);
+        for (HttpResponse<String> answer : List.of(replace, drop, unknown, malformed)) {
+            assertThat(answer.statusCode()).isEqualTo(404);
+            assertThat(json(answer).path("code").asString()).isEqualTo("request.not_found");
+        }
+        assertThat(patch(other, image, 0, jpeg(9000)).statusCode()).isEqualTo(404);
+        assertThat(send("HEAD", "/api/v1/uploads/" + image, null, session(other), "Tus-Resumable", TUS).statusCode())
+                .isEqualTo(404);
+        assertThat(json(get(other, "/api/v1/materials?state=uploading")).path("items")).isEmpty();
+        assertThat(get(other, "/api/v1/materials/" + set.materialId()).statusCode()).isEqualTo(404);
+        // Nothing changed for its owner.
+        assertThat(uploads.row(set.uploadIds().get(1)).state()).isEqualTo("failed");
+        assertThat(uploads.row(image).offset()).isZero();
+        assertThat(setRequest(gm, "POST", "/api/v1/image-sets", "{\"name\":\"x\",\"images\":[]}").statusCode())
+                .isEqualTo(400);
+        assertThat(send("POST", "/api/v1/image-sets", "{}".getBytes(StandardCharsets.UTF_8), "Content-Type",
+                "application/json").statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void aSetsChainRestartsFromItsAssembledOriginalAndIsRetriedFromItsImagesWithoutOne() throws Exception {
+        Gm gm = signUp();
+        List<byte[]> images = List.of(jpeg(9000), png(9000));
+        SetMade set = createSet(gm, "Ficha", images, List.of("a.jpg", "b.png"));
+        sendImage(gm, set.uploadIds().get(0), images.get(0));
+        sendImage(gm, set.uploadIds().get(1), images.get(1));
+        StepRow first = steps(set.versionId()).getFirst();
+        // The images step fails for good before any original: the version fails, and a retry reads the images again.
+        assertThat(outcome(first.jobId(), claim(first.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.step_failed\",\"retry\":false}").statusCode())
+                .isEqualTo(204);
+        Uploaded uploaded = new Uploaded(set.materialId(), set.versionId(), set.uploadIds().getFirst(), first.jobId());
+        assertThat(actions(gm, uploaded)).containsExactly("retry", "discard");
+        assertThat(act(gm, uploaded, "retry").statusCode()).isEqualTo(200);
+        StepRow retried = offeredStep(set.versionId());
+        assertThat(retried.stage()).isEqualTo("images");
+        JsonNode claim = claim(retried.jobId());
+        assertThat(claim.path("input").path("input").asString()).isEqualTo("images");
+        assertThat(claim.path("input").path("inputs")).hasSize(2);
+        assertThat(input(retried.jobId(), claim, "image-" + set.uploadIds().get(1)).body()).isEqualTo(images.get(1));
+        Images assembled = imagesReport(retried.jobId(), claim, 2);
+
+        // A pipeline change restarts the chain from the assembled original, through the same first stage.
+        StepRow triage = offeredStep(set.versionId());
+        assertThat(outcome(triage.jobId(), claim(triage.jobId()),
+                "{\"outcome\":\"failed\",\"code\":\"ingestion.pipeline_changed\",\"retry\":false}")
+                .statusCode()).isEqualTo(204);
+        StepRow restart = offeredStep(set.versionId());
+        assertThat(restart.stage()).isEqualTo("images");
+        assertThat(restart.inputFileId()).isEqualTo(assembled.original());
+        JsonNode restarted = claim(restart.jobId());
+        assertThat(restarted.path("input").path("input").asString()).isEqualTo("source");
+        assertThat(restarted.path("input").path("inputFileId").asString()).isEqualTo(assembled.original().toString());
+        assertThat(restarted.path("input").has("inputs")).isFalse();
+        assertThat(input(restart.jobId(), restarted, "source").statusCode()).isEqualTo(200);
+        assertThat(input(restart.jobId(), restarted, "image-" + set.uploadIds().get(1)).statusCode()).isEqualTo(404);
+    }
+
+    /** A replacement whose length with the set's other images passes 2 GiB is refused, and no upload is created. */
+    private void assertReplaceOverTwoGibibytesIsRefused(Gm gm) throws Exception {
+        HttpResponse<String> created = setRequest(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Grandes\",\"images\":["
+                + "{\"name\":\"a.jpg\",\"length\":2000000000},{\"name\":\"b.jpg\",\"length\":9000}]}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID setId = UUID.fromString(json(created).path("id").asString());
+        UUID second = UUID.fromString(json(created).path("images").get(1).path("uploadId").asString());
+        assertThat(patch(gm, second, 0, pdf(9000)).statusCode()).isEqualTo(415);
+        long before = uploads.rows.values().stream().filter(row -> row.versionId().equals(setId)).count();
+        HttpResponse<String> tooBig = setRequest(gm, "POST", "/api/v1/image-sets/" + setId + "/images/2",
+                "{\"name\":\"b.jpg\",\"length\":200000000}");
+        assertThat(tooBig.statusCode()).isEqualTo(413);
+        assertThat(json(tooBig).path("code").asString()).isEqualTo("upload.set_too_large");
+        assertThat(uploads.rows.values().stream().filter(row -> row.versionId().equals(setId)).count())
+                .isEqualTo(before);
+        assertThat(uploads.row(second).state()).isEqualTo("failed");
+    }
+
+    /** An image set as created: its material, version (its id) and images' uploads in order. */
+    record SetMade(String materialId, UUID versionId, List<UUID> uploadIds) {
+    }
+
+    /** An images step's report: its assembled original and its one batch. */
+    record Images(UUID original, UUID batch) {
+    }
+
+    private SetMade createSet(Gm gm, String name, List<byte[]> images, List<String> names) throws Exception {
+        StringBuilder body = new StringBuilder("{\"name\":").append(JSON.writeValueAsString(name))
+                .append(",\"kind\":\"other\",\"language\":\"detect\",\"images\":[");
+        for (int index = 0; index < images.size(); index++) {
+            body.append(index == 0 ? "" : ",").append("{\"name\":").append(JSON.writeValueAsString(names.get(index)))
+                    .append(",\"length\":").append(images.get(index).length).append('}');
+        }
+        HttpResponse<String> created = setRequest(gm, "POST", "/api/v1/image-sets", body.append("]}").toString());
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(created.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode answer = json(created);
+        List<UUID> ids = new ArrayList<>();
+        for (JsonNode member : answer.path("images")) {
+            assertThat(member.path("position").asInt()).isEqualTo(ids.size() + 1);
+            ids.add(UUID.fromString(member.path("uploadId").asString()));
+        }
+        return new SetMade(answer.path("materialId").asString(), UUID.fromString(answer.path("id").asString()),
+                List.copyOf(ids));
+    }
+
+    private HttpResponse<String> setRequest(Gm gm, String method, String path, String body) throws Exception {
+        return send(method, path, body == null ? null : body.getBytes(StandardCharsets.UTF_8), session(gm),
+                "Content-Type", "application/json");
+    }
+
+    /** Sends every part of an image, then its completion: the completion's answer. */
+    private HttpResponse<String> sendImage(Gm gm, UUID uploadId, byte[] content) throws Exception {
+        sendParts(gm, uploadId, content);
+        return completeImage(gm, uploadId, content);
+    }
+
+    private void sendParts(Gm gm, UUID uploadId, byte[] content) throws Exception {
+        for (int offset = 0; offset < content.length; offset += 4 * MIB) {
+            byte[] part = java.util.Arrays.copyOfRange(content, offset, Math.min(content.length, offset + 4 * MIB));
+            HttpResponse<String> patched = patch(gm, uploadId, offset, part);
+            assertThat(patched.statusCode()).as(patched.body()).isEqualTo(204);
+        }
+    }
+
+    private HttpResponse<String> patch(Gm gm, UUID uploadId, int offset, byte[] part) throws Exception {
+        return send("PATCH", "/api/v1/uploads/" + uploadId, part, session(gm), "Tus-Resumable", TUS,
+                "Content-Type", "application/offset+octet-stream", "Upload-Offset", Integer.toString(offset),
+                "Upload-Checksum", "sha256 " + Base64.getEncoder().encodeToString(sha256(part)));
+    }
+
+    /** The completion of an upload whose whole file is said to be {@code content}. */
+    private HttpResponse<String> completeImage(Gm gm, UUID uploadId, byte[] content) throws Exception {
+        return send("POST", "/api/v1/uploads/" + uploadId + "/completion",
+                ("{\"sha256\":\"" + HexFormat.of().formatHex(sha256(content)) + "\"}").getBytes(StandardCharsets.UTF_8),
+                session(gm), "Tus-Resumable", TUS, "Content-Type", "application/json");
+    }
+
+    /**
+     * An images step's done report over {@code total} pages in one batch, as the worker sends it: the assembled
+     * original, the batch, a triage step over the batch and the held passages step.
+     */
+    private Images imagesReport(UUID jobId, JsonNode claim, int total) throws Exception {
+        UUID original = output(jobId, claim, pdf(5000));
+        UUID batch = output(jobId, claim, pdf(4000));
+        HttpResponse<String> reported = outcome(jobId, claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":"
+                + "\"6\",\"pageTotal\":" + total + ",\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[{"
+                + "\"fileId\":\"" + batch + "\",\"firstPage\":1,\"lastPage\":" + total + "}],\"next\":[{\"stage\":"
+                + "\"triage\",\"firstPage\":1,\"lastPage\":" + total + ",\"input\":\"" + batch + "\"},"
+                + passagesStep(total) + "]}}");
+        assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+        return new Images(original, batch);
+    }
+
+    private static UploadRow expiring(UploadRow row, Instant at) {
+        return new UploadRow(row.id(), row.ownerId(), row.versionId(), row.length(), row.offset(), row.pieceCount(),
+                row.format(), at, row.busyToken(), row.busyUntil(), row.state(), row.createdAt(), row.updatedAt(),
+                row.position(), row.name(), row.failureCode());
+    }
+
+    private static byte[] jpeg(int size) {
+        byte[] content = new byte[size];
+        content[0] = (byte) 0xff;
+        content[1] = (byte) 0xd8;
+        content[2] = (byte) 0xff;
+        content[size - 1] = 7;
+        return content;
+    }
+
+    private static byte[] heic(int size) {
+        byte[] content = new byte[size];
+        byte[] head = {0, 0, 0, 24, 'f', 't', 'y', 'p', 'h', 'e', 'i', 'c'};
+        System.arraycopy(head, 0, content, 0, head.length);
+        content[size - 1] = 3;
+        return content;
     }
 
     // --- helpers

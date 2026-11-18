@@ -113,6 +113,23 @@ public class Materials {
     }
 
     /**
+     * An image set still uploading (Story 1.21): its id (its version's) and its images in order. Each image has its
+     * place, its upload, its state ({@code open}, {@code complete} or {@code failed}), the bytes verified of its length,
+     * its expiry, and, while it is not complete, its file name (to resume it or name it); a failed one has its reason.
+     */
+    public record ImageSet(UUID id, List<SetImage> images) {
+    }
+
+    /** One image of a set still uploading. {@code toString} names no file. */
+    public record SetImage(int position, UUID uploadId, String name, String state, long offset, long length,
+                           Instant expiresAt, String failure) {
+        @Override
+        public String toString() {
+            return "SetImage[position=" + position + ", state=" + state + "]";
+        }
+    }
+
+    /**
      * Pages of the version's page total that have an outcome (Stories 1.15 and 1.16); from Story 1.17, the pages with a
      * text layer and with an image only ({@code text}, {@code image}: those of them with an outcome, of all of them),
      * the pages read directly, read by OCR and unreadable, and {@code reading}: {@value PageRangeRow#TEXT} or
@@ -140,10 +157,11 @@ public class Materials {
     /**
      * A material: {@code kind} may be null, {@code upload} is there only while the state is {@code uploading},
      * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed};
-     * {@code actions}, the GM's actions its newest version allows now (Story 1.20), in {@link #ACTIONS} order.
+     * {@code actions}, the GM's actions its newest version allows now (Story 1.20), in {@link #ACTIONS} order; from
+     * Story 1.21, {@code imageSet} only while an image set is uploading (then {@code upload} is null).
      */
     public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
-                           String failure, List<String> actions) {
+                           String failure, List<String> actions, ImageSet imageSet) {
         @Override
         public String toString() {
             return "Material[id=" + id + ", state=" + state + "]";
@@ -431,8 +449,12 @@ public class Materials {
         UUID owner = OwnerContext.require();
         List<UUID> uploading = rows.stream().map(NewestVersion::version)
                 .filter(version -> Uploads.UPLOADING.equals(version.state())).map(version -> version.id()).toList();
+        // A plain upload's one open row; a set's members are grouped apart, by version (Story 1.21).
         Map<UUID, UploadRow> open = uploads.joined().openForVersions(owner, uploading).stream()
+                .filter(row -> !row.member())
                 .collect(Collectors.toMap(UploadRow::versionId, Function.identity(), (first, second) -> first));
+        Map<UUID, List<UploadRow>> sets = uploads.joined().membersOf(owner, uploading).stream()
+                .collect(Collectors.groupingBy(UploadRow::versionId));
         List<UUID> counted = rows.stream().map(NewestVersion::version).filter(version -> version.pageTotal() != null)
                 .map(version -> version.id()).toList();
         // One read per kind of range for all the listed versions; the counts are derived here.
@@ -460,8 +482,20 @@ public class Materials {
                     pages, FAILED.equals(row.version().state()) ? row.version().failureCode() : null,
                     actions(row.version().state(), pages == null ? 0 : pages.unreadable(),
                             IngestionSteps.retryCheck(materials, uploads, settings,
-                                    row.version()) == IngestionSteps.RetryCheck.ALLOWED));
+                                    row.version()) == IngestionSteps.RetryCheck.ALLOWED),
+                    imageSet(row.version(), sets.get(row.version().id())));
         }).toList();
+    }
+
+    /** A version's image set while it uploads (Story 1.21); null for any other version. */
+    private ImageSet imageSet(VersionRow version, List<UploadRow> members) {
+        if (members == null || members.isEmpty() || !Uploads.UPLOADING.equals(version.state())) {
+            return null;
+        }
+        return new ImageSet(version.id(), members.stream().map(member -> new SetImage(member.position(),
+                member.id(), UploadRow.COMPLETE.equals(member.state()) || member.name() == null ? null
+                : vault.decryptText(Uploads.memberName(member.id(), member.ownerId()), member.name()),
+                member.state(), member.offset(), member.length(), member.expiresAt(), member.failureCode())).toList());
     }
 
     /**

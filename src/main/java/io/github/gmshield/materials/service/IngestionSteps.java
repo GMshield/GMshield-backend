@@ -55,13 +55,17 @@ import tools.jackson.databind.node.ObjectNode;
  * <ul>
  *   <li>{@link #start}: a completed PDF upload gets its first step (stage {@value #CLEAN}, the whole raw file), a
  *       completed TXT or Markdown upload its only one (stage {@value #TEXT_STAGE}), in the transaction that makes the
- *       version {@code waiting}. Images wait for their own stories.</li>
+ *       version {@code waiting}. From Story 1.21, an image set (an image alone is a set of one) whose every image is
+ *       complete gets its first step (stage {@value #IMAGES_STAGE}), which reads them all, in order.</li>
  *   <li>{@link #input}: at the claim, a {@code waiting} version becomes {@code processing}; the worker gets the stage,
  *       the attempt, the page range, the chain's page total and pipeline version, the name of its input
  *       ({@value #SOURCE}), which {@link #openInput} streams, and, when that input is a file of the version, its id
  *       and the pages it holds. A step over every text file of the version (Story 1.18) gets the input
  *       {@value #TEXTS} instead and {@code texts}, the name ({@code text-<fileId>}) and pages of each text file of
- *       the version in page order, each of which {@link #openInput} streams to that step only.</li>
+ *       the version in page order, each of which {@link #openInput} streams to that step only. A step of an image set
+ *       whose input is not a file of the version (Story 1.21) gets the input {@value #IMAGES_INPUT} instead and
+ *       {@code inputs}, the name ({@code image-<uploadId>}) and format of each complete image of the set in its
+ *       order, each of which {@link #openInput} streams to that step only.</li>
  *   <li>{@link #completed}: one report, recorded in the claim's transaction with the version locked: the pipeline
  *       version (the first report's is kept; a report under another one restarts the chain), the page total, the
  *       cleaned original (a later one replaces it), the page batches and the {@code texts} files (adopted from the
@@ -108,6 +112,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     /** A step's input that is every text file of its version (Story 1.18); each one's input name is its prefix. */
     public static final String TEXTS = "texts";
     static final String TEXT_INPUT = "text-";
+    /** The first stage of an image set (Story 1.21): assemble its images, in order, into one PDF. */
+    public static final String IMAGES_STAGE = "images";
+    /** A step's input that is every image of its set (Story 1.21); each one's input name is its prefix. */
+    public static final String IMAGES_INPUT = "images";
+    static final String IMAGE_INPUT = "image-";
     public static final String PASSWORD_REQUIRED = "ingestion.password_required";
     public static final String TOO_MANY_STEPS = "ingestion.too_many_steps";
     public static final String STEP_FAILED = "ingestion.step_failed";
@@ -136,7 +145,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     /** The files a step may read or a next step may name: never the pictures, which may be one per page. */
     static final Set<String> STEP_FILES = Set.of(VersionFileRow.ORIGINAL, VersionFileRow.BATCH, VersionFileRow.TEXT);
     /** The first stage of each format with a chain in this release; the stage a restart starts from too. */
-    static final Map<String, String> START_STAGES = Map.of("pdf", CLEAN, "txt", TEXT_STAGE, "markdown", TEXT_STAGE);
+    static final Map<String, String> START_STAGES = Map.of("pdf", CLEAN, "txt", TEXT_STAGE, "markdown", TEXT_STAGE,
+            Format.IMAGES, IMAGES_STAGE);
     static final Set<String> LAYERS = Set.of(PageRangeRow.TEXT, PageRangeRow.IMAGE);
     static final Set<String> OUTCOMES = Set.of(PageRangeRow.READ_DIRECTLY, PageRangeRow.READ_BY_OCR,
             PageRangeRow.UNREADABLE);
@@ -210,6 +220,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             ArrayNode texts = input.putArray("texts");
             textFiles(version.id()).forEach(file -> texts.addObject().put("name", TEXT_INPUT + file.fileId())
                     .put("firstPage", file.firstPage()).put("lastPage", file.lastPage()));
+        } else if (readsImages(step, version)) {
+            input.put("input", IMAGES_INPUT);
+            ArrayNode images = input.putArray("inputs");
+            uploads.joined().completeOfVersion(job.ownerId(), version.id()).forEach(upload -> images.addObject()
+                    .put("name", IMAGE_INPUT + upload.id()).put("format", upload.format()));
         } else {
             input.put("input", SOURCE);
             Optional.ofNullable(step.inputFileId()).flatMap(fileId -> materials.versionFile(version.id(), fileId))
@@ -232,6 +247,16 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         return input;
     }
 
+    /**
+     * Whether the step reads the images of its set (Story 1.21): a step of an image version whose input is not one of
+     * the version's files (it names the set's first image). A restart reads the stored original instead.
+     */
+    private boolean readsImages(StepRow step, VersionRow version) {
+        return !step.inputTexts() && Format.IMAGES.equals(version.format()) && (step.inputFileId() == null
+                || materials.versionFile(version.id(), step.inputFileId()).filter(file -> STEP_FILES.contains(
+                file.role())).isEmpty());
+    }
+
     /** The version's text files, in page order. */
     private List<VersionFileRow> textFiles(UUID versionId) {
         return materials.versionFiles(versionId, Set.of(VersionFileRow.TEXT)).stream()
@@ -251,6 +276,12 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             // A step over every text file reads those files, by name, and nothing else.
             return textFiles(version.get().id()).stream().filter(file -> (TEXT_INPUT + file.fileId()).equals(name))
                     .findFirst().map(file -> new StoredFile(owner, file.fileId(), file.sizeBytes(), file.pieceCount()));
+        }
+        if (readsImages(step.get(), version.get())) {
+            // A step over the images of a set reads them, by name, and nothing else.
+            return uploads.joined().completeOfVersion(owner, version.get().id()).stream()
+                    .filter(upload -> (IMAGE_INPUT + upload.id()).equals(name)).findFirst()
+                    .map(upload -> new StoredFile(owner, upload.id(), upload.length(), upload.pieceCount()));
         }
         if (!SOURCE.equals(name)) {
             return Optional.empty();
@@ -849,19 +880,20 @@ public class IngestionSteps implements JobHandler, IngestionStart {
 
     /**
      * The raw upload of the version becomes {@code removing}; its pieces and its row go after the commit, and the
-     * upload sweep finishes whatever is left (Story 1.20: a discarded version's removal uses it too).
+     * upload sweep finishes whatever is left (Story 1.20: a discarded version's removal uses it too). From Story 1.21,
+     * every complete image of a set.
      */
     void removeRawUpload(UUID owner, UUID versionId, Instant now) {
-        Optional<UploadRow> upload = uploads.joined().completeForVersion(owner, versionId);
-        if (upload.isEmpty() || !uploads.joined().removeComplete(upload.get().id(), now)) {
+        List<UploadRow> removed = uploads.joined().completeOfVersion(owner, versionId).stream()
+                .filter(upload -> uploads.joined().removeComplete(upload.id(), now)).toList();
+        if (removed.isEmpty()) {
             return;
         }
-        UploadRow row = upload.get();
-        afterCommit(() -> {
+        afterCommit(() -> removed.forEach(row -> {
             files.deleteFile(row.ownerId(), row.id());
             uploads.separately(store -> store.deleteRemoving(row.id()));
             log.atInfo().addKeyValue("ownerId", row.ownerId()).addKeyValue("uploadId", row.id()).log("upload.removed");
-        });
+        }));
     }
 
     /** Work after the commit, never the caller's failure: what it leaves, the sweeps finish. */

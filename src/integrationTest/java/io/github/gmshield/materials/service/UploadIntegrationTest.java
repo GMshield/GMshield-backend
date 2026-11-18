@@ -28,6 +28,7 @@ import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -119,6 +120,10 @@ class UploadIntegrationTest {
     private JdbcClient jdbc;
     @Autowired
     private TestClock clock;
+    @Autowired
+    private ImageSets sets;
+    @Autowired
+    private Materials materials;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -327,6 +332,156 @@ class UploadIntegrationTest {
             request.headers(headers);
         }
         return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    // --- image sets (Story 1.21)
+
+    @Test
+    void twoImagesCompletingAtOnceStartTheirSetOnceWithTheNamesStoredOnlyEncrypted() throws Exception {
+        UUID owner = Ids.newId();
+        List<byte[]> images = List.of(jpeg(5 * MIB + 7), jpeg(3 * MIB), jpeg(70_000));
+        ImageSets.Created set = as(owner, () -> sets.create("Ficha", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("foto-1.jpg", images.get(0).length),
+                new ImageSets.Image("foto-2.jpg", images.get(1).length),
+                new ImageSets.Image("foto-3.jpg", images.get(2).length))));
+        UUID versionId = set.setId();
+        assertThat(state(versionId)).isEqualTo("uploading");
+        for (ImageSets.Member member : set.images()) {
+            Map<String, Object> stored = row("select position, name, state, failure_code from upload where id = ?",
+                    member.uploadId());
+            assertThat(stored).containsEntry("position", member.position()).containsEntry("state", "open");
+            assertThat(stored.get("failure_code")).isNull();
+            byte[] name = (byte[]) stored.get("name");
+            assertThat(new String(name, StandardCharsets.ISO_8859_1)).doesNotContain("foto");
+            assertThat(vault.decryptText(new Binding("upload", "name", member.uploadId(), owner), name))
+                    .isEqualTo("foto-" + member.position() + ".jpg");
+        }
+        // The last two complete at once: whichever locks the version second starts the set, exactly once.
+        sendWhole(owner, set.images().get(0).uploadId(), images.get(0));
+        assertThat(state(versionId)).isEqualTo("uploading");
+        for (int index = 1; index < 3; index++) {
+            byte[] content = images.get(index);
+            UUID id = set.images().get(index).uploadId();
+            as(owner, () -> uploads.patch(id, 0, content.length, sha256(content), new ByteArrayInputStream(content)));
+        }
+        ExecutorService threads = Executors.newFixedThreadPool(2);
+        try {
+            List<Future<Uploads.Completed>> done = threads.invokeAll(List.of(
+                    () -> as(owner, () -> uploads.complete(set.images().get(1).uploadId(), sha256(images.get(1)))),
+                    () -> as(owner, () -> uploads.complete(set.images().get(2).uploadId(), sha256(images.get(2))))));
+            List<String> states = new java.util.ArrayList<>();
+            for (Future<Uploads.Completed> each : done) {
+                states.add(each.get().state());
+            }
+            assertThat(states).containsExactlyInAnyOrder("uploading", "waiting");
+        } finally {
+            threads.shutdownNow();
+        }
+        assertThat(state(versionId)).isEqualTo("waiting");
+        assertThat(row("select format, size_bytes from material_version where id = ?", versionId))
+                .containsEntry("format", "images")
+                .containsEntry("size_bytes", images.stream().mapToLong(image -> image.length).sum());
+        assertThat(count("select count(*) from ingestion_step where version_id = ?", versionId)).isEqualTo(1);
+        assertThat(row("select stage, input_file_id from ingestion_step where version_id = ?", versionId))
+                .containsEntry("stage", "images").containsEntry("input_file_id", set.images().getFirst().uploadId());
+        assertThat(storage.joined().completeOfVersion(owner, versionId)).extracting(UploadRow::position)
+                .containsExactly(1, 2, 3);
+    }
+
+    @Test
+    void aFailedImageIsKeptApartThenLeftOutAndTheSetsPlacesCloseUpInPostgres() throws Exception {
+        UUID owner = Ids.newId();
+        List<byte[]> images = List.of(jpeg(9000), jpeg(9000), jpeg(9000));
+        ImageSets.Created set = as(owner, () -> sets.create("Ficha", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("a.jpg", 9000), new ImageSets.Image("b.jpg", 9000),
+                new ImageSets.Image("c.jpg", 9000))));
+        UUID second = set.images().get(1).uploadId();
+        as(owner, () -> uploads.patch(second, 0, 9000, sha256(images.get(1)), new ByteArrayInputStream(images.get(1))));
+        assertThatThrownBy(() -> as(owner, () -> uploads.complete(second, sha256(new byte[] {1}))))
+                .satisfies(code("upload.file_checksum_mismatch"));
+        assertThat(row("select state, failure_code, busy_token from upload where id = ?", second))
+                .containsEntry("state", "failed").containsEntry("failure_code", "upload.file_checksum_mismatch");
+        assertThat(files.fileExists(owner, second)).isFalse();
+        assertThat(state(set.setId())).isEqualTo("uploading");
+        sendWhole(owner, set.images().get(0).uploadId(), images.get(0));
+        sendWhole(owner, set.images().get(2).uploadId(), images.get(2));
+        assertThat(state(set.setId())).isEqualTo("uploading");
+
+        // The material's view, from Postgres: the set's images in order, the failed one with its reason and name.
+        Materials.ImageSet listed = as(owner, () -> materials.find(set.materialId())).orElseThrow().imageSet();
+        assertThat(listed.id()).isEqualTo(set.setId());
+        assertThat(listed.images()).extracting(Materials.SetImage::position, Materials.SetImage::state,
+                        Materials.SetImage::failure, Materials.SetImage::name)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(1, "complete", null, null),
+                        org.assertj.core.groups.Tuple.tuple(2, "failed", "upload.file_checksum_mismatch", "b.jpg"),
+                        org.assertj.core.groups.Tuple.tuple(3, "complete", null, null));
+        Uploads.Completed dropped = as(owner, () -> sets.drop(set.setId(), 2));
+        assertThat(dropped.state()).isEqualTo("waiting");
+        assertThat(count("select count(*) from upload where id = ?", second)).isZero();
+        assertThat(row("select position from upload where id = ?", set.images().get(2).uploadId()))
+                .containsEntry("position", 2);
+        assertThat(count("select count(*) from ingestion_step where version_id = ?", set.setId())).isEqualTo(1);
+    }
+
+    @Test
+    void theSweepFailsAnExpiredImageAloneAndDiscardsASetNobodyCanFinishItsCompleteImagesIncluded() throws Exception {
+        UUID owner = Ids.newId();
+        ImageSets.Created kept = as(owner, () -> sets.create("Ficha", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("a.jpg", 9000), new ImageSets.Image("b.jpg", 9000))));
+        UUID first = kept.images().get(0).uploadId();
+        UUID second = kept.images().get(1).uploadId();
+        byte[] start = Arrays.copyOf(jpeg(9000), 4096);
+        as(owner, () -> uploads.patch(first, 0, start.length, sha256(start), new ByteArrayInputStream(start)));
+        sendWhole(owner, second, jpeg(9000));
+        ImageSets.Created lost = as(owner, () -> sets.create("Perdida", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("c.jpg", 9000), new ImageSets.Image("d.jpg", 9000))));
+        assertThat(files.fileExists(owner, first)).isTrue();
+        assertThat(files.fileExists(owner, second)).isTrue();
+        clock.advance(Duration.ofHours(6).plusSeconds(1));
+
+        sweep.sweep();
+
+        // The tab was closed mid-set: the open image expired and failed, and with no image open and every failed one
+        // expired, the set is discarded, its complete image included: no row and no piece is left.
+        assertThat(state(kept.setId())).isEqualTo("discarded");
+        assertThat(count("select count(*) from upload where version_id = ?", kept.setId())).isZero();
+        assertThat(files.fileExists(owner, first)).isFalse();
+        assertThat(files.fileExists(owner, second)).isFalse();
+        assertThat(state(lost.setId())).isEqualTo("discarded");
+        assertThat(count("select count(*) from upload where version_id = ?", lost.setId())).isZero();
+
+        // A set with an image still open within its six hours is kept, its expired image failed alone.
+        ImageSets.Created waiting = as(owner, () -> sets.create("Espera", Uploads.Details.NONE, List.of(
+                new ImageSets.Image("e.jpg", 9000), new ImageSets.Image("f.jpg", 9000))));
+        UUID expired = waiting.images().get(0).uploadId();
+        jdbc.sql("update upload set expires_at = now() - interval '1 minute' where id = ?").param(expired).update();
+        clock.now.set(Instant.now());
+        sweep.sweep();
+        assertThat(state(waiting.setId())).isEqualTo("uploading");
+        assertThat(row("select state, failure_code from upload where id = ?", expired))
+                .containsEntry("state", "failed").containsEntry("failure_code", "upload.expired");
+        // V14: a failed row always has its reason, an open one never.
+        UUID open = waiting.images().get(1).uploadId();
+        assertThatThrownBy(() -> jdbc.sql("update upload set failure_code = 'x' where id = ?").param(open).update())
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("update upload set state = 'failed' where id = ?").param(open).update())
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+    }
+
+    private void sendWhole(UUID owner, UUID id, byte[] content) throws Exception {
+        as(owner, () -> uploads.patch(id, 0, content.length, sha256(content), new ByteArrayInputStream(content)));
+        as(owner, () -> uploads.complete(id, sha256(content)));
+    }
+
+    private static byte[] jpeg(int size) {
+        byte[] content = new byte[size];
+        content[0] = (byte) 0xff;
+        content[1] = (byte) 0xd8;
+        content[2] = (byte) 0xff;
+        for (int i = 3; i < size; i++) {
+            content[i] = (byte) (i * 7 + (i >>> 9));
+        }
+        return content;
     }
 
     /** A new account's session token, through the stand-in for Google. */

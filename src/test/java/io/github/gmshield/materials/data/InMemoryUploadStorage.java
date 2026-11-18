@@ -51,6 +51,11 @@ public class InMemoryUploadStorage implements UploadStorage {
 
     private final class Store implements UploadStore {
 
+        /** A set's members in order; an upload outside a set first. */
+        private static final Comparator<UploadRow> IN_ORDER = Comparator
+                .comparing(UploadRow::position, Comparator.nullsFirst(Comparator.naturalOrder()))
+                .thenComparing(UploadRow::createdAt).thenComparing(UploadRow::id);
+
         @Override
         public void insert(UploadRow row) {
             synchronized (InMemoryUploadStorage.this) {
@@ -120,8 +125,7 @@ public class InMemoryUploadStorage implements UploadStorage {
 
         @Override
         public Optional<UploadRow> completeForVersion(UUID owner, UUID versionId) {
-            return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
-                    && row.state().equals(UploadRow.COMPLETE)).min(Comparator.comparing(UploadRow::createdAt));
+            return completeOfVersion(owner, versionId).stream().findFirst();
         }
 
         @Override
@@ -162,6 +166,81 @@ public class InMemoryUploadStorage implements UploadStorage {
                     .sorted(Comparator.comparing(UploadRow::updatedAt).thenComparing(UploadRow::id)).limit(limit).toList();
         }
 
+        // --- image sets (Story 1.21)
+
+        @Override
+        public List<UploadRow> ofVersion(UUID owner, UUID versionId) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
+                    && !row.state().equals(UploadRow.REMOVING)).sorted(IN_ORDER).toList();
+        }
+
+        @Override
+        public List<UploadRow> membersOf(UUID owner, Collection<UUID> versionIds) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner)
+                            && versionIds.contains(row.versionId()) && row.member()
+                            && !row.state().equals(UploadRow.REMOVING))
+                    .sorted(Comparator.comparing(UploadRow::versionId).thenComparing(IN_ORDER)).toList();
+        }
+
+        @Override
+        public List<UploadRow> completeOfVersion(UUID owner, UUID versionId) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
+                    && row.state().equals(UploadRow.COMPLETE)).sorted(IN_ORDER).toList();
+        }
+
+        @Override
+        public boolean failHeld(UUID id, UUID token, String code, Instant now) {
+            return update(id, row -> token.equals(row.busyToken()) && row.state().equals(UploadRow.OPEN),
+                    row -> failed(row, code, now));
+        }
+
+        @Override
+        public boolean failExpired(UUID id, String code, Instant now) {
+            return update(id, row -> row.state().equals(UploadRow.OPEN) && row.member()
+                            && !row.expiresAt().isAfter(now) && leaseFree(row, now),
+                    row -> failed(row, code, now));
+        }
+
+        @Override
+        public boolean removeFailed(UUID id, Instant now) {
+            return update(id, row -> row.state().equals(UploadRow.FAILED),
+                    row -> with(row, row.offset(), row.pieceCount(), row.format(), row.busyToken(), row.busyUntil(),
+                            UploadRow.REMOVING, now));
+        }
+
+        @Override
+        public int closeGap(UUID owner, UUID versionId, int position, Instant now) {
+            int moved = 0;
+            for (UploadRow row : List.copyOf(rows.values())) {
+                if (row.ownerId().equals(owner) && row.versionId().equals(versionId) && row.member()
+                        && row.position() > position && !row.state().equals(UploadRow.REMOVING)) {
+                    UploadRow before = row;
+                    rows.put(row.id(), new UploadRow(row.id(), row.ownerId(), row.versionId(), row.length(),
+                            row.offset(), row.pieceCount(), row.format(), row.expiresAt(), row.busyToken(),
+                            row.busyUntil(), row.state(), row.createdAt(), now, row.position() - 1, row.name(),
+                            row.failureCode()));
+                    RollbackUndo.onRollback(() -> rows.put(before.id(), before));
+                    moved++;
+                }
+            }
+            return moved;
+        }
+
+        @Override
+        public List<UploadRow> abandonedSets(Instant now, int limit) {
+            Map<List<UUID>, List<UploadRow>> sets = rows.values().stream().filter(UploadRow::member)
+                    .filter(row -> !row.state().equals(UploadRow.REMOVING))
+                    .collect(java.util.stream.Collectors.groupingBy(row -> List.of(row.ownerId(), row.versionId())));
+            return sets.values().stream()
+                    .filter(members -> members.stream().noneMatch(row -> row.state().equals(UploadRow.OPEN)
+                            || (row.state().equals(UploadRow.FAILED) && row.expiresAt().isAfter(now))))
+                    .filter(members -> members.stream().anyMatch(row -> row.state().equals(UploadRow.FAILED)))
+                    .map(members -> members.stream().filter(row -> row.state().equals(UploadRow.FAILED))
+                            .min(Comparator.comparing(UploadRow::id)).orElseThrow())
+                    .sorted(Comparator.comparing(UploadRow::expiresAt).thenComparing(UploadRow::id)).limit(limit)
+                    .toList();
+        }
+
         private boolean update(UUID id, java.util.function.Predicate<UploadRow> when, UnaryOperator<UploadRow> change) {
             synchronized (InMemoryUploadStorage.this) {
                 UploadRow before = rows.get(id);
@@ -181,7 +260,14 @@ public class InMemoryUploadStorage implements UploadStorage {
         private static UploadRow with(UploadRow row, long offset, int pieces, String format, UUID token, Instant until,
                                       String state, Instant now) {
             return new UploadRow(row.id(), row.ownerId(), row.versionId(), row.length(), offset, pieces, format,
-                    row.expiresAt(), token, until, state, row.createdAt(), now);
+                    row.expiresAt(), token, until, state, row.createdAt(), now, row.position(), row.name(),
+                    row.failureCode());
+        }
+
+        private static UploadRow failed(UploadRow row, String code, Instant now) {
+            return new UploadRow(row.id(), row.ownerId(), row.versionId(), row.length(), row.offset(),
+                    row.pieceCount(), row.format(), row.expiresAt(), null, null, UploadRow.FAILED, row.createdAt(), now,
+                    row.position(), row.name(), code);
         }
     }
 }

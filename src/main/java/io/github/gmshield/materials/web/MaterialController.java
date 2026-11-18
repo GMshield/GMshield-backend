@@ -86,6 +86,49 @@ class MaterialController {
         }
     }
 
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "MaterialSetImage", requiredProperties = {"position", "uploadId", "state", "offset", "length",
+        "expiresAt"})
+    record SetImageView(
+            @Schema(description = "The image's place in its set, from 1", format = "int32", example = "2") int position,
+            @Schema(description = "The image's upload: it resumes at /api/v1/uploads/{uploadId}", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000006") String uploadId,
+            @Schema(description = "The image's file name, while it is not complete", example = "foto-2.jpg")
+            String name,
+            @Schema(description = "The image's upload state", example = "failed",
+                    allowableValues = {"open", "complete", "failed"}) String state,
+            @Schema(description = "Bytes verified and stored", format = "int64", example = "0") long offset,
+            @Schema(description = "The image's size in bytes", format = "int64", example = "3145728") long length,
+            @Schema(description = "When the image's upload expires", format = "date-time",
+                    example = "2026-11-17T06:00:00Z") String expiresAt,
+            @Schema(description = "Why the image failed (category.reason), only when it failed",
+                    example = "upload.file_checksum_mismatch",
+                    allowableValues = {"upload.file_checksum_mismatch", "upload.format_refused", "upload.expired"})
+            String failure) {
+
+        static SetImageView of(Materials.SetImage image) {
+            return new SetImageView(image.position(), image.uploadId().toString(), image.name(), image.state(),
+                    image.offset(), image.length(), image.expiresAt().toString(), image.failure());
+        }
+
+        @Override
+        public String toString() {
+            return "SetImageView[position=" + position + ", state=" + state + "]";
+        }
+    }
+
+    @Schema(name = "MaterialImageSet", requiredProperties = {"id", "images"})
+    record ImageSetView(
+            @Schema(description = "The set's id: /api/v1/image-sets/{id}", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000004") String id,
+            @ArraySchema(arraySchema = @Schema(description = "The set's images, in their order"),
+                    schema = @Schema(implementation = SetImageView.class)) List<SetImageView> images) {
+
+        static ImageSetView of(Materials.ImageSet set) {
+            return new ImageSetView(set.id().toString(), set.images().stream().map(SetImageView::of).toList());
+        }
+    }
+
     @Schema(name = "MaterialPageCount", requiredProperties = {"done", "total"})
     record CountView(
             @Schema(description = "Pages of this kind that have an outcome", format = "int32", example = "40") int done,
@@ -139,13 +182,16 @@ class MaterialController {
                     + " order: accept and discard while it needs review, reprocess too when a page is unreadable;"
                     + " retry (when it can start again) and discard while it is failed; none otherwise"),
                     schema = @Schema(type = "string", allowableValues = {"accept", "reprocess", "retry", "discard"}))
-            List<String> actions) {
+            List<String> actions,
+            @Schema(description = "The image set still uploading (Story 1.21), only while the state is uploading;"
+                    + " upload is then absent") ImageSetView imageSet) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
                     material.upload() == null ? null : UploadView.of(material.upload()),
                     material.pages() == null ? null : PagesView.of(material.pages()),
-                    material.failure(), material.actions());
+                    material.failure(), material.actions(),
+                    material.imageSet() == null ? null : ImageSetView.of(material.imageSet()));
         }
 
         @Override
