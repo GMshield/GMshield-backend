@@ -45,8 +45,8 @@ below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` 
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
-use `shared`, `library` and `materials`) and `accounts` (sign-in with Google, accounts and sessions, below; it may
-use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails the build when a class outside
+use `shared`, `library`, `materials` and `vault`) and `accounts` (sign-in with Google, accounts and sessions, below;
+it may use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
@@ -479,8 +479,8 @@ use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails t
     campaign; the system tier the `ready` version of each material attached through `material_system` to the
     campaign's system (one already in the campaign tier is left out); a tier switched off has none. A source is a
     version id, the `source` of the Qdrant payload. `pending` is the ids of the in-scope passages whose ordinal falls
-    in the run of an `index.change` job that has not ended. A campaign not found (unknown, or another owner's) is
-    404 `request.not_found`.
+    in the run of an `index.change` job that has not ended, kept by tier (`pending(tier)`). A campaign not found
+    (unknown, or another owner's) is 404 `request.not_found`.
   - `Scopes.passages(scope, ids)` checks every id first: any id that is not a passage of an allowed source still
     `ready` (unknown, another owner's, a version no longer `ready`, out of every tier) refuses the whole request with
     403 `scope.passage_refused`, which names no id, before anything is decrypted. Otherwise it answers
@@ -498,6 +498,20 @@ use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails t
     is `{passages: [{id, tier, text, sectionPath, page}]}` (`JobPassage`), never cached. No production job kind
     implements `passages` yet, so every real job is refused: the story that adds the interactive (answer) job kind
     wires it through `Scopes`, and a test-only handler (`ScopedPassagesFlowTest`) proves the path meanwhile.
+  - **The question input (Story 2.3).** `Scopes.questionInput(scope, question)` is the one builder of the input of a
+    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
+    sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
+    source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
+    (100, all the worker reads) in order, so a re-index of a whole library never fills the claim reply (the total is
+    logged as a count, `pending`, beside `pendingListed`); `owner` is the scope's owner, for the worker's Qdrant
+    filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
+    use `vault :: service`). The question is 1 to 4,000 characters (code points), else
+    `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier join it
+    with Story 2.10. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
+    (no claim schema change). Lines (`scope.question_input`) carry counts, never the question or the key. No
+    production kind carries a question until Story 2.4; the test-only kind `test.question` (`ScopedPassagesFlowTest`)
+    proves that the claim reply carries the input and that the passages route serves the ids the worker found. The
+    worker's search (`GMshield-worker`, `retrieval/search.py`) needs contract 1.8.0, unchanged here.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an

@@ -32,12 +32,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.transaction.PlatformTransactionManager;
+import tools.jackson.databind.JsonNode;
 
 /**
  * Story 2.2 without a database: every row of the I/O matrix the resolver answers, on the in-memory stores, asserted on
  * source and passage ids. The tiers, the versions a tier takes, the pending passages, a read within the scope, its
- * refusal before anything is decrypted, the settings, and another owner's campaign. No model is called. The same
- * queries against PostgreSQL are in {@code ScopeIntegrationTest}; the internal endpoint in
+ * refusal before anything is decrypted, the settings, and another owner's campaign; Story 2.3's question input. No
+ * model is called. The same queries against PostgreSQL are in {@code ScopeIntegrationTest}; the internal endpoint in
  * {@code ScopedPassagesFlowTest}.
  */
 class ScopesTest {
@@ -46,7 +47,9 @@ class ScopesTest {
     private final InMemoryIndexStore index = new InMemoryIndexStore(materials);
     private final InMemoryLibraryStore libraryStore = new InMemoryLibraryStore();
     private final InMemoryTransactionManager transactions = new InMemoryTransactionManager();
-    private final Vault vault = TestVaults.vault();
+    /** Every token key buffer the vault handed out, to see that the question input zeroed it. */
+    private final List<byte[]> handedKeys = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final Vault vault = TestVaults.handingOutTokenKeys(handedKeys);
     /** The jobs that have not ended, as the jobs module would answer. */
     private final Set<UUID> unended = ConcurrentHashMap.newKeySet();
     private ScopeFixture fixture;
@@ -61,7 +64,7 @@ class ScopesTest {
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         scopes = new Scopes(library, TestMaterials.scopeReads(materials, index, vault,
                 ids -> ids.stream().filter(unended::contains).collect(Collectors.toSet()),
-                beans.getBeanProvider(PlatformTransactionManager.class)),
+                beans.getBeanProvider(PlatformTransactionManager.class)), vault,
                 beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
     }
@@ -177,6 +180,8 @@ class ScopesTest {
         ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
 
         assertThat(scope.pending()).hasSize(200).containsExactlyElementsOf(passages.subList(200, 400));
+        assertThat(scope.pending(Tier.CAMPAIGN)).isEqualTo(scope.pending());
+        assertThat(scope.pending(Tier.SYSTEM)).isEmpty();
         // Once it ended, nothing is pending; while all three run, every passage is.
         unended.remove(second);
         assertThat(as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING)).pending()).isEmpty();
@@ -279,6 +284,134 @@ class ScopesTest {
                         assertThat(e.problem().code()).isEqualTo("request.not_found");
                     });
         }
+    }
+
+    // --- the question input (Story 2.3)
+
+    @Test
+    void theQuestionInputCarriesTheQuestionTheOwnerAndEachTiersSourcesAndPendingInTierOrder() {
+        Library2 lib = twoTiers();
+        UUID second = fixture.material(lib.gm().owner(), lib.gm().campaign(), null, "ready").getFirst();
+        List<UUID> secondPassages = fixture.passages(lib.gm().owner(), second, "O", 4);
+        UUID campaignJob = Ids.newId();
+        UUID systemJob = Ids.newId();
+        fixture.indexChange(lib.gm().owner(), campaignJob, second, 1, 2);
+        fixture.indexChange(lib.gm().owner(), systemJob, lib.b(), 0, 1);
+        unended.addAll(List.of(campaignJob, systemJob));
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+
+        JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Qual é o alcance da Espada Vorpal?"));
+
+        assertThat(fieldNames(input)).containsExactly("question", "owner", "tiers", "tokenKey");
+        assertThat(input.path("question").asString()).isEqualTo("Qual é o alcance da Espada Vorpal?");
+        assertThat(input.path("owner").asString()).isEqualTo(lib.gm().owner().toString());
+        JsonNode tiers = input.path("tiers");
+        assertThat(tiers.size()).isEqualTo(2);
+        assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(strings(tiers.get(0).path("sources"))).containsExactly(lib.a().toString(), second.toString());
+        assertThat(strings(tiers.get(0).path("pending"))).containsExactly(secondPassages.get(1).toString(),
+                secondPassages.get(2).toString());
+        assertThat(tiers.get(1).path("tier").asString()).isEqualTo("system");
+        assertThat(strings(tiers.get(1).path("sources"))).containsExactly(lib.b().toString());
+        assertThat(strings(tiers.get(1).path("pending"))).containsExactly(lib.bPassages().get(0).toString(),
+                lib.bPassages().get(1).toString());
+        // Nothing of another campaign, and the owner's token key in Base64.
+        assertThat(input.toString()).doesNotContain(lib.c().toString());
+        assertThat(java.util.Base64.getDecoder().decode(input.path("tokenKey").asString()))
+                .isEqualTo(vault.ownerTokenKey(lib.gm().owner()));
+    }
+
+    @Test
+    void aTierWithNoSourceIsStillListedWithEmptyListsAndAnEmptyScopeHasTwoEmptyTiers() {
+        Library2 lib = twoTiers();
+        ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                new ScopeSettings(false, true, false, false)));
+        ScopeFixture.Starter empty = fixture.starter();
+        ResolvedScope nothing = as(empty.owner(), () -> scopes.resolve(empty.campaign(), ScopeSettings.STARTING));
+
+        JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(systemOnly, "Vorpal?"));
+        JsonNode none = as(empty.owner(), () -> scopes.questionInput(nothing, "Vorpal?"));
+
+        assertThat(input.path("tiers").get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(input.path("tiers").get(0).path("sources").isEmpty()).isTrue();
+        assertThat(input.path("tiers").get(0).path("pending").isEmpty()).isTrue();
+        assertThat(strings(input.path("tiers").get(1).path("sources"))).containsExactly(lib.b().toString());
+        assertThat(none.path("tiers").size()).isEqualTo(2);
+        for (JsonNode tier : none.path("tiers")) {
+            assertThat(tier.path("sources").isArray()).isTrue();
+            assertThat(tier.path("sources").isEmpty()).isTrue();
+            assertThat(tier.path("pending").isEmpty()).isTrue();
+        }
+        assertThat(none.path("owner").asString()).isEqualTo(empty.owner().toString());
+    }
+
+    @Test
+    void aTiersPendingIsListedUpToItsFirstHundredInOrder() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID version = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        List<UUID> passages = fixture.passages(gm.owner(), version, "P", 150);
+        UUID job = Ids.newId();
+        fixture.indexChange(gm.owner(), job, version, 0, 149);
+        unended.add(job);
+        ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
+
+        JsonNode input = as(gm.owner(), () -> scopes.questionInput(scope, "Vorpal?"));
+
+        assertThat(scope.pending(Tier.CAMPAIGN)).hasSize(150);
+        assertThat(Scopes.MAX_PENDING).isEqualTo(100);
+        assertThat(strings(input.path("tiers").get(0).path("pending")))
+                .containsExactlyElementsOf(passages.subList(0, 100).stream().map(UUID::toString).toList());
+    }
+
+    @Test
+    void theTokenKeyBufferIsZeroedOnceEncoded() {
+        Library2 lib = twoTiers();
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        handedKeys.clear();
+
+        JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Vorpal?"));
+
+        assertThat(handedKeys).hasSize(1);
+        assertThat(handedKeys.getFirst()).hasSize(32).containsOnly(0);
+        assertThat(java.util.Base64.getDecoder().decode(input.path("tokenKey").asString())).hasSize(32)
+                .isNotEqualTo(new byte[32]);
+    }
+
+    @Test
+    void aQuestionIsOneTo4000CharactersAndTheInputIsBuiltOnlyForTheScopesOwner() {
+        Library2 lib = twoTiers();
+        ScopeFixture.Starter them = fixture.starter();
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        // 4000 code points, each a surrogate pair: 8000 UTF-16 units, still within the bound.
+        String longest = "\uD83D\uDC09".repeat(4000);
+
+        assertThat(as(lib.gm().owner(), () -> scopes.questionInput(scope, "?")).path("question").asString())
+                .isEqualTo("?");
+        assertThat(as(lib.gm().owner(), () -> scopes.questionInput(scope, longest)).path("question").asString())
+                .isEqualTo(longest);
+        assertThat(as(lib.gm().owner(), () -> scopes.questionInput(scope, "a".repeat(4000))).path("question")
+                .asString()).hasSize(4000);
+        for (String question : java.util.Arrays.asList(null, "", "a".repeat(4001), longest + "a")) {
+            assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.questionInput(scope, question)))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessage("scope.question_invalid");
+        }
+        assertThat(Scopes.MAX_QUESTION).isEqualTo(4000);
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.questionInput(scope, "Vorpal?")))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> scopes.questionInput(scope, "Vorpal?"))
+                .isInstanceOf(OwnerContext.NoOwnerException.class);
+    }
+
+    private static List<String> fieldNames(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.propertyNames().forEach(names::add);
+        return names;
+    }
+
+    private static List<String> strings(JsonNode array) {
+        List<String> found = new ArrayList<>();
+        array.forEach(item -> found.add(item.asString()));
+        return found;
     }
 
     private void assertRefused(UUID owner, ResolvedScope scope, List<UUID> ids) {
