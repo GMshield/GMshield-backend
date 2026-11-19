@@ -152,6 +152,12 @@ public interface MaterialStore {
     /** The ordinals of the current owner's passages of a version, ascending (Story 2.1). */
     List<Integer> passageOrdinals(UUID versionId);
 
+    /**
+     * How many of the current owner's passages of a version have an ordinal from {@code first} to {@code last}, counted
+     * without reading one; 0 for another owner's.
+     */
+    long countPassages(UUID versionId, int first, int last);
+
     /** The current owner's passages of a version from ordinal {@code first} to {@code last}, in order (Story 2.1). */
     List<PassageRow> passages(UUID versionId, int first, int last);
 

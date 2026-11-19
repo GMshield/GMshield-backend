@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -44,6 +45,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       campaign ({@code material.campaign_id}), or that belong to a game system ({@code material_system}).</li>
  *   <li>{@link #pendingPassages}: the ids of the passages of these versions whose index change has not ended
  *       ({@link IndexChanges#unended}).</li>
+ *   <li>{@link #indexing}: how many passages of these versions are still waiting for search, that is the distinct
+ *       passages in the runs of their index changes that have not ended. Counted with one count query per run's
+ *       ordinal range (overlapping runs merged first), so no passage id or text is read; nothing pending is empty.</li>
  *   <li>{@link #passages}: passages by id, checked before anything is decrypted: every id must be a passage of the
  *       owner, of one of the given versions, and that version {@code ready}; otherwise nothing is read.</li>
  *   <li>{@link #places} (Story 2.5): where cited passages stand, filtered rather than refused: a passage that is not
@@ -114,6 +118,16 @@ public class ScopeReads {
         @Override
         public String toString() {
             return "VersionPage[page=" + page + ", pageTotal=" + pageTotal + "]";
+        }
+    }
+
+    /** How many passages of some versions are still waiting for search: {@code remaining >= 1}. */
+    @NamedInterface("service")
+    public record Indexing(int remaining) {
+        public Indexing {
+            if (remaining < 1) {
+                throw new IllegalArgumentException("materials.indexing_invalid");
+            }
         }
     }
 
@@ -195,6 +209,45 @@ public class ScopeReads {
             }
             return List.copyOf(new LinkedHashSet<>(pending));
         });
+    }
+
+    /**
+     * How many of the owner's passages of these versions are still waiting for search, as the class says; empty when
+     * none is.
+     */
+    public Optional<Indexing> indexing(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return Optional.empty();
+        }
+        return reading(() -> {
+            long remaining = 0;
+            for (UUID versionId : new LinkedHashSet<>(versionIds)) {
+                for (int[] range : merged(IndexChanges.unended(index, unendedJobs, versionId))) {
+                    remaining += materials.countPassages(versionId, range[0], range[1]);
+                }
+            }
+            return remaining == 0 ? Optional.<Indexing>empty()
+                    : Optional.of(new Indexing(Math.toIntExact(remaining)));
+        });
+    }
+
+    /**
+     * The ordinal ranges of these runs, overlapping or touching ones merged, by first ordinal: a passage is counted
+     * once even if two runs were ever to cover it ({@code IndexChanges} cuts a version's runs apart).
+     */
+    private static List<int[]> merged(List<IndexChangeRow> runs) {
+        List<IndexChangeRow> sorted = runs.stream()
+                .sorted(Comparator.comparingInt(IndexChangeRow::firstOrdinal)).toList();
+        List<int[]> ranges = new ArrayList<>();
+        for (IndexChangeRow run : sorted) {
+            int[] last = ranges.isEmpty() ? null : ranges.getLast();
+            if (last != null && run.firstOrdinal() <= last[1] + 1) {
+                last[1] = Math.max(last[1], run.lastOrdinal());
+            } else {
+                ranges.add(new int[] {run.firstOrdinal(), run.lastOrdinal()});
+            }
+        }
+        return ranges;
     }
 
     /**

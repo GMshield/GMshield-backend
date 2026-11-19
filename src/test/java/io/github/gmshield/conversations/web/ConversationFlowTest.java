@@ -26,9 +26,13 @@ import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.jobs.service.JobSweep;
+import io.github.gmshield.jobs.service.Jobs;
+import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.limits.data.InMemoryUsageStore;
 import io.github.gmshield.limits.data.UsageRow;
+import io.github.gmshield.materials.data.IndexChangeRow;
+import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialTestStores;
@@ -112,6 +116,7 @@ class ConversationFlowTest {
     private static final String MATERIAL_NAME = "SRD 5.2.1 Livro";
     private static final List<String> SECTION = List.of("Magias", "Fire Bolt");
     private static final Instant START = Instant.parse("2026-11-18T12:00:00Z");
+    private static final String CURRENT = "/api/v1/conversations/current";
 
     @TestConfiguration(proxyBeanMethods = false)
     @Import({LibraryTestStores.class, MaterialTestStores.class, JobMemoryStores.class, ConversationTestStores.class})
@@ -170,6 +175,12 @@ class ConversationFlowTest {
     @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
+    private InMemoryIndexStore index;
+    @Autowired
+    private InMemoryLibraryStore library;
+    @Autowired
+    private Jobs jobService;
+    @Autowired
     private JobSweep sweep;
     @Autowired
     private MutableClock clock;
@@ -222,6 +233,8 @@ class ConversationFlowTest {
         JsonNode current = json(get(gm, "/api/v1/conversations/current"));
         assertThat(current.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
         assertThat(current.path("hasSources").asBoolean()).isTrue();
+        assertThat(current.has("indexing")).isTrue();
+        assertThat(current.path("indexing").isNull()).isTrue();
 
         HttpResponse<String> asked = ask(gm, gm.campaign(), QUESTION);
 
@@ -460,7 +473,9 @@ class ConversationFlowTest {
     void aCampaignWithNothingAcceptedHasNoSourcesAndAskingStillWorks() throws Exception {
         Gm gm = signUp();
 
-        assertThat(json(get(gm, "/api/v1/conversations/current")).path("hasSources").asBoolean()).isFalse();
+        JsonNode current = json(get(gm, "/api/v1/conversations/current"));
+        assertThat(current.path("hasSources").asBoolean()).isFalse();
+        assertThat(current.path("indexing").isNull()).isTrue();
         HttpResponse<String> asked = ask(gm, gm.campaign(), "What does Fire Bolt do?");
 
         assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
@@ -468,6 +483,74 @@ class ConversationFlowTest {
         Claim claim = claim(jobOf(turnId(asked)));
         assertThat(claim.input().path("tiers").get(0).path("sources")).isEmpty();
         assertThat(claim.input().path("tiers").get(1).path("sources")).isEmpty();
+    }
+
+    // --- the indexing count (the GM's notice)
+
+    @Test
+    void theCurrentConversationCountsThePassagesStillBeingPreparedForSearchUntilNoneIsLeft() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Source srd = source(gm, gm.campaign(), java.util.Collections.nCopies(450, 1));
+        Source coimbra = source(gm, gm.campaign(), java.util.Collections.nCopies(5, 1));
+        Source outside = source(gm, null, java.util.Collections.nCopies(3, 1));
+        Source theirs = source(them, them.campaign(), java.util.Collections.nCopies(4, 1));
+        // The count's line is at DEBUG (asked every 5 s per tab): let this test see it.
+        Logger scopeLog = (Logger) LoggerFactory.getLogger(io.github.gmshield.scope.service.Scopes.class);
+        ch.qos.logback.classic.Level level = scopeLog.getLevel();
+        scopeLog.setLevel(ch.qos.logback.classic.Level.DEBUG);
+        // Matrix row "Nothing pending": every in-scope version indexed.
+        JsonNode before = json(get(gm, CURRENT));
+        assertThat(before.has("indexing")).isTrue();
+        assertThat(before.path("indexing").isNull()).isTrue();
+        List<UUID> changes = new ArrayList<>();
+        try {
+            // The SRD in three runs, as an accept makes them; Coimbra's one run, ended; an out-of-scope version and
+            // another owner's version pending.
+            UUID first = indexChange(gm, srd, 0, 199);
+            UUID second = indexChange(gm, srd, 200, 399);
+            UUID third = indexChange(gm, srd, 400, 449);
+            UUID coimbraRun = indexChange(gm, coimbra, 0, 4);
+            changes.addAll(List.of(first, second, third, coimbraRun, indexChange(gm, outside, 0, 2),
+                    indexChange(them, theirs, 0, 3)));
+            as(gm.id(), () -> jobService.cancel(coimbraRun));
+
+            // Matrix row "Indexing": every SRD passage pending, Coimbra and the others not counted.
+            assertIndexing(gm, 450);
+            assertIndexing(them, 4);
+            // Matrix row "One finishes": a run ends, then the next fails (ended too); the count only falls.
+            as(gm.id(), () -> jobService.cancel(first));
+            assertIndexing(gm, 250);
+            jobs.rows.computeIfPresent(second, (id, row) -> row.released("failed", "job.attempts_exhausted",
+                    clock.instant()));
+            assertIndexing(gm, 50);
+            // Matrix row "Failed change": the version's only unended job fails, so nothing is pending any more.
+            jobs.rows.computeIfPresent(third, (id, row) -> row.released("failed", "job.attempts_exhausted",
+                    clock.instant()));
+            JsonNode after = json(get(gm, CURRENT));
+            assertThat(after.has("indexing")).isTrue();
+            assertThat(after.path("indexing").isNull()).isTrue();
+            assertThat(after.path("hasSources").asBoolean()).isTrue();
+            assertThat(logged.list).filteredOn(event -> "scope.indexing".equals(event.getFormattedMessage()))
+                    .isNotEmpty().allSatisfy(event -> assertThat(event.getLevel())
+                            .isEqualTo(ch.qos.logback.classic.Level.DEBUG))
+                    .allSatisfy(event -> assertThat(event.getKeyValuePairs().toString())
+                            .doesNotContain(PASSAGE_TEXT).doesNotContain(MATERIAL_NAME));
+        } finally {
+            scopeLog.setLevel(level);
+            // Leave no index job behind for the other tests' lanes, whatever happened.
+            for (UUID change : changes) {
+                as(jobs.row(change).ownerId(), () -> jobService.cancel(change));
+            }
+        }
+    }
+
+    @Test
+    void anAccountWithNoCampaignHasNoCurrentConversation() throws Exception {
+        Gm gm = signUp();
+        library.campaigns.remove(gm.campaign());
+
+        assertProblem(get(gm, CURRENT), 404, "request.not_found");
     }
 
     @Test
@@ -1278,6 +1361,20 @@ class ConversationFlowTest {
         if (answer.body() instanceof String body) {
             assertThat(JSON.readTree(body).path("code").asString()).isEqualTo("request.not_found");
         }
+    }
+
+    /** An index change of the source's passages {@code first} to {@code last}, as a job that has not ended. */
+    private UUID indexChange(Gm gm, Source source, int first, int last) {
+        return as(gm.id(), () -> jobService.create("index.change", job -> index.insertChange(new IndexChangeRow(
+                job.id(), gm.id(), source.versionId(), first, last, null))).id());
+    }
+
+    private void assertIndexing(Gm gm, int remaining) throws Exception {
+        HttpResponse<String> current = get(gm, CURRENT);
+        assertThat(current.statusCode()).as(current.body()).isEqualTo(200);
+        JsonNode indexing = json(current).path("indexing");
+        assertThat(indexing.path("remaining").asInt()).as(current.body()).isEqualTo(remaining);
+        assertThat(indexing.size()).isEqualTo(1);
     }
 
     private List<UUID> accepted(Gm gm, int count) {

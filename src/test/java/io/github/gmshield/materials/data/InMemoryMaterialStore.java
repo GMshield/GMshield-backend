@@ -462,6 +462,11 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public long countPassages(UUID versionId, int first, int last) {
+        return passages(versionId, first, last).size();
+    }
+
+    @Override
     public List<PassageRow> passages(UUID versionId, int first, int last) {
         return passages(versionId).stream().filter(row -> row.ordinal() >= first && row.ordinal() <= last).toList();
     }

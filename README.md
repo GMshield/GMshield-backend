@@ -525,9 +525,10 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
 - **Ask a question (`conversations`, Story 2.4, public contract 1.11.0, internal contract 1.10.0).** The tenth module;
   it may use `shared`, `jobs`, `scope`, `library` and `vault`. `/api/v1/conversations/**` and `/api/v1/turns/**` join
   the library routes (`LibraryOwnerFilter`): the session's account is the owner.
-  - `GET /api/v1/conversations/current` answers `{campaignId, hasSources}`: the current campaign, and whether
-    `Scopes.resolve(campaign, STARTING)` has an allowed source or a pending passage. No campaign is 404
-    `request.not_found`.
+  - `GET /api/v1/conversations/current` answers `{campaignId, hasSources, indexing}`: the current campaign, whether
+    `Scopes.resolve(campaign, STARTING)` has an allowed source or a pending passage (from public contract 1.15.0, read
+    through `Scopes.status`: an allowed source), and how many of that scope's passages are still waiting for search. No
+    campaign is 404 `request.not_found`.
   - `POST /api/v1/campaigns/{campaignId}/turns` with `{question}` (1 to 4,000 code points, not blank; else 400
     `request.invalid`) answers 201 `{id, conversationId, language}`. In one transaction: the campaign's one
     conversation (made on the first question), the turn with the question encrypted (binding `turn`/`question`),
@@ -623,6 +624,25 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     (`ground=reference` stays 400). Lines (`conversation.reference_page`, `conversation.reference_picture`,
     `scope.reference_page`) carry ids and numbers only. No migration. **Deploy order: backend, then frontend (its
     minimum public contract becomes 1.14.0).** Roll back in the reverse order.
+  - **The indexing count (public contract 1.15.0; the internal contract and the worker do not change).**
+    `CurrentConversation.indexing` (schema `IndexingCount`) is `{remaining}` (an integer, at least 1), or null when
+    nothing in scope is pending. The frontend shows it as "Preparando as fontes para busca: faltam {remaining} trechos".
+    Polling: while the tab is visible, every 5 s, the frontend reads `current` again; a failed read keeps the number;
+    polling stops after 10 minutes of unchanged successful reads, and resumes on a new count from the page.
+    `current` now asks `Scopes.status(campaign, STARTING)` instead of `resolve`: one look-up of the in-scope sources
+    (the campaign and system tiers' `ready` versions, as `resolve` takes them), `hasSources` from those sources alone
+    (a pending passage always belongs to one, so its meaning is unchanged), and `indexing` from `ScopeReads.indexing`;
+    no pending passage id is loaded (`Scopes.indexing` answers the count alone). `remaining` is the number of distinct
+    passages of those versions covered by an unended (`waiting`, `offered` or `running`) `index.change`: one `count`
+    query per run's ordinal range (`MaterialStore.countPassages(version, first, last)`, overlapping runs merged first),
+    so no passage id or text is loaded. It only falls as runs end, unless something new is accepted. An ended (`done`,
+    `failed`, `cancelled`) change, a version of another campaign or of a switched-off tier, and another owner's are not
+    counted. The line `scope.indexing` carries ids and counts only, at DEBUG (it comes every 5 s per open tab). No migration.
+    - Known gap: the worker does not yet start indexing when it starts. Until that follow-up lands (deferred, with the
+      pending-passage fallback cap and reporting a failed index change), a fresh deploy has no unended index change
+      before its first job claim, so `indexing` is null and no notice shows during that time.
+    - **Deploy order: backend, then frontend (its minimum public contract becomes 1.15.0).** Roll back in the reverse
+      order.
   - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
     `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
     through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel
