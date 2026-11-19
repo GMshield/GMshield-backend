@@ -47,6 +47,12 @@ import tools.jackson.databind.node.ObjectNode;
  *       a count), and {@code tokenKey} Base64 of the owner's {@link Vault#ownerTokenKey}, whose
  *       buffer is zeroed once encoded. The question is 1 to {@value #MAX_QUESTION} characters (code points), else
  *       {@code IllegalArgumentException}. Provider, model and tier join it with Story 2.10.</li>
+ *   <li>{@link #references} (Story 2.5): where cited passages stand within a resolved scope, in the order cited, each
+ *       once. A citation is model output, so an id that is not a passage of an allowed source that is still
+ *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; the line carries the
+ *       dropped count only. No passage text is decrypted.</li>
+ *   <li>{@link #removedVersions} (Story 2.5): which of these versions are removed for the owner (gone,
+ *       {@code discarded}, pending removal, or of a material that is gone), so a stored reference shows as removed.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -124,6 +130,30 @@ public class Scopes {
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("requested", ids.size())
                 .addKeyValue("passages", passages.size()).log("scope.passages_read");
         return passages;
+    }
+
+    /** Where the cited passages with these ids stand within {@code scope}, as the class says. */
+    public List<CitedPlace> references(ResolvedScope scope, List<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        if (!OwnerContext.require().equals(scope.ownerId())) {
+            throw new IllegalStateException("scope.owner_mismatch");
+        }
+        List<UUID> cited = ids.stream().filter(Objects::nonNull).distinct().toList();
+        List<CitedPlace> places = reading(() -> reads.places(cited, scope.allowedSources())).stream()
+                .map(place -> new CitedPlace(place.passageId(), place.versionId(), place.materialId(),
+                        place.materialName(), place.sectionPath(), place.page())).toList();
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", cited.size())
+                .addKeyValue("kept", places.size()).addKeyValue("dropped", cited.size() - places.size())
+                .log("scope.references_read");
+        return places;
+    }
+
+    /** Which of these versions are removed for the owner, as the class says. */
+    public Set<UUID> removedVersions(Set<UUID> versionIds) {
+        Objects.requireNonNull(versionIds, "versionIds");
+        OwnerContext.require();
+        return versionIds.isEmpty() ? Set.of() : reading(() -> reads.removedVersions(versionIds));
     }
 
     private List<UUID> pendingOf(List<UUID> sources) {

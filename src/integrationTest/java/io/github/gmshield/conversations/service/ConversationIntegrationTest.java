@@ -11,10 +11,13 @@ import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
+import io.github.gmshield.vault.service.Binding;
+import io.github.gmshield.vault.service.Vault;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -36,6 +39,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * per claim and number with their sequences, a gap refused with nothing stored, the usage recorded once per call id
  * ({@code ON CONFLICT DO NOTHING}), the final {@code done}, the stored events read back after a sequence, the
  * encrypted columns, and another owner. The same rows without a database are in {@code ConversationFlowTest}.
+ * Story 2.5: the references of a completed turn stored by value in {@code turn_reference} (passage ids as
+ * {@code uuid[]}, the name and the section path encrypted), read back, and marked removed after a discard.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -56,6 +61,8 @@ class ConversationIntegrationTest {
     private JobClaims claims;
     @Autowired
     private JdbcClient jdbc;
+    @Autowired
+    private Vault vault;
     @Autowired
     private PlatformTransactionManager transactions;
 
@@ -145,11 +152,83 @@ class ConversationIntegrationTest {
                 TurnEvent::code).containsExactly(org.assertj.core.groups.Tuple.tuple("error", "model.refused"));
     }
 
+    @Test
+    void aCompletedTurnsReferencesAreStoredByValueOnPostgresAndShowRemovedLater() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        List<UUID> passages = List.of(Ids.newId(), Ids.newId(), Ids.newId());
+        as(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "SRD 5.2.1"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, passages.get(0), 0, 4),
+                    passage(owner, version, passages.get(1), 1, 4), passage(owner, version, passages.get(2), 2, 9)));
+            return null;
+        });
+        Conversations.Asked asked = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        UUID jobId = jdbc.sql("select job_id from turn where id = :id").param("id", asked.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of("azure-openai"));
+        claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1, List.of(
+                JobEvent.delta("Fire Bolt causa 1d10."), JobEvent.citation(passages.get(2), 9),
+                JobEvent.citation(passages.get(1), 20), JobEvent.citation(Ids.newId(), 20),
+                JobEvent.citation(passages.get(0), 20))), List.of());
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
+
+        List<TurnReference> references = as(owner, () -> conversations.references(asked.turnId()));
+
+        assertThat(references).extracting(TurnReference::number, TurnReference::page, TurnReference::passageIds,
+                TurnReference::removed).containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(1, 9, List.of(passages.get(2)), false),
+                        org.assertj.core.groups.Tuple.tuple(2, 4, List.of(passages.get(1), passages.get(0)), false));
+        assertThat(references.getFirst().materialName()).isEqualTo("SRD 5.2.1");
+        assertThat(references.getFirst().sectionPath()).containsExactly("Magias", "Fire Bolt");
+        List<Map<String, Object>> rows = jdbc.sql("select owner_id, number, version_id, material_id, page,"
+                + " material_name, section_path from turn_reference where turn_id = :turn order by number")
+                .param("turn", asked.turnId()).query().listOfRows();
+        assertThat(rows).hasSize(2);
+        assertThat(rows.getFirst().get("owner_id")).isEqualTo(owner);
+        assertThat(rows.getFirst().get("version_id")).isEqualTo(version);
+        assertThat(rows.getFirst().get("material_id")).isEqualTo(material);
+        assertThat(rows).allSatisfy(row -> {
+            assertThat(new String((byte[]) row.get("material_name"), StandardCharsets.ISO_8859_1)).doesNotContain("SRD");
+            assertThat(new String((byte[]) row.get("section_path"), StandardCharsets.ISO_8859_1))
+                    .doesNotContain("Magias").doesNotContain("Fire Bolt");
+        });
+        assertThat(jdbc.sql("select cardinality(passage_ids) from turn_reference where turn_id = :turn and number = 2")
+                .param("turn", asked.turnId()).query(Integer.class).single()).isEqualTo(2);
+        // Another owner reads no reference.
+        UUID other = Ids.newId();
+        assertThat(as(other, () -> conversations.references(asked.turnId()))).isEmpty();
+
+        as(owner, () -> materials.discardVersion(version, Instant.now()));
+
+        assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::removed)
+                .containsExactly(true, true);
+    }
+
+    private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page) {
+        String text = "Fire Bolt deals 1d10 Fire damage " + ordinal;
+        byte[] place = ("{\"sectionPath\":[\"Magias\",\"Fire Bolt\"],\"range\":[0," + text.length() + "]}")
+                .getBytes(StandardCharsets.UTF_8);
+        return new PassageRow(id, owner, version, ordinal, page,
+                vault.encryptText(new Binding("passage", "text", id, owner), text),
+                vault.encrypt(new Binding("passage", "place", id, owner), place), Instant.now()
+                        .truncatedTo(ChronoUnit.MICROS));
+    }
+
     private void readyVersion(UUID owner, UUID campaign) {
         as(owner, () -> {
             Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
             UUID material = Ids.newId();
-            materials.insertMaterial(new MaterialRow(material, owner, new byte[] {2}, now, "rulebook", null, campaign));
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "Livro"), now, "rulebook", null, campaign));
             materials.insertVersion(new VersionRow(Ids.newId(), owner, material, "ready", "pdf", 1000L, now, now));
             return null;
         });

@@ -3,16 +3,21 @@ package io.github.gmshield.materials.service;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.materials.data.IndexChangeRow;
 import io.github.gmshield.materials.data.IndexStore;
+import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.OwnerContext;
+import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -39,6 +44,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       ({@link IndexChanges#unended}).</li>
  *   <li>{@link #passages}: passages by id, checked before anything is decrypted: every id must be a passage of the
  *       owner, of one of the given versions, and that version {@code ready}; otherwise nothing is read.</li>
+ *   <li>{@link #places} (Story 2.5): where cited passages stand, filtered rather than refused: a passage that is not
+ *       the owner's, not of one of the given versions, or of a version that is not {@code ready} is left out. Only
+ *       the place (section path) and the material's name are decrypted, never a passage's text.</li>
+ *   <li>{@link #removedVersions} (Story 2.5): which of these versions are gone, {@code discarded}, pending removal, or
+ *       of a material that is gone.</li>
  * </ul>
  *
  * Nothing here logs; a text or a section title never leaves but in {@link Passage}, whose {@code toString} names ids.
@@ -59,6 +69,23 @@ public class ScopeReads {
         @Override
         public String toString() {
             return "Passage[id=" + id + ", versionId=" + versionId + ", page=" + page + "]";
+        }
+    }
+
+    /**
+     * Where a cited passage stands (Story 2.5): its id, its version and material, the material's name, its section path
+     * (outermost first) and its page. {@code toString} names ids and the page only.
+     */
+    @NamedInterface("service")
+    public record Place(UUID passageId, UUID versionId, UUID materialId, String materialName, List<String> sectionPath,
+                        int page) {
+        public Place {
+            sectionPath = List.copyOf(sectionPath);
+        }
+
+        @Override
+        public String toString() {
+            return "Place[passageId=" + passageId + ", versionId=" + versionId + ", page=" + page + "]";
         }
     }
 
@@ -127,6 +154,66 @@ public class ScopeReads {
                 read.add(decrypt(found.get(id)));
             }
             return Optional.of(List.copyOf(read));
+        });
+    }
+
+    /**
+     * Where the owner's passages with these ids stand, in the order given, each once; an id that is not a passage of
+     * the owner, not of one of {@code versionIds}, or of a version that is not {@code ready} is left out. No passage
+     * text is decrypted.
+     */
+    public List<Place> places(List<UUID> ids, Set<UUID> versionIds) {
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        if (wanted.isEmpty() || versionIds.isEmpty()) {
+            return List.of();
+        }
+        return reading(() -> {
+            Map<UUID, PassageRow> found = materials.findPassages(wanted).stream()
+                    .collect(Collectors.toMap(PassageRow::id, row -> row, (first, second) -> first));
+            Map<UUID, Optional<MaterialRow>> materialOfVersion = new HashMap<>();
+            Map<UUID, String> names = new HashMap<>();
+            List<Place> places = new ArrayList<>();
+            for (UUID id : wanted) {
+                PassageRow row = found.get(id);
+                if (row == null || !versionIds.contains(row.versionId())) {
+                    continue;
+                }
+                Optional<MaterialRow> material = materialOfVersion.computeIfAbsent(row.versionId(), version ->
+                        materials.findVersion(version).filter(candidate -> Materials.READY.equals(candidate.state()))
+                                .flatMap(ready -> materials.findMaterial(ready.materialId())));
+                if (material.isEmpty()) {
+                    continue;
+                }
+                MaterialRow source = material.get();
+                String name = names.computeIfAbsent(source.id(), key -> vault.decryptText(new Binding(Uploads.MATERIAL,
+                        Uploads.FIELD_NAME, source.id(), source.ownerId()), source.name()));
+                Passages.Place place = Passages.place(vault.decrypt(Passages.place(row.id(), row.ownerId()),
+                        row.place()));
+                places.add(new Place(row.id(), row.versionId(), source.id(), name, place.sectionPath(), row.page()));
+            }
+            return List.copyOf(places);
+        });
+    }
+
+    /**
+     * Which of these versions are removed for the owner: gone (or another owner's), {@code discarded}, with their
+     * removal pending, or of a material that is gone.
+     */
+    public Set<UUID> removedVersions(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return Set.of();
+        }
+        return reading(() -> {
+            Set<UUID> removed = new HashSet<>();
+            for (UUID versionId : new LinkedHashSet<>(versionIds)) {
+                Optional<VersionRow> version = materials.findVersion(versionId);
+                if (version.isEmpty() || version.get().removalPending()
+                        || Uploads.DISCARDED.equals(version.get().state())
+                        || materials.findMaterial(version.get().materialId()).isEmpty()) {
+                    removed.add(versionId);
+                }
+            }
+            return Set.copyOf(removed);
         });
     }
 

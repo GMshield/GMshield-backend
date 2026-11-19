@@ -17,6 +17,8 @@ import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.conversations.data.EventBatchRow;
 import io.github.gmshield.conversations.data.InMemoryConversationStore;
+import io.github.gmshield.conversations.data.InMemoryTurnReferenceStore;
+import io.github.gmshield.conversations.data.TurnReferenceRow;
 import io.github.gmshield.conversations.data.TurnRow;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
@@ -82,6 +84,10 @@ import tools.jackson.databind.json.JsonMapper;
  * server-sent events the GM reads (replay from {@code Last-Event-ID}, the keep-alive, the end on {@code done} or
  * {@code error}). The no-splice rule for a reported and a lapsed attempt, the encrypted columns, the foreign owner. The
  * same tables against PostgreSQL are in {@code ConversationIntegrationTest}.
+ *
+ * <p>Story 2.5: every row of its I/O matrix: the cited passages expanded into numbered references stored by value with
+ * the turn and sent on {@code done}, one per place, a bad id dropped, {@code silent} with no reference, a replay with
+ * {@code removed} as of now, no reference for a failed answer, and the invariant (references xor silent).
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -93,6 +99,8 @@ class ConversationFlowTest {
     private static final String WORKER_CREDENTIAL = "gmshield-test-mode-worker-credential-not-a-secret";
     private static final String QUESTION = "Quanto dano causa Fire Bolt?";
     private static final String PASSAGE_TEXT = "Fire Bolt deals 1d10 Fire damage";
+    private static final String MATERIAL_NAME = "SRD 5.2.1 Livro";
+    private static final List<String> SECTION = List.of("Magias", "Fire Bolt");
     private static final Instant START = Instant.parse("2026-11-18T12:00:00Z");
 
     @TestConfiguration(proxyBeanMethods = false)
@@ -145,6 +153,8 @@ class ConversationFlowTest {
     private InMemoryJobStream stream;
     @Autowired
     private InMemoryConversationStore conversations;
+    @Autowired
+    private InMemoryTurnReferenceStore references;
     @Autowired
     private InMemoryUsageStore usage;
     @Autowired
@@ -243,7 +253,16 @@ class ConversationFlowTest {
         assertThat(JSON.readTree(events.get(2).data()).path("passageId").asString())
                 .isEqualTo(passages.getFirst().toString());
         assertThat(JSON.readTree(events.get(2).data()).path("offset").asInt()).isEqualTo(20);
-        assertThat(events.get(3).data()).isEqualTo("{}");
+        JsonNode done = JSON.readTree(events.get(3).data());
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("references")).hasSize(1);
+        JsonNode reference = done.path("references").get(0);
+        assertThat(reference.path("number").asInt()).isEqualTo(1);
+        assertThat(reference.path("materialName").asString()).isEqualTo(MATERIAL_NAME);
+        assertThat(strings(reference.path("sectionPath"))).isEqualTo(SECTION);
+        assertThat(reference.path("page").asInt()).isEqualTo(1);
+        assertThat(strings(reference.path("passageIds"))).containsExactly(passages.getFirst().toString());
+        assertThat(reference.path("removed").asBoolean()).isFalse();
         // One usage row for the call, with the attempt's model; no price.
         UsageRow recorded = usage.rows.get(call);
         assertThat(recorded.jobId()).isEqualTo(job.id());
@@ -557,24 +576,277 @@ class ConversationFlowTest {
                 .extracting(EventBatchRow::claimId).doesNotContainNull();
     }
 
+    // --- Story 2.5: sources under every answer
+
+    @Test
+    void citationsOnTwoPlacesBecomeTwoReferencesNumberedByFirstCitation() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm, gm.campaign(), List.of(3, 7));
+        UUID a = source.passages().get(0);
+        UUID b = source.passages().get(1);
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(a, 3), delta(" Dois."), citation(b, 9),
+                delta(" Três."), citation(a, 15)));
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("references")).hasSize(2);
+        JsonNode first = done.path("references").get(0);
+        JsonNode second = done.path("references").get(1);
+        assertThat(first.path("number").asInt()).isEqualTo(1);
+        assertThat(strings(first.path("passageIds"))).containsExactly(a.toString());
+        assertThat(first.path("page").asInt()).isEqualTo(3);
+        assertThat(second.path("number").asInt()).isEqualTo(2);
+        assertThat(strings(second.path("passageIds"))).containsExactly(b.toString());
+        assertThat(second.path("page").asInt()).isEqualTo(7);
+        assertThat(second.path("materialName").asString()).isEqualTo(MATERIAL_NAME);
+        assertThat(strings(second.path("sectionPath"))).isEqualTo(SECTION);
+        // Stored by value with the turn: version, material, page and passages in the clear, name and path encrypted.
+        List<TurnReferenceRow> stored = references.anyOfTurn(turnId);
+        assertThat(stored).extracting(TurnReferenceRow::number).containsExactly(1, 2);
+        assertThat(stored.getFirst().versionId()).isEqualTo(source.versionId());
+        assertThat(stored.getFirst().materialId()).isEqualTo(source.materialId());
+        assertThat(stored.getFirst().ownerId()).isEqualTo(gm.id());
+        assertThat(stored.get(1).passageIds()).containsExactly(b);
+    }
+
+    @Test
+    void passagesCitedAtTheSamePlaceShareOneReference() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 2);
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(passages.get(1), 3), delta(" Dois."),
+                citation(passages.get(0), 9), citation(passages.get(1), 9)));
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("references")).hasSize(1);
+        assertThat(done.path("references").get(0).path("number").asInt()).isEqualTo(1);
+        assertThat(strings(done.path("references").get(0).path("passageIds")))
+                .containsExactly(passages.get(1).toString(), passages.get(0).toString());
+    }
+
+    @Test
+    void aForeignOrOutOfScopeIdIsDroppedAndTheOtherReferencesStay() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        List<UUID> mine = accepted(gm, 1);
+        UUID theirs = accepted(them, 1).getFirst();
+        UUID outside = source(gm, null, List.of(2)).passages().getFirst();
+        UUID unknown = Ids.newId();
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(theirs, 3), citation(mine.getFirst(), 3),
+                citation(outside, 3), citation(unknown, 3)));
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("references")).hasSize(1);
+        assertThat(strings(done.path("references").get(0).path("passageIds")))
+                .containsExactly(mine.getFirst().toString());
+        // The line names the dropped count, never an id or a text.
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).isEqualTo("conversation.references_stored");
+            Map<String, Object> pairs = new LinkedHashMap<>();
+            event.getKeyValuePairs().forEach(pair -> pairs.put(pair.key, pair.value));
+            assertThat(pairs).containsEntry("turnId", turnId).containsEntry("cited", 4).containsEntry("dropped", 3)
+                    .containsEntry("references", 1);
+        });
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain(theirs.toString()).doesNotContain(outside.toString())
+                .doesNotContain(unknown.toString()).doesNotContain(MATERIAL_NAME).doesNotContain("Magias"));
+    }
+
+    @Test
+    void anAnswerWhoseEveryCitationIsDroppedIsSilent() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        Gm them = signUp();
+        UUID theirs = accepted(them, 1).getFirst();
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Algo."), citation(theirs, 5), citation(Ids.newId(), 5)));
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("silent").asBoolean()).isTrue();
+        assertThat(done.path("references")).isEmpty();
+        assertThat(references.anyOfTurn(turnId)).isEmpty();
+    }
+
+    @Test
+    void anAnswerWithNoCitationIsSilent() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Ainda não sei: as fontes não dizem nada sobre isso.")));
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("silent").asBoolean()).isTrue();
+        assertThat(done.path("references")).isEmpty();
+        // An answer with no event at all is silent too.
+        assertThat(done(gm, answered(gm, QUESTION, List.of()), null).path("silent").asBoolean()).isTrue();
+    }
+
+    @Test
+    void aReplayBeforeDoneSendsTheSameReferencesWithRemovedAsOfNow() throws Exception {
+        Gm gm = signUp();
+        Source kept = source(gm, gm.campaign(), List.of(1));
+        Source discarded = source(gm, gm.campaign(), List.of(2));
+        Source deleted = source(gm, gm.campaign(), List.of(3));
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(kept.passages().getFirst(), 3),
+                citation(discarded.passages().getFirst(), 3), citation(deleted.passages().getFirst(), 3)));
+        JsonNode before = done(gm, turnId, null);
+        assertThat(before.path("references")).extracting(reference -> reference.path("removed").asBoolean())
+                .containsExactly(false, false, false);
+
+        as(gm.id(), () -> {
+            materials.discardVersion(discarded.versionId(), clock.instant());
+            materials.deletePassages(deleted.versionId());
+            materials.deleteVersion(deleted.versionId());
+            return materials.deleteMaterial(deleted.materialId());
+        });
+
+        JsonNode after = done(gm, turnId, "2");
+        assertThat(after.path("references")).hasSize(3);
+        assertThat(after.path("references")).extracting(reference -> reference.path("number").asInt())
+                .containsExactly(1, 2, 3);
+        assertThat(after.path("references")).extracting(reference -> reference.path("removed").asBoolean())
+                .containsExactly(false, true, true);
+        // Stored by value: the removed sources still show their name, section path and page.
+        assertThat(after.path("references").get(2).path("materialName").asString()).isEqualTo(MATERIAL_NAME);
+        assertThat(after.path("references").get(2).path("page").asInt()).isEqualTo(3);
+        assertThat(strings(after.path("references").get(2).path("passageIds")))
+                .containsExactly(deleted.passages().getFirst().toString());
+    }
+
+    @Test
+    void aVersionDiscardedWithItsRemovalFinishedShowsItsReferenceRemoved() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm, gm.campaign(), List.of(1));
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+
+        // Discarded, then its removal finished (VersionRemoval clears the flag): the permanent state.
+        as(gm.id(), () -> {
+            materials.discardVersion(source.versionId(), clock.instant());
+            return materials.clearRemovalPending(source.versionId(), clock.instant());
+        });
+
+        assertThat(materials.versions.get(source.versionId()).removalPending()).isFalse();
+        assertThat(done(gm, turnId, null).path("references").get(0).path("removed").asBoolean()).isTrue();
+    }
+
+    @Test
+    void aFailedAnswerStoresNoReference() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+        postEvents(claim, 1, List.of(delta("Fire Bolt "), citation(passages.getFirst(), 5)), List.of());
+
+        report(claim, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}");
+
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name).containsExactly("delta", "citation", "error");
+        assertThat(references.anyOfTurn(turnId)).isEmpty();
+    }
+
+    @Test
+    void everyCompletedTurnHasAReferenceOrIsSilent() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 2);
+        UUID cited = answered(gm, QUESTION, List.of(delta("Um."), citation(passages.getFirst(), 3)));
+        UUID uncited = answered(gm, QUESTION, List.of(delta("as fontes não dizem nada sobre isso.")));
+        UUID allDropped = answered(gm, QUESTION, List.of(delta("Um."), citation(Ids.newId(), 3)));
+
+        for (UUID turnId : List.of(cited, uncited, allDropped)) {
+            assertThat(conversations.turns.get(turnId).modelKnowledge()).isFalse();
+            JsonNode done = done(gm, turnId, null);
+            JsonNode replayed = done(gm, turnId, "1");
+            assertThat(replayed).isEqualTo(done);
+            assertThat(done.path("references").isEmpty()).isEqualTo(references.anyOfTurn(turnId).isEmpty());
+        }
+        assertThat(done(gm, cited, null).path("silent").asBoolean()).isFalse();
+        assertThat(done(gm, uncited, null).path("silent").asBoolean()).isTrue();
+        assertThat(done(gm, allDropped, null).path("silent").asBoolean()).isTrue();
+    }
+
+    @Test
+    void aReferencesNameAndSectionPathAreStoredOnlyEncrypted() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(passages.getFirst(), 3)));
+
+        TurnReferenceRow row = references.anyOfTurn(turnId).getFirst();
+
+        assertThat(new String(row.materialName(), StandardCharsets.ISO_8859_1)).doesNotContain("SRD")
+                .doesNotContain("Livro");
+        assertThat(new String(row.sectionPath(), StandardCharsets.ISO_8859_1)).doesNotContain("Magias")
+                .doesNotContain("Fire Bolt");
+        assertThat(row.toString()).doesNotContain("SRD").doesNotContain("Magias");
+        // Under another row's binding the ciphertext does not open.
+        assertThat(as(gm.id(), () -> {
+            try {
+                vault.decryptText(new io.github.gmshield.vault.service.Binding("turn_reference", "material_name",
+                        Ids.newId(), gm.id()), row.materialName());
+                return false;
+            } catch (RuntimeException refused) {
+                return true;
+            }
+        })).isTrue();
+    }
+
     // --- helpers
 
     private List<UUID> accepted(Gm gm, int count) {
+        return source(gm, gm.campaign(), java.util.Collections.nCopies(count, 1)).passages();
+    }
+
+    /** A material, its version and its passages: one per page given, in that order. */
+    record Source(UUID materialId, UUID versionId, List<UUID> passages) {
+    }
+
+    /** An accepted material of {@code campaign} (none: out of every scope), one passage per page given. */
+    private Source source(Gm gm, UUID campaign, List<Integer> pages) {
         return as(gm.id(), () -> {
             Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
             UUID materialId = Ids.newId();
-            materials.insertMaterial(new MaterialRow(materialId, gm.id(), new byte[] {2}, now, "rulebook", null,
-                    gm.campaign()));
+            materials.insertMaterial(new MaterialRow(materialId, gm.id(),
+                    TestMaterials.materialName(vault, materialId, gm.id(), MATERIAL_NAME), now, "rulebook", null,
+                    campaign));
             UUID versionId = Ids.newId();
             materials.insertVersion(new VersionRow(versionId, gm.id(), materialId, "ready", "pdf", 1000L, now, now));
             List<PassageRow> rows = new ArrayList<>();
-            for (int ordinal = 0; ordinal < count; ordinal++) {
-                rows.add(TestMaterials.passage(vault, Ids.newId(), gm.id(), versionId, ordinal, 1,
-                        PASSAGE_TEXT + " " + ordinal, List.of("Magias", "Fire Bolt"), now));
+            for (int ordinal = 0; ordinal < pages.size(); ordinal++) {
+                rows.add(TestMaterials.passage(vault, Ids.newId(), gm.id(), versionId, ordinal, pages.get(ordinal),
+                        PASSAGE_TEXT + " " + ordinal, SECTION, now));
             }
             materials.insertPassages(rows);
-            return rows.stream().map(PassageRow::id).toList();
+            return new Source(materialId, versionId, rows.stream().map(PassageRow::id).toList());
         });
+    }
+
+    /** Asks, claims, posts the events in one batch and reports done; answers the turn. */
+    private UUID answered(Gm gm, String question, List<Map<String, Object>> events) throws Exception {
+        UUID turnId = turnId(ask(gm, gm.campaign(), question));
+        Claim claim = claim(jobOf(turnId));
+        if (!events.isEmpty()) {
+            assertThat(postEvents(claim, 1, events, List.of()).statusCode()).isEqualTo(200);
+        }
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+        return turnId;
+    }
+
+    /** The data of the turn's done event, after the invariant: references non-empty exactly when not silent. */
+    private JsonNode done(Gm gm, UUID turnId, String lastEventId) throws Exception {
+        List<Event> events = streamAll(gm, turnId, lastEventId);
+        assertThat(events).isNotEmpty();
+        assertThat(events.getLast().name()).isEqualTo("done");
+        JsonNode data = JSON.readTree(events.getLast().data());
+        assertThat(data.path("silent").isBoolean()).isTrue();
+        assertThat(data.path("references").isArray()).isTrue();
+        assertThat(data.path("silent").asBoolean()).isEqualTo(data.path("references").isEmpty());
+        return data;
+    }
+
+    private static List<String> strings(JsonNode array) {
+        List<String> found = new ArrayList<>();
+        array.forEach(item -> found.add(item.asString()));
+        return found;
     }
 
     private <T> T as(UUID owner, Supplier<T> work) {

@@ -537,8 +537,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10.
   - `GET /api/v1/turns/{turnId}/events` is `text/event-stream` (`TurnStreams`): the stored events after
     `Last-Event-ID` (0 when absent or not a number), then new ones, each `id:` its sequence (1, 2, … per turn) and
-    named `delta {text}`, `citation {passageId, offset}`, `done {}` or `error {code}` (the public document names
-    `TurnDeltaEvent`, `TurnCitationEvent`, `TurnDoneEvent` and `TurnErrorEvent`). A comment `: keep-alive` goes out
+    named `delta {text}`, `citation {passageId, offset}`, `done {silent, references}` (Story 2.5, below) or
+    `error {code}` (the public document names `TurnDeltaEvent`, `TurnCitationEvent`, `TurnDoneEvent` and
+    `TurnErrorEvent`). A comment `: keep-alive` goes out
     after 15 s without an event (`gmshield.conversations.keep-alive`); the stream closes after `done` or `error`, or
     after 30 min (`gmshield.conversations.stream-timeout`). The database is the stream's truth: each stream runs on a
     virtual thread as the turn's owner (captured before it starts), is woken after each commit that stores an event,
@@ -559,10 +560,31 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     transaction, to `jobs.service.UsageReports`, which `limits` implements (`ModelUsage`): one `model_call_usage` row
     per call id (`ON CONFLICT DO NOTHING`) with the job, owner, the attempt's provider, model and tier, the response id
     and the token counts; no price (Story 9.2).
-  - The end: `completed` appends `done`; the job's end in `failed` appends `error {code}` (a failed attempt that is
-    retried appends nothing). **No splice:** once a turn has a posted batch holding an event (`JobHandler.delivered`; usage alone shows the GM nothing), a failed outcome
+  - The end: `completed` stores the turn's source references (below), then appends `done`; the job's end in
+    `failed` appends `error {code}` and stores no reference (a failed attempt that is retried appends nothing). **No splice:** once a turn has a posted batch holding an event (`JobHandler.delivered`; usage alone shows the GM nothing), a failed outcome
     ends the job as with `retry: false`, and a lapsed claim ends it `failed` with `job.claim_lapsed`: it is never offered
     again.
+  - **Sources under every answer (Story 2.5, public contract 1.12.0; the internal contract stays 1.10.0).** In
+    `AnswerJobs.completed`, inside the transaction that appends `done`, the passage ids of the turn's stored citations
+    (in sequence order) are read again within the turn's scope, rebuilt from its frozen settings:
+    `Scopes.references(scope, ids)` (through `ScopeReads.places`) keeps only the passages of the owner whose version
+    is an allowed source still `ready`, and decrypts only the section path and the material's name, never a passage's
+    text. An unknown, foreign or out-of-scope id is dropped, never refused; the line `conversation.references_stored`
+    carries the cited, dropped and stored counts only (`cited` and `dropped` count distinct cited passage ids, not
+    citation events). One reference per distinct place `(versionId, sectionPath,
+    page)`, numbered 1…n by first citation, each with its `passageIds`. They are stored by value in `turn_reference`
+    (`V18__turn_references.sql`, a library table): turn, number, version id, material id, page, passage ids, and the
+    material's name and the section path encrypted (bindings `turn_reference`/`material_name` and
+    `turn_reference`/`section_path`). No reference row points at `material_version` or `material`.
+  - The `done` event's data is built when it is streamed, from `turn_reference`: `{silent, references: [{number,
+    materialName, sectionPath: […], page, passageIds: […], removed}]}` (`TurnDoneEvent`, `TurnSourceReference`).
+    `silent` is true exactly when `references` is empty: the frontend then shows the one "the sources say nothing"
+    sentence. `removed` is true when the reference's version is gone, `discarded` or pending removal, or its material
+    is gone (`Scopes.removedVersions`), as of the moment it is sent, so a replay from `Last-Event-ID` shows the current
+    state. Delta, citation and error data do not change. While a turn's model knowledge is off (always, until Epic 3),
+    every completed turn therefore has a reference or is silent. Rolling back below this release: roll the frontend
+    back first (the reverse of the deploy order; the 2.5 frontend requires public contract 1.12.0 and reports
+    unhealthy against an older backend), then the backend; `turn_reference` is then left unread.
   - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
     `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
     through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel
