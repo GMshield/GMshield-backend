@@ -63,8 +63,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * /internal/v1/jobs/{jobId}/claims/{claimId}/passages} as the worker calls it. No production kind reads passages until
  * Story 2.4, so a test-only handler ({@link ScopedHandler}) is given a campaign per job and answers through
  * {@link Scopes}: passages of both tiers labelled, a refusal for any id out of the scope with nothing returned, a
- * kind without passages (an index change), a bad grant, and the 1 to 100 ids. Every assertion is on passage ids; no
- * model is called.
+ * kind without passages (an index change), a bad grant, and the 1 to 100 ids. Story 2.3 adds the test-only kind
+ * {@code test.question} ({@link QuestionHandler}): its claim carries the question input and the passages route serves
+ * the ids found. Every assertion is on passage ids; no model is called.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles(value = {"test-mode", "unit"}, inheritProfiles = false)
@@ -107,6 +108,11 @@ class ScopedPassagesFlowTest extends HttpTestSupport {
         @Bean
         ScopedHandler scopedHandler(Scopes scopes) {
             return new ScopedHandler(scopes);
+        }
+
+        @Bean
+        QuestionHandler questionHandler(Scopes scopes) {
+            return new QuestionHandler(scopes);
         }
     }
 
@@ -161,8 +167,66 @@ class ScopedPassagesFlowTest extends HttpTestSupport {
         }
     }
 
+    /**
+     * Story 2.3's test-only kind {@value #KIND}: an interactive job that carries a question within a campaign's
+     * starting scope. Its input is {@link Scopes#questionInput}, its passages {@link Scopes#passages}, and its result
+     * (the ids the worker handed over) is kept. No production kind carries a question until Story 2.4.
+     */
+    static class QuestionHandler implements JobHandler {
+
+        static final String KIND = "test.question";
+
+        /** What a job asks: its campaign and its question. */
+        record Asked(UUID campaign, String question) {
+        }
+
+        final Map<UUID, Asked> asked = new ConcurrentHashMap<>();
+        final Map<UUID, JsonNode> results = new ConcurrentHashMap<>();
+        private final Scopes scopes;
+
+        QuestionHandler(Scopes scopes) {
+            this.scopes = scopes;
+        }
+
+        @Override
+        public String kind() {
+            return KIND;
+        }
+
+        @Override
+        public Lane lane() {
+            return Lane.INTERACTIVE;
+        }
+
+        @Override
+        public JsonNode input(JobRef job) {
+            Asked question = asked.get(job.id());
+            return scopes.questionInput(scopes.resolve(question.campaign(), ScopeSettings.STARTING),
+                    question.question());
+        }
+
+        @Override
+        public List<JobPassage> passages(JobRef job, List<UUID> ids) {
+            ResolvedScope scope = scopes.resolve(asked.get(job.id()).campaign(), ScopeSettings.STARTING);
+            return scopes.passages(scope, ids).stream().map(passage -> new JobPassage(passage.id(),
+                    passage.tier().word(), passage.text(), passage.sectionPath(), passage.page())).toList();
+        }
+
+        @Override
+        public void completed(JobRef job, JsonNode result) {
+            results.put(job.id(), result);
+        }
+
+        @Override
+        public void failed(JobRef job, String code) {
+            // nothing to record
+        }
+    }
+
     @Autowired
     private ScopedHandler handler;
+    @Autowired
+    private QuestionHandler questions;
     @Autowired
     private Jobs jobs;
     @Autowired
@@ -334,6 +398,77 @@ class ScopedPassagesFlowTest extends HttpTestSupport {
         assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + claim.jobId() + "/claims/" + claim.claimId()
                 + "/outcome", "{\"outcome\":\"done\"}", "X-Job-Grant", claim.grant()).statusCode()).isEqualTo(204);
         assertProblem(passages(claim, List.of(lib.aPassages().getFirst())), 403, "job.grant_refused");
+    }
+
+    // --- Story 2.3: a job that carries a question
+
+    @Test
+    void theClaimOfAQuestionCarriesItsInputAndThePassagesRouteServesTheIdsTheWorkerFound() throws Exception {
+        Matrix lib = matrix();
+        UUID owner = lib.gm().owner();
+        // A's passages 1 and 2 are in an index change that has not ended: pending in the campaign tier.
+        UUID change = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                jobs.create(IndexChanges.KIND, job -> index.insertChange(new IndexChangeRow(job.id(), owner, lib.a(),
+                        1, 2, null))).id()));
+        try {
+            String question = "Qual é o alcance da Espada Vorpal?";
+            UUID jobId = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                    jobs.create(QuestionHandler.KIND, job -> questions.asked.put(job.id(),
+                            new QuestionHandler.Asked(lib.gm().campaign(), question))).id()));
+
+            HttpResponse<String> claimed = sendAsWorker("POST", "/internal/v1/jobs/" + jobId + "/claims", null);
+
+            assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+            JsonNode reply = json(claimed);
+            assertThat(reply.path("kind").asString()).isEqualTo(QuestionHandler.KIND);
+            JsonNode input = reply.path("input");
+            assertThat(input.path("question").asString()).isEqualTo(question);
+            assertThat(input.path("owner").asString()).isEqualTo(owner.toString());
+            JsonNode tiers = input.path("tiers");
+            assertThat(tiers.size()).isEqualTo(2);
+            assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
+            assertThat(tiers.get(0).path("sources")).extracting(JsonNode::asString).containsExactly(lib.a().toString());
+            assertThat(tiers.get(0).path("pending")).extracting(JsonNode::asString)
+                    .containsExactly(lib.aPassages().get(1).toString(), lib.aPassages().get(2).toString());
+            assertThat(tiers.get(1).path("tier").asString()).isEqualTo("system");
+            assertThat(tiers.get(1).path("sources")).hasSize(1);
+            assertThat(tiers.get(1).path("pending").isEmpty()).isTrue();
+            assertThat(input.path("tokenKey").asString())
+                    .isEqualTo(java.util.Base64.getEncoder().encodeToString(vault.ownerTokenKey(owner)));
+            assertThat(claimed.body()).doesNotContain(lib.cPassages().getFirst().toString());
+            Claim claim = new Claim(jobId, reply.path("claimId").asString(), reply.path("grant").asString());
+
+            // The worker fetches a pending passage and the found ids by id: labelled, in the order asked.
+            UUID pending = lib.aPassages().get(2);
+            UUID found = lib.bPassages().getFirst();
+            HttpResponse<String> read = passages(claim, List.of(pending, found));
+            assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+            JsonNode served = json(read).path("passages");
+            assertThat(served).extracting(passage -> passage.path("id").asString())
+                    .containsExactly(pending.toString(), found.toString());
+            assertThat(served).extracting(passage -> passage.path("tier").asString())
+                    .containsExactly("campaign", "system");
+            assertThat(served.get(0).path("text").asString()).isEqualTo("Texto A 2");
+            // An id out of the scope is refused, with nothing read.
+            assertProblem(passages(claim, List.of(found, lib.cPassages().getFirst())), 403, "scope.passage_refused");
+
+            // Its result, the ids the worker handed over, is recorded.
+            String result = "{\"outcome\":\"done\",\"result\":{\"ids\":[\"" + pending + "\",\"" + found + "\"]}}";
+            assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + jobId + "/claims/" + claim.claimId() + "/outcome",
+                    result, "X-Job-Grant", claim.grant()).statusCode()).isEqualTo(204);
+            assertThat(questions.results.get(jobId).path("ids")).extracting(JsonNode::asString)
+                    .containsExactly(pending.toString(), found.toString());
+            // No line carries the question, a passage's text or the token key.
+            assertNoTextLogged();
+            String tokenKey = input.path("tokenKey").asString();
+            assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                    + event.getKeyValuePairs()).doesNotContain("Vorpal").doesNotContain(tokenKey));
+            assertThat(logged.list).anySatisfy(event -> assertThat(event.getFormattedMessage())
+                    .isEqualTo("scope.question_input"));
+        } finally {
+            OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions)
+                    .execute(status -> jobs.cancel(change)));
+        }
     }
 
     /** A job of the scoped kind for {@code owner}, given {@code campaign}, claimed. */
