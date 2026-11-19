@@ -10,6 +10,8 @@ import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -49,6 +51,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       the place (section path) and the material's name are decrypted, never a passage's text.</li>
  *   <li>{@link #removedVersions} (Story 2.5): which of these versions are gone, {@code discarded}, pending removal, or
  *       of a material that is gone.</li>
+ *   <li>{@link #versionPage} and {@link #versionPicture} (Story 2.7): one page of a given version of a given material,
+ *       and its picture, as the review ground serves a page ({@link Materials#versionPage}), for a version that is not
+ *       removed ({@link #removedVersions}) and is {@code ready} or {@code superseded}: the version a stored reference
+ *       names, even when it is no longer the newest. A page outside 1 to the page total is not served.</li>
  * </ul>
  *
  * Nothing here logs; a text or a section title never leaves but in {@link Passage}, whose {@code toString} names ids.
@@ -62,6 +68,9 @@ public class ScopeReads {
     private final Vault vault;
     private final Function<Collection<UUID>, Set<UUID>> unendedJobs;
     private final ObjectProvider<PlatformTransactionManager> transactions;
+    private final Materials pages;
+    /** The states of a version a stored reference may still open (Story 2.7). */
+    private static final Set<String> CITED = Set.of(Materials.READY, Materials.SUPERSEDED);
 
     /** A passage read for a scope: its id, its version (its source), section path (outermost first), page and text. */
     @NamedInterface("service")
@@ -89,19 +98,77 @@ public class ScopeReads {
         }
     }
 
-    @Autowired
-    ScopeReads(MaterialStore materials, IndexStore index, Vault vault, Jobs jobs,
-               ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, index, vault, jobs::unended, transactions);
+    /**
+     * One page of a version (Story 2.7), as {@link Materials.VersionPage} has it: its number and the version's page
+     * total, its picture's size (both null for a page with no picture), its lines or its text, its passages' places in
+     * reading order, and its outcome. {@code toString} names numbers only.
+     */
+    @NamedInterface("service")
+    public record VersionPage(int page, int pageTotal, Integer pictureWidth, Integer pictureHeight, List<PageLine> lines,
+                              String text, List<PagePlace> passages, String outcome) {
+        public VersionPage {
+            lines = List.copyOf(lines);
+            passages = List.copyOf(passages);
+        }
+
+        @Override
+        public String toString() {
+            return "VersionPage[page=" + page + ", pageTotal=" + pageTotal + "]";
+        }
     }
 
+    /** A text line of a picture page and its box, {@code [left, top, right, bottom]} as fractions of the picture. */
+    @NamedInterface("service")
+    public record PageLine(String text, List<Double> box) {
+        @Override
+        public String toString() {
+            return "PageLine[box=" + box + "]";
+        }
+    }
+
+    /** A passage's place on its page: its boxes (a picture page), or its code-point range (a text page). */
+    @NamedInterface("service")
+    public record PagePlace(UUID id, List<List<Double>> boxes, List<Integer> range) {
+    }
+
+    /** A page's picture: WebP, streamed one decrypted piece at a time. */
+    @NamedInterface("service")
+    public static final class PagePicture {
+        private final Materials.Picture picture;
+
+        PagePicture(Materials.Picture picture) {
+            this.picture = picture;
+        }
+
+        public long size() {
+            return picture.size();
+        }
+
+        public void writeTo(OutputStream out) throws IOException {
+            picture.writeTo(out);
+        }
+
+        @Override
+        public String toString() {
+            return "PagePicture[size=" + picture.size() + "]";
+        }
+    }
+
+    @Autowired
+    ScopeReads(MaterialStore materials, IndexStore index, Vault vault, Jobs jobs,
+               ObjectProvider<PlatformTransactionManager> transactions, Materials pages) {
+        this(materials, index, vault, jobs::unended, transactions, pages);
+    }
+
+    /** {@code pages} may be null where no page is read (it then answers no page). */
     ScopeReads(MaterialStore materials, IndexStore index, Vault vault, Function<Collection<UUID>, Set<UUID>> unendedJobs,
-               ObjectProvider<PlatformTransactionManager> transactions) {
+               ObjectProvider<PlatformTransactionManager> transactions, Materials pages) {
         this.materials = materials;
         this.index = index;
         this.vault = vault;
         this.unendedJobs = unendedJobs;
         this.transactions = transactions;
+        this.pages = pages;
     }
 
     /** The ids of the owner's {@code ready} versions of the campaign's materials, oldest first. */
@@ -206,15 +273,55 @@ public class ScopeReads {
         return reading(() -> {
             Set<UUID> removed = new HashSet<>();
             for (UUID versionId : new LinkedHashSet<>(versionIds)) {
-                Optional<VersionRow> version = materials.findVersion(versionId);
-                if (version.isEmpty() || version.get().removalPending()
-                        || Uploads.DISCARDED.equals(version.get().state())
-                        || materials.findMaterial(version.get().materialId()).isEmpty()) {
+                if (removed(materials.findVersion(versionId).orElse(null))) {
                     removed.add(versionId);
                 }
             }
             return Set.copyOf(removed);
         });
+    }
+
+    /**
+     * Page {@code page} of the owner's version {@code versionId} of material {@code materialId}, as the class says;
+     * empty when the version is not that material's, is removed or not {@code ready} or {@code superseded}, the page
+     * is outside 1 to the page total, or it has no view (unless it is unreadable).
+     */
+    public Optional<VersionPage> versionPage(UUID materialId, UUID versionId, int page) {
+        return reading(() -> cited(materialId, versionId, page).flatMap(version -> pages.versionPage(version, page))
+                .map(ScopeReads::page));
+    }
+
+    /** The picture of that page, as {@link #versionPage} finds it; empty also for a page with no picture. */
+    public Optional<PagePicture> versionPicture(UUID materialId, UUID versionId, int page) {
+        return reading(() -> cited(materialId, versionId, page)
+                .flatMap(version -> pages.versionPicture(version, page)).map(PagePicture::new));
+    }
+
+    private Optional<VersionRow> cited(UUID materialId, UUID versionId, int page) {
+        if (pages == null || materialId == null || versionId == null) {
+            return Optional.empty();
+        }
+        return materials.findVersion(versionId).filter(row -> !removed(row))
+                .filter(row -> materialId.equals(row.materialId())).filter(row -> CITED.contains(row.state()))
+                .filter(row -> Materials.hasPage(row, page));
+    }
+
+    /**
+     * The removed rule (Story 2.5): gone (null: unknown or another owner's), discarded, pending removal, or of a
+     * material that is gone.
+     */
+    private boolean removed(VersionRow version) {
+        return version == null || version.removalPending() || Uploads.DISCARDED.equals(version.state())
+                || materials.findMaterial(version.materialId()).isEmpty();
+    }
+
+    private static VersionPage page(Materials.VersionPage page) {
+        return new VersionPage(page.page(), page.pageTotal(),
+                page.picture() == null ? null : page.picture().width(),
+                page.picture() == null ? null : page.picture().height(),
+                page.lines().stream().map(line -> new PageLine(line.text(), line.box())).toList(), page.text(),
+                page.passages().stream().map(place -> new PagePlace(place.id(), place.boxes(), place.range())).toList(),
+                page.outcome());
     }
 
     private boolean ready(UUID versionId) {

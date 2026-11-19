@@ -13,6 +13,8 @@ import io.github.gmshield.library.service.Library;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.Scopes;
+import io.github.gmshield.scope.service.SourcePage;
+import io.github.gmshield.scope.service.SourcePicture;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
@@ -54,6 +56,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       or {@code offered} job is cancelled, a {@code running} one keeps its claim (so the worker can still post usage
  *       and report), and the turn ends at once ({@link AnswerJobs}: references so far, {@code done} marked
  *       {@code stopped}) unless it has ended already. Repeating it changes nothing.</li>
+ *   <li>{@link #referencePage} and {@link #referencePicture} (Story 2.7): a page of the version a stored source
+ *       reference names, on the ground "a source reference stored with a turn of that campaign" (AD-9). Three checks
+ *       come first: the owner's turn exists, its conversation's campaign is the owner's, and the turn has a reference
+ *       with that number. {@link Scopes#referencePage} then serves the page from the stored version and material, never
+ *       from an id the client sent. Empty for anything not served.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -198,6 +205,40 @@ public class Conversations {
                             row.sectionPath())),
                     row.page(), row.passageIds(), removed.contains(row.versionId()))).toList();
         });
+    }
+
+    /** Page {@code page} of the version the owner's turn's reference {@code number} names, as the class says. */
+    public Optional<SourcePage> referencePage(UUID turnId, int number, int page) {
+        Optional<SourcePage> served = reading(() -> cited(turnId, number).flatMap(cited -> scopes.referencePage(
+                cited.campaignId(), cited.materialId(), cited.versionId(), page)));
+        log.atInfo().addKeyValue("turnId", turnId).addKeyValue("number", number).addKeyValue("page", page)
+                .addKeyValue("served", served.isPresent()).log("conversation.reference_page");
+        return served;
+    }
+
+    /** The picture of that page, as {@link #referencePage} finds it; empty also for a page with no picture. */
+    public Optional<SourcePicture> referencePicture(UUID turnId, int number, int page) {
+        Optional<SourcePicture> served = reading(() -> cited(turnId, number).flatMap(cited -> scopes
+                .referencePicture(cited.campaignId(), cited.materialId(), cited.versionId(), page)));
+        log.atInfo().addKeyValue("turnId", turnId).addKeyValue("number", number).addKeyValue("page", page)
+                .addKeyValue("served", served.isPresent()).log("conversation.reference_picture");
+        return served;
+    }
+
+    /** What a stored reference names: its turn's campaign, and its material and version. */
+    private record Cited(UUID campaignId, UUID materialId, UUID versionId) {
+    }
+
+    /** The owner's turn's reference {@code number}, when the turn's conversation's campaign is the owner's. */
+    private Optional<Cited> cited(UUID turnId, int number) {
+        if (turnId == null) {
+            return Optional.empty();
+        }
+        return store.findTurn(turnId).flatMap(turn -> store.findConversation(turn.conversationId()))
+                .filter(conversation -> library.campaign(conversation.campaignId()).isPresent())
+                .flatMap(conversation -> referenceStore.references(turnId).stream()
+                        .filter(row -> row.number() == number).findFirst()
+                        .map(row -> new Cited(conversation.campaignId(), row.materialId(), row.versionId())));
     }
 
     static Binding question(UUID turnId, UUID owner) {

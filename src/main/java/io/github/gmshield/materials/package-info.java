@@ -15,7 +15,8 @@
  * <p>From Story 2.2, {@code service.ScopeReads} is the one public read of library items for a campaign: the ready
  * versions by campaign and by system, the pending passage ids of a set of versions, and checked passage reads by id,
  * over the owner-scoped store queries {@code readyOfCampaign}, {@code readyOfSystem}, {@code passageIds} and
- * {@code findPassages}. It is this module's only named interface, and only the {@code scope} module may use it
+ * {@code findPassages}; from Story 2.7, a page and picture of a given cited version, through the review ground's
+ * read. It is this module's only named interface, and only the {@code scope} module may use it
  * ({@code ModuleBoundaryTest}).
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",

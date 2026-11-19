@@ -6,6 +6,8 @@ import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Vault;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -53,6 +55,11 @@ import tools.jackson.databind.node.ObjectNode;
  *       dropped count only. No passage text is decrypted.</li>
  *   <li>{@link #removedVersions} (Story 2.5): which of these versions are removed for the owner (gone,
  *       {@code discarded}, pending removal, or of a material that is gone), so a stored reference shows as removed.</li>
+ *   <li>{@link #referencePage} and {@link #referencePicture} (Story 2.7): one page of the version a source reference
+ *       stored with a turn of the campaign names, and its picture: the ground "a source reference stored with a turn of
+ *       that campaign" (AD-9), which the caller has checked against the turn. The campaign must be the owner's. The
+ *       version is served even when a newer one was accepted since, never once it is removed
+ *       ({@link #removedVersions}); any page from 1 to its page total, one per call. Empty for anything else.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -154,6 +161,54 @@ public class Scopes {
         Objects.requireNonNull(versionIds, "versionIds");
         OwnerContext.require();
         return versionIds.isEmpty() ? Set.of() : reading(() -> reads.removedVersions(versionIds));
+    }
+
+    /** Page {@code page} of a cited version of the owner's campaign, as the class says. */
+    public Optional<SourcePage> referencePage(UUID campaignId, UUID materialId, UUID versionId, int page) {
+        OwnerContext.require();
+        Optional<SourcePage> served = reading(() -> ofCampaign(campaignId)
+                ? reads.versionPage(materialId, versionId, page).map(Scopes::page) : Optional.<SourcePage>empty());
+        log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("versionId", versionId)
+                .addKeyValue("page", page).addKeyValue("served", served.isPresent()).log("scope.reference_page");
+        return served;
+    }
+
+    /** The picture of that page, as {@link #referencePage} finds it; empty also for a page with no picture. */
+    public Optional<SourcePicture> referencePicture(UUID campaignId, UUID materialId, UUID versionId, int page) {
+        OwnerContext.require();
+        return reading(() -> ofCampaign(campaignId)
+                ? reads.versionPicture(materialId, versionId, page).map(Scopes::picture)
+                : Optional.<SourcePicture>empty());
+    }
+
+    private boolean ofCampaign(UUID campaignId) {
+        return campaignId != null && library.campaign(campaignId).isPresent();
+    }
+
+    private static SourcePage page(ScopeReads.VersionPage page) {
+        return new SourcePage(page.page(), page.pageTotal(), page.pictureWidth(), page.pictureHeight(),
+                page.lines().stream().map(line -> new SourcePage.Line(line.text(), line.box())).toList(), page.text(),
+                page.passages().stream().map(place -> new SourcePage.Place(place.id(), place.boxes(), place.range()))
+                        .toList(), page.outcome());
+    }
+
+    private static SourcePicture picture(ScopeReads.PagePicture picture) {
+        return new SourcePicture() {
+            @Override
+            public long size() {
+                return picture.size();
+            }
+
+            @Override
+            public void writeTo(OutputStream out) throws IOException {
+                picture.writeTo(out);
+            }
+
+            @Override
+            public String toString() {
+                return "SourcePicture[size=" + picture.size() + "]";
+            }
+        };
     }
 
     private List<UUID> pendingOf(List<UUID> sources) {

@@ -606,6 +606,23 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     order: backend, then worker (its minimum internal contract becomes 1.11.0), then frontend (its minimum public
     contract becomes 1.13.0).** Roll back in the reverse order. The `job.failed` line of a lapsed claim now logs its
     real code (`job.claim_lapsed` or `job.attempts_exhausted`).
+  - **Open the cited page (Story 2.7, public contract 1.14.0; the internal contract and the worker do not change).**
+    `GET /api/v1/turns/{turnId}/references/{number}/pages/{page}` answers one page of the version a stored source
+    reference names, with the same shape as `MaterialPageView` (the OpenAPI document points at that schema), and `GET
+    …/pages/{page}/picture` streams its WebP picture (`image/webp`, `Content-Length`, `nosniff`); both `no-store`. The
+    path is the ground (AD-9): "a source reference stored with a turn of that campaign". `Conversations` checks that the
+    owner's turn exists, that its conversation's campaign is the owner's and that the turn has a reference with that
+    number; `Scopes.referencePage`/`referencePicture` then serve the page from the stored `versionId` and `materialId`
+    through `ScopeReads.versionPage`/`versionPicture`, which reuse `Materials.versionPage` (the review ground's read).
+    The cited version is served even when a newer one was accepted since (`superseded`), never once it is removed
+    (`Scopes.removedVersions`' rule) or neither `ready` nor `superseded`; any page from 1 to its page total, one per
+    request. Everything else is 404 `request.not_found`: another owner's turn, a malformed or unknown id or number, no
+    such reference, a removed version, a page out of range, a page with no view (an unreadable page with no view answers
+    `picture: null`, `outcome: unreadable`, as on the review ground) and, for the picture, a page with no picture. No
+    page is ever served on a passage or material id the client sends. The materials route keeps `?ground=review` only
+    (`ground=reference` stays 400). Lines (`conversation.reference_page`, `conversation.reference_picture`,
+    `scope.reference_page`) carry ids and numbers only. No migration. **Deploy order: backend, then frontend (its
+    minimum public contract becomes 1.14.0).** Roll back in the reverse order.
   - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
     `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
     through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel
