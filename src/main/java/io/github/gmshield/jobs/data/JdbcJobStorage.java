@@ -79,7 +79,8 @@ class JdbcJobStorage implements JobStorage {
     static final class Sql implements JobStore {
 
         private static final String COLUMNS = "select id, owner_id, kind, lane, state, attempt, trace_id, offered_at,"
-                + " claim_id, grant_hash, claim_renew_at, claim_lapses_at, outcome_code, created_at, updated_at from job ";
+                + " claim_id, grant_hash, claim_renew_at, claim_lapses_at, outcome_code, created_at, updated_at,"
+                + " model_provider, model_id, model_tier from job ";
         /** Namespace of the lane locks ({@code pg_advisory_xact_lock(int, int)}): the story's number. */
         private static final int LANE_LOCKS = 1012;
 
@@ -92,9 +93,10 @@ class JdbcJobStorage implements JobStorage {
         @Override
         public void insert(JobRow row) {
             jdbc.get().sql("insert into job (id, owner_id, kind, lane, state, attempt, trace_id, offered_at, claim_id,"
-                            + " grant_hash, claim_renew_at, claim_lapses_at, outcome_code, created_at, updated_at)"
+                            + " grant_hash, claim_renew_at, claim_lapses_at, outcome_code, created_at, updated_at,"
+                            + " model_provider, model_id, model_tier)"
                             + " values (:id, :owner, :kind, :lane, :state, :attempt, :trace, :offeredAt, :claim, :grant,"
-                            + " :renewAt, :lapsesAt, :code, :createdAt, :updatedAt)")
+                            + " :renewAt, :lapsesAt, :code, :createdAt, :updatedAt, :modelProvider, :modelId, :modelTier)")
                     .param("id", row.id())
                     .param("owner", row.ownerId())
                     .param("kind", row.kind())
@@ -110,6 +112,9 @@ class JdbcJobStorage implements JobStorage {
                     .param("code", row.outcomeCode(), Types.VARCHAR)
                     .param("createdAt", time(row.createdAt()))
                     .param("updatedAt", time(row.updatedAt()))
+                    .param("modelProvider", row.modelProvider(), Types.VARCHAR)
+                    .param("modelId", row.modelId(), Types.VARCHAR)
+                    .param("modelTier", row.modelTier(), Types.VARCHAR)
                     .update();
         }
 
@@ -130,7 +135,8 @@ class JdbcJobStorage implements JobStorage {
             }
             return jdbc.get().sql("update job set state = :state, attempt = :attempt, offered_at = :offeredAt,"
                             + " claim_id = :claim, grant_hash = :grant, claim_renew_at = :renewAt,"
-                            + " claim_lapses_at = :lapsesAt, outcome_code = :code, updated_at = :updatedAt"
+                            + " claim_lapses_at = :lapsesAt, outcome_code = :code, updated_at = :updatedAt,"
+                            + " model_provider = :modelProvider, model_id = :modelId, model_tier = :modelTier"
                             + " where id = :id and state = :expectedState and attempt = :expectedAttempt"
                             + " and claim_id is not distinct from :expectedClaim")
                     .param("state", next.state())
@@ -142,6 +148,9 @@ class JdbcJobStorage implements JobStorage {
                     .param("lapsesAt", time(next.claimLapsesAt()), Types.TIMESTAMP_WITH_TIMEZONE)
                     .param("code", next.outcomeCode(), Types.VARCHAR)
                     .param("updatedAt", time(next.updatedAt()))
+                    .param("modelProvider", next.modelProvider(), Types.VARCHAR)
+                    .param("modelId", next.modelId(), Types.VARCHAR)
+                    .param("modelTier", next.modelTier(), Types.VARCHAR)
                     .param("id", expected.id())
                     .param("expectedState", expected.state())
                     .param("expectedAttempt", expected.attempt())
@@ -159,7 +168,7 @@ class JdbcJobStorage implements JobStorage {
         public List<JobRow> oldestWaitingPerOwner(String lane) {
             return jdbc.get().sql("select distinct on (owner_id) id, owner_id, kind, lane, state, attempt, trace_id,"
                             + " offered_at, claim_id, grant_hash, claim_renew_at, claim_lapses_at, outcome_code, created_at,"
-                            + " updated_at from job where state = 'waiting' and lane = :lane order by owner_id, created_at, id")
+                            + " updated_at, model_provider, model_id, model_tier from job where state = 'waiting' and lane = :lane order by owner_id, created_at, id")
                     .param("lane", lane).query(Sql::row).list();
         }
 
@@ -292,7 +301,8 @@ class JdbcJobStorage implements JobStorage {
                     rs.getString("lane"), rs.getString("state"), rs.getInt("attempt"), rs.getString("trace_id"),
                     instant(rs, "offered_at"), rs.getObject("claim_id", UUID.class), rs.getBytes("grant_hash"),
                     instant(rs, "claim_renew_at"), instant(rs, "claim_lapses_at"), rs.getString("outcome_code"),
-                    instant(rs, "created_at"), instant(rs, "updated_at"));
+                    instant(rs, "created_at"), instant(rs, "updated_at"), rs.getString("model_provider"),
+                    rs.getString("model_id"), rs.getString("model_tier"));
         }
 
         private static Instant instant(ResultSet rs, String column) throws SQLException {

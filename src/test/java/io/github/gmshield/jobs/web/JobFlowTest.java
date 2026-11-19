@@ -61,6 +61,8 @@ class JobFlowTest extends HttpTestSupport {
 
     /** A kind whose handler gives a JSON array as its input: never a valid claim. */
     static final String ARRAY_INPUT = "array-input";
+    /** A test-only kind that calls a model (Story 2.10): no production kind does yet. */
+    static final String TEST_MODEL = "test.model";
 
     @org.springframework.boot.test.context.TestConfiguration(proxyBeanMethods = false)
     static class Handlers {
@@ -74,6 +76,41 @@ class JobFlowTest extends HttpTestSupport {
         @org.springframework.context.annotation.Bean
         StatedRecipes statedRecipes() {
             return new StatedRecipes();
+        }
+
+        @org.springframework.context.annotation.Bean
+        io.github.gmshield.jobs.service.JobHandler modelHandler() {
+            return new io.github.gmshield.jobs.service.JobHandler() {
+                @Override
+                public String kind() {
+                    return TEST_MODEL;
+                }
+
+                @Override
+                public Lane lane() {
+                    return Lane.INTERACTIVE;
+                }
+
+                @Override
+                public boolean callsModel() {
+                    return true;
+                }
+
+                @Override
+                public JsonNode input(JobRef job) {
+                    return tools.jackson.databind.node.JsonNodeFactory.instance.objectNode().put("prompt", "fake:tool");
+                }
+
+                @Override
+                public void completed(JobRef job, JsonNode result) {
+                }
+
+                @Override
+                public void failed(JobRef job, String code) {
+                    LoggerFactory.getLogger(JobFlowTest.class).atInfo().addKeyValue("jobId", job.id())
+                            .addKeyValue("code", code).log("test-model.failed");
+                }
+            };
         }
 
         @org.springframework.context.annotation.Bean
@@ -346,11 +383,98 @@ class JobFlowTest extends HttpTestSupport {
     void aJobOfAKindWithoutAHandlerEndsFailedAtItsClaim() throws Exception {
         UUID id = UUID.randomUUID();
         storage.rows.put(id, new JobRow(id, UUID.randomUUID(), "gone", "interactive", "offered", 0,
-                TraceContext.newTraceId(), START, null, null, null, null, null, START, START));
+                TraceContext.newTraceId(), START, null, null, null, null, null, START, START, null, null, null));
 
         assertProblem(claim(id), 409, "job.not_offered");
         assertThat(storage.row(id).state()).isEqualTo("failed");
         assertThat(storage.row(id).outcomeCode()).isEqualTo("job.unknown_kind");
+    }
+
+    // ---- models (Story 2.10)
+
+    @Test
+    void aModelKindsClaimAnswersTheResolvedModelRecordsItAndEachRetryResolvesItAgain() throws Exception {
+        UUID id = createAs(UUID.randomUUID(), TEST_MODEL);
+
+        HttpResponse<String> first = claimStating(id, "{\"providers\":[\"anthropic\",\"azure-openai\"]}");
+
+        assertThat(first.statusCode()).as(first.body()).isEqualTo(201);
+        JsonNode model = json(first).path("model");
+        assertThat(model.path("provider").asString()).isEqualTo("azure-openai");
+        assertThat(model.path("model").asString()).isEqualTo("gpt-6.1-terra");
+        assertThat(model.path("tier").asString()).isEqualTo("full");
+        JobRow row = storage.row(id);
+        assertThat(List.of(row.modelProvider(), row.modelId(), row.modelTier()))
+                .containsExactly("azure-openai", "gpt-6.1-terra", "full");
+        assertThat(row.attempt()).isEqualTo(1);
+        assertThat(logText()).contains("\"modelProvider\":\"azure-openai\"");
+
+        // The attempt fails; the row keeps a model of an older setting until the next claim resolves it again.
+        assertThat(outcome(id, json(first).path("claimId").asString(), json(first).path("grant").asString(),
+                "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}").statusCode()).isEqualTo(204);
+        assertThat(storage.row(id).state()).isEqualTo("offered");
+        storage.rows.put(id, storage.row(id).withModel("anthropic", "claude-sonnet-5-5", "lightweight"));
+        HttpResponse<String> second = claimStating(id, "{\"providers\":[\"azure-openai\"]}");
+
+        assertThat(second.statusCode()).as(second.body()).isEqualTo(201);
+        assertThat(json(second).path("attempt").asInt()).isEqualTo(2);
+        assertThat(json(second).path("model").path("provider").asString()).isEqualTo("azure-openai");
+        assertThat(List.of(storage.row(id).modelProvider(), storage.row(id).modelId(), storage.row(id).modelTier()))
+                .containsExactly("azure-openai", "gpt-6.1-terra", "full");
+
+        // Once the job ends, the row names the model that answered.
+        assertThat(outcome(id, json(second).path("claimId").asString(), json(second).path("grant").asString(),
+                "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+        assertThat(storage.row(id).state()).isEqualTo("done");
+        assertThat(storage.row(id).modelProvider()).isEqualTo("azure-openai");
+    }
+
+    @Test
+    void aWorkerWithoutTheResolvedProvidersKeyIsRefusedAndTheJobEndsFailedWithoutUsingAnAttempt() throws Exception {
+        for (String body : new String[] {null, "{}", "{\"providers\":[]}", "{\"providers\":[\"anthropic\"]}"}) {
+            UUID id = createAs(UUID.randomUUID(), TEST_MODEL);
+
+            assertProblem(claimStating(id, body), 409, "job.not_offered");
+
+            JobRow row = storage.row(id);
+            assertThat(row.state()).as(body).isEqualTo("failed");
+            assertThat(row.outcomeCode()).isEqualTo("job.provider_unavailable");
+            assertThat(row.attempt()).isZero();
+            assertThat(row.grantHash()).isNull();
+            assertThat(row.modelProvider()).isNull();
+            assertProblem(claimStating(id, "{\"providers\":[\"azure-openai\"]}"), 409, "job.not_offered");
+        }
+        assertThat(logEvents()).contains("test-model.failed");
+        // The line that ends the job names the resolved provider and what the worker stated.
+        assertThat(logText()).contains("\"modelProvider\":\"azure-openai\"").contains("\"statedProviders\":\"anthropic\"");
+    }
+
+    @Test
+    void providersThatAreNotWordsOrMoreThanEightAreRefusedBeforeTheClaim() throws Exception {
+        UUID id = createAs(UUID.randomUUID(), TEST_MODEL);
+        String nine = "[" + String.join(",", java.util.Collections.nCopies(9, "\"openai\"")) + "]";
+
+        for (String providers : List.of("[\"Azure\"]", "[\"\"]", "[\"" + "a".repeat(33) + "\"]", "[null]", nine)) {
+            assertProblem(claimStating(id, "{\"providers\":" + providers + "}"), 400, "request.invalid");
+        }
+        assertThat(storage.row(id).state()).isEqualTo("offered");
+        assertThat(storage.row(id).attempt()).isZero();
+    }
+
+    @Test
+    void aKindThatCallsNoModelClaimsAsBeforeWithoutAModelWhateverTheProvidersStated() throws Exception {
+        UUID silent = createProbe("interactive", 0, 0, null);
+        UUID stating = createProbe("interactive", 0, 0, null);
+
+        HttpResponse<String> plain = claim(silent);
+        HttpResponse<String> stated = claimStating(stating, "{\"providers\":[\"anthropic\"]}");
+
+        for (HttpResponse<String> response : List.of(plain, stated)) {
+            assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+            assertThat(json(response).has("model")).isFalse();
+        }
+        assertThat(storage.row(silent).modelProvider()).isNull();
+        assertThat(storage.row(stating).modelProvider()).isNull();
     }
 
     // ---- credential and grant
@@ -870,6 +994,15 @@ class JobFlowTest extends HttpTestSupport {
 
     private boolean cancelAs(UUID owner, UUID id) {
         return OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> jobs.cancel(id)));
+    }
+
+    private UUID createAs(UUID owner, String kind) {
+        return OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                jobs.create(kind, job -> { }).id()));
+    }
+
+    private HttpResponse<String> claimStating(UUID id, String body) throws Exception {
+        return sendAsWorker("POST", "/internal/v1/jobs/" + id + "/claims", body);
     }
 
     private UUID createAs(UUID owner, Lane lane) {

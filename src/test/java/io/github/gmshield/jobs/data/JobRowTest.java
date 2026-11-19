@@ -16,7 +16,7 @@ class JobRowTest {
 
     private static JobRow row(byte[] grantHash) {
         return new JobRow(ID, OWNER, "probe", "interactive", "running", 1, "0af7651916cd43dd8448eb211c80319c", AT,
-                CLAIM, grantHash, AT, AT, null, AT, AT);
+                CLAIM, grantHash, AT, AT, null, AT, AT, null, null, null);
     }
 
     @Test
@@ -28,5 +28,18 @@ class JobRowTest {
         assertThat(row).isNotEqualTo(row(new byte[] {0})).isNotEqualTo(row(null));
         assertThat(row(null)).isEqualTo(row(null));
         assertThat(row.toString()).doesNotContain("c0ffee").doesNotContain("[B@");
+    }
+
+    @Test
+    void theModelOfTheLastClaimStaysThroughRenewalsReleasesAndOffersAndCountsForEquality() {
+        JobRow row = row(null).withModel("azure-openai", "gpt-6.1-terra", "full");
+
+        for (JobRow copy : java.util.List.of(row.renewed(AT, AT, AT), row.released("done", null, AT), row.offered(AT),
+                row.withState("waiting", AT), row.claimed(CLAIM, null, AT, AT, AT))) {
+            assertThat(java.util.List.of(copy.modelProvider(), copy.modelId(), copy.modelTier()))
+                    .containsExactly("azure-openai", "gpt-6.1-terra", "full");
+        }
+        assertThat(row).isNotEqualTo(row(null)).isEqualTo(row(null).withModel("azure-openai", "gpt-6.1-terra", "full"));
+        assertThat(row(null).modelProvider()).isNull();
     }
 }

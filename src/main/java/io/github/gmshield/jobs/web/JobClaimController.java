@@ -1,12 +1,16 @@
 package io.github.gmshield.jobs.web;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.jobs.service.JobClaims;
+import io.github.gmshield.jobs.service.ModelChoice;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.http.CacheControl;
@@ -57,10 +61,27 @@ class JobClaimController {
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")
-            String traceparent) {
+            String traceparent,
+            @Schema(description = "For a kind that calls a model (contract 1.9.0): the model of this attempt, resolved again"
+                    + " at every claim. Absent for every other kind") @JsonInclude(JsonInclude.Include.NON_NULL)
+            JobModel model) {
         @Override
         public String toString() {
             return "JobClaim[claimId=" + claimId + ", attempt=" + attempt + "]";
+        }
+    }
+
+    @Schema(description = "The model one attempt calls (contract 1.9.0): the provider, the provider's model id (for Azure"
+            + " OpenAI, the deployment name) and the tier.")
+    record JobModel(
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, pattern = "^[a-z0-9-]{1,32}$", maxLength = 32,
+                    description = "azure-openai, anthropic or openai; an open word, so a new provider needs no new"
+                            + " contract") String provider,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, maxLength = 128) String model,
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "full or lightweight") String tier) {
+
+        static JobModel of(ModelChoice choice) {
+            return choice == null ? null : new JobModel(choice.provider(), choice.model(), choice.tier());
         }
     }
 
@@ -69,7 +90,12 @@ class JobClaimController {
     record JobClaimRequest(
             @Schema(description = "The worker's index recipe (AD-10): when it differs from the last one stated, the"
                     + " backend re-indexes every ready version recorded under another one", pattern = "^[A-Za-z0-9._-]{1,32}$",
-                    maxLength = 32) String indexRecipe) {
+                    maxLength = 32) String indexRecipe,
+            @ArraySchema(maxItems = 8, arraySchema = @Schema(description = "The providers the worker holds a key for"
+                    + " (contract 1.9.0). A kind that calls a model is refused (409 job.not_offered, the job ends failed"
+                    + " with job.provider_unavailable, no attempt used) unless its resolved provider is stated; absent"
+                    + " means none"),
+                    schema = @Schema(pattern = "^[a-z0-9-]{1,32}$", maxLength = 32)) List<String> providers) {
     }
 
     @Schema(description = "The live claim's new times.")
@@ -90,13 +116,15 @@ class JobClaimController {
     @PostMapping(produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
     @Operation(operationId = "claimJob", summary = "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for"
-            + " an index recipe that is not one)")
+            + " an index recipe or providers that are not ones)")
     ResponseEntity<JobClaim> claim(@PathVariable UUID jobId,
                                    @RequestBody(required = false) JobClaimRequest body) {
-        JobClaims.Claim claim = claims.claim(jobId, body == null ? null : body.indexRecipe());
+        JobClaims.Claim claim = body == null ? claims.claim(jobId)
+                : claims.claim(jobId, body.indexRecipe(), body.providers());
         return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
                 .body(new JobClaim(claim.claimId(), claim.attempt(), claim.renewAt(), claim.lapsesAt(), claim.grant(),
-                        claim.kind(), JSON.convertValue(claim.input(), OBJECT), claim.traceparent()));
+                        claim.kind(), JSON.convertValue(claim.input(), OBJECT), claim.traceparent(),
+                        JobModel.of(claim.model())));
     }
 
     @PostMapping(path = "/{claimId}/renewals", produces = MediaType.APPLICATION_JSON_VALUE)

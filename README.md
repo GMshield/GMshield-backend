@@ -39,14 +39,15 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Eight modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Nine modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
-use `shared`, `library`, `materials` and `vault`) and `accounts` (sign-in with Google, accounts and sessions, below;
-it may use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also fails the build when a class outside
+use `shared`, `library`, `materials` and `vault`), `limits` (the model setting, below; it may use `shared` and
+`jobs`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+`library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
@@ -506,12 +507,20 @@ it may use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also 
     logged as a count, `pending`, beside `pendingListed`); `owner` is the scope's owner, for the worker's Qdrant
     filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
     use `vault :: service`). The question is 1 to 4,000 characters (code points), else
-    `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier join it
-    with Story 2.10. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
+    `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier come
+    with the claim (Story 2.10, `model`), never in this input. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
     (no claim schema change). Lines (`scope.question_input`) carry counts, never the question or the key. No
     production kind carries a question until Story 2.4; the test-only kind `test.question` (`ScopedPassagesFlowTest`)
     proves that the claim reply carries the input and that the passages route serves the ids the worker found. The
     worker's search (`GMshield-worker`, `retrieval/search.py`) needs contract 1.8.0, unchanged here.
+- **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
+  the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
+  provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
+  deployment names). An unknown provider, or a missing or invalid id (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) of the
+  active one, stops the start with `setting.invalid` naming only the variables; the other providers' ids are not
+  read. `ModelProviders` (`jobs.service.ModelChoices`) resolves `(provider, model, tier)` for an attempt: every job
+  uses the `full` tier until Epic 9. There is no fallback provider, no price and no usage here (Story 9.2). The
+  keys are the worker's: the backend holds none.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -540,7 +549,8 @@ it may use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also 
     `offered` or `running`), the next being the oldest job of the owner after the one offered last.
   - The worker claims with `POST /internal/v1/jobs/{id}/claims` (201): `claimId`, `attempt`, `renewAt`,
     `lapsesAt`, a random `grant` (32 bytes, Base64url; only `vault.tokenHash("grant", …)` is stored), the
-    `kind`, the handler's `input` and the job's `traceparent`. A live claim answers `409 job.claimed`; a job
+    `kind`, the handler's `input`, the job's `traceparent` and, for a kind that calls a model, its `model`
+    (Story 2.10, below). The optional body states the worker's `indexRecipe` (Story 2.1) and `providers`. A live claim answers `409 job.claimed`; a job
     that is waiting, done, failed or cancelled `409 job.not_offered`. It renews with `POST …/claims/{claimId}/renewals`
     and reports with `POST …/claims/{claimId}/outcome` (`{outcome: done|failed, code?, result?}`, 204),
     both with `X-Job-Grant`: a wrong, expired or replaced grant, or another job's, is `403 job.grant_refused`.
@@ -556,6 +566,17 @@ it may use `shared`, `vault`, `audit` and `library`). `ModuleBoundaryTest` also 
     (`DataSourceTransactionManager` over a `DelegatingDataSource`), because a JPA transaction needs an owner.
   - Every backend line about a job carries the trace id of the request that created it; the worker logs
     under it and sends it back in `traceparent`.
+  - **Models (Story 2.10, AD-18, internal contract 1.9.0).** A `JobHandler` whose `callsModel()` is true (default
+    false; no production kind yet) gets a model per attempt. A claim may state `providers` (at most 8, each
+    `^[a-z0-9-]{1,32}$`, else 400 `request.invalid` before the claim): those the worker holds a key for. For such a
+    kind each claim asks `jobs.service.ModelChoices` (implemented by `limits`) for the provider, model and tier,
+    records them on the job row (`model_provider`, `model_id`, `model_tier`, `V16__job_model.sql`; overwritten at
+    every claim, so a retry resolves them again, and kept once the job ends, naming the model that answered) and
+    answers them as `model: {provider, model, tier}`. When the worker did not state that provider (no `providers`
+    means none), the claim rolls back without using an attempt and the job ends `failed` with
+    `job.provider_unavailable`, as a job whose input failed does; the claim is answered `409 job.not_offered`. A kind
+    that calls no model claims as before, with no `model` in the answer, whatever the providers. `job.claimed` logs
+    `modelProvider` and `modelTier` (`none` for other kinds).
   - Test mode only: the `probe` kind and `POST /internal/v1/test-mode/probe-jobs` (`{lane, workMs, failTimes}`,
     owned by a fixed test-mode owner; `GET …/{id}` shows its state), with the table `job_probe` from the
     test-mode migration location. Left out of both OpenAPI documents.
@@ -595,6 +616,10 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |
+| `GMSHIELD_MODEL_PROVIDER` | the active model provider (Story 2.10): `azure-openai` (default), `anthropic` or `openai`; there is no fallback. Its two model ids below must be set and valid, else `setting.invalid` |
+| `GMSHIELD_MODEL_AZURE_OPENAI_FULL`, `GMSHIELD_MODEL_AZURE_OPENAI_LIGHTWEIGHT` | Azure OpenAI's deployment per tier (default `gpt-6.1-terra` for both) |
+| `GMSHIELD_MODEL_ANTHROPIC_FULL`, `GMSHIELD_MODEL_ANTHROPIC_LIGHTWEIGHT` | Anthropic's model per tier (default `claude-sonnet-5-5` and `claude-haiku-5-5`) |
+| `GMSHIELD_MODEL_OPENAI_FULL`, `GMSHIELD_MODEL_OPENAI_LIGHTWEIGHT` | OpenAI's model per tier (no default: OpenAI cannot be selected until both are set) |
 | `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
 | `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
 | `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |
