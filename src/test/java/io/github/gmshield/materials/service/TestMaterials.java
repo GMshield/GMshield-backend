@@ -34,7 +34,15 @@ public final class TestMaterials {
     public static ScopeReads scopeReads(MaterialStore materials, IndexStore index, Vault vault,
                                         Function<Collection<UUID>, Set<UUID>> unendedJobs,
                                         ObjectProvider<PlatformTransactionManager> transactions) {
-        return new ScopeReads(materials, index, vault, unendedJobs, transactions, null);
+        return scopeReads(materials, index, vault, unendedJobs, ids -> Set.of(), transactions);
+    }
+
+    /** {@link #scopeReads(MaterialStore, IndexStore, Vault, Function, ObjectProvider)}, with which jobs failed. */
+    public static ScopeReads scopeReads(MaterialStore materials, IndexStore index, Vault vault,
+                                        Function<Collection<UUID>, Set<UUID>> unendedJobs,
+                                        Function<Collection<UUID>, Set<UUID>> failedJobs,
+                                        ObjectProvider<PlatformTransactionManager> transactions) {
+        return new ScopeReads(materials, index, vault, unendedJobs, failedJobs, transactions, null);
     }
 
     /**

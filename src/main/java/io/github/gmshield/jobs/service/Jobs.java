@@ -8,6 +8,7 @@ import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -135,6 +136,35 @@ public class Jobs {
     public Set<UUID> unended(Collection<UUID> jobIds) {
         UUID owner = OwnerContext.require();
         return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().unended(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * Those of {@code jobIds} that are jobs of the bound owner that ended {@code failed} (indexing at worker start), in
+     * one read joined to the caller's transaction: another owner's job, an unknown one or one in any other state is
+     * left out.
+     */
+    public Set<UUID> failed(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().failed(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * The ids of the bound owner's jobs of {@code kind} that ended {@code failed}, in one read joined to the caller's
+     * transaction (the index retry sweep).
+     */
+    public Set<UUID> failedOfKind(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        UUID owner = OwnerContext.require();
+        return Set.copyOf(storage.joined().failedOfKind(kind, owner));
+    }
+
+    /**
+     * The owners, of every owner, with a job of {@code kind} that ended {@code failed}, in one read of its own: ids only,
+     * for a sweep that then visits each one as that owner (indexing at worker start).
+     */
+    public List<UUID> ownersWithFailed(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        return storage.separately(store -> store.ownersWithFailed(kind));
     }
 
     /**

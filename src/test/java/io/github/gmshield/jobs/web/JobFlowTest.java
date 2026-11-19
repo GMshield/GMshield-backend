@@ -284,6 +284,53 @@ class JobFlowTest extends HttpTestSupport {
     }
 
     @Test
+    void theWorkerStatesItsRecipeOutsideAClaimAndTheBackendReactsAsToOneStatedAtAClaim() throws Exception {
+        String recipe = "s" + UUID.randomUUID().toString().substring(0, 8);
+        UUID job = createProbe("interactive", 0, 0, null);
+        recipes.stated.clear();
+
+        // Anything but a recipe is refused (the claim's 400) and publishes nothing.
+        for (String body : List.of("{\"indexRecipe\":\"two words\"}", "{\"indexRecipe\":\"\"}", "{}",
+                "{\"indexRecipe\":null}", "{\"indexRecipe\":\"" + "x".repeat(33) + "\"}")) {
+            assertProblem(sendAsWorker("PUT", "/internal/v1/index-recipe", body), 400, "request.invalid");
+        }
+        // No body at all, or a JSON null: Spring refuses the required body before the route runs.
+        for (String body : List.of("", "null")) {
+            assertProblem(sendAsWorker("PUT", "/internal/v1/index-recipe", body), 400, "request.invalid");
+        }
+        assertThat(recipes.stated).isEmpty();
+
+        // Matrix row "Deploy": the first statement after a start is published at once, with no job claimed.
+        HttpResponse<String> stated = sendAsWorker("PUT", "/internal/v1/index-recipe",
+                "{\"indexRecipe\":\"" + recipe + "\"}");
+        assertThat(stated.statusCode()).isEqualTo(204);
+        assertThat(stated.body()).isEmpty();
+        assertThat(recipes.stated).containsExactly(recipe);
+        // Matrix row "Same recipe again": every 30 s, on its own or at a claim, it publishes nothing more.
+        for (int check = 0; check < 3; check++) {
+            assertThat(sendAsWorker("PUT", "/internal/v1/index-recipe", "{\"indexRecipe\":\"" + recipe + "\"}")
+                    .statusCode()).isEqualTo(204);
+        }
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + job + "/claims", "{\"indexRecipe\":\"" + recipe
+                + "\"}").statusCode()).isEqualTo(201);
+        assertThat(recipes.stated).containsExactly(recipe);
+        // A new one is published once, whichever way it is stated.
+        assertThat(sendAsWorker("PUT", "/internal/v1/index-recipe", "{\"indexRecipe\":\"" + recipe + "-2\"}")
+                .statusCode()).isEqualTo(204);
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + UUID.randomUUID() + "/claims",
+                "{\"indexRecipe\":\"" + recipe + "-2\"}").statusCode()).isEqualTo(404);
+        assertThat(recipes.stated).containsExactly(recipe, recipe + "-2");
+
+        // The worker's credential only: no grant, and nothing without it.
+        HttpResponse<String> anonymous = java.net.http.HttpClient.newHttpClient().send(HttpRequest
+                .newBuilder(uri("/internal/v1/index-recipe")).header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString("{\"indexRecipe\":\"" + recipe + "-3\"}"))
+                .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(anonymous.statusCode()).isEqualTo(401);
+        assertThat(recipes.stated).containsExactly(recipe, recipe + "-2");
+    }
+
+    @Test
     void aClaimRunsTheJobAndAnswersAttemptGrantTimesInputAndTraceparent() throws Exception {
         String trace = TraceContext.newTraceId();
         UUID id = createProbe("interactive", 1500, 1, trace);

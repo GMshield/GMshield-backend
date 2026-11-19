@@ -2,6 +2,7 @@ package io.github.gmshield.materials.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -49,6 +50,34 @@ class JpaIndexStore implements IndexStore {
             em().flush();
         });
         return found.isPresent();
+    }
+
+    @Override
+    public List<IndexChangeRow> retryable(Collection<UUID> jobIds) {
+        if (jobIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select c from IndexChange c where c.jobId in :ids and c.retries < :most"
+                        + " order by c.versionId, c.firstOrdinal", IndexChangeEntity.class)
+                .setParameter("ids", List.copyOf(jobIds)).setParameter("most", (short) IndexChangeRow.MAX_RETRIES)
+                .getResultList().stream().map(IndexChangeEntity::row).toList();
+    }
+
+    @Override
+    public Optional<IndexChangeRow> moveChange(UUID jobId, UUID newJobId) {
+        Optional<IndexChangeEntity> found = change(jobId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        IndexChangeRow before = found.get().row();
+        IndexChangeRow moved = new IndexChangeRow(newJobId, before.ownerId(), before.versionId(), before.firstOrdinal(),
+                before.lastOrdinal(), null, before.retries() + 1);
+        EntityManager em = em();
+        em.remove(found.get());
+        em.flush();
+        em.persist(new IndexChangeEntity(moved));
+        em.flush();
+        return Optional.of(moved);
     }
 
     @Override

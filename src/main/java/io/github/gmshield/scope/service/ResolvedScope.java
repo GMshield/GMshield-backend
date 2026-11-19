@@ -11,8 +11,9 @@ import java.util.UUID;
 /**
  * A campaign's scope as {@link Scopes#resolve} found it for its owner (Story 2.2): the allowed sources of each tier,
  * each a material version's id (the {@code source} of the index's payload), and {@code pending}, the ids of the
- * in-scope passages whose index change has not ended, kept by tier (Story 2.3: the question input groups them so).
- * Only {@link Scopes} makes one, so a scope cannot be forged by another module. {@code toString} names ids and counts
+ * in-scope passages not indexed (their index change has not ended, or its job failed), kept by tier (Story 2.3: the
+ * question input groups them so); empty, not computed, in a scope from {@link Scopes#resolveSources}. Only
+ * {@link Scopes} makes one, so a scope cannot be forged by another module. {@code toString} names ids and counts
  * only.
  */
 public final class ResolvedScope {
@@ -74,8 +75,9 @@ public final class ResolvedScope {
     }
 
     /**
-     * The ids of the in-scope passages whose index change has not ended, by tier (campaign, then system), then by
-     * source, then by ordinal.
+     * The ids of the in-scope passages not indexed (their index change has not ended, or its job failed), by tier
+     * (campaign, then system); within a tier, those of unended runs first, then those of failed runs, each by source,
+     * then by ordinal.
      */
     public List<UUID> pending() {
         List<UUID> all = new ArrayList<>(campaignPending);

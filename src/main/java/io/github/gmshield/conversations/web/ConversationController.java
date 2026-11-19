@@ -68,7 +68,7 @@ class ConversationController {
         this.streams = streams;
     }
 
-    @Schema(name = "CurrentConversation", requiredProperties = {"campaignId", "hasSources", "indexing"})
+    @Schema(name = "CurrentConversation", requiredProperties = {"campaignId", "hasSources", "indexing", "indexingFailed"})
     record CurrentView(
             @Schema(description = "The current campaign's id", format = "uuid") UUID campaignId,
             @Schema(description = "Whether the campaign's scope has an accepted source (an allowed source, or one whose"
@@ -76,12 +76,28 @@ class ConversationController {
             @Schema(description = "How many passages of the campaign's scope are still being prepared for search (the"
                     + " distinct in-scope passages covered by an index change that has not ended); null when nothing in"
                     + " scope is pending", types = {"object", "null"}, implementation = IndexingView.class)
-            IndexingView indexing) {
+            IndexingView indexing,
+            @Schema(description = "How many passages of the campaign's scope could not be prepared for search (the"
+                    + " distinct in-scope passages covered by an index change whose job failed), and whether a retry"
+                    + " remains (contract 1.16.0); null when none failed", types = {"object", "null"},
+                    implementation = IndexingFailureView.class)
+            IndexingFailureView indexingFailed) {
 
         static CurrentView of(Conversations.Current current) {
             return new CurrentView(current.campaignId(), current.hasSources(),
-                    current.indexing() == null ? null : new IndexingView(current.indexing().remaining()));
+                    current.indexing() == null ? null : new IndexingView(current.indexing().remaining()),
+                    current.indexingFailed() == null ? null : new IndexingFailureView(
+                            current.indexingFailed().passages(), current.indexingFailed().retrying()));
         }
+    }
+
+    @Schema(name = "IndexingFailure", requiredProperties = {"passages", "retrying"},
+            description = "Passages that could not be prepared for search")
+    record IndexingFailureView(
+            @Schema(description = "The passages of the campaign's scope whose index change failed", format = "int32",
+                    minimum = "1", example = "200") int passages,
+            @Schema(description = "True while a retry of one of their index changes remains (every 10 minutes, at most"
+                    + " 3 times); false once none does") boolean retrying) {
     }
 
     @Schema(name = "IndexingCount", requiredProperties = {"remaining"},

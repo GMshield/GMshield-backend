@@ -2,10 +2,12 @@ package io.github.gmshield.materials.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -20,6 +22,8 @@ public class InMemoryIndexStore implements IndexStore {
 
     public final Map<UUID, IndexChangeRow> changes = new ConcurrentHashMap<>();
     public final Map<UUID, IndexRemovalRow> removals = new ConcurrentHashMap<>();
+    /** The jobs whose index change a move refuses, as a failing database would (the retry sweep's isolation). */
+    public final Set<UUID> refusedMoves = ConcurrentHashMap.newKeySet();
     private final InMemoryMaterialStore materials;
 
     public InMemoryIndexStore(InMemoryMaterialStore materials) {
@@ -57,10 +61,42 @@ public class InMemoryIndexStore implements IndexStore {
         found.ifPresent(before -> {
             ownerFor(before.ownerId());
             changes.put(jobId, new IndexChangeRow(before.jobId(), before.ownerId(), before.versionId(),
-                    before.firstOrdinal(), before.lastOrdinal(), recipe));
+                    before.firstOrdinal(), before.lastOrdinal(), recipe, before.retries()));
             RollbackUndo.onRollback(() -> changes.put(jobId, before));
         });
         return found.isPresent();
+    }
+
+    @Override
+    public List<IndexChangeRow> retryable(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return changes.values().stream().filter(row -> row.ownerId().equals(owner) && jobIds.contains(row.jobId())
+                        && row.retries() < IndexChangeRow.MAX_RETRIES)
+                .sorted(Comparator.comparing(IndexChangeRow::versionId)
+                        .thenComparingInt(IndexChangeRow::firstOrdinal)).toList();
+    }
+
+    @Override
+    public synchronized Optional<IndexChangeRow> moveChange(UUID jobId, UUID newJobId) {
+        Optional<IndexChangeRow> found = findChange(jobId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        IndexChangeRow before = found.get();
+        ownerFor(before.ownerId());
+        IndexChangeRow moved = new IndexChangeRow(newJobId, before.ownerId(), before.versionId(), before.firstOrdinal(),
+                before.lastOrdinal(), null, before.retries() + 1);
+        if (moved.retries() > IndexChangeRow.MAX_RETRIES || changes.containsKey(newJobId)
+                || refusedMoves.contains(jobId)) {
+            throw new IllegalStateException("key or check refused");
+        }
+        changes.remove(jobId);
+        changes.put(newJobId, moved);
+        RollbackUndo.onRollback(() -> {
+            changes.remove(newJobId);
+            changes.put(jobId, before);
+        });
+        return Optional.of(moved);
     }
 
     @Override

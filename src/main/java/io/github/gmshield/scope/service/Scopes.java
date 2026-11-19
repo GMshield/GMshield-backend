@@ -35,16 +35,19 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #resolve}: a campaign of the owner and its {@link ScopeSettings} become a {@link ResolvedScope}. The
  *       campaign tier is the {@code ready} version of each material of the campaign; the system tier the {@code ready}
  *       version of each material that belongs to the campaign's game system (a version already in the campaign tier
- *       is left out of it). A tier switched off has no source. {@code pending} names the in-scope passages whose index
- *       change has not ended. A campaign that is not found (unknown, or another owner's) is {@code request.not_found}
- *       (404).</li>
+ *       is left out of it). A tier switched off has no source. {@code pending} names the in-scope passages that are not
+ *       indexed: their index change has not ended, or its job failed (they stay in the keyword fallback; the unended
+ *       runs' passages come first). A campaign that is not found (unknown, or another owner's) is
+ *       {@code request.not_found} (404). {@link #resolveSources} is the same without {@code pending} (not computed,
+ *       empty), for the reads that check only sources and tiers: an answer's passages and references.</li>
  *   <li>{@link #indexing}: how many passages of the campaign's scope under {@code settings} are still waiting for
  *       search, over the same sources as {@link #resolve}: the distinct passages of the in-scope versions covered by
  *       an index change that has not ended. Counted, never read, and kept out of {@link #resolve} so a question is not
  *       slowed. Empty when nothing in scope is pending; an unknown campaign is {@code request.not_found} (404), as for
  *       {@link #resolve}. {@link #status} answers it with whether the scope has a source (an allowed source: a pending
- *       passage always belongs to one), from the same one look-up of the sources; the line {@code scope.indexing} is
- *       at DEBUG, since the GM's notice asks for it every few seconds.</li>
+ *       passage always belongs to one), and with the passages of the in-scope versions whose index change failed, and
+ *       whether a retry remains ({@link IndexingFailure}; null when none failed), from the same one look-up of the
+ *       sources; the line {@code scope.indexing} is at DEBUG, since the GM's notice asks for it every few seconds.</li>
  *   <li>{@link #passages}: passages by id within a resolved scope, decrypted and labelled with their tier, in the
  *       order asked, each once. Every id is checked first: when any is not a passage of an allowed source that is
  *       still {@code ready} (unknown, another owner's, of a version no longer {@code ready}, or out of every tier), the
@@ -53,10 +56,11 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #questionInput} (Story 2.3): the input of an interactive job that carries a question, built from a
  *       resolved scope only: {@code {question, owner, tiers: [{tier, sources, pending}], tokenKey}}, the tiers in
  *       order (campaign, then system, each always present, a tier with no source with empty lists), {@code pending}
- *       the first {@value #MAX_PENDING} of the tier's pending passages (all the worker reads; the total is logged as
- *       a count), and {@code tokenKey} Base64 of the owner's {@link Vault#ownerTokenKey}, whose
- *       buffer is zeroed once encoded. The question is 1 to {@value #MAX_QUESTION} characters (code points), else
- *       {@code IllegalArgumentException}. Provider, model and tier join it with Story 2.10.</li>
+ *       the first {@value #MAX_PENDING} of the tier's pending passages in order (the worker reads them within a time
+ *       budget; the total and how many were left out are logged as counts), and {@code tokenKey} Base64 of the
+ *       owner's {@link Vault#ownerTokenKey}, whose buffer is zeroed once encoded. The question is 1 to
+ *       {@value #MAX_QUESTION} characters (code points), else {@code IllegalArgumentException}. Provider, model and
+ *       tier join it with Story 2.10.</li>
  *   <li>{@link #references} (Story 2.5): where cited passages stand within a resolved scope, in the order cited, each
  *       once. A citation is model output, so an id that is not a passage of an allowed source that is still
  *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; the line carries the
@@ -81,8 +85,11 @@ public class Scopes {
             "Passage outside the scope");
     /** The longest question, in characters (code points). */
     public static final int MAX_QUESTION = 4000;
-    /** The most pending passages of a tier a question input lists, in order: the worker reads no more. */
-    public static final int MAX_PENDING = 100;
+    /**
+     * The most pending passages of a tier a question input lists, in order: the worker reads no more, and reads them a
+     * page at a time within its time budget.
+     */
+    public static final int MAX_PENDING = 5_000;
     private static final Logger log = LoggerFactory.getLogger(Scopes.class);
 
     private final Library library;
@@ -99,20 +106,35 @@ public class Scopes {
 
     /** The owner's campaign's scope under {@code settings}, as the class says. */
     public ResolvedScope resolve(UUID campaignId, ScopeSettings settings) {
+        return resolve(campaignId, settings, true);
+    }
+
+    /**
+     * The owner's campaign's scope under {@code settings} without its pending passages: the same sources and tiers, and
+     * the same refusals, as {@link #resolve}, but {@code pending} is not computed (empty), so no pending passage id is
+     * read. For reads that check only the allowed sources and tiers ({@link #passages}, {@link #references}), never for
+     * a {@link #questionInput}.
+     */
+    public ResolvedScope resolveSources(UUID campaignId, ScopeSettings settings) {
+        return resolve(campaignId, settings, false);
+    }
+
+    private ResolvedScope resolve(UUID campaignId, ScopeSettings settings, boolean withPending) {
         Objects.requireNonNull(settings, "settings");
         UUID owner = OwnerContext.require();
         return reading(() -> {
             Library.Campaign campaign = campaignOf(campaignId);
             List<UUID> campaignSources = campaignSources(campaign, settings);
             List<UUID> systemSources = systemSources(campaign, settings, campaignSources);
-            List<UUID> campaignPending = pendingOf(campaignSources);
-            List<UUID> systemPending = pendingOf(systemSources);
+            List<UUID> campaignPending = withPending ? pendingOf(campaignSources) : List.of();
+            List<UUID> systemPending = withPending ? pendingOf(systemSources) : List.of();
             ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, campaignSources, systemSources,
                     campaignPending, systemPending);
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("campaignSources", campaignSources.size())
                     .addKeyValue("systemSources", systemSources.size())
-                    .addKeyValue("pending", campaignPending.size() + systemPending.size()).log("scope.resolved");
+                    .addKeyValue("pending", campaignPending.size() + systemPending.size())
+                    .addKeyValue("pendingRead", withPending).log("scope.resolved");
             return scope;
         });
     }
@@ -123,8 +145,9 @@ public class Scopes {
     }
 
     /**
-     * Whether the owner's campaign's scope under {@code settings} has a source, and how many of its passages wait for
-     * search, from one look-up of its sources and without reading a pending passage's id ({@link #indexing}).
+     * Whether the owner's campaign's scope under {@code settings} has a source, how many of its passages wait for
+     * search, and how many could not be prepared for search, from one look-up of its sources and without reading a
+     * pending passage's id ({@link #indexing}).
      */
     public ScopeStatus status(UUID campaignId, ScopeSettings settings) {
         Objects.requireNonNull(settings, "settings");
@@ -136,10 +159,14 @@ public class Scopes {
             sources.addAll(systemSources(campaign, settings, campaignSources));
             Indexing indexing = sources.isEmpty() ? null : reads.indexing(sources)
                     .map(count -> new Indexing(count.remaining())).orElse(null);
+            IndexingFailure failed = sources.isEmpty() ? null : reads.failed(sources)
+                    .map(count -> new IndexingFailure(count.passages(), count.retrying())).orElse(null);
             log.atDebug().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("sources", sources.size())
-                    .addKeyValue("remaining", indexing == null ? 0 : indexing.remaining()).log("scope.indexing");
-            return new ScopeStatus(!sources.isEmpty(), indexing);
+                    .addKeyValue("remaining", indexing == null ? 0 : indexing.remaining())
+                    .addKeyValue("failed", failed == null ? 0 : failed.passages())
+                    .addKeyValue("retrying", failed != null && failed.retrying()).log("scope.indexing");
+            return new ScopeStatus(!sources.isEmpty(), indexing, failed);
         });
     }
 
@@ -290,12 +317,14 @@ public class Scopes {
         } finally {
             Arrays.fill(key, (byte) 0);
         }
+        int listed = Math.min(scope.pending(Tier.CAMPAIGN).size(), MAX_PENDING)
+                + Math.min(scope.pending(Tier.SYSTEM).size(), MAX_PENDING);
         log.atInfo().addKeyValue("campaignId", scope.campaignId())
                 .addKeyValue("campaignSources", scope.sources(Tier.CAMPAIGN).size())
                 .addKeyValue("systemSources", scope.sources(Tier.SYSTEM).size())
                 .addKeyValue("pending", scope.pending().size())
-                .addKeyValue("pendingListed", Math.min(scope.pending(Tier.CAMPAIGN).size(), MAX_PENDING)
-                        + Math.min(scope.pending(Tier.SYSTEM).size(), MAX_PENDING))
+                .addKeyValue("pendingListed", listed)
+                .addKeyValue("pendingLeftOut", scope.pending().size() - listed)
                 .log("scope.question_input");
         return input;
     }

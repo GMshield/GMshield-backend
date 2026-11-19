@@ -235,6 +235,8 @@ class ConversationFlowTest {
         assertThat(current.path("hasSources").asBoolean()).isTrue();
         assertThat(current.has("indexing")).isTrue();
         assertThat(current.path("indexing").isNull()).isTrue();
+        assertThat(current.has("indexingFailed")).isTrue();
+        assertThat(current.path("indexingFailed").isNull()).isTrue();
 
         HttpResponse<String> asked = ask(gm, gm.campaign(), QUESTION);
 
@@ -518,19 +520,33 @@ class ConversationFlowTest {
             // Matrix row "Indexing": every SRD passage pending, Coimbra and the others not counted.
             assertIndexing(gm, 450);
             assertIndexing(them, 4);
-            // Matrix row "One finishes": a run ends, then the next fails (ended too); the count only falls.
+            assertThat(json(get(gm, CURRENT)).path("indexingFailed").isNull()).isTrue();
+            // Matrix row "One finishes": a run ends (cancelled: neither pending nor failed), then the next fails; the
+            // count only falls, and the failed run is reported apart, with a retry to come.
             as(gm.id(), () -> jobService.cancel(first));
             assertIndexing(gm, 250);
+            assertThat(json(get(gm, CURRENT)).path("indexingFailed").isNull()).isTrue();
             jobs.rows.computeIfPresent(second, (id, row) -> row.released("failed", "job.attempts_exhausted",
                     clock.instant()));
             assertIndexing(gm, 50);
-            // Matrix row "Failed change": the version's only unended job fails, so nothing is pending any more.
+            assertIndexingFailed(gm, 200, true);
+            // Matrix row "Failed change": the version's only unended job fails, so nothing is pending any more; both
+            // failed runs are reported.
             jobs.rows.computeIfPresent(third, (id, row) -> row.released("failed", "job.attempts_exhausted",
                     clock.instant()));
             JsonNode after = json(get(gm, CURRENT));
             assertThat(after.has("indexing")).isTrue();
             assertThat(after.path("indexing").isNull()).isTrue();
             assertThat(after.path("hasSources").asBoolean()).isTrue();
+            assertIndexingFailed(gm, 250, true);
+            assertIndexingFailed(them, null, false);
+            // Matrix row "Retries used": once every failed run has used its retries, none remains.
+            for (UUID run : List.of(second, third)) {
+                IndexChangeRow row = index.changes.get(run);
+                index.changes.put(run, new IndexChangeRow(row.jobId(), row.ownerId(), row.versionId(),
+                        row.firstOrdinal(), row.lastOrdinal(), null, IndexChangeRow.MAX_RETRIES));
+            }
+            assertIndexingFailed(gm, 250, false);
             assertThat(logged.list).filteredOn(event -> "scope.indexing".equals(event.getFormattedMessage()))
                     .isNotEmpty().allSatisfy(event -> assertThat(event.getLevel())
                             .isEqualTo(ch.qos.logback.classic.Level.DEBUG))
@@ -542,6 +558,44 @@ class ConversationFlowTest {
             for (UUID change : changes) {
                 as(jobs.row(change).ownerId(), () -> jobService.cancel(change));
             }
+        }
+    }
+
+    @Test
+    void anAnswersPassagesAndReferencesReadsNeverListItsPendingPassages() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm, gm.campaign(), List.of(1, 1, 2));
+        UUID run = indexChange(gm, source, 0, 2);
+        try {
+            UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+            Claim claim = claim(jobOf(turnId));
+            // The question input lists them: the claim resolves the whole scope.
+            assertThat(strings(claim.input().path("tiers").get(0).path("pending")))
+                    .containsExactlyElementsOf(source.passages().stream().map(UUID::toString).toList());
+            int from = logged.list.size();
+
+            // Each passages read (up to ~50 a question while indexing) and the references check only the sources.
+            HttpResponse<String> read = sendAsWorker("POST", claim.path("passages"),
+                    "{\"ids\":[\"" + source.passages().getFirst() + "\"]}", claim.grant());
+            assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+            assertThat(json(read).path("passages").get(0).path("tier").asString()).isEqualTo("campaign");
+            assertThat(postEvents(claim, 1, List.of(delta("Um."), citation(source.passages().getFirst(), 3)),
+                    List.of()).statusCode()).isEqualTo(200);
+            assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+
+            assertThat(done(gm, turnId, null).path("references")).hasSize(1);
+            List<Map<String, Object>> resolved = new ArrayList<>();
+            for (ILoggingEvent event : List.copyOf(logged.list.subList(from, logged.list.size()))) {
+                if ("scope.resolved".equals(event.getFormattedMessage())) {
+                    Map<String, Object> pairs = new LinkedHashMap<>();
+                    event.getKeyValuePairs().forEach(pair -> pairs.put(pair.key, pair.value));
+                    resolved.add(pairs);
+                }
+            }
+            assertThat(resolved).hasSize(2).allSatisfy(pairs -> assertThat(pairs)
+                    .containsEntry("pendingRead", false).containsEntry("pending", 0));
+        } finally {
+            as(gm.id(), () -> jobService.cancel(run));
         }
     }
 
@@ -1367,6 +1421,22 @@ class ConversationFlowTest {
     private UUID indexChange(Gm gm, Source source, int first, int last) {
         return as(gm.id(), () -> jobService.create("index.change", job -> index.insertChange(new IndexChangeRow(
                 job.id(), gm.id(), source.versionId(), first, last, null))).id());
+    }
+
+    /** {@code indexingFailed} as {@code {passages, retrying}}, or null when {@code passages} is. */
+    private void assertIndexingFailed(Gm gm, Integer passages, boolean retrying) throws Exception {
+        HttpResponse<String> current = get(gm, CURRENT);
+        assertThat(current.statusCode()).as(current.body()).isEqualTo(200);
+        JsonNode failed = json(current).path("indexingFailed");
+        assertThat(json(current).has("indexingFailed")).isTrue();
+        if (passages == null) {
+            assertThat(failed.isNull()).as(current.body()).isTrue();
+            return;
+        }
+        assertThat(failed.path("passages").asInt()).as(current.body()).isEqualTo(passages);
+        assertThat(failed.path("retrying").isBoolean()).isTrue();
+        assertThat(failed.path("retrying").asBoolean()).as(current.body()).isEqualTo(retrying);
+        assertThat(failed.size()).isEqualTo(2);
     }
 
     private void assertIndexing(Gm gm, int remaining) throws Exception {

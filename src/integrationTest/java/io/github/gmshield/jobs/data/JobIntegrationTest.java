@@ -57,6 +57,7 @@ import tools.jackson.databind.json.JsonMapper;
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
             "gmshield.materials.upload-sweep.enabled=false",
             "gmshield.materials.version-removal-sweep.enabled=false",
+            "gmshield.materials.index-retry-sweep.enabled=false",
             "gmshield.files.dir=${java.io.tmpdir}/gmshield-job-it",
             "gmshield.jobs.output-max-bytes=6MB", "gmshield.jobs.output-claim-max-bytes=10MB"})
 @ActiveProfiles("test-mode")

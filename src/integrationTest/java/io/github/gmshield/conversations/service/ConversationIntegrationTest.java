@@ -48,6 +48,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
     "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.materials.index-retry-sweep.enabled=false",
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-conversation-it"})
 @ActiveProfiles("test-mode")
 class ConversationIntegrationTest {

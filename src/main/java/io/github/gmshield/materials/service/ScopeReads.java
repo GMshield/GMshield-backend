@@ -43,11 +43,17 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <ul>
  *   <li>{@link #readyOfCampaign} and {@link #readyOfSystem}: the ids of the {@code ready} versions of the materials of a
  *       campaign ({@code material.campaign_id}), or that belong to a game system ({@code material_system}).</li>
- *   <li>{@link #pendingPassages}: the ids of the passages of these versions whose index change has not ended
- *       ({@link IndexChanges#unended}).</li>
+ *   <li>{@link #pendingPassages}: the ids of the passages of these versions that are not indexed: their index change
+ *       has not ended ({@link IndexChanges#unended}), or its job failed ({@link IndexChanges#failed}; a failed run stays
+ *       in the keyword fallback until a retry indexes it). A cancelled run is neither. The unended runs' passages
+ *       come first, then the failed runs'.</li>
  *   <li>{@link #indexing}: how many passages of these versions are still waiting for search, that is the distinct
  *       passages in the runs of their index changes that have not ended. Counted with one count query per run's
- *       ordinal range (overlapping runs merged first), so no passage id or text is read; nothing pending is empty.</li>
+ *       ordinal range (overlapping runs merged first), so no passage id or text is read; nothing pending is empty. A
+ *       failed run is not counted here.</li>
+ *   <li>{@link #failed} (indexing at worker start): how many passages of these versions are in runs whose job failed,
+ *       counted the same way, and whether a retry of one of them remains (fewer than
+ *       {@link IndexChangeRow#MAX_RETRIES} retries); none is empty.</li>
  *   <li>{@link #passages}: passages by id, checked before anything is decrypted: every id must be a passage of the
  *       owner, of one of the given versions, and that version {@code ready}; otherwise nothing is read.</li>
  *   <li>{@link #places} (Story 2.5): where cited passages stand, filtered rather than refused: a passage that is not
@@ -71,6 +77,7 @@ public class ScopeReads {
     private final IndexStore index;
     private final Vault vault;
     private final Function<Collection<UUID>, Set<UUID>> unendedJobs;
+    private final Function<Collection<UUID>, Set<UUID>> failedJobs;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Materials pages;
     /** The states of a version a stored reference may still open (Story 2.7). */
@@ -131,6 +138,19 @@ public class ScopeReads {
         }
     }
 
+    /**
+     * How many passages of some versions are in runs whose job failed: {@code passages >= 1}, and whether a retry of one
+     * of these runs remains.
+     */
+    @NamedInterface("service")
+    public record IndexingFailure(int passages, boolean retrying) {
+        public IndexingFailure {
+            if (passages < 1) {
+                throw new IllegalArgumentException("materials.indexing_failure_invalid");
+            }
+        }
+    }
+
     /** A text line of a picture page and its box, {@code [left, top, right, bottom]} as fractions of the picture. */
     @NamedInterface("service")
     public record PageLine(String text, List<Double> box) {
@@ -171,16 +191,18 @@ public class ScopeReads {
     @Autowired
     ScopeReads(MaterialStore materials, IndexStore index, Vault vault, Jobs jobs,
                ObjectProvider<PlatformTransactionManager> transactions, Materials pages) {
-        this(materials, index, vault, jobs::unended, transactions, pages);
+        this(materials, index, vault, jobs::unended, jobs::failed, transactions, pages);
     }
 
     /** {@code pages} may be null where no page is read (it then answers no page). */
     ScopeReads(MaterialStore materials, IndexStore index, Vault vault, Function<Collection<UUID>, Set<UUID>> unendedJobs,
-               ObjectProvider<PlatformTransactionManager> transactions, Materials pages) {
+               Function<Collection<UUID>, Set<UUID>> failedJobs, ObjectProvider<PlatformTransactionManager> transactions,
+               Materials pages) {
         this.materials = materials;
         this.index = index;
         this.vault = vault;
         this.unendedJobs = unendedJobs;
+        this.failedJobs = failedJobs;
         this.transactions = transactions;
         this.pages = pages;
     }
@@ -197,14 +219,21 @@ public class ScopeReads {
 
     /**
      * The ids of the owner's passages of these versions whose ordinal falls in the run of an index change that has not
-     * ended, by version as given, then by ordinal.
+     * ended, then those in a run whose job failed (each id once): each part by version as given, then by ordinal. Runs
+     * still being indexed come first, so failed runs never crowd them out of a capped list.
      */
     public List<UUID> pendingPassages(Collection<UUID> versionIds) {
         return reading(() -> {
+            Set<UUID> versions = new LinkedHashSet<>(versionIds);
             List<UUID> pending = new ArrayList<>();
-            for (UUID versionId : new LinkedHashSet<>(versionIds)) {
-                for (IndexChangeRow run : IndexChanges.unended(index, unendedJobs, versionId)) {
-                    pending.addAll(materials.passageIds(versionId, run.firstOrdinal(), run.lastOrdinal()));
+            for (UUID versionId : versions) {
+                for (int[] range : merged(IndexChanges.unended(index, unendedJobs, versionId))) {
+                    pending.addAll(materials.passageIds(versionId, range[0], range[1]));
+                }
+            }
+            for (UUID versionId : versions) {
+                for (int[] range : merged(IndexChanges.failed(index, failedJobs, versionId))) {
+                    pending.addAll(materials.passageIds(versionId, range[0], range[1]));
                 }
             }
             return List.copyOf(new LinkedHashSet<>(pending));
@@ -228,6 +257,29 @@ public class ScopeReads {
             }
             return remaining == 0 ? Optional.<Indexing>empty()
                     : Optional.of(new Indexing(Math.toIntExact(remaining)));
+        });
+    }
+
+    /**
+     * How many of the owner's passages of these versions are in runs whose job failed, and whether a retry remains, as
+     * the class says; empty when there is none.
+     */
+    public Optional<IndexingFailure> failed(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return Optional.empty();
+        }
+        return reading(() -> {
+            long passages = 0;
+            boolean retrying = false;
+            for (UUID versionId : new LinkedHashSet<>(versionIds)) {
+                List<IndexChangeRow> runs = IndexChanges.failed(index, failedJobs, versionId);
+                retrying |= runs.stream().anyMatch(run -> run.retries() < IndexChangeRow.MAX_RETRIES);
+                for (int[] range : merged(runs)) {
+                    passages += materials.countPassages(versionId, range[0], range[1]);
+                }
+            }
+            return passages == 0 ? Optional.<IndexingFailure>empty()
+                    : Optional.of(new IndexingFailure(Math.toIntExact(passages), retrying));
         });
     }
 

@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,6 +54,10 @@ class ScopesTest {
     private final Vault vault = TestVaults.handingOutTokenKeys(handedKeys);
     /** The jobs that have not ended, as the jobs module would answer. */
     private final Set<UUID> unended = ConcurrentHashMap.newKeySet();
+    /** The jobs that ended failed, as the jobs module would answer. */
+    private final Set<UUID> failed = ConcurrentHashMap.newKeySet();
+    /** How many times the jobs module was asked which index changes are unended or failed. */
+    private final AtomicInteger jobsAsked = new AtomicInteger();
     private ScopeFixture fixture;
     private Scopes scopes;
 
@@ -64,7 +69,14 @@ class ScopesTest {
         Library library = TestLibraries.library(libraryStore, vault,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         scopes = new Scopes(library, TestMaterials.scopeReads(materials, index, vault,
-                ids -> ids.stream().filter(unended::contains).collect(Collectors.toSet()),
+                ids -> {
+                    jobsAsked.incrementAndGet();
+                    return ids.stream().filter(unended::contains).collect(Collectors.toSet());
+                },
+                ids -> {
+                    jobsAsked.incrementAndGet();
+                    return ids.stream().filter(failed::contains).collect(Collectors.toSet());
+                },
                 beans.getBeanProvider(PlatformTransactionManager.class)), vault,
                 beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
@@ -237,21 +249,21 @@ class ScopesTest {
         ScopeFixture.Starter gm = fixture.starter();
         // No accepted material: no source, no count.
         assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
-                .isEqualTo(new ScopeStatus(false, null));
+                .isEqualTo(new ScopeStatus(false, null, null));
         UUID a = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
         List<UUID> runs = indexed(gm.owner(), a, "A", 250);
         // Every passage indexed: a source, no count.
         assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
-                .isEqualTo(new ScopeStatus(true, null));
+                .isEqualTo(new ScopeStatus(true, null, null));
         // Every passage pending: a source (as resolve says, with its pending passages), and the count.
         unended.addAll(runs);
         assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
-                .isEqualTo(new ScopeStatus(true, new Indexing(250)));
+                .isEqualTo(new ScopeStatus(true, new Indexing(250), null));
         ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
         assertThat(!scope.allowedSources().isEmpty() || !scope.pending().isEmpty()).isTrue();
         // A tier switched off: no source.
         assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), new ScopeSettings(false, false, false, false))))
-                .isEqualTo(new ScopeStatus(false, null));
+                .isEqualTo(new ScopeStatus(false, null, null));
     }
 
     @Test
@@ -342,6 +354,95 @@ class ScopesTest {
         assertThatThrownBy(() -> new Indexing(-1)).isInstanceOf(IllegalArgumentException.class);
     }
 
+    // --- failed index changes (indexing at worker start)
+
+    @Test
+    void aFailedRunIsPendingForTheFallbackButNotIndexingAndIsReportedWithWhetherARetryRemains() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID a = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        List<UUID> passages = fixture.passages(gm.owner(), a, "A", 450);
+        UUID failedRun = Ids.newId();
+        UUID running = Ids.newId();
+        UUID done = Ids.newId();
+        fixture.indexChange(gm.owner(), failedRun, a, 0, 199, 0);
+        fixture.indexChange(gm.owner(), running, a, 200, 399, 0);
+        fixture.indexChange(gm.owner(), done, a, 400, 449, 0);
+        unended.add(running);
+        failed.add(failedRun);
+        // No passage's text or place opens: the counts read none.
+        Runnable scramble = () -> materials.passages.replaceAll((id, row) -> new PassageRow(row.id(), row.ownerId(),
+                row.versionId(), row.ordinal(), row.page(), new byte[] {1, 2, 3}, new byte[] {4, 5, 6},
+                row.createdAt()));
+
+        // Matrix row "Run fails": its passages stay in the fallback, after the unended run's (which a cap or the
+        // worker's read budget must never leave out for a failed run), each in order.
+        ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
+        List<UUID> expected = new ArrayList<>(passages.subList(200, 400));
+        expected.addAll(passages.subList(0, 200));
+        assertThat(scope.pending()).containsExactlyElementsOf(expected);
+        scramble.run();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, new Indexing(200), new IndexingFailure(200, true)));
+        // The unended run ends: only the failure is left.
+        unended.clear();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null, new IndexingFailure(200, true)));
+
+        // Matrix row "Retries used": the run failed with retries 3; nothing remains to retry.
+        index.changes.remove(failedRun);
+        fixture.indexChange(gm.owner(), failedRun, a, 0, 199, 3);
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null, new IndexingFailure(200, false)));
+        // A failed run of the system tier with a retry left: the passages add up, and a retry remains.
+        UUID b = fixture.material(gm.owner(), null, gm.system(), "ready").getFirst();
+        fixture.passages(gm.owner(), b, "B", 30);
+        UUID bFailed = Ids.newId();
+        fixture.indexChange(gm.owner(), bFailed, b, 0, 29, 2);
+        failed.add(bFailed);
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null, new IndexingFailure(230, true)));
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), new ScopeSettings(true, false, false, false))))
+                .isEqualTo(new ScopeStatus(true, null, new IndexingFailure(200, false)));
+
+        // The retry succeeds (the sweep moved the row to a new job, which is done): nothing is reported.
+        failed.clear();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null, null));
+        assertThatThrownBy(() -> new IndexingFailure(0, true)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aCancelledRunIsNeitherPendingNorFailedAndAFailedRunOutOfScopeOrOfARemovedVersionIsNotCounted() {
+        Library2 lib = twoTiers();
+        UUID owner = lib.gm().owner();
+        // A cancelled run: the jobs module answers it neither unended nor failed.
+        fixture.indexChange(owner, Ids.newId(), lib.a(), 0, 2, 0);
+        // A failed run of another campaign's version (C), of a discarded version and of another owner's.
+        UUID cFailed = Ids.newId();
+        fixture.indexChange(owner, cFailed, lib.c(), 0, 1, 0);
+        UUID removed = fixture.material(owner, lib.gm().campaign(), null, "ready").getFirst();
+        fixture.passages(owner, removed, "R", 5);
+        UUID removedFailed = Ids.newId();
+        fixture.indexChange(owner, removedFailed, removed, 0, 4, 0);
+        fixture.discard(owner, removed);
+        ScopeFixture.Starter them = fixture.starter();
+        UUID theirs = fixture.material(them.owner(), them.campaign(), null, "ready").getFirst();
+        fixture.passages(them.owner(), theirs, "T", 5);
+        UUID theirFailed = Ids.newId();
+        fixture.indexChange(them.owner(), theirFailed, theirs, 0, 4, 0);
+        failed.addAll(List.of(cFailed, removedFailed, theirFailed));
+
+        // Matrix row "Removed version": not counted.
+        assertThat(as(owner, () -> scopes.status(lib.gm().campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null, null));
+        assertThat(as(owner, () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING)).pending()).isEmpty();
+        UUID other = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+        assertThat(as(owner, () -> scopes.status(other, ScopeSettings.STARTING)).failed())
+                .isEqualTo(new IndexingFailure(2, true));
+        assertThat(as(them.owner(), () -> scopes.status(them.campaign(), ScopeSettings.STARTING)).failed())
+                .isEqualTo(new IndexingFailure(5, true));
+    }
+
     // --- passages by id
 
     @Test
@@ -362,6 +463,42 @@ class ScopesTest {
         assertThat(read.getFirst().toString()).doesNotContain("B 1").doesNotContain("Seção");
         assertThat(Tier.CAMPAIGN.word()).isEqualTo("campaign");
         assertThat(Tier.SYSTEM.word()).isEqualTo("system");
+    }
+
+    @Test
+    void aScopeResolvedForItsSourcesHasTheSameSourcesAndTiersButReadsNoPendingPassage() {
+        Library2 lib = twoTiers();
+        UUID run = Ids.newId();
+        fixture.indexChange(lib.gm().owner(), run, lib.a(), 0, 2, 0);
+        unended.add(run);
+        ResolvedScope full = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        assertThat(full.pending()).containsExactlyElementsOf(lib.aPassages());
+        jobsAsked.set(0);
+
+        ResolvedScope sources = as(lib.gm().owner(),
+                () -> scopes.resolveSources(lib.gm().campaign(), ScopeSettings.STARTING));
+
+        assertThat(jobsAsked).hasValue(0);
+        assertThat(sources.pending()).isEmpty();
+        for (Tier tier : Tier.values()) {
+            assertThat(sources.sources(tier)).isEqualTo(full.sources(tier));
+        }
+        assertThat(sources.allowedSources()).isEqualTo(full.allowedSources());
+        // The passages and references reads answer as from the full scope, still asking no job.
+        UUID a0 = lib.aPassages().getFirst();
+        UUID b0 = lib.bPassages().getFirst();
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(sources, List.of(a0, b0))))
+                .extracting(ScopedPassage::id, ScopedPassage::tier)
+                .containsExactly(tuple(a0, Tier.CAMPAIGN), tuple(b0, Tier.SYSTEM));
+        assertThat(as(lib.gm().owner(), () -> scopes.references(sources, List.of(a0, b0)))).hasSize(2);
+        assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.passages(sources, List.of(lib.cPassages()
+                .getFirst())))).isInstanceOf(ApiException.class);
+        assertThat(jobsAsked).hasValue(0);
+        // The same refusals: another owner's campaign is not found.
+        ScopeFixture.Starter them = fixture.starter();
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING))).isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.problem().code()).isEqualTo("request.not_found"));
     }
 
     @Test
@@ -567,21 +704,36 @@ class ScopesTest {
     }
 
     @Test
-    void aTiersPendingIsListedUpToItsFirstHundredInOrder() {
+    void aTiersPendingIsListedUpToItsFirst5000InOrderAndHowManyWereLeftOutIsLogged() {
         ScopeFixture.Starter gm = fixture.starter();
         UUID version = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
-        List<UUID> passages = fixture.passages(gm.owner(), version, "P", 150);
+        List<UUID> passages = fixture.passages(gm.owner(), version, "P", 5_100);
         UUID job = Ids.newId();
-        fixture.indexChange(gm.owner(), job, version, 0, 149);
+        fixture.indexChange(gm.owner(), job, version, 0, 5_099);
         unended.add(job);
         ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory
+                .getLogger(Scopes.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logged =
+                new ch.qos.logback.core.read.ListAppender<>();
+        logged.start();
+        logger.addAppender(logged);
 
-        JsonNode input = as(gm.owner(), () -> scopes.questionInput(scope, "Vorpal?"));
+        JsonNode input;
+        try {
+            input = as(gm.owner(), () -> scopes.questionInput(scope, "Vorpal?"));
+        } finally {
+            logger.detachAppender(logged);
+        }
 
-        assertThat(scope.pending(Tier.CAMPAIGN)).hasSize(150);
-        assertThat(Scopes.MAX_PENDING).isEqualTo(100);
+        assertThat(scope.pending(Tier.CAMPAIGN)).hasSize(5_100);
+        assertThat(Scopes.MAX_PENDING).isEqualTo(5_000);
         assertThat(strings(input.path("tiers").get(0).path("pending")))
-                .containsExactlyElementsOf(passages.subList(0, 100).stream().map(UUID::toString).toList());
+                .containsExactlyElementsOf(passages.subList(0, 5_000).stream().map(UUID::toString).toList());
+        assertThat(logged.list).filteredOn(event -> event.getMessage().equals("scope.question_input"))
+                .singleElement().satisfies(event -> assertThat(event.getKeyValuePairs())
+                        .extracting(pair -> pair.key + "=" + pair.value)
+                        .contains("pending=5100", "pendingListed=5000", "pendingLeftOut=100"));
     }
 
     @Test

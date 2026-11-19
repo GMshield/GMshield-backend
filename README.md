@@ -453,7 +453,37 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     (`StaleIndexes`, the other read of a library table without an owner: ids only), in a transaction of its own as
     that owner, each such version with no unended index change gets a new set (its earlier rows go and its recipe
     is cleared). A claim without a body (a worker before 1.7.0) states nothing. A failed change leaves the version
-    without a recipe, so the next start's reconcile indexes it again.
+    without a recipe; the retry sweep gives the failed run a new job (below), and once its retries are used, the next
+    start's reconcile indexes the version again.
+  - **Indexing at worker start (internal contract 1.12.0, public contract 1.16.0, migration V20).**
+    - `PUT /internal/v1/index-recipe` takes `{indexRecipe}` (schema `IndexRecipeStatement`) and answers 204, or 400
+      `request.invalid` for one that is not a recipe. It needs the worker's credential and no grant. It goes through
+      `JobClaims.stateRecipe`, the same comparison as a claim: `IndexRecipeStated` is published only when the recipe
+      differs from the last one stated (a claim's or a statement's), and the state is reset when publishing throws.
+      The worker (from internal contract 1.12.0) states its recipe at every compatible check (at its start, then every
+      30 s), so after a deploy the reconcile runs within one check, with no job claimed; restating every 30 s also
+      covers a backend redeployed while the worker keeps running (the last recipe is kept in memory only).
+    - A run is failed when its `index_change` row's job ended `failed` (`Jobs.failed`); a `cancelled` run is not.
+      `ScopeReads.pendingPassages` counts failed runs as pending, so the keyword fallback still reads their passages;
+      `ScopeReads.indexing` does not.
+    - `IndexRetrySweep` (every `GMSHIELD_INDEX_RETRY_EVERY`, 10 min, the first one period after the start; switched off
+      by `gmshield.materials.index-retry-sweep.enabled=false`) visits each owner with a failed `index.change` job
+      (`Jobs.ownersWithFailed`: ids only) as that owner, in a transaction of its own. Each run of a `ready` or
+      `superseded` version whose job failed and whose `retries < 3` gets, under the version lock, a new
+      `index.change` job for the same ordinal range: the row moves to the new job (`job_id` is the key; the failed job
+      row stays as history) and `retries` goes up by 1 (line `index.change_retried`). It never starts a whole version
+      again, and never reads a worker's failure code. `IndexChanges.start` (an accept, a reconcile) begins every row at
+      0, so a run that used its 3 retries is indexed again by the next reconcile only.
+    - `V20__index_change_retries.sql` adds `index_change.retries smallint not null default 0` (0 to 3). Additive: the
+      previous release keeps working on it.
+    - `CurrentConversation.indexingFailed` (schema `IndexingFailure`, required and nullable) is `{passages, retrying}`:
+      the distinct in-scope passages of the merged failed runs (at least 1), and whether any of those runs has
+      `retries < 3`; null when none failed. `indexing` is unchanged.
+    - `Scopes.MAX_PENDING` is 5,000 per tier (the worker reads them within a time budget); the line
+      `scope.question_input` logs `pendingLeftOut`, the pending passages past it.
+    - **Deploy order: backend, then frontend (its minimum public contract becomes 1.16.0), then worker (it states its
+      recipe only to a backend at 1.12.0 or later; its minimum stays 1.11.0).** The worker and the frontend do not
+      depend on each other here. Roll back in the reverse order.
   - `IndexRemovals`, kind `index.removal` on the ingestion lane: a discard cancels the version's unended index
     changes and creates one in its transaction (Story 3.4's delete will reuse it); its input is `{source, owner}`,
     and the worker deletes the points by a filter on both.
@@ -504,8 +534,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
     sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
     source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
-    (100, all the worker reads) in order, so a re-index of a whole library never fills the claim reply (the total is
-    logged as a count, `pending`, beside `pendingListed`); `owner` is the scope's owner, for the worker's Qdrant
+    (5,000 from indexing at worker start, 100 before; the worker reads them 100 at a time within a time budget) in
+    order, so a re-index of a whole library never fills the claim reply (the total is logged as a count, `pending`,
+    beside `pendingListed` and `pendingLeftOut`); `owner` is the scope's owner, for the worker's Qdrant
     filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
     use `vault :: service`). The question is 1 to 4,000 characters (code points), else
     `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier come
@@ -638,9 +669,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     so no passage id or text is loaded. It only falls as runs end, unless something new is accepted. An ended (`done`,
     `failed`, `cancelled`) change, a version of another campaign or of a switched-off tier, and another owner's are not
     counted. The line `scope.indexing` carries ids and counts only, at DEBUG (it comes every 5 s per open tab). No migration.
-    - Known gap: the worker does not yet start indexing when it starts. Until that follow-up lands (deferred, with the
-      pending-passage fallback cap and reporting a failed index change), a fresh deploy has no unended index change
-      before its first job claim, so `indexing` is null and no notice shows during that time.
+    - Indexing starts at the worker's start since internal contract 1.12.0, and failed changes are reported apart
+      (`indexingFailed`; "Indexing at worker start" above).
     - **Deploy order: backend, then frontend (its minimum public contract becomes 1.15.0).** Roll back in the reverse
       order.
   - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
@@ -747,6 +777,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
+| `GMSHIELD_INDEX_RETRY_EVERY` | how often the index changes whose job failed get a new job, each run at most 3 times (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |
