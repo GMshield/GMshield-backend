@@ -7,10 +7,12 @@ import io.github.gmshield.shared.service.OwnerContext;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -90,8 +92,33 @@ class ConversationController {
                     minimum = "0") int offset) {
     }
 
-    @Schema(name = "TurnDoneEvent", types = "object", description = "The data of a done event: the answer is complete (an empty object)")
-    record DoneEvent() {
+    @Schema(name = "TurnSourceReference", requiredProperties = {"number", "materialName", "sectionPath", "page",
+        "passageIds", "removed"}, description = "A source reference of a completed answer, stored by value with the"
+            + " turn: one distinct place (material version, section path, page) the answer cited")
+    record SourceReference(
+            @Schema(description = "Its number, 1..n by first citation: unique within the turn and contiguous from 1",
+                    format = "int32", minimum = "1") int number,
+            @Schema(description = "The material's name") String materialName,
+            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty"),
+                    schema = @Schema(type = "string")) List<String> sectionPath,
+            @Schema(description = "The page", format = "int32", minimum = "1") int page,
+            @ArraySchema(arraySchema = @Schema(description = "The cited passages at this place, in the order first"
+                    + " cited; a passage id appears in at most one reference of the turn"), minItems = 1,
+                    schema = @Schema(type = "string", format = "uuid"))
+            List<UUID> passageIds,
+            @Schema(description = "Whether its source has been removed since (its version gone, discarded or pending"
+                    + " removal, or its material gone), as of when the event is sent. A version superseded by a newer"
+                    + " accepted one is not removed") boolean removed) {
+    }
+
+    @Schema(name = "TurnDoneEvent", requiredProperties = {"silent", "references"},
+            description = "The data of a done event: the answer is complete, with its source references. Built when"
+                    + " the event is sent, so a replay shows removed as of then")
+    record DoneEvent(
+            @Schema(description = "True exactly when references is empty: the sources say nothing about the question")
+            boolean silent,
+            @ArraySchema(arraySchema = @Schema(description = "The source references, by number (1..n, each once)"),
+                    schema = @Schema(implementation = SourceReference.class)) List<SourceReference> references) {
     }
 
     @Schema(name = "TurnErrorEvent", requiredProperties = "code",

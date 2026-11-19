@@ -32,6 +32,12 @@ public final class TestMaterials {
         return new ScopeReads(materials, index, vault, unendedJobs, transactions);
     }
 
+    /** A material's name encrypted as an upload stores it (binding {@code material}/{@code name}). */
+    public static byte[] materialName(Vault vault, UUID materialId, UUID owner, String name) {
+        return vault.encryptText(new io.github.gmshield.vault.service.Binding(Uploads.MATERIAL, Uploads.FIELD_NAME,
+                materialId, owner), name);
+    }
+
     /** A passage row as ingestion stores it: its text and its place (the section path, no box) encrypted. */
     public static PassageRow passage(Vault vault, UUID id, UUID owner, UUID versionId, int ordinal, int page,
                                      String text, List<String> sectionPath, Instant now) {

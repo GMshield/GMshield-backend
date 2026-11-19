@@ -270,6 +270,78 @@ class ScopesTest {
                 .isInstanceOf(OwnerContext.NoOwnerException.class);
     }
 
+    // --- cited places (Story 2.5)
+
+    @Test
+    void citedPlacesOfTheScopeAreReadInTheOrderCitedEachOnceAndEveryOtherIdIsDroppedWithoutDecryptingText() {
+        Library2 lib = twoTiers();
+        ScopeFixture.Starter them = fixture.starter();
+        UUID theirVersion = fixture.material(them.owner(), them.campaign(), null, "ready").getFirst();
+        UUID theirs = fixture.passages(them.owner(), theirVersion, "T", 1).getFirst();
+        UUID reviewing = fixture.material(lib.gm().owner(), lib.gm().campaign(), null, "needs_review").getFirst();
+        UUID reviewingP = fixture.passages(lib.gm().owner(), reviewing, "R", 1).getFirst();
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        UUID a1 = lib.aPassages().get(1);
+        UUID a0 = lib.aPassages().getFirst();
+        UUID b0 = lib.bPassages().getFirst();
+        // A passage whose text no longer opens: a place is read without its text.
+        PassageRow row = materials.passages.get(a1);
+        materials.passages.put(a1, new PassageRow(row.id(), row.ownerId(), row.versionId(), row.ordinal(),
+                row.page(), new byte[] {1, 2, 3}, row.place(), row.createdAt()));
+        List<UUID> cited = new ArrayList<>(List.of(a1, theirs, lib.cPassages().getFirst(), a0, reviewingP, a1));
+        cited.add(null);
+        cited.addAll(List.of(Ids.newId(), b0));
+
+        List<CitedPlace> places = as(lib.gm().owner(), () -> scopes.references(scope, cited));
+
+        assertThat(places).extracting(CitedPlace::passageId, CitedPlace::versionId, CitedPlace::materialName,
+                        CitedPlace::sectionPath, CitedPlace::page)
+                .containsExactly(tuple(a1, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 1"), 1),
+                        tuple(a0, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1),
+                        tuple(b0, lib.b(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1));
+        assertThat(places.getFirst().materialId()).isEqualTo(materials.versions.get(lib.a()).materialId());
+        assertThat(places.getFirst().toString()).doesNotContain(ScopeFixture.MATERIAL_NAME).doesNotContain("Seção");
+        assertThat(as(lib.gm().owner(), () -> scopes.references(scope, List.of(theirs, Ids.newId())))).isEmpty();
+        assertThat(as(lib.gm().owner(), () -> scopes.references(scope, List.of()))).isEmpty();
+        // A version no longer ready after the resolve is dropped too.
+        fixture.state(lib.gm().owner(), lib.b(), "superseded");
+        assertThat(as(lib.gm().owner(), () -> scopes.references(scope, List.of(b0, a0))))
+                .extracting(CitedPlace::passageId).containsExactly(a0);
+        // Only the scope's owner reads within it.
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.references(scope, List.of(a0))))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void aVersionGoneDiscardedWithItsRemovalPendingOrFinishedPendingRemovalOrOfAGoneMaterialIsRemoved() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID kept = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        UUID superseded = fixture.material(gm.owner(), gm.campaign(), null, "superseded").getFirst();
+        UUID discarded = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.discard(gm.owner(), discarded);
+        UUID gone = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.delete(gm.owner(), gone, false);
+        UUID materialGone = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.delete(gm.owner(), materialGone, true);
+        // Discarded with its removal finished: the permanent state after VersionRemoval.
+        UUID removalDone = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.discard(gm.owner(), removalDone);
+        fixture.finishRemoval(gm.owner(), removalDone);
+        assertThat(materials.versions.get(removalDone).removalPending()).isFalse();
+        // Still ready, but with its removal pending.
+        UUID readyPending = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.pendRemoval(gm.owner(), readyPending);
+        ScopeFixture.Starter them = fixture.starter();
+        UUID theirs = fixture.material(them.owner(), them.campaign(), null, "ready").getFirst();
+
+        Set<UUID> removed = as(gm.owner(), () -> scopes.removedVersions(Set.of(kept, superseded, discarded, gone,
+                materialGone, removalDone, readyPending, theirs)));
+
+        assertThat(removed).containsExactlyInAnyOrder(discarded, gone, materialGone, removalDone, readyPending, theirs);
+        assertThat(as(gm.owner(), () -> scopes.removedVersions(Set.of()))).isEmpty();
+        assertThatThrownBy(() -> scopes.removedVersions(Set.of(kept))).isInstanceOf(OwnerContext.NoOwnerException.class);
+    }
+
     // --- the campaign
 
     @Test

@@ -33,6 +33,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 final class ScopeFixture {
 
+    /** The name of every material made here. */
+    static final String MATERIAL_NAME = "Livro de Regras";
+
     private final Library library;
     private final InMemoryLibraryStore libraryStore;
     private final InMemoryMaterialStore materials;
@@ -82,7 +85,8 @@ final class ScopeFixture {
     List<UUID> material(UUID owner, UUID campaign, UUID system, String... states) {
         return as(owner, () -> {
             UUID materialId = Ids.newId();
-            materials.insertMaterial(new MaterialRow(materialId, owner, new byte[] {2}, next(), "rulebook", null,
+            materials.insertMaterial(new MaterialRow(materialId, owner,
+                    TestMaterials.materialName(vault, materialId, owner, MATERIAL_NAME), next(), "rulebook", null,
                     campaign));
             if (system != null) {
                 materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, system, next()));
@@ -115,6 +119,39 @@ final class ScopeFixture {
     void indexChange(UUID owner, UUID jobId, UUID versionId, int first, int last) {
         as(owner, () -> {
             index.insertChange(new IndexChangeRow(jobId, owner, versionId, first, last, null));
+            return null;
+        });
+    }
+
+    /** Discards the owner's version, its removal pending, as the GM's discard does. */
+    void discard(UUID owner, UUID versionId) {
+        as(owner, () -> materials.discardVersion(versionId, next()));
+    }
+
+    /** Ends the removal of the owner's discarded version: the state a finished {@code VersionRemoval} leaves. */
+    void finishRemoval(UUID owner, UUID versionId) {
+        as(owner, () -> materials.clearRemovalPending(versionId, next()));
+    }
+
+    /** Marks the owner's version as pending removal, its state unchanged. */
+    void pendRemoval(UUID owner, UUID versionId) {
+        as(owner, () -> {
+            VersionRow before = materials.versions.get(versionId);
+            materials.versions.put(versionId, new VersionRow(before.id(), before.ownerId(), before.materialId(),
+                    before.state(), before.format(), before.sizeBytes(), before.createdAt(), next(),
+                    before.pageTotal(), before.pipelineVersion(), before.failureCode(), true, before.indexRecipe()));
+            return null;
+        });
+    }
+
+    /** Deletes the owner's version, and its material with it when {@code material} is true. */
+    void delete(UUID owner, UUID versionId, boolean material) {
+        as(owner, () -> {
+            UUID materialId = materials.versions.get(versionId).materialId();
+            materials.deleteVersion(versionId);
+            if (material) {
+                materials.deleteMaterial(materialId);
+            }
             return null;
         });
     }

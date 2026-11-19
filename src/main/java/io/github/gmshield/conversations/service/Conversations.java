@@ -3,6 +3,8 @@ package io.github.gmshield.conversations.service;
 import io.github.gmshield.conversations.data.ConversationRow;
 import io.github.gmshield.conversations.data.ConversationStore;
 import io.github.gmshield.conversations.data.EventBatchRow;
+import io.github.gmshield.conversations.data.TurnReferenceRow;
+import io.github.gmshield.conversations.data.TurnReferenceStore;
 import io.github.gmshield.conversations.data.TurnRow;
 import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Jobs;
@@ -21,7 +23,9 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,6 +47,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       {@code question.answer} job on the interactive lane.</li>
  *   <li>{@link #turn} and {@link #eventsAfter}: a turn of the owner, and its stored events after a sequence, decrypted,
  *       in order.</li>
+ *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
+ *       {@code removed} as of now when its source is removed ({@link Scopes#removedVersions}).</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -57,6 +63,7 @@ public class Conversations {
     private static final Logger log = LoggerFactory.getLogger(Conversations.class);
 
     private final ConversationStore store;
+    private final TurnReferenceStore referenceStore;
     private final Library library;
     private final Scopes scopes;
     private final Jobs jobs;
@@ -64,9 +71,10 @@ public class Conversations {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
-    Conversations(ConversationStore store, Library library, Scopes scopes, Jobs jobs, Vault vault,
-                  ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+    Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes, Jobs jobs,
+                  Vault vault, ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.store = store;
+        this.referenceStore = referenceStore;
         this.library = library;
         this.scopes = scopes;
         this.jobs = jobs;
@@ -143,6 +151,23 @@ public class Conversations {
                         .forEach(events::add);
             }
             return List.copyOf(events);
+        });
+    }
+
+    /** The owner's turn's source references, by number, as the class says; empty for none or another owner's turn. */
+    public List<TurnReference> references(UUID turnId) {
+        return reading(() -> {
+            List<TurnReferenceRow> rows = referenceStore.references(turnId);
+            if (rows.isEmpty()) {
+                return List.<TurnReference>of();
+            }
+            Set<UUID> removed = scopes.removedVersions(rows.stream().map(TurnReferenceRow::versionId)
+                    .collect(Collectors.toUnmodifiableSet()));
+            return rows.stream().map(row -> new TurnReference(row.number(),
+                    vault.decryptText(TurnReferences.materialName(row.id(), row.ownerId()), row.materialName()),
+                    TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
+                            row.sectionPath())),
+                    row.page(), row.passageIds(), removed.contains(row.versionId()))).toList();
         });
     }
 

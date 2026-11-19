@@ -3,6 +3,8 @@ package io.github.gmshield.conversations.service;
 import io.github.gmshield.conversations.data.ConversationRow;
 import io.github.gmshield.conversations.data.ConversationStore;
 import io.github.gmshield.conversations.data.EventBatchRow;
+import io.github.gmshield.conversations.data.TurnReferenceRow;
+import io.github.gmshield.conversations.data.TurnReferenceStore;
 import io.github.gmshield.conversations.data.TurnRow;
 import io.github.gmshield.jobs.service.JobEvent;
 import io.github.gmshield.jobs.service.JobEventBatch;
@@ -11,6 +13,7 @@ import io.github.gmshield.jobs.service.JobPassage;
 import io.github.gmshield.jobs.service.JobProblems;
 import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Lane;
+import io.github.gmshield.scope.service.CitedPlace;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.Scopes;
@@ -19,7 +22,9 @@ import io.github.gmshield.vault.service.Vault;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,8 +44,13 @@ import tools.jackson.databind.JsonNode;
  *       taking the turn's next sequences; a number past the next one of its claim is
  *       {@code job.batch_out_of_order}. Once the turn has a batch, the job has delivered (no splice: it is never
  *       offered again).</li>
- *   <li>{@code completed} appends {@code done}, and the job's end in {@code failed} appends {@code error} with its
- *       code. A stream waiting on the turn is woken after each commit ({@link TurnStreams}).</li>
+ *   <li>{@code completed} expands the turn's citations into source references (Story 2.5), then appends
+ *       {@code done}; the job's end in {@code failed} appends {@code error} with its code and stores no reference. A
+ *       stream waiting on the turn is woken after each commit ({@link TurnStreams}).</li>
+ *   <li>The expansion runs in the transaction that ends the job: the passage ids of the turn's stored citations, in
+ *       sequence order, are read again within the turn's scope ({@link Scopes#references}), which drops an unknown,
+ *       foreign or out-of-scope id; the places left become references ({@link TurnReferences#group}), stored by value
+ *       with the material's name and the section path encrypted. No reference makes the answer {@code silent}.</li>
  * </ul>
  *
  * Lines carry ids and counts only, never the question or the answer's text.
@@ -52,13 +62,18 @@ public class AnswerJobs implements JobHandler {
     private static final Logger log = LoggerFactory.getLogger(AnswerJobs.class);
 
     private final ConversationStore store;
+    private final TurnReferenceStore references;
+    private final Conversations conversations;
     private final Scopes scopes;
     private final Vault vault;
     private final TurnStreams streams;
     private final Clock clock;
 
-    AnswerJobs(ConversationStore store, Scopes scopes, Vault vault, TurnStreams streams, ObjectProvider<Clock> clock) {
+    AnswerJobs(ConversationStore store, TurnReferenceStore references, Conversations conversations, Scopes scopes,
+               Vault vault, TurnStreams streams, ObjectProvider<Clock> clock) {
         this.store = store;
+        this.references = references;
+        this.conversations = conversations;
         this.scopes = scopes;
         this.vault = vault;
         this.streams = streams;
@@ -117,7 +132,35 @@ public class AnswerJobs implements JobHandler {
 
     @Override
     public void completed(JobRef job, JsonNode result) {
-        append(turnOf(job), null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null)));
+        TurnRow turn = turnOf(job);
+        storeReferences(turn);
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null)));
+    }
+
+    /** The turn's citations become its stored references, as the class says. */
+    private void storeReferences(TurnRow turn) {
+        List<UUID> cited = conversations.eventsAfter(turn.id(), 0).stream()
+                .filter(event -> TurnEvent.CITATION.equals(event.type())).map(TurnEvent::passageId)
+                .filter(Objects::nonNull).distinct().toList();
+        List<CitedPlace> places = cited.isEmpty() ? List.of() : scopes.references(scopeOf(turn), cited);
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        List<TurnReferenceRow> rows = new ArrayList<>();
+        for (TurnReferences.Grouped grouped : TurnReferences.group(places)) {
+            UUID rowId = Ids.newId();
+            CitedPlace place = grouped.place();
+            rows.add(new TurnReferenceRow(rowId, turn.ownerId(), turn.id(), grouped.number(), place.versionId(),
+                    place.materialId(), place.page(), grouped.passageIds(),
+                    vault.encryptText(TurnReferences.materialName(rowId, turn.ownerId()), place.materialName()),
+                    vault.encrypt(TurnReferences.sectionPath(rowId, turn.ownerId()),
+                            TurnReferences.pathJson(place.sectionPath())), now));
+        }
+        if (!rows.isEmpty()) {
+            references.insertReferences(rows);
+        }
+        log.atInfo().addKeyValue("jobId", turn.jobId()).addKeyValue("turnId", turn.id())
+                .addKeyValue("cited", cited.size()).addKeyValue("dropped", cited.size() - places.size())
+                .addKeyValue("references", rows.size()).addKeyValue("silent", rows.isEmpty())
+                .log("conversation.references_stored");
     }
 
     @Override

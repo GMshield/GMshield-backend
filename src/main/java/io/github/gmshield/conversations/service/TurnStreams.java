@@ -24,7 +24,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * 0 when absent), each with its sequence as {@code id:}, then waits for more. A store wakes it after its commit
  * ({@link #wake}); a poll every {@code gmshield.conversations.poll} (1 s) is the backstop, so a second backend instance
  * needs nothing more. A comment line ({@code : keep-alive}) goes out every {@code gmshield.conversations.keep-alive}
- * (15 s) without an event. The stream closes after {@code done} or {@code error}, after
+ * (15 s) without an event. A {@code done} event's data is built when it is sent, from the turn's stored source
+ * references (Story 2.5). The stream closes after {@code done} or {@code error}, after
  * {@code gmshield.conversations.stream-timeout} (30 min), or when the client leaves; none of these touches the job.
  * Lines carry ids and counts only.
  */
@@ -118,6 +119,17 @@ public class TurnStreams implements DisposableBean {
             woken.release();
         }
 
+        /**
+         * The event's data line; a {@code done} event's is built now from the turn's stored references, so a replay
+         * shows {@code removed} as of now (Story 2.5).
+         */
+        private String dataLine(TurnEvent event) {
+            if (!TurnEvent.DONE.equals(event.type())) {
+                return TurnEvents.dataLine(event);
+            }
+            return TurnEvents.doneLine(OwnerContext.callAs(owner, () -> conversations.references(turnId)));
+        }
+
         void close() {
             if (closed.compareAndSet(false, true)) {
                 woken.release();
@@ -135,7 +147,7 @@ public class TurnStreams implements DisposableBean {
                     List<TurnEvent> events = OwnerContext.callAs(owner, () -> conversations.eventsAfter(turnId, last));
                     for (TurnEvent event : events) {
                         emitter.send(SseEmitter.event().id(Long.toString(event.sequence())).name(event.type())
-                                .data(TurnEvents.dataLine(event)));
+                                .data(dataLine(event)));
                         last = event.sequence();
                         sent++;
                         quietSince = System.nanoTime();
