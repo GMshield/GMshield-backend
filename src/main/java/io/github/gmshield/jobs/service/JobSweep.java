@@ -127,7 +127,7 @@ public class JobSweep {
         if (ended) {
             JobTrace.run(lapsed.traceId(), () -> log.atWarn().addKeyValue("jobId", lapsed.id())
                     .addKeyValue("attempt", lapsed.attempt()).addKeyValue("state", JobState.FAILED)
-                    .addKeyValue("code", JobProblems.ATTEMPTS_EXHAUSTED).log("job.failed"));
+                    .addKeyValue("code", code).log("job.failed"));
             if (lane == Lane.INGESTION) {
                 offers.offerNextIngestion();
             }

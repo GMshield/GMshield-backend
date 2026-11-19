@@ -24,9 +24,9 @@ class JdbcUsageStore implements UsageStore {
     public boolean insertOnce(UsageRow row) {
         return jdbc.getObject().sql("""
                         insert into model_call_usage (call_id, owner_id, job_id, provider, model, tier, response_id,
-                            input_tokens, cache_read, cache_write, output_tokens, reasoning, created_at)
+                            input_tokens, cache_read, cache_write, output_tokens, reasoning, estimated, created_at)
                         values (:callId, :ownerId, :jobId, :provider, :model, :tier, :responseId, :input, :cacheRead,
-                            :cacheWrite, :output, :reasoning, :createdAt)
+                            :cacheWrite, :output, :reasoning, :estimated, :createdAt)
                         on conflict (call_id) do nothing""")
                 .param("callId", row.callId())
                 .param("ownerId", row.ownerId())
@@ -40,6 +40,7 @@ class JdbcUsageStore implements UsageStore {
                 .param("cacheWrite", row.cacheWrite())
                 .param("output", row.output())
                 .param("reasoning", row.reasoning())
+                .param("estimated", row.estimated())
                 .param("createdAt", OffsetDateTime.ofInstant(row.createdAt(), ZoneOffset.UTC))
                 .update() == 1;
     }

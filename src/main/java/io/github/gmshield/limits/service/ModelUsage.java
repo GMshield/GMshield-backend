@@ -19,7 +19,8 @@ import org.springframework.stereotype.Service;
 /**
  * The usage of each model call (Story 2.4, AD-32), the {@code jobs} module's {@link UsageReports}: one
  * {@code model_call_usage} row per worker call id, written once whatever how often the worker reports it, with the job,
- * its owner, the attempt's provider, model and tier, the provider's response id and the token counts. No price until
+ * its owner, the attempt's provider, model and tier, the provider's response id, the token counts and whether they are
+ * the worker's estimate (Story 2.6). No price until
  * Story 9.2. Lines carry ids and counts only.
  */
 @Service
@@ -45,11 +46,12 @@ public class ModelUsage implements UsageReports {
         for (CallUsage call : usage) {
             written += store.insertOnce(new UsageRow(call.callId(), job.ownerId(), job.id(), model.provider(),
                     model.model(), model.tier(), call.responseId(), call.input(), call.cacheRead(), call.cacheWrite(),
-                    call.output(), call.reasoning(), now)) ? 1 : 0;
+                    call.output(), call.reasoning(), call.estimated(), now)) ? 1 : 0;
         }
         log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("modelProvider", model.provider())
                 .addKeyValue("modelTier", model.tier()).addKeyValue("calls", usage.size())
                 .addKeyValue("recorded", written)
+                .addKeyValue("estimated", usage.stream().filter(CallUsage::estimated).count())
                 .addKeyValue("inputTokens", usage.stream().mapToLong(CallUsage::input).sum())
                 .addKeyValue("outputTokens", usage.stream().mapToLong(CallUsage::output).sum())
                 .log("model.usage_recorded");

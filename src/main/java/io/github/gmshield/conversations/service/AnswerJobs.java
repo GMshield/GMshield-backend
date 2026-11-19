@@ -51,6 +51,11 @@ import tools.jackson.databind.JsonNode;
  *       sequence order, are read again within the turn's scope ({@link Scopes#references}), which drops an unknown,
  *       foreign or out-of-scope id; the places left become references ({@link TurnReferences#group}), stored by value
  *       with the material's name and the section path encrypted. No reference makes the answer {@code silent}.</li>
+ *   <li>The GM's stop (Story 2.6, {@link Conversations#stop}) ends the turn at once: unless it has a final event, its
+ *       citations so far become references as above, {@code done} marked {@code stopped} is appended and
+ *       {@code turn.stopped_at} is set. From then on a batch stores no event (its usage is still recorded), the answer
+ *       to each batch is to stop ({@link #stopRequested}), the job counts as delivered, so it is never offered again,
+ *       and {@code completed} or {@code failed} adds no event and no reference: a turn has one final event.</li>
  * </ul>
  *
  * Lines carry ids and counts only, never the question or the answer's text.
@@ -111,6 +116,12 @@ public class AnswerJobs implements JobHandler {
     @Override
     public void events(JobRef job, JobEventBatch batch) {
         TurnRow turn = turnOf(job);
+        if (turn.stoppedAt() != null) {
+            log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("turnId", turn.id())
+                    .addKeyValue("claimId", batch.claimId()).addKeyValue("batch", batch.number())
+                    .addKeyValue("events", batch.events().size()).log("conversation.batch_after_stop");
+            return;
+        }
         int last = store.lastBatch(turn.id(), batch.claimId());
         if (batch.number() <= last) {
             log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("turnId", turn.id())
@@ -127,14 +138,51 @@ public class AnswerJobs implements JobHandler {
 
     @Override
     public boolean delivered(JobRef job) {
-        return store.turnOfJob(job.id()).map(turn -> store.hasPostedBatch(turn.id())).orElse(false);
+        return store.turnOfJob(job.id()).map(turn -> turn.stoppedAt() != null || store.hasPostedBatch(turn.id()))
+                .orElse(false);
+    }
+
+    @Override
+    public boolean stopRequested(JobRef job) {
+        return store.turnOfJob(job.id()).map(turn -> turn.stoppedAt() != null).orElse(false);
     }
 
     @Override
     public void completed(JobRef job, JsonNode result) {
         TurnRow turn = turnOf(job);
+        if (ended(turn, "completed")) {
+            return;
+        }
         storeReferences(turn);
-        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null)));
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, false)));
+    }
+
+    /**
+     * The GM's stop of the turn (Story 2.6), in the transaction of {@link Conversations#stop}, which holds the job's
+     * lock: unless the turn has a final event, its references, {@code done} marked {@code stopped} and
+     * {@code stopped_at}. False when the turn had ended already: nothing changes then.
+     */
+    boolean stop(TurnRow turn) {
+        if (ended(turn, "stop")) {
+            return false;
+        }
+        storeReferences(turn);
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, true)));
+        if (!store.markStopped(turn.id(), clock.instant().truncatedTo(ChronoUnit.MICROS))) {
+            throw new IllegalStateException("conversations.turn_missing");
+        }
+        return true;
+    }
+
+    /** Whether the turn's last stored event is a final one ({@code done} or {@code error}); logs {@code by} when so. */
+    private boolean ended(TurnRow turn, String by) {
+        long last = store.lastSequence(turn.id());
+        boolean ended = last > 0 && conversations.eventsAfter(turn.id(), last - 1).stream().anyMatch(TurnEvent::last);
+        if (ended) {
+            log.atInfo().addKeyValue("jobId", turn.jobId()).addKeyValue("turnId", turn.id()).addKeyValue("by", by)
+                    .log("conversation.turn_already_ended");
+        }
+        return ended;
     }
 
     /** The turn's citations become its stored references, as the class says. */
@@ -165,8 +213,8 @@ public class AnswerJobs implements JobHandler {
 
     @Override
     public void failed(JobRef job, String code) {
-        store.turnOfJob(job.id()).ifPresent(turn ->
-                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, code))));
+        store.turnOfJob(job.id()).filter(turn -> !ended(turn, "failed")).ifPresent(turn ->
+                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, code, false))));
     }
 
     /** Stores the events after the turn's last sequence, encrypted, and wakes its streams after the commit. */
@@ -206,7 +254,7 @@ public class AnswerJobs implements JobHandler {
 
     private static TurnEvent turnEvent(JobEvent event) {
         return JobEvent.DELTA.equals(event.type())
-                ? new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null)
-                : new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.offset(), null);
+                ? new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null, false)
+                : new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.offset(), null, false);
     }
 }

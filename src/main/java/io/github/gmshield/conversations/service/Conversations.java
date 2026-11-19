@@ -49,6 +49,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       in order.</li>
  *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
  *       {@code removed} as of now when its source is removed ({@link Scopes#removedVersions}).</li>
+ *   <li>{@link #stop} (Story 2.6): the GM's stop of a turn of the owner (else {@code request.not_found}), in one
+ *       transaction that first locks the turn's job row, the lock its batches and its outcome take: a {@code waiting}
+ *       or {@code offered} job is cancelled, a {@code running} one keeps its claim (so the worker can still post usage
+ *       and report), and the turn ends at once ({@link AnswerJobs}: references so far, {@code done} marked
+ *       {@code stopped}) unless it has ended already. Repeating it changes nothing.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -61,6 +66,8 @@ public class Conversations {
     static final String BATCH = "turn_event_batch";
     static final String FIELD_PAYLOAD = "payload";
     private static final Logger log = LoggerFactory.getLogger(Conversations.class);
+    /** The job states a stop cancels: the worker holds no claim yet. */
+    private static final Set<String> UNCLAIMED = Set.of("waiting", "offered");
 
     private final ConversationStore store;
     private final TurnReferenceStore referenceStore;
@@ -69,10 +76,12 @@ public class Conversations {
     private final Jobs jobs;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
+    private final ObjectProvider<AnswerJobs> answers;
     private final Clock clock;
 
     Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes, Jobs jobs,
-                  Vault vault, ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+                  Vault vault, ObjectProvider<PlatformTransactionManager> transactions,
+                  ObjectProvider<AnswerJobs> answers, ObjectProvider<Clock> clock) {
         this.store = store;
         this.referenceStore = referenceStore;
         this.library = library;
@@ -80,6 +89,7 @@ public class Conversations {
         this.jobs = jobs;
         this.vault = vault;
         this.transactions = transactions;
+        this.answers = answers;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
@@ -124,7 +134,7 @@ public class Conversations {
             ScopeSettings settings = ScopeSettings.STARTING;
             JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
-                    language, settings.campaignTier(), settings.systemTier(), settings.modelKnowledge(), now)));
+                    language, settings.campaignTier(), settings.systemTier(), settings.modelKnowledge(), now, null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("turnId", turnId)
                     .addKeyValue("jobId", job.id()).addKeyValue("language", language == null ? "unsure" : language)
@@ -139,6 +149,25 @@ public class Conversations {
     public Optional<Turn> turn(UUID turnId) {
         return turnId == null ? Optional.empty() : reading(() -> store.findTurn(turnId)
                 .map(row -> new Turn(row.id(), row.conversationId(), row.language())));
+    }
+
+    /** Stops the owner's turn's answer, as the class says. */
+    public void stop(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        writing(() -> {
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : store.findTurn(turnId))
+                    .orElseThrow(ConversationProblems::notFound);
+            UUID jobId = turn.jobId();
+            String state = jobs.lock(jobId).orElseThrow(() -> new IllegalStateException("conversations.job_missing"));
+            // Under the job's lock, a batch or an outcome committed before is seen: AnswerJobs.stop reads the turn's
+            // events after it, so a turn that has ended (by its outcome or an earlier stop) is left as it is.
+            boolean cancelled = UNCLAIMED.contains(state) && jobs.cancel(jobId);
+            boolean stopped = answers.getObject().stop(turn);
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turn.id()).addKeyValue("jobId", jobId)
+                    .addKeyValue("jobState", state).addKeyValue("cancelled", cancelled).addKeyValue("stopped", stopped)
+                    .log("conversation.turn_stopped");
+            return stopped;
+        });
     }
 
     /** The owner's turn's stored events after {@code sequence}, in order. */

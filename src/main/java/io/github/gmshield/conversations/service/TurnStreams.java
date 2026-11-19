@@ -127,7 +127,8 @@ public class TurnStreams implements DisposableBean {
             if (!TurnEvent.DONE.equals(event.type())) {
                 return TurnEvents.dataLine(event);
             }
-            return TurnEvents.doneLine(OwnerContext.callAs(owner, () -> conversations.references(turnId)));
+            return TurnEvents.doneLine(OwnerContext.callAs(owner, () -> conversations.references(turnId)),
+                    event.stopped());
         }
 
         void close() {

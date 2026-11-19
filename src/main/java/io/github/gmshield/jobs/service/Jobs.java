@@ -24,7 +24,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * {@link OwnerContext}: when that transaction rolls back there is no job and no message. After the commit the job
  * is offered on its lane's stream (an interactive job at once; an ingestion job when the lane is free). If Redis
  * fails then, the job is still recorded and the sweep offers it. A job can be cancelled in its owner's transaction
- * (Story 1.16).
+ * (Story 1.16), and its row locked there (Story 2.6).
  */
 @Service
 public class Jobs {
@@ -135,6 +135,20 @@ public class Jobs {
     public Set<UUID> unended(Collection<UUID> jobIds) {
         UUID owner = OwnerContext.require();
         return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().unended(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * Locks the row of a job of the bound owner (Story 2.6), inside the caller's transaction, and answers its state:
+     * the same lock its event batches and its outcome take first, so what the caller does next is strictly ordered
+     * with them. Empty when the job is unknown or another owner's.
+     */
+    public Optional<String> lock(UUID jobId) {
+        Objects.requireNonNull(jobId, "jobId");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("jobs.transaction_required");
+        }
+        UUID owner = OwnerContext.require();
+        return storage.joined().findForUpdate(jobId).filter(row -> row.ownerId().equals(owner)).map(JobRow::state);
     }
 
     /**
