@@ -53,7 +53,16 @@ import tools.jackson.databind.node.ObjectNode;
  *       index change of the version is left unended and every row of its set reports that same recipe, the version
  *       records it.</li>
  *   <li>{@link #cancel}: a discarded version's unended index changes are cancelled, in the caller's transaction.</li>
+ *   <li>{@link #retryFailed} (indexing at worker start): for the {@link IndexRetrySweep}, in the caller's transaction,
+ *       each of the owner's runs whose job ended {@code failed}, of a {@code ready} or {@code superseded} version, with
+ *       fewer than {@link IndexChangeRow#MAX_RETRIES} retries, gets a new job for the same ordinal range, with the
+ *       version locked: the row moves to the new job and counts one more retry; the failed job stays as history. A
+ *       whole version is never started again here. {@link #start} begins every row at 0.</li>
  * </ul>
+ *
+ * A run whose job ended {@code failed} still counts as not indexed: its passages stay in the keyword fallback
+ * ({@link ScopeReads#pendingPassages}) and the GM's notice reports them ({@link ScopeReads#failed}), but not as
+ * indexing ({@link ScopeReads#indexing}). A {@code cancelled} run is neither.
  *
  * Nothing here logs a name, a text or the token key.
  */
@@ -123,6 +132,51 @@ public class IndexChanges implements JobHandler {
         }
         Set<UUID> open = unendedJobs.apply(jobIds(rows));
         return rows.stream().filter(row -> open.contains(row.jobId())).toList();
+    }
+
+    /**
+     * The owner's index changes of the version whose job ended {@code failed}, by first ordinal: runs not indexed, which
+     * the retry sweep may give a new job. {@code failedJobs} answers which of these jobs of the owner failed
+     * ({@link Jobs#failed}).
+     */
+    static List<IndexChangeRow> failed(IndexStore index, Function<Collection<UUID>, Set<UUID>> failedJobs,
+                                       UUID versionId) {
+        List<IndexChangeRow> rows = index.changes(versionId);
+        if (rows.isEmpty()) {
+            return List.of();
+        }
+        Set<UUID> failed = failedJobs.apply(jobIds(rows));
+        return rows.stream().filter(row -> failed.contains(row.jobId())).toList();
+    }
+
+    /**
+     * Gives each of the owner's failed runs still to retry a new job, as the class says, in the caller's transaction;
+     * answers how many.
+     */
+    int retryFailed() {
+        UUID owner = OwnerContext.require();
+        // The owner's failed index.change jobs first, then only their rows still to retry: a retried run's row has
+        // moved to its new job, so a failed job kept as history matches no row.
+        Set<UUID> failed = jobs.failedOfKind(KIND);
+        List<IndexChangeRow> candidates = failed.isEmpty() ? List.of() : index.retryable(failed);
+        int retried = 0;
+        for (IndexChangeRow row : candidates) {
+            // The lock orders this with an accept, a reconcile or a discard of the version; the row is read again after
+            // it, since a new set may have replaced it meanwhile.
+            boolean indexed = materials.lockVersion(row.versionId())
+                    .filter(version -> INDEXED.contains(version.state())).isPresent();
+            if (!indexed || index.findChange(row.jobId()).isEmpty()) {
+                continue;
+            }
+            JobRef job = jobs.create(KIND, created -> index.moveChange(row.jobId(), created.id())
+                    .orElseThrow(() -> new IllegalStateException("index.change_missing")));
+            retried++;
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", row.versionId())
+                    .addKeyValue("failedJobId", row.jobId()).addKeyValue("jobId", job.id())
+                    .addKeyValue("firstOrdinal", row.firstOrdinal()).addKeyValue("lastOrdinal", row.lastOrdinal())
+                    .addKeyValue("retries", row.retries() + 1).log("index.change_retried");
+        }
+        return retried;
     }
 
     /** Cancels the owner's unended index changes of the version, in the caller's transaction; answers how many. */
@@ -263,7 +317,8 @@ public class IndexChanges implements JobHandler {
 
     @Override
     public void failed(JobRef job, String code) {
-        // The version keeps no recipe: the next reconcile (a backend start, or a new recipe) indexes it again.
+        // The version keeps no recipe. The retry sweep gives this run a new job, at most MAX_RETRIES times; after that,
+        // the next reconcile (a backend start, or a new recipe) indexes the version again.
         log.atWarn().addKeyValue("jobId", job.id()).addKeyValue("code", code).log("index.change_failed");
     }
 }

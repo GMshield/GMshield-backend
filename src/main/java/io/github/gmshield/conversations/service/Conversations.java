@@ -11,6 +11,7 @@ import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.scope.service.Indexing;
+import io.github.gmshield.scope.service.IndexingFailure;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.ScopeStatus;
 import io.github.gmshield.scope.service.Scopes;
@@ -43,7 +44,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <ul>
  *   <li>{@link #current}: the current campaign, whether its starting scope has a source (an allowed source, or a
  *       pending passage of one), and how many of that scope's passages are still waiting for search
- *       ({@link Scopes#indexing}; null when nothing in it is pending). No campaign is {@code request.not_found}.</li>
+ *       ({@link Scopes#indexing}; null when nothing in it is pending), and how many could not be prepared for search,
+ *       with whether a retry remains ({@link Scopes#status}; null when none). No campaign is
+ *       {@code request.not_found}.</li>
  *   <li>{@link #ask}: a question of 1 to {@value Scopes#MAX_QUESTION} code points, not blank (else
  *       {@code request.invalid}, nothing recorded), on a campaign of the owner (else {@code request.not_found}). In one
  *       transaction: the campaign's one conversation (made on the first question), the turn with the question
@@ -102,8 +105,11 @@ public class Conversations {
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
-    /** The current campaign, whether it has a source, and its passages waiting for search (null: nothing pending). */
-    public record Current(UUID campaignId, boolean hasSources, Indexing indexing) {
+    /**
+     * The current campaign, whether it has a source, its passages waiting for search (null: nothing pending), and those
+     * that could not be prepared for search (null: none).
+     */
+    public record Current(UUID campaignId, boolean hasSources, Indexing indexing, IndexingFailure indexingFailed) {
     }
 
     /** A recorded turn: its id, its conversation and its language (null when unsure). */
@@ -120,7 +126,7 @@ public class Conversations {
             Library.Campaign campaign = library.currentCampaign().orElseThrow(ConversationProblems::notFound);
             // One look-up of the sources; a pending passage always belongs to an allowed source.
             ScopeStatus status = scopes.status(campaign.id(), ScopeSettings.STARTING);
-            return new Current(campaign.id(), status.hasSources(), status.indexing());
+            return new Current(campaign.id(), status.hasSources(), status.indexing(), status.failed());
         });
     }
 

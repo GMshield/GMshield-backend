@@ -117,8 +117,13 @@ final class ScopeFixture {
 
     /** An index change of the version over ordinals {@code first} to {@code last}, as job {@code jobId}. */
     void indexChange(UUID owner, UUID jobId, UUID versionId, int first, int last) {
+        indexChange(owner, jobId, versionId, first, last, 0);
+    }
+
+    /** {@link #indexChange(UUID, UUID, UUID, int, int)} after {@code retries} retries of the retry sweep. */
+    void indexChange(UUID owner, UUID jobId, UUID versionId, int first, int last, int retries) {
         as(owner, () -> {
-            index.insertChange(new IndexChangeRow(jobId, owner, versionId, first, last, null));
+            index.insertChange(new IndexChangeRow(jobId, owner, versionId, first, last, null, retries));
             return null;
         });
     }

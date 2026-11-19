@@ -67,6 +67,7 @@ import tools.jackson.databind.json.JsonMapper;
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
     "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.materials.index-retry-sweep.enabled=false",
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
 @ActiveProfiles("test-mode")
 class IngestionIntegrationTest {
@@ -1068,6 +1069,63 @@ class IngestionIntegrationTest {
         reconcile.reconcile("it-3");
         assertThat(indexChanges(chain)).isEqualTo(again);
         // The new set (and every other owner's the reconciles made) would hold the shared ingestion lane.
+        freeTheIngestionLane();
+    }
+
+    @Autowired
+    private IndexRetrySweep retrySweep;
+
+    @Test
+    void theRetrySweepMovesOnlyAFailedRunToANewJobOnPostgres() throws Exception {
+        Chain chain = reviewed(4, List.of());
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(chain.owner(), () -> store.insertPassages(java.util.stream.IntStream.rangeClosed(2, 200)
+                .mapToObj(ordinal -> passageRow(chain, Ids.newId(), ordinal, 4, now)).toList()));
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+        List<Map<String, Object>> changes = indexChanges(chain);
+        assertThat(changes).hasSize(2);
+        UUID failedJob = (UUID) changes.get(0).get("job_id");
+        UUID doneJob = (UUID) changes.get(1).get("job_id");
+        JobClaims.Claim failing = claims.claim(failedJob);
+        claims.report(failing.jobId(), failing.claimId(), failing.grant(), "failed", "index.embedding_unavailable", false,
+                null);
+        JobClaims.Claim done = claims.claim(doneJob);
+        claims.report(done.jobId(), done.claimId(), done.grant(), "done", null, null,
+                JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+        assertThat(jobs.ownersWithFailed("index.change")).contains(chain.owner());
+        java.util.Set<UUID> failedJobs = as(chain.owner(), () -> new TransactionTemplate(transactions)
+                .execute(status -> jobs.failed(List.of(failedJob, doneJob))));
+        assertThat(failedJobs).containsExactly(failedJob);
+        // Other tests' failed index changes are left out, so the sweep's count is this owner's alone.
+        jdbc.sql("update job set state = 'cancelled' where kind = 'index.change' and state = 'failed'"
+                + " and owner_id <> ?").param(chain.owner()).update();
+
+        assertThat(retrySweep.sweep()).isEqualTo(1);
+
+        List<Map<String, Object>> after = jdbc.sql("select c.job_id, c.first_ordinal, c.last_ordinal, c.recipe,"
+                + " c.retries, j.kind, j.state from index_change c join job j on j.id = c.job_id where c.version_id = ?"
+                + " order by c.first_ordinal").param(chain.versionId()).query().listOfRows();
+        assertThat(after).satisfiesExactly(
+                retried -> assertThat(retried).doesNotContainEntry("job_id", failedJob)
+                        .containsEntry("first_ordinal", 0).containsEntry("last_ordinal", 199)
+                        .containsEntry("recipe", null).containsEntry("retries", 1)
+                        .containsEntry("kind", "index.change"),
+                kept -> assertThat(kept).containsEntry("job_id", doneJob).containsEntry("recipe", "it-1")
+                        .containsEntry("retries", 0));
+        assertThat(jdbc.sql("select state from job where id = ?").param(failedJob).query(String.class).single())
+                .isEqualTo("failed");
+        // Matrix row "Retries used": a run at 3 retries whose job failed is not retried again.
+        Object retriedJob = after.getFirst().get("job_id");
+        jdbc.sql("update index_change set retries = 3 where job_id = ?").param(retriedJob).update();
+        jdbc.sql("update job set state = 'failed', outcome_code = 'index.embedding_unavailable' where id = ?")
+                .param(retriedJob).update();
+        assertThat(retrySweep.sweep()).isZero();
+        assertThat(jdbc.sql("select job_id, retries from index_change where version_id = ? and first_ordinal = 0")
+                .param(chain.versionId()).query().singleRow())
+                .containsEntry("job_id", retriedJob).containsEntry("retries", 3);
+        // The retry check holds: a fourth retry is refused by the table.
+        assertThatThrownBy(() -> jdbc.sql("update index_change set retries = 4 where job_id = ?")
+                .param(retriedJob).update()).hasMessageContaining("index_change_retries_check");
         freeTheIngestionLane();
     }
 

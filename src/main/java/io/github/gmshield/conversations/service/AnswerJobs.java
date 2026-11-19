@@ -104,12 +104,12 @@ public class AnswerJobs implements JobHandler {
     public JsonNode input(JobRef job) {
         TurnRow turn = turnOf(job);
         String question = vault.decryptText(Conversations.question(turn.id(), turn.ownerId()), turn.question());
-        return scopes.questionInput(scopeOf(turn), question);
+        return scopes.questionInput(scopeOf(turn, true), question);
     }
 
     @Override
     public List<JobPassage> passages(JobRef job, List<UUID> ids) {
-        return scopes.passages(scopeOf(turnOf(job)), ids).stream().map(passage -> new JobPassage(passage.id(),
+        return scopes.passages(scopeOf(turnOf(job), false), ids).stream().map(passage -> new JobPassage(passage.id(),
                 passage.tier().word(), passage.text(), passage.sectionPath(), passage.page())).toList();
     }
 
@@ -190,7 +190,7 @@ public class AnswerJobs implements JobHandler {
         List<UUID> cited = conversations.eventsAfter(turn.id(), 0).stream()
                 .filter(event -> TurnEvent.CITATION.equals(event.type())).map(TurnEvent::passageId)
                 .filter(Objects::nonNull).distinct().toList();
-        List<CitedPlace> places = cited.isEmpty() ? List.of() : scopes.references(scopeOf(turn), cited);
+        List<CitedPlace> places = cited.isEmpty() ? List.of() : scopes.references(scopeOf(turn, false), cited);
         Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
         List<TurnReferenceRow> rows = new ArrayList<>();
         for (TurnReferences.Grouped grouped : TurnReferences.group(places)) {
@@ -245,11 +245,17 @@ public class AnswerJobs implements JobHandler {
         return store.turnOfJob(job.id()).orElseThrow(() -> new IllegalStateException("conversations.turn_missing"));
     }
 
-    private ResolvedScope scopeOf(TurnRow turn) {
+    /**
+     * The turn's scope: with its pending passages for a question input; without them ({@link Scopes#resolveSources})
+     * for the passages and references reads, which check only the allowed sources and tiers.
+     */
+    private ResolvedScope scopeOf(TurnRow turn, boolean withPending) {
         ConversationRow conversation = store.findConversation(turn.conversationId())
                 .orElseThrow(() -> new IllegalStateException("conversations.conversation_missing"));
-        return scopes.resolve(conversation.campaignId(), new ScopeSettings(turn.campaignTier(), turn.systemTier(),
-                false, turn.modelKnowledge()));
+        ScopeSettings settings = new ScopeSettings(turn.campaignTier(), turn.systemTier(), false,
+                turn.modelKnowledge());
+        return withPending ? scopes.resolve(conversation.campaignId(), settings)
+                : scopes.resolveSources(conversation.campaignId(), settings);
     }
 
     private static TurnEvent turnEvent(JobEvent event) {

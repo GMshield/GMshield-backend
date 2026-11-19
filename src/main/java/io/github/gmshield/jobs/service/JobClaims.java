@@ -39,7 +39,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *   <li>From Story 2.1 a claim may state the worker's index recipe ({@code [A-Za-z0-9._-]{1,32}}; anything else is
  *       refused before the claim). One that differs from the last one stated since this backend started, the first one
  *       included, is published as {@link IndexRecipeStated} once the claim ended, whatever its answer. A claim without
- *       one changes nothing.</li>
+ *       one changes nothing. From contract 1.12.0 the worker also states it on its own ({@link #stateRecipe}), at
+ *       its start and every check of the backend, so a deploy starts indexing before any job is claimed; the same
+ *       comparison and the same event serve both.</li>
  *   <li>From Story 2.10 a claim may state the providers the worker holds a key for (at most 8, each
  *       {@code [a-z0-9-]{1,32}}; anything else is refused before the claim). A claim of a kind that calls a model
  *       ({@link JobHandler#callsModel()}) resolves the provider, model and tier through {@link ModelChoices}, records
@@ -137,7 +139,7 @@ public class JobClaims {
             throw JobProblems.invalid();
         }
         Set<String> stated = providers == null ? Set.of() : Set.copyOf(providers);
-        boolean newRecipe = indexRecipe != null && !indexRecipe.equals(statedRecipe.getAndSet(indexRecipe));
+        boolean newRecipe = indexRecipe != null && newlyStated(indexRecipe);
         try {
             return offeredClaim(jobId, stated);
         } finally {
@@ -147,7 +149,30 @@ public class JobClaims {
         }
     }
 
-    /** Publishes the stated recipe; a listener's failure is never the claim's, and the next claim publishes it again. */
+    /**
+     * The worker states its index recipe outside a claim (contract 1.12.0, {@code PUT /internal/v1/index-recipe}): at
+     * its start and at every check of the backend. Validated and compared as at a claim; one that differs from the last
+     * one stated is published at once ({@link IndexRecipeStated}). Anything but a recipe is refused
+     * ({@code request.invalid}) and changes nothing.
+     */
+    public void stateRecipe(String indexRecipe) {
+        if (indexRecipe == null || !RECIPE.matcher(indexRecipe).matches()) {
+            throw JobProblems.invalid();
+        }
+        if (newlyStated(indexRecipe)) {
+            stated(indexRecipe);
+        }
+    }
+
+    /** Records {@code recipe} as the last one stated; whether it differs from the one before. */
+    private boolean newlyStated(String recipe) {
+        return !recipe.equals(statedRecipe.getAndSet(recipe));
+    }
+
+    /**
+     * Publishes the stated recipe; a listener's failure is never the claim's (or the statement's), and the next claim or
+     * statement publishes it again.
+     */
     private void stated(String recipe) {
         try {
             events.publishEvent(new IndexRecipeStated(recipe));

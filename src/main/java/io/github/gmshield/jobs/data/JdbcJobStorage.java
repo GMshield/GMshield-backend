@@ -200,6 +200,28 @@ class JdbcJobStorage implements JobStorage {
         }
 
         @Override
+        public List<UUID> failed(Collection<UUID> ids, UUID owner) {
+            if (ids.isEmpty()) {
+                return List.of();
+            }
+            return jdbc.get().sql("select id from job where owner_id = :owner and state = 'failed' and id in (:ids)")
+                    .param("owner", owner).param("ids", List.copyOf(ids)).query(UUID.class).list();
+        }
+
+        @Override
+        public List<UUID> failedOfKind(String kind, UUID owner) {
+            return jdbc.get().sql("select id from job where owner_id = :owner and state = 'failed' and kind = :kind")
+                    .param("owner", owner).param("kind", kind).query(UUID.class).list();
+        }
+
+        @Override
+        public List<UUID> ownersWithFailed(String kind) {
+            return jdbc.get().sql("select distinct owner_id from job where state = 'failed' and kind = :kind"
+                            + " order by owner_id")
+                    .param("kind", kind).query(UUID.class).list();
+        }
+
+        @Override
         public boolean busy(String lane) {
             // Boolean.TRUE.equals never unboxes: an absent or null answer reads as "not busy" (java:S2259).
             return Boolean.TRUE.equals(jdbc.get()

@@ -17,8 +17,10 @@ import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.scope.service.Indexing;
+import io.github.gmshield.scope.service.IndexingFailure;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
+import io.github.gmshield.scope.service.ScopeStatus;
 import io.github.gmshield.scope.service.ScopedPassage;
 import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.scope.service.Tier;
@@ -36,6 +38,7 @@ import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -50,6 +53,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
     "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.materials.index-retry-sweep.enabled=false",
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-scope-it"})
 @ActiveProfiles("test-mode")
 class ScopeIntegrationTest {
@@ -64,6 +68,8 @@ class ScopeIntegrationTest {
     private IndexStore index;
     @Autowired
     private Jobs jobs;
+    @Autowired
+    private JdbcClient jdbc;
     @Autowired
     private Vault vault;
     @Autowired
@@ -105,6 +111,15 @@ class ScopeIntegrationTest {
             as(owner, () -> jobs.cancel(changes.get(2)));
             assertScope(owner, campaign, system, a, b, aPassages, bPassages, cPassages, oldPassages,
                     reviewingPassages);
+            // A cancelled run is neither pending nor failed; once A's last run ends failed, its passages are pending
+            // for the fallback (after the unended run's), and reported as failed, not as indexing.
+            assertThat(as(owner, () -> scopes.status(campaign.id(), ScopeSettings.STARTING)).failed()).isNull();
+            jdbc.sql("update job set state = 'failed', outcome_code = 'job.attempts_exhausted' where id = ?")
+                    .param(changes.get(2)).update();
+            assertThat(as(owner, () -> scopes.resolve(campaign.id(), ScopeSettings.STARTING)).pending())
+                    .containsExactlyElementsOf(aPassages.subList(200, 450));
+            assertThat(as(owner, () -> scopes.status(campaign.id(), ScopeSettings.STARTING)))
+                    .isEqualTo(new ScopeStatus(true, new Indexing(200), new IndexingFailure(50, true)));
         } finally {
             // Leave no job behind for the other tests' ingestion lane, whatever happened.
             for (UUID change : changes) {

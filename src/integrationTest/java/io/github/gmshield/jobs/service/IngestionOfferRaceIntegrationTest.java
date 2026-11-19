@@ -32,7 +32,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * is what makes it hold: each decision reads "busy" and the next job, and offers it, while no other decision runs.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
-    "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false"})
+    "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.materials.index-retry-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class IngestionOfferRaceIntegrationTest {
 
