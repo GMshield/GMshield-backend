@@ -39,14 +39,15 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Nine modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Ten modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
-use `shared`, `library`, `materials` and `vault`), `limits` (the model setting, below; it may use `shared` and
-`jobs`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
+`jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
+`scope`, `library` and `vault`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
 `library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
@@ -496,9 +497,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting, 
     100 or a null one). As the job's owner, in a read-only transaction, the job's handler answers through
     `JobHandler.passages(JobRef, ids)`, whose default is 403 `job.passages_refused`; through `Scopes`, a job whose
     campaign is gone is 404 `request.not_found` and any id out of the scope 403 `scope.passage_refused`. The answer
-    is `{passages: [{id, tier, text, sectionPath, page}]}` (`JobPassage`), never cached. No production job kind
-    implements `passages` yet, so every real job is refused: the story that adds the interactive (answer) job kind
-    wires it through `Scopes`, and a test-only handler (`ScopedPassagesFlowTest`) proves the path meanwhile.
+    is `{passages: [{id, tier, text, sectionPath, page}]}` (`JobPassage`), never cached. From Story 2.4 the
+    production kind `question.answer` implements it through `Scopes`; a test-only handler (`ScopedPassagesFlowTest`)
+    proves the path too.
   - **The question input (Story 2.3).** `Scopes.questionInput(scope, question)` is the one builder of the input of a
     job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
     sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
@@ -521,6 +522,59 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting, 
   read. `ModelProviders` (`jobs.service.ModelChoices`) resolves `(provider, model, tier)` for an attempt: every job
   uses the `full` tier until Epic 9. There is no fallback provider, no price and no usage here (Story 9.2). The
   keys are the worker's: the backend holds none.
+- **Ask a question (`conversations`, Story 2.4, public contract 1.11.0, internal contract 1.10.0).** The tenth module;
+  it may use `shared`, `jobs`, `scope`, `library` and `vault`. `/api/v1/conversations/**` and `/api/v1/turns/**` join
+  the library routes (`LibraryOwnerFilter`): the session's account is the owner.
+  - `GET /api/v1/conversations/current` answers `{campaignId, hasSources}`: the current campaign, and whether
+    `Scopes.resolve(campaign, STARTING)` has an allowed source or a pending passage. No campaign is 404
+    `request.not_found`.
+  - `POST /api/v1/campaigns/{campaignId}/turns` with `{question}` (1 to 4,000 code points, not blank; else 400
+    `request.invalid`) answers 201 `{id, conversationId, language}`. In one transaction: the campaign's one
+    conversation (made on the first question), the turn with the question encrypted (binding `turn`/`question`),
+    `ScopeSettings.STARTING` frozen on it and its language, and its job of kind `question.answer` on the interactive
+    lane. Another owner's campaign, an unknown one or a malformed id is 404, with nothing recorded. The language is
+    `pt-BR`, `en` or null when unsure (`Languages`: a count of each language's short words, no library, no model).
+    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10.
+  - `GET /api/v1/turns/{turnId}/events` is `text/event-stream` (`TurnStreams`): the stored events after
+    `Last-Event-ID` (0 when absent or not a number), then new ones, each `id:` its sequence (1, 2, … per turn) and
+    named `delta {text}`, `citation {passageId, offset}`, `done {}` or `error {code}` (the public document names
+    `TurnDeltaEvent`, `TurnCitationEvent`, `TurnDoneEvent` and `TurnErrorEvent`). A comment `: keep-alive` goes out
+    after 15 s without an event (`gmshield.conversations.keep-alive`); the stream closes after `done` or `error`, or
+    after 30 min (`gmshield.conversations.stream-timeout`). The database is the stream's truth: each stream runs on a
+    virtual thread as the turn's owner (captured before it starts), is woken after each commit that stores an event,
+    and polls every second (`gmshield.conversations.poll`) as a backstop, so replay, a reopened stream and a second
+    instance need nothing more. A client that leaves never touches the job. Another owner's turn is 404.
+  - `AnswerJobs` (`question.answer`, interactive, `callsModel()`): its input is `Scopes.questionInput` of the turn's
+    campaign under its frozen settings, its passages `Scopes.passages` within that scope.
+  - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/events` (`jobs`), with `X-Job-Grant`: `{batch, events: [{type:
+    delta, text} | {type: citation, passageId, offset}], usage: [{callId, responseId?, input, cacheRead, cacheWrite,
+    output, reasoning}]}` answers `{stop: false}` (Story 2.6 fills it). A malformed body is 400 `request.invalid`
+    first; then the grant (403 `job.grant_refused`); then the batch (400 `job.events_invalid`: a number below 1, more
+    than 500 events, a delta of 0 or more than 16,384 code points, a citation without its id or with a negative
+    offset, more than 16 usages, a usage without its call id or with a negative count). On the job's locked row, as the
+    owner, `JobHandler.events(job, batch)` stores it (default 403 `job.events_refused`, so `jobs` depends on no feature
+    module): `batch` starts at 1 per claim; a repeated `(claim, batch)` is accepted and stored once; a gap is 409
+    `job.batch_out_of_order` with nothing stored. Each batch is one encrypted JSON array (binding
+    `turn_event_batch`/`payload`) whose events take the turn's next sequences. Its usage goes, in the same
+    transaction, to `jobs.service.UsageReports`, which `limits` implements (`ModelUsage`): one `model_call_usage` row
+    per call id (`ON CONFLICT DO NOTHING`) with the job, owner, the attempt's provider, model and tier, the response id
+    and the token counts; no price (Story 9.2).
+  - The end: `completed` appends `done`; the job's end in `failed` appends `error {code}` (a failed attempt that is
+    retried appends nothing). **No splice:** once a turn has a posted batch holding an event (`JobHandler.delivered`; usage alone shows the GM nothing), a failed outcome
+    ends the job as with `retry: false`, and a lapsed claim ends it `failed` with `job.claim_lapsed`: it is never offered
+    again.
+  - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
+    `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
+    through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel
+    every unended `question.answer` job**, with the backend stopped, as `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind = 'question.answer' and state in ('waiting', 'offered', 'running');
+    ```
+
+  - Lines carry ids, counts and codes, never a question, an answer's text or a passage's text.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -567,7 +621,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting, 
   - Every backend line about a job carries the trace id of the request that created it; the worker logs
     under it and sends it back in `traceparent`.
   - **Models (Story 2.10, AD-18, internal contract 1.9.0).** A `JobHandler` whose `callsModel()` is true (default
-    false; no production kind yet) gets a model per attempt. A claim may state `providers` (at most 8, each
+    false; `question.answer` from Story 2.4) gets a model per attempt. A claim may state `providers` (at most 8, each
     `^[a-z0-9-]{1,32}$`, else 400 `request.invalid` before the claim): those the worker holds a key for. For such a
     kind each claim asks `jobs.service.ModelChoices` (implemented by `limits`) for the provider, model and tier,
     records them on the job row (`model_provider`, `model_id`, `model_tier`, `V16__job_model.sql`; overwritten at

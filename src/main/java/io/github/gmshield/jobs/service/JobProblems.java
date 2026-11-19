@@ -16,8 +16,14 @@ public final class JobProblems {
             "Job passages request invalid");
     static final ApiProblem PASSAGES_REFUSED = ApiProblem.of(403, CATEGORY, "passages_refused",
             "Job passages refused");
+    static final ApiProblem EVENTS_INVALID = ApiProblem.of(400, CATEGORY, "events_invalid", "Job events invalid");
+    static final ApiProblem EVENTS_REFUSED = ApiProblem.of(403, CATEGORY, "events_refused", "Job events refused");
+    static final ApiProblem BATCH_OUT_OF_ORDER = ApiProblem.of(409, CATEGORY, "batch_out_of_order",
+            "Job event batch out of order");
     /** The code of a job whose attempts all lapsed. */
     public static final String ATTEMPTS_EXHAUSTED = "job.attempts_exhausted";
+    /** The code of a job whose claim lapsed (Story 2.4: the code that ends a job that delivered an event). */
+    public static final String CLAIM_LAPSED = "job.claim_lapsed";
     /** The code of a failed outcome that named none. */
     public static final String FAILED = "job.failed";
     /** The code of a job whose handler could not give its input (it failed, or it was not a JSON object). */
@@ -59,6 +65,19 @@ public final class JobProblems {
 
     static ApiException passagesRefused() {
         return new ApiException(PASSAGES_REFUSED);
+    }
+
+    static ApiException eventsInvalid() {
+        return new ApiException(EVENTS_INVALID);
+    }
+
+    static ApiException eventsRefused() {
+        return new ApiException(EVENTS_REFUSED);
+    }
+
+    /** A batch whose number is past the next one of its claim (Story 2.4): nothing is stored. */
+    public static ApiException batchOutOfOrder() {
+        return new ApiException(BATCH_OUT_OF_ORDER);
     }
 
     static ApiException notFound() {

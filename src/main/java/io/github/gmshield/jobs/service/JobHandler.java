@@ -55,6 +55,26 @@ public interface JobHandler {
     }
 
     /**
+     * A numbered batch of answer events of the job's live claim (Story 2.4), posted by the worker to
+     * {@code POST .../events}: the handler stores it once, or accepts a batch it already stored (a repeated number of
+     * the same claim) without storing it again, and refuses a gap with {@link JobProblems#batchOutOfOrder()}. Runs as
+     * the owner, in the transaction of the job's locked row, so the batches of one job are stored one at a time. A kind
+     * whose jobs stream no events keeps this default: {@code job.events_refused} (403).
+     */
+    default void events(JobRef job, JobEventBatch batch) {
+        throw JobProblems.eventsRefused();
+    }
+
+    /**
+     * Whether the job has delivered an event (Story 2.4): once it has, a failed attempt (reported or lapsed) ends the job
+     * instead of offering it again, so no answer is spliced from two attempts. Runs as the owner, in the transaction
+     * that ends or retries the job.
+     */
+    default boolean delivered(JobRef job) {
+        return false;
+    }
+
+    /**
      * The worker reported the job done; {@code result} is what it sent (an empty object when it sent none). The
      * files the worker sent back are adopted here, with {@link Jobs#adoptOutput}; any it does not adopt are removed
      * once the job ended. A result that cannot be recorded throws {@link JobResultInvalid}.
