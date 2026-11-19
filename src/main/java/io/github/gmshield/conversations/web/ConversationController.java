@@ -30,7 +30,8 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 /**
- * The GM's conversation (Story 2.4): the current conversation, a new turn, and a turn's answer as server-sent events.
+ * The GM's conversation (Story 2.4): the current conversation, a new turn, a turn's answer as server-sent events, and
+ * the GM's stop of an answer (Story 2.6).
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -41,6 +42,7 @@ class ConversationController {
     static final String CURRENT = "/api/v1/conversations/current";
     static final String TURNS = "/api/v1/campaigns/{campaignId}/turns";
     static final String EVENTS = "/api/v1/turns/{turnId}/events";
+    static final String STOP = "/api/v1/turns/{turnId}/stop";
     static final String LAST_EVENT_ID = "Last-Event-ID";
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern SEQUENCE = Pattern.compile("\\d{1,18}");
@@ -111,12 +113,14 @@ class ConversationController {
                     + " accepted one is not removed") boolean removed) {
     }
 
-    @Schema(name = "TurnDoneEvent", requiredProperties = {"silent", "references"},
-            description = "The data of a done event: the answer is complete, with its source references. Built when"
-                    + " the event is sent, so a replay shows removed as of then")
+    @Schema(name = "TurnDoneEvent", requiredProperties = {"stopped", "silent", "references"},
+            description = "The data of a done event: the answer is complete, or the GM stopped it, with its source"
+                    + " references. Built when the event is sent, so a replay shows removed as of then")
     record DoneEvent(
-            @Schema(description = "True exactly when references is empty: the sources say nothing about the question")
-            boolean silent,
+            @Schema(description = "True when the GM stopped the answer: the text sent so far is all there is, and the"
+                    + " references are those of the citations sent so far") boolean stopped,
+            @Schema(description = "True exactly when the answer was not stopped and references is empty: the sources"
+                    + " say nothing about the question") boolean silent,
             @ArraySchema(arraySchema = @Schema(description = "The source references, by number (1..n, each once)"),
                     schema = @Schema(implementation = SourceReference.class)) List<SourceReference> references) {
     }
@@ -180,6 +184,21 @@ class ConversationController {
         SseEmitter emitter = streams.open(owner, turn.id(), after(lastEventId));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).header("X-Accel-Buffering", "no")
                 .contentType(MediaType.TEXT_EVENT_STREAM).body(emitter);
+    }
+
+    @PostMapping(path = STOP)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "stopTurn", summary = "Stop the turn's answer (204): its stream ends at once with a done"
+            + " event marked stopped, after the text and citations stored so far, and the worker is told to stop at its"
+            + " next batch. A turn whose answer has ended already is left as it is (204 too), so repeating it is safe."
+            + " request.not_found (404) for a turn that is not the account's",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<Void> stop(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.stop(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 
     /** The sequence after which to send: the last event id received, 0 when absent or not one. */

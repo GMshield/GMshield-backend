@@ -1,5 +1,6 @@
 package io.github.gmshield.conversations.data;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -20,6 +21,9 @@ public interface ConversationStore {
     void insertTurn(TurnRow row);
 
     Optional<TurnRow> findTurn(UUID id);
+
+    /** Sets the owner's turn's {@code stopped_at} (Story 2.6); false for an unknown turn or another owner's. */
+    boolean markStopped(UUID turnId, Instant at);
 
     /** The current owner's turn answered by this job. */
     Optional<TurnRow> turnOfJob(UUID jobId);

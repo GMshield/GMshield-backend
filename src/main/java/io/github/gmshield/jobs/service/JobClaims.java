@@ -351,8 +351,9 @@ public class JobClaims {
      * more than {@value #MAX_USAGE} usages, or a usage without its call id or with a negative count). Then, as the owner
      * and on the job's locked row, the handler stores the batch ({@link JobHandler#events}: once per claim and number, a
      * gap {@code job.batch_out_of_order}, 409; a kind without events {@code job.events_refused}, 403) and the usage is
-     * recorded once per call id ({@link UsageReports}), in that one transaction. Answers whether the worker must stop:
-     * never yet (Story 2.6 adds the GM's stop). Lines carry ids and counts only.
+     * recorded once per call id ({@link UsageReports}), in that one transaction. Answers whether the worker must stop
+     * (Story 2.6, the GM's stop): {@link JobHandler#stopRequested}, read in that same locked transaction after the
+     * batch, so a stop committed before it is always seen. Lines carry ids and counts only.
      */
     public boolean events(UUID jobId, UUID claimId, String grant, JobEventBatch batch, List<CallUsage> calls) {
         Instant now = clock.now();
@@ -369,21 +370,23 @@ public class JobClaims {
             throw JobProblems.eventsInvalid();
         }
         Optional<JobHandler> handler = handlers.find(seen.kind());
-        JobTrace.run(seen.traceId(), () -> {
+        return Boolean.TRUE.equals(JobTrace.call(seen.traceId(), () -> {
+            boolean stop;
             try {
-                owners.call(seen.ownerId(), () -> {
+                stop = Boolean.TRUE.equals(owners.call(seen.ownerId(), () -> {
                     JobRow current = storage.joined().findForUpdate(jobId).orElse(null);
                     if (current == null || !grantMatches(current, claimId, presented, clock.now())) {
                         throw JobProblems.grantRefused();
                     }
                     JobRef job = ref(current);
-                    handler.orElseThrow(JobProblems::eventsRefused).events(job, batch);
+                    JobHandler kind = handler.orElseThrow(JobProblems::eventsRefused);
+                    kind.events(job, batch);
                     if (!usage.isEmpty() && current.modelProvider() != null) {
                         this.usage.record(job, new ModelChoice(current.modelProvider(), current.modelId(),
                                 current.modelTier()), List.copyOf(usage));
                     }
-                    return null;
-                });
+                    return kind.stopRequested(job);
+                }));
             } catch (io.github.gmshield.shared.service.ApiException refused) {
                 log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
                         .addKeyValue("batch", batch.number()).addKeyValue("reason", refused.problem().code())
@@ -392,9 +395,9 @@ public class JobClaims {
             }
             log.atDebug().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
                     .addKeyValue("batch", batch.number()).addKeyValue("events", batch.events().size())
-                    .addKeyValue("usage", usage.size()).log("job.events_posted");
-        });
-        return false;
+                    .addKeyValue("usage", usage.size()).addKeyValue("stop", stop).log("job.events_posted");
+            return stop;
+        }));
     }
 
     /** A number from 1, at most {@value #MAX_EVENTS} events, each a delta or a citation as {@link #events} says. */

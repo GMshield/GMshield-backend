@@ -41,6 +41,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * encrypted columns, and another owner. The same rows without a database are in {@code ConversationFlowTest}.
  * Story 2.5: the references of a completed turn stored by value in {@code turn_reference} (passage ids as
  * {@code uuid[]}, the name and the section path encrypted), read back, and marked removed after a discard.
+ * Story 2.6: the GM's stop on PostgreSQL: the job row locked, {@code turn.stopped_at} set, the references so far and
+ * {@code done} marked stopped stored at once, the next batch stored no more but its usage recorded as an estimate
+ * ({@code model_call_usage.estimated}), and the worker's {@code done} adding nothing.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -99,7 +102,7 @@ class ConversationIntegrationTest {
         JobEventBatch first = new JobEventBatch(claim.claimId(), 1, List.of(JobEvent.delta("Fire Bolt causa "),
                 JobEvent.delta("1d10.")));
         JobEventBatch second = new JobEventBatch(claim.claimId(), 2, List.of(JobEvent.citation(passage, 16)));
-        List<CallUsage> usage = List.of(new CallUsage(call, "chatcmpl-it", 100, 10, 0, 7, 2));
+        List<CallUsage> usage = List.of(new CallUsage(call, "chatcmpl-it", 100, 10, 0, 7, 2, false));
         claims.events(jobId, claim.claimId(), claim.grant(), first, List.of());
         claims.events(jobId, claim.claimId(), claim.grant(), second, usage);
         claims.events(jobId, claim.claimId(), claim.grant(), second, usage);
@@ -211,6 +214,69 @@ class ConversationIntegrationTest {
 
         assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::removed)
                 .containsExactly(true, true);
+    }
+
+    @Test
+    void aStopEndsTheTurnAtOnceOnPostgresAndTheNextBatchIsToldToStop() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        UUID cited = Ids.newId();
+        as(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "SRD 5.2.1"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, cited, 0, 4)));
+            return null;
+        });
+        Conversations.Asked asked = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        UUID jobId = jdbc.sql("select job_id from turn where id = :id").param("id", asked.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of("azure-openai"));
+        assertThat(claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1,
+                List.of(JobEvent.delta("Fire Bolt causa"), JobEvent.citation(cited, 9))), List.of())).isFalse();
+
+        OwnerContext.callAs(owner, () -> {
+            conversations.stop(asked.turnId());
+            return null;
+        });
+
+        assertThat(jdbc.sql("select stopped_at from turn where id = :id").param("id", asked.turnId()).query()
+                .singleValue()).isNotNull();
+        assertThat(jdbc.sql("select state from job where id = :id").param("id", jobId).query(String.class).single())
+                .isEqualTo("running");
+        UUID call = Ids.newId();
+        assertThat(claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 2,
+                List.of(JobEvent.delta(" 1d10."))), List.of(new CallUsage(call, null, 40, 0, 0, 3, 0, true))))
+                .isTrue();
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
+        // Stopping again changes nothing.
+        OwnerContext.callAs(owner, () -> {
+            conversations.stop(asked.turnId());
+            return null;
+        });
+
+        List<TurnEvent> events = as(owner, () -> conversations.eventsAfter(asked.turnId(), 0));
+        assertThat(events).extracting(TurnEvent::type).containsExactly("delta", "citation", "done");
+        assertThat(events.getLast().stopped()).isTrue();
+        assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::passageIds)
+                .containsExactly(List.of(cited));
+        assertThat(jdbc.sql("select estimated from model_call_usage where call_id = :call").param("call", call)
+                .query(Boolean.class).single()).isTrue();
+        assertThat(jdbc.sql("select state from job where id = :id").param("id", jobId).query(String.class).single())
+                .isEqualTo("done");
+        // Another owner's stop finds nothing.
+        UUID other = Ids.newId();
+        assertThatThrownBy(() -> OwnerContext.callAs(other, () -> {
+            conversations.stop(asked.turnId());
+            return null;
+        })).isInstanceOfSatisfying(ApiException.class, refused ->
+                assertThat(refused.problem().code()).isEqualTo("request.not_found"));
     }
 
     private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page) {

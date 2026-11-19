@@ -75,6 +75,14 @@ public interface JobHandler {
     }
 
     /**
+     * Whether the worker must stop the job (Story 2.6): the answer to each event batch it posts. Runs as the owner, in
+     * the transaction of the job's locked row that stored the batch, so a stop committed before the batch is seen.
+     */
+    default boolean stopRequested(JobRef job) {
+        return false;
+    }
+
+    /**
      * The worker reported the job done; {@code result} is what it sent (an empty object when it sent none). The
      * files the worker sent back are adopted here, with {@link Jobs#adoptOutput}; any it does not adopt are removed
      * once the job ended. A result that cannot be recorded throws {@link JobResultInvalid}.

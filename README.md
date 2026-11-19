@@ -549,7 +549,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     campaign under its frozen settings, its passages `Scopes.passages` within that scope.
   - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/events` (`jobs`), with `X-Job-Grant`: `{batch, events: [{type:
     delta, text} | {type: citation, passageId, offset}], usage: [{callId, responseId?, input, cacheRead, cacheWrite,
-    output, reasoning}]}` answers `{stop: false}` (Story 2.6 fills it). A malformed body is 400 `request.invalid`
+    output, reasoning, estimated?}]}` answers `{stop}`: true once the GM stopped the answer (Story 2.6, below). A
+    malformed body is 400 `request.invalid`
     first; then the grant (403 `job.grant_refused`); then the batch (400 `job.events_invalid`: a number below 1, more
     than 500 events, a delta of 0 or more than 16,384 code points, a citation without its id or with a negative
     offset, more than 16 usages, a usage without its call id or with a negative count). On the job's locked row, as the
@@ -559,7 +560,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     `turn_event_batch`/`payload`) whose events take the turn's next sequences. Its usage goes, in the same
     transaction, to `jobs.service.UsageReports`, which `limits` implements (`ModelUsage`): one `model_call_usage` row
     per call id (`ON CONFLICT DO NOTHING`) with the job, owner, the attempt's provider, model and tier, the response id
-    and the token counts; no price (Story 9.2).
+    and the token counts, and whether they are the worker's estimate (`estimated`, Story 2.6); no price (Story 9.2).
   - The end: `completed` stores the turn's source references (below), then appends `done`; the job's end in
     `failed` appends `error {code}` and stores no reference (a failed attempt that is retried appends nothing). **No splice:** once a turn has a posted batch holding an event (`JobHandler.delivered`; usage alone shows the GM nothing), a failed outcome
     ends the job as with `retry: false`, and a lapsed claim ends it `failed` with `job.claim_lapsed`: it is never offered
@@ -585,6 +586,26 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     every completed turn therefore has a reference or is silent. Rolling back below this release: roll the frontend
     back first (the reverse of the deploy order; the 2.5 frontend requires public contract 1.12.0 and reports
     unhealthy against an older backend), then the backend; `turn_reference` is then left unread.
+  - **Stop an answer (Story 2.6, public contract 1.13.0, internal contract 1.11.0).** `POST /api/v1/turns/{turnId}/stop`
+    answers 204 for any turn of the owner, whatever its state (so repeating it is safe), and 404 `request.not_found` for
+    anything else. `Conversations.stop` runs in the owner's transaction and first locks the turn's job row (`Jobs.lock`:
+    the lock the batch and outcome paths take first, so a stop and a batch are strictly ordered). A `waiting` or
+    `offered` job is cancelled (`Jobs.cancel`); a `running` one keeps its claim, so the worker can still post usage and
+    report. Unless the turn already has a final event, `AnswerJobs.stop` then stores the references of the citations so
+    far (as `completed` does), appends `done` marked stopped (stored as `{"type": "done", "stopped": true}`) and sets
+    `turn.stopped_at`: the GM's stream ends at once, before the worker hears of it. From then on: a batch stores no
+    event (its usage is still recorded; line `conversation.batch_after_stop`), the reply to each batch is `{stop: true}`
+    (`JobHandler.stopRequested`, read in the batch's locked transaction), `completed` and `failed` add no event and no
+    reference (line `conversation.turn_already_ended`), and `delivered` is true, so a stopped job is never offered
+    again, whether its claim lapses (`job.claim_lapsed`) or a failure is reported. A disconnect never stops a job: only
+    this route does. The `done` event's data gains `stopped` (always present), and `silent` is true exactly when the
+    answer was not stopped and has no reference: a stopped answer is never the silent one. A usage may say `estimated`
+    (default false), stored in `model_call_usage.estimated`: the worker estimates a call it stopped before the provider
+    sent its usage. `V19__answer_stop.sql` adds `turn.stopped_at timestamptz null` and `model_call_usage.estimated
+    boolean not null default false`; both are additive, so the previous release keeps working on this schema. **Deploy
+    order: backend, then worker (its minimum internal contract becomes 1.11.0), then frontend (its minimum public
+    contract becomes 1.13.0).** Roll back in the reverse order. The `job.failed` line of a lapsed claim now logs its
+    real code (`job.claim_lapsed` or `job.attempts_exhausted`).
   - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
     `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
     through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel

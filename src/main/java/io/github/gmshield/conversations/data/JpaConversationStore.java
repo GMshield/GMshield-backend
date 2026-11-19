@@ -2,6 +2,7 @@ package io.github.gmshield.conversations.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -55,6 +56,18 @@ class JpaConversationStore implements ConversationStore {
     public Optional<TurnRow> findTurn(UUID id) {
         return em().createQuery("select t from Turn t where t.id = :id", TurnEntity.class).setParameter("id", id)
                 .getResultList().stream().findFirst().map(TurnEntity::row);
+    }
+
+    @Override
+    public boolean markStopped(UUID turnId, Instant at) {
+        EntityManager em = em();
+        Optional<TurnEntity> found = em.createQuery("select t from Turn t where t.id = :id", TurnEntity.class)
+                .setParameter("id", turnId).getResultList().stream().findFirst();
+        found.ifPresent(entity -> {
+            entity.stop(at);
+            em.flush();
+        });
+        return found.isPresent();
     }
 
     @Override

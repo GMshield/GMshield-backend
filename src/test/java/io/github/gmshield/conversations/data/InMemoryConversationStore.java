@@ -2,6 +2,7 @@ package io.github.gmshield.conversations.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +57,19 @@ public class InMemoryConversationStore implements ConversationStore {
     @Override
     public Optional<TurnRow> findTurn(UUID id) {
         return owned(turns).filter(row -> row.id().equals(id)).findFirst();
+    }
+
+    @Override
+    public synchronized boolean markStopped(UUID turnId, Instant at) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty()) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.stopped(at));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
     }
 
     @Override

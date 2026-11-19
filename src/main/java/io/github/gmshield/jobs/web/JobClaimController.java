@@ -138,7 +138,8 @@ class JobClaimController {
     }
 
     @Schema(name = "JobCallUsage", requiredProperties = {"callId", "input", "cacheRead", "cacheWrite", "output",
-            "reasoning"}, description = "One model call's tokens (contract 1.10.0), recorded once by its call id")
+            "reasoning"}, description = "One model call's tokens (contract 1.10.0), recorded once by its call id;"
+            + " estimated from contract 1.11.0")
     record JobCallUsage(
             @Schema(description = "The worker's id of the call (a UUIDv7)", format = "uuid") UUID callId,
             @Schema(description = "The provider's response id, when it sent one", maxLength = 256) String responseId,
@@ -147,10 +148,14 @@ class JobClaimController {
             @Schema(minimum = "0", format = "int64") long cacheRead,
             @Schema(minimum = "0", format = "int64") long cacheWrite,
             @Schema(description = "Output tokens, reasoning included", minimum = "0", format = "int64") long output,
-            @Schema(minimum = "0", format = "int64") long reasoning) {
+            @Schema(minimum = "0", format = "int64") long reasoning,
+            @Schema(description = "True when the counts are the worker's estimate, not the provider's: a call stopped"
+                    + " before the provider sent its usage (contract 1.11.0). Absent means false",
+                    defaultValue = "false") Boolean estimated) {
 
         CallUsage usage() {
-            return new CallUsage(callId, responseId, input, cacheRead, cacheWrite, output, reasoning);
+            return new CallUsage(callId, responseId, input, cacheRead, cacheWrite, output, reasoning,
+                    Boolean.TRUE.equals(estimated));
         }
     }
 
@@ -171,7 +176,8 @@ class JobClaimController {
     }
 
     @Schema(name = "JobEventsReply", requiredProperties = "stop", description = "Whether the worker must stop the"
-            + " answer (always false until the GM can stop one)")
+            + " answer (contract 1.11.0): true once the GM stopped it. The worker then ends the model call, posts no"
+            + " more events, only the usage still to report, and reports the outcome done")
     record JobEventsReply(boolean stop) {
     }
 

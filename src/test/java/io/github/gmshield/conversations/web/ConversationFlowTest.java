@@ -88,6 +88,10 @@ import tools.jackson.databind.json.JsonMapper;
  * <p>Story 2.5: every row of its I/O matrix: the cited passages expanded into numbered references stored by value with
  * the turn and sent on {@code done}, one per place, a bad id dropped, {@code silent} with no reference, a replay with
  * {@code removed} as of now, no reference for a failed answer, and the invariant (references xor silent).
+ *
+ * <p>Story 2.6: every backend row of its I/O matrix: the GM's stop mid-answer, with nothing cited, before the claim,
+ * after the end, then a lapse, and on a foreign turn; the batch reply's {@code stop}; exactly one final event over
+ * stop-then-done, stop-then-failed and stop-then-lapse; an estimated usage stored as one.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -272,6 +276,8 @@ class ConversationFlowTest {
         assertThat(recorded.responseId()).isEqualTo("chatcmpl-1");
         assertThat(recorded.input()).isEqualTo(120);
         assertThat(recorded.output()).isEqualTo(9);
+        // A usage posted without estimated (the previous worker, during the rollout) is not an estimate.
+        assertThat(recorded.estimated()).isFalse();
         // No line carries the question or an answer's text.
         assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
                 + event.getKeyValuePairs()).doesNotContain("Fire Bolt").doesNotContain("dano"));
@@ -790,7 +796,190 @@ class ConversationFlowTest {
         })).isTrue();
     }
 
+    // --- Story 2.6: stop an answer
+
+    @Test
+    void aStopMidAnswerEndsTheTurnAtOnceWithItsReferencesAndTheNextBatchIsToldToStop() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        UUID jobId = jobOf(turnId);
+        Claim claim = claim(jobId);
+        for (HttpResponse<String> posted : List.of(postEvents(claim, 1, List.of(delta("Fire Bolt ")), List.of()),
+                postEvents(claim, 2, List.of(delta("causa 1d10"), citation(passages.getFirst(), 10)), List.of()),
+                postEvents(claim, 3, List.of(delta(" de dano")), List.of()))) {
+            assertThat(posted.statusCode()).as(posted.body()).isEqualTo(200);
+            assertThat(json(posted).path("stop").asBoolean()).isFalse();
+        }
+
+        try (Stream open = open(gm, turnId, "4")) {
+            HttpResponse<String> stopped = stopTurn(gm, turnId);
+
+            assertThat(stopped.statusCode()).as(stopped.body()).isEqualTo(204);
+            assertThat(stopped.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+            // The open stream ends at once with done, before the worker hears of the stop.
+            List<Event> live = open.events(Duration.ofSeconds(2));
+            assertThat(live).extracting(Event::id, Event::name)
+                    .containsExactly(org.assertj.core.groups.Tuple.tuple("5", "done"));
+        }
+        assertThat(conversations.turns.get(turnId).stoppedAt()).isEqualTo(clock.instant());
+        assertThat(jobs.row(jobId).state()).isEqualTo("running");
+
+        UUID call = Ids.newId();
+        HttpResponse<String> fourth = postEvents(claim, 4, List.of(delta(" de fogo.")),
+                List.of(usage(call, "chatcmpl-9", 300, 12, true)));
+        assertThat(fourth.statusCode()).as(fourth.body()).isEqualTo(200);
+        assertThat(json(fourth).path("stop").asBoolean()).isTrue();
+        assertThat(conversations.batches.values().stream().filter(batch -> batch.turnId().equals(turnId)))
+                .extracting(EventBatchRow::batch).doesNotContain(4);
+        assertThat(usage.rows.get(call).estimated()).isTrue();
+        assertThat(usage.rows.get(call).output()).isEqualTo(12);
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+        assertThat(jobs.row(jobId).state()).isEqualTo("done");
+
+        List<Event> events = streamAll(gm, turnId, null);
+        assertThat(events).extracting(Event::name).containsExactly("delta", "delta", "citation", "delta", "done");
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("stopped").asBoolean()).isTrue();
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("references")).extracting(reference -> reference.path("number").asInt())
+                .containsExactly(1);
+        assertThat(references.anyOfTurn(turnId)).hasSize(1);
+        // Stopping again changes nothing.
+        assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+        assertThat(streamAll(gm, turnId, null)).hasSize(5);
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Fire Bolt").doesNotContain("dano"));
+    }
+
+    @Test
+    void aStopWithNothingCitedIsStoppedAndNeverSilent() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+        postEvents(claim, 1, List.of(delta("Fire Bolt ")), List.of());
+
+        assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name).containsExactly("delta", "done");
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("stopped").asBoolean()).isTrue();
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("references")).isEmpty();
+        assertThat(references.anyOfTurn(turnId)).isEmpty();
+    }
+
+    @Test
+    void aStopBeforeTheClaimCancelsTheJobAndEndsTheTurnWithNoText() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        UUID jobId = jobOf(turnId);
+        assertThat(jobs.row(jobId).state()).isEqualTo("offered");
+
+        assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+
+        assertThat(jobs.row(jobId).state()).isEqualTo("cancelled");
+        assertThat(sendAsWorker("POST", "/internal/v1/jobs/" + jobId + "/claims", "{\"providers\":[\"azure-openai\"]}",
+                null).statusCode()).isEqualTo(409);
+        List<Event> events = streamAll(gm, turnId, null);
+        assertThat(events).extracting(Event::id, Event::name)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple("1", "done"));
+        assertThat(done(gm, turnId, null).path("stopped").asBoolean()).isTrue();
+    }
+
+    @Test
+    void aStopAfterTheEndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID finished = answered(gm, QUESTION, List.of(delta("Um.")));
+        UUID failedTurn = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(failedTurn));
+        postEvents(claim, 1, List.of(delta("a")), List.of());
+        report(claim, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}");
+        long batches = conversations.batches.size();
+
+        for (UUID turnId : List.of(finished, failedTurn)) {
+            assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+            assertThat(conversations.turns.get(turnId).stoppedAt()).isNull();
+        }
+
+        assertThat(conversations.batches).hasSize((int) batches);
+        assertThat(done(gm, finished, null).path("stopped").asBoolean()).isFalse();
+        assertThat(streamAll(gm, failedTurn, null)).extracting(Event::name).containsExactly("delta", "error");
+        assertThat(jobs.row(jobOf(finished)).state()).isEqualTo("done");
+        assertThat(jobs.row(jobOf(failedTurn)).state()).isEqualTo("failed");
+    }
+
+    @Test
+    void aStopThenALapseFailsTheJobWithoutOfferingItAgainOrASecondFinalEvent() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        UUID jobId = jobOf(turnId);
+        claim(jobId);
+        assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+
+        clock.advance(Duration.ofSeconds(100));
+        sweep.sweep();
+
+        assertThat(jobs.row(jobId).state()).isEqualTo("failed");
+        assertThat(jobs.row(jobId).outcomeCode()).isEqualTo("job.claim_lapsed");
+        assertThat(stream.offered("gmshield:work:interactive").stream().filter(jobId::equals)).hasSize(1);
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name).containsExactly("done");
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).isEqualTo("job.failed");
+            assertThat(event.getKeyValuePairs().toString()).contains(jobId.toString()).contains("job.claim_lapsed");
+        });
+    }
+
+    @Test
+    void aStopThenAFailureEndsTheJobWithoutAnErrorEvent() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        UUID jobId = jobOf(turnId);
+        Claim claim = claim(jobId);
+        postEvents(claim, 1, List.of(delta("Fire Bolt"), citation(passages.getFirst(), 9)), List.of());
+        stopTurn(gm, turnId);
+        int stored = references.anyOfTurn(turnId).size();
+
+        assertThat(report(claim, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}").statusCode())
+                .isEqualTo(204);
+
+        assertThat(jobs.row(jobId).state()).isEqualTo("failed");
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name).containsExactly("delta", "citation", "done");
+        assertThat(references.anyOfTurn(turnId)).hasSize(stored).hasSize(1);
+    }
+
+    @Test
+    void anotherOwnersTurnCannotBeStopped() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        accepted(them, 1);
+        UUID theirTurn = turnId(ask(them, them.campaign(), QUESTION));
+        UUID theirJob = jobOf(theirTurn);
+
+        for (String id : List.of(theirTurn.toString(), UUID.randomUUID().toString(), "nope")) {
+            HttpResponse<String> refused = send(gm, "POST", "/api/v1/turns/" + id + "/stop", "");
+            assertProblem(refused, 404, "request.not_found");
+            assertThat(refused.body()).doesNotContain(theirTurn.toString());
+        }
+
+        assertThat(jobs.row(theirJob).state()).isEqualTo("offered");
+        assertThat(conversations.anyTurnOfJob(theirJob).orElseThrow().stoppedAt()).isNull();
+        assertThat(conversations.batches.values().stream().filter(batch -> batch.turnId().equals(theirTurn)))
+                .isEmpty();
+    }
+
     // --- helpers
+
+    private HttpResponse<String> stopTurn(Gm gm, UUID turnId) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri("/api/v1/turns/" + turnId + "/stop"))
+                .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+    }
 
     private List<UUID> accepted(Gm gm, int count) {
         return source(gm, gm.campaign(), java.util.Collections.nCopies(count, 1)).passages();
@@ -831,15 +1020,21 @@ class ConversationFlowTest {
         return turnId;
     }
 
-    /** The data of the turn's done event, after the invariant: references non-empty exactly when not silent. */
+    /**
+     * The data of the turn's done event, after the invariant: silent exactly when not stopped and with no reference
+     * (Story 2.6), and the turn has one final event, its last.
+     */
     private JsonNode done(Gm gm, UUID turnId, String lastEventId) throws Exception {
         List<Event> events = streamAll(gm, turnId, lastEventId);
         assertThat(events).isNotEmpty();
         assertThat(events.getLast().name()).isEqualTo("done");
+        assertThat(events).filteredOn(event -> "done".equals(event.name()) || "error".equals(event.name())).hasSize(1);
         JsonNode data = JSON.readTree(events.getLast().data());
+        assertThat(data.path("stopped").isBoolean()).isTrue();
         assertThat(data.path("silent").isBoolean()).isTrue();
         assertThat(data.path("references").isArray()).isTrue();
-        assertThat(data.path("silent").asBoolean()).isEqualTo(data.path("references").isEmpty());
+        assertThat(data.path("silent").asBoolean())
+                .isEqualTo(!data.path("stopped").asBoolean() && data.path("references").isEmpty());
         return data;
     }
 
@@ -910,6 +1105,11 @@ class ConversationFlowTest {
     }
 
     private static Map<String, Object> usage(UUID callId, String responseId, long input, long output) {
+        return usage(callId, responseId, input, output, null);
+    }
+
+    private static Map<String, Object> usage(UUID callId, String responseId, long input, long output,
+                                             Boolean estimated) {
         Map<String, Object> call = new LinkedHashMap<>();
         call.put("callId", callId.toString());
         if (responseId != null) {
@@ -920,6 +1120,9 @@ class ConversationFlowTest {
         call.put("cacheWrite", 0);
         call.put("output", output);
         call.put("reasoning", 0);
+        if (estimated != null) {
+            call.put("estimated", estimated);
+        }
         return call;
     }
 

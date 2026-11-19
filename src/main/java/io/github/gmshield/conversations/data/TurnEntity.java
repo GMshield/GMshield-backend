@@ -8,7 +8,10 @@ import java.time.Instant;
 import java.util.UUID;
 import org.hibernate.annotations.TenantId;
 
-/** {@code turn}: written once. Hibernate fills {@code owner_id} and filters every query by it. */
+/**
+ * {@code turn}: written once, but for {@code stopped_at}, set once by the GM's stop (Story 2.6). Hibernate fills
+ * {@code owner_id} and filters every query by it.
+ */
 @Entity(name = "Turn")
 @Table(name = "turn")
 class TurnEntity {
@@ -45,6 +48,9 @@ class TurnEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    @Column(name = "stopped_at")
+    private Instant stoppedAt;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -60,10 +66,15 @@ class TurnEntity {
         this.systemTier = row.systemTier();
         this.modelKnowledge = row.modelKnowledge();
         this.createdAt = row.createdAt();
+        this.stoppedAt = row.stoppedAt();
+    }
+
+    void stop(Instant at) {
+        this.stoppedAt = at;
     }
 
     TurnRow row() {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                modelKnowledge, createdAt);
+                modelKnowledge, createdAt, stoppedAt);
     }
 }
