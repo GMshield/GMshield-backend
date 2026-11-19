@@ -19,7 +19,8 @@ import org.springframework.stereotype.Service;
  * <ol>
  *   <li>creates the consumer group {@code workers} on each stream when it is missing (a new or a flushed Redis);</li>
  *   <li>takes back lapsed claims: the job goes back to waiting while attempts remain, otherwise it ends
- *       {@code failed} with {@code job.attempts_exhausted};</li>
+ *       {@code failed} with {@code job.attempts_exhausted}; a job that delivered an event (Story 2.4,
+ *       {@link JobHandler#delivered}) ends {@code failed} with {@code job.claim_lapsed} at once;</li>
  *   <li>offers again every job offered longer than the re-offer delay without a claim (Redis lost the message);</li>
  *   <li>offers waiting jobs (an earlier offer failed, or a job just went back to waiting);</li>
  *   <li>removes the outputs no handler adopted once their job ended (Story 1.15): the file's pieces, then its row;
@@ -97,8 +98,12 @@ public class JobSweep {
 
     private void takeBack(JobRow lapsed, Instant now) {
         Lane lane = Lane.of(lapsed.lane()).orElseThrow();
-        if (lapsed.attempt() < settings.maxAttempts()) {
-            JobRow waiting = lapsed.released(JobState.WAITING, "job.claim_lapsed", now);
+        Optional<JobHandler> handler = handlers.find(lapsed.kind());
+        // No splice (Story 2.4): a job that delivered an event is never offered again, whatever its attempts.
+        boolean delivered = handler.isPresent() && Boolean.TRUE.equals(JobTrace.call(lapsed.traceId(), () ->
+                owners.read(lapsed.ownerId(), () -> handler.get().delivered(JobClaims.ref(lapsed)))));
+        if (!delivered && lapsed.attempt() < settings.maxAttempts()) {
+            JobRow waiting = lapsed.released(JobState.WAITING, JobProblems.CLAIM_LAPSED, now);
             if (storage.separately(store -> store.replace(lapsed, waiting))) {
                 JobTrace.run(lapsed.traceId(), () -> log.atWarn().addKeyValue("jobId", lapsed.id())
                         .addKeyValue("claimId", lapsed.claimId()).addKeyValue("attempt", lapsed.attempt())
@@ -107,8 +112,8 @@ public class JobSweep {
             }
             return;
         }
-        JobRow failed = lapsed.released(JobState.FAILED, JobProblems.ATTEMPTS_EXHAUSTED, now);
-        Optional<JobHandler> handler = handlers.find(lapsed.kind());
+        String code = delivered ? JobProblems.CLAIM_LAPSED : JobProblems.ATTEMPTS_EXHAUSTED;
+        JobRow failed = lapsed.released(JobState.FAILED, code, now);
         boolean ended = handler.isEmpty()
                 ? storage.separately(store -> store.replace(lapsed, failed))
                 : JobTrace.call(lapsed.traceId(), () -> owners.call(lapsed.ownerId(), () -> {
@@ -116,7 +121,7 @@ public class JobSweep {
                     if (current == null || !storage.joined().replace(lapsed, failed)) {
                         return false;
                     }
-                    handler.get().failed(JobClaims.ref(lapsed), JobProblems.ATTEMPTS_EXHAUSTED);
+                    handler.get().failed(JobClaims.ref(lapsed), code);
                     return true;
                 }));
         if (ended) {

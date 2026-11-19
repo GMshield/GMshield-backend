@@ -1,7 +1,10 @@
 package io.github.gmshield.jobs.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
+import io.github.gmshield.jobs.service.JobEvent;
+import io.github.gmshield.jobs.service.JobEventBatch;
 import io.github.gmshield.jobs.service.ModelChoice;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -113,6 +116,65 @@ class JobClaimController {
             @Schema(description = "For done only: the result for the job's handler") Map<String, Object> result) {
     }
 
+    @Schema(name = "JobStreamEvent", requiredProperties = "type", description = "One answer event (contract 1.10.0): a"
+            + " delta with its display text, or a citation of a given passage id at a code-point offset of the answer's"
+            + " text")
+    record JobStreamEvent(
+            @Schema(allowableValues = {"delta", "citation"}) String type,
+            @Schema(description = "For delta only: 1 to 16,384 code points of display text, citation markers removed",
+                    maxLength = JobClaims.MAX_DELTA) String text,
+            @Schema(description = "For citation only: the cited passage's id", format = "uuid") UUID passageId,
+            @Schema(description = "For citation only: where the citation stands, in code points of the answer's text",
+                    minimum = "0", format = "int32") Integer offset) {
+
+        JobEvent event() {
+            return new JobEvent(type, text, passageId, offset);
+        }
+
+        @Override
+        public String toString() {
+            return "JobStreamEvent[type=" + type + "]";
+        }
+    }
+
+    @Schema(name = "JobCallUsage", requiredProperties = {"callId", "input", "cacheRead", "cacheWrite", "output",
+            "reasoning"}, description = "One model call's tokens (contract 1.10.0), recorded once by its call id")
+    record JobCallUsage(
+            @Schema(description = "The worker's id of the call (a UUIDv7)", format = "uuid") UUID callId,
+            @Schema(description = "The provider's response id, when it sent one", maxLength = 256) String responseId,
+            @Schema(description = "Input tokens, cache reads and writes included", minimum = "0", format = "int64")
+            long input,
+            @Schema(minimum = "0", format = "int64") long cacheRead,
+            @Schema(minimum = "0", format = "int64") long cacheWrite,
+            @Schema(description = "Output tokens, reasoning included", minimum = "0", format = "int64") long output,
+            @Schema(minimum = "0", format = "int64") long reasoning) {
+
+        CallUsage usage() {
+            return new CallUsage(callId, responseId, input, cacheRead, cacheWrite, output, reasoning);
+        }
+    }
+
+    @Schema(name = "JobEvents", requiredProperties = {"batch", "events"}, description = "A numbered batch of answer"
+            + " events of the claim (contract 1.10.0), with the usage of the model calls that ended since the last one")
+    record JobEventsRequest(
+            @Schema(description = "From 1 per claim, one more each time; a repeated number is accepted and stored once",
+                    minimum = "1", format = "int32") Integer batch,
+            @ArraySchema(maxItems = JobClaims.MAX_EVENTS, arraySchema = @Schema(description = "In order; may be empty"),
+                    schema = @Schema(implementation = JobStreamEvent.class)) List<JobStreamEvent> events,
+            @ArraySchema(maxItems = JobClaims.MAX_USAGE, arraySchema = @Schema(description = "Absent means none"),
+                    schema = @Schema(implementation = JobCallUsage.class)) List<JobCallUsage> usage) {
+
+        @Override
+        public String toString() {
+            return "JobEventsRequest[batch=" + batch + "]";
+        }
+    }
+
+    @Schema(name = "JobEventsReply", requiredProperties = "stop", description = "Whether the worker must stop the"
+            + " answer (always false until the GM can stop one)")
+    record JobEventsReply(boolean stop) {
+    }
+
     @PostMapping(produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
     @Operation(operationId = "claimJob", summary = "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for"
@@ -150,5 +212,29 @@ class JobClaimController {
         JsonNode result = body.result() == null ? null : JSON.valueToTree(body.result());
         claims.report(jobId, claimId, grant, body.outcome(), body.code(), body.retry(), result);
         return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping(path = "/{claimId}/events", consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "postJobEvents", summary = "Post a numbered batch of answer events of the live claim and"
+            + " the usage of its model calls (400 request.invalid for a malformed body, before the grant is checked; 403"
+            + " job.grant_refused; 400 job.events_invalid; 403 job.events_refused for a kind that streams no events; 409"
+            + " job.batch_out_of_order, with nothing stored, for a number past the next one of the claim)")
+    ResponseEntity<JobEventsReply> events(@PathVariable UUID jobId, @PathVariable UUID claimId,
+                                          @Parameter(in = ParameterIn.HEADER, name = GRANT_HEADER, required = true,
+                                                  description = "The claim's grant")
+                                          @RequestHeader(name = GRANT_HEADER, required = false) String grant,
+                                          @RequestBody JobEventsRequest body) {
+        List<JobEvent> events = body.events() == null ? null
+                : body.events().stream().map(event -> event == null ? null : event.event()).toList();
+        JobEventBatch batch = body.batch() == null || events == null ? null
+                : new JobEventBatch(claimId, body.batch(), events.stream().filter(java.util.Objects::nonNull).toList());
+        if (events != null && events.contains(null)) {
+            batch = null;
+        }
+        List<CallUsage> usage = body.usage() == null ? List.of()
+                : body.usage().stream().map(call -> call == null ? null : call.usage()).toList();
+        boolean stop = claims.events(jobId, claimId, grant, batch, usage);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new JobEventsReply(stop));
     }
 }

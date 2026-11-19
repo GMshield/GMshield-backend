@@ -83,11 +83,13 @@ public class JobClaims {
     private final Vault vault;
     private final ApplicationEventPublisher events;
     private final ModelChoices models;
+    private final UsageReports usage;
     /** The index recipe the worker stated last since this backend started; null before the first. */
     private final AtomicReference<String> statedRecipe = new AtomicReference<>();
 
     JobClaims(JobStorage storage, JobHandlers handlers, JobOffers offers, OwnerWork owners, JobSettings settings,
-              JobClock clock, Vault vault, ApplicationEventPublisher events, ModelChoices models) {
+              JobClock clock, Vault vault, ApplicationEventPublisher events, ModelChoices models,
+              UsageReports usage) {
         this.storage = storage;
         this.handlers = handlers;
         this.offers = offers;
@@ -97,6 +99,7 @@ public class JobClaims {
         this.vault = vault;
         this.events = events;
         this.models = models;
+        this.usage = usage;
     }
 
     /**
@@ -331,6 +334,105 @@ public class JobClaims {
         }
     }
 
+    /** The most events one batch may carry. */
+    public static final int MAX_EVENTS = 500;
+    /** The longest delta text, in code points. */
+    public static final int MAX_DELTA = 16_384;
+    /** The most call usages one batch may carry. */
+    public static final int MAX_USAGE = 16;
+    /** A provider's response id: printable ASCII, at most 256 characters. */
+    static final Pattern RESPONSE_ID = Pattern.compile("[\\x21-\\x7E]{1,256}");
+
+    /**
+     * A numbered batch of answer events of the live claim (Story 2.4, internal contract 1.10.0), with the usage of the
+     * model calls that ended since the last batch. The live claim's grant comes first ({@code job.grant_refused}, 403),
+     * then the batch ({@code job.events_invalid}, 400: a number below 1, more than {@value #MAX_EVENTS} events, an event
+     * that is not a delta of 1 to {@value #MAX_DELTA} code points or a citation of a passage id at an offset from 0,
+     * more than {@value #MAX_USAGE} usages, or a usage without its call id or with a negative count). Then, as the owner
+     * and on the job's locked row, the handler stores the batch ({@link JobHandler#events}: once per claim and number, a
+     * gap {@code job.batch_out_of_order}, 409; a kind without events {@code job.events_refused}, 403) and the usage is
+     * recorded once per call id ({@link UsageReports}), in that one transaction. Answers whether the worker must stop:
+     * never yet (Story 2.6 adds the GM's stop). Lines carry ids and counts only.
+     */
+    public boolean events(UUID jobId, UUID claimId, String grant, JobEventBatch batch, List<CallUsage> calls) {
+        Instant now = clock.now();
+        byte[] presented = hashOf(grant);
+        JobRow seen = storage.joined().find(jobId).orElse(null);
+        if (seen == null || !grantMatches(seen, claimId, presented, now)) {
+            refusedGrant(jobId);
+            throw JobProblems.grantRefused();
+        }
+        List<CallUsage> usage = calls == null ? List.of() : calls;
+        if (batch == null || !validBatch(batch) || !validUsage(usage)) {
+            JobTrace.run(seen.traceId(), () -> log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
+                    .addKeyValue("reason", JobProblems.EVENTS_INVALID.code()).log("request.refused"));
+            throw JobProblems.eventsInvalid();
+        }
+        Optional<JobHandler> handler = handlers.find(seen.kind());
+        JobTrace.run(seen.traceId(), () -> {
+            try {
+                owners.call(seen.ownerId(), () -> {
+                    JobRow current = storage.joined().findForUpdate(jobId).orElse(null);
+                    if (current == null || !grantMatches(current, claimId, presented, clock.now())) {
+                        throw JobProblems.grantRefused();
+                    }
+                    JobRef job = ref(current);
+                    handler.orElseThrow(JobProblems::eventsRefused).events(job, batch);
+                    if (!usage.isEmpty() && current.modelProvider() != null) {
+                        this.usage.record(job, new ModelChoice(current.modelProvider(), current.modelId(),
+                                current.modelTier()), List.copyOf(usage));
+                    }
+                    return null;
+                });
+            } catch (io.github.gmshield.shared.service.ApiException refused) {
+                log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
+                        .addKeyValue("batch", batch.number()).addKeyValue("reason", refused.problem().code())
+                        .log("request.refused");
+                throw refused;
+            }
+            log.atDebug().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
+                    .addKeyValue("batch", batch.number()).addKeyValue("events", batch.events().size())
+                    .addKeyValue("usage", usage.size()).log("job.events_posted");
+        });
+        return false;
+    }
+
+    /** A number from 1, at most {@value #MAX_EVENTS} events, each a delta or a citation as {@link #events} says. */
+    static boolean validBatch(JobEventBatch batch) {
+        if (batch.number() < 1 || batch.events().size() > MAX_EVENTS) {
+            return false;
+        }
+        for (JobEvent event : batch.events()) {
+            boolean valid = event != null && switch (event.type()) {
+                case JobEvent.DELTA -> event.text() != null && !event.text().isEmpty()
+                        && event.text().codePointCount(0, event.text().length()) <= MAX_DELTA
+                        && event.passageId() == null && event.offset() == null;
+                case JobEvent.CITATION -> event.text() == null && event.passageId() != null && event.offset() != null
+                        && event.offset() >= 0;
+                case null, default -> false;
+            };
+            if (!valid) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** At most {@value #MAX_USAGE} usages, each with its call id, counts from 0 and a response id that is one. */
+    static boolean validUsage(List<CallUsage> usage) {
+        if (usage.size() > MAX_USAGE) {
+            return false;
+        }
+        for (CallUsage call : usage) {
+            if (call == null || call.callId() == null || call.input() < 0 || call.cacheRead() < 0
+                    || call.cacheWrite() < 0 || call.output() < 0 || call.reasoning() < 0
+                    || call.responseId() != null && !RESPONSE_ID.matcher(call.responseId()).matches()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** What the worker reported, once checked. */
     private record Reported(boolean done, boolean lastAttempt, String code, JsonNode result) {
     }
@@ -343,10 +445,13 @@ public class JobClaims {
             throw JobProblems.grantRefused();
         }
         String code = reported.code() == null ? JobProblems.FAILED : reported.code();
+        JobRef job = ref(current);
+        // No splice (Story 2.4): a job that delivered an event is never offered again.
+        boolean delivered = !reported.done() && handler.map(h -> h.delivered(job)).orElse(false);
         JobRow next;
         if (reported.done()) {
             next = current.released(JobState.DONE, null, now);
-        } else if (!reported.lastAttempt() && current.attempt() < settings.maxAttempts()) {
+        } else if (!reported.lastAttempt() && !delivered && current.attempt() < settings.maxAttempts()) {
             next = current.released(JobState.WAITING, code, now);
         } else {
             next = current.released(JobState.FAILED, code, now);
@@ -354,7 +459,6 @@ public class JobClaims {
         if (!storage.joined().replace(current, next)) {
             throw JobProblems.grantRefused();
         }
-        JobRef job = ref(current);
         if (reported.done()) {
             JsonNode result = reported.result() == null ? JsonNodeFactory.instance.objectNode() : reported.result();
             handler.ifPresent(h -> h.completed(job, result));
