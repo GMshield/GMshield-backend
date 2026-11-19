@@ -23,6 +23,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -191,6 +192,154 @@ class ScopesTest {
         // A version out of the scope pends nothing in it.
         assertThat(as(gm.owner(), () -> scopes.resolve(gm.campaign(), new ScopeSettings(false, true, false, false)))
                 .pending()).isEmpty();
+    }
+
+    // --- indexing (the GM's notice)
+
+    /** {@code count} passages of the version, and its index changes as IndexChanges makes them: runs of 200. */
+    private List<UUID> indexed(UUID owner, UUID version, String tag, int count) {
+        List<UUID> runs = new ArrayList<>();
+        fixture.passages(owner, version, tag, count);
+        for (int first = 0; first < count; first += 200) {
+            UUID job = Ids.newId();
+            fixture.indexChange(owner, job, version, first, Math.min(first + 200, count) - 1);
+            runs.add(job);
+        }
+        return runs;
+    }
+
+    @Test
+    void theIndexingCountsThePassagesStillPendingWithoutReadingOne() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID srd = fixture.material(gm.owner(), null, gm.system(), "ready").getFirst();
+        UUID coimbra = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        List<UUID> srdRuns = indexed(gm.owner(), srd, "S", 3142);
+        indexed(gm.owner(), coimbra, "C", 779);
+        // Matrix row "Indexing": the SRD's first ten runs (2,000 passages) have not ended; every run of Coimbra has.
+        unended.addAll(srdRuns.subList(0, 10));
+        // No passage's text or place opens: the count reads none.
+        materials.passages.replaceAll((id, row) -> new PassageRow(row.id(), row.ownerId(), row.versionId(),
+                row.ordinal(), row.page(), new byte[] {1, 2, 3}, new byte[] {4, 5, 6}, row.createdAt()));
+
+        Optional<Indexing> indexing = as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING));
+
+        assertThat(indexing).contains(new Indexing(2000));
+        // As runs end the count falls; once none is left, there is no count (matrix row "Nothing pending").
+        unended.removeAll(srdRuns.subList(0, 9));
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING)))
+                .contains(new Indexing(200));
+        unended.clear();
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING))).isEmpty();
+    }
+
+    @Test
+    void theStatusSaysWhetherTheScopeHasASourceAndCountsItsPendingPassagesFromOneLookUp() {
+        ScopeFixture.Starter gm = fixture.starter();
+        // No accepted material: no source, no count.
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(false, null));
+        UUID a = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        List<UUID> runs = indexed(gm.owner(), a, "A", 250);
+        // Every passage indexed: a source, no count.
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, null));
+        // Every passage pending: a source (as resolve says, with its pending passages), and the count.
+        unended.addAll(runs);
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)))
+                .isEqualTo(new ScopeStatus(true, new Indexing(250)));
+        ResolvedScope scope = as(gm.owner(), () -> scopes.resolve(gm.campaign(), ScopeSettings.STARTING));
+        assertThat(!scope.allowedSources().isEmpty() || !scope.pending().isEmpty()).isTrue();
+        // A tier switched off: no source.
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), new ScopeSettings(false, false, false, false))))
+                .isEqualTo(new ScopeStatus(false, null));
+    }
+
+    @Test
+    void twoPendingVersionsAddUpAndTheCountFallsWhenOneEnds() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID a = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        UUID b = fixture.material(gm.owner(), null, gm.system(), "ready").getFirst();
+        List<UUID> aRuns = indexed(gm.owner(), a, "A", 300);
+        List<UUID> bRuns = indexed(gm.owner(), b, "B", 50);
+        // Matrix row "Two versions": A's second run (100 passages) and B's one run (50) pending.
+        unended.add(aRuns.get(1));
+        unended.addAll(bRuns);
+
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING)))
+                .contains(new Indexing(150));
+        // A tier switched off is not counted.
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), new ScopeSettings(true, false, false, false))))
+                .contains(new Indexing(100));
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), new ScopeSettings(false, false, false, false))))
+                .isEmpty();
+        // Matrix row "One finishes": B's run ends; the number falls and never rises.
+        unended.removeAll(bRuns);
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING)))
+                .contains(new Indexing(100));
+    }
+
+    @Test
+    void aPassageCoveredByTwoUnendedRunsIsCountedOnce() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID a = fixture.material(gm.owner(), gm.campaign(), null, "ready").getFirst();
+        fixture.passages(gm.owner(), a, "A", 30);
+        UUID first = Ids.newId();
+        UUID second = Ids.newId();
+        UUID third = Ids.newId();
+        fixture.indexChange(gm.owner(), first, a, 0, 14);
+        fixture.indexChange(gm.owner(), second, a, 10, 19);
+        fixture.indexChange(gm.owner(), third, a, 25, 40);
+        unended.addAll(List.of(first, second, third));
+
+        // 0 to 19 (20 passages) and 25 to 29 (5; the run goes past the last passage).
+        assertThat(as(gm.owner(), () -> scopes.indexing(gm.campaign(), ScopeSettings.STARTING)))
+                .contains(new Indexing(25));
+    }
+
+    @Test
+    void nothingOutOfScopeAnEndedOrFailedChangeOrAVersionNotReadyIsCounted() {
+        Library2 lib = twoTiers();
+        UUID owner = lib.gm().owner();
+        // Everything indexed: no count.
+        assertThat(as(owner, () -> scopes.indexing(lib.gm().campaign(), ScopeSettings.STARTING))).isEmpty();
+        // Matrix row "Out of scope": another campaign's version (C), a version under review and another owner's are
+        // pending: still no count.
+        UUID cJob = Ids.newId();
+        fixture.indexChange(owner, cJob, lib.c(), 0, 1);
+        UUID reviewing = fixture.material(owner, lib.gm().campaign(), null, "needs_review").getFirst();
+        List<UUID> reviewingRuns = indexed(owner, reviewing, "R", 5);
+        ScopeFixture.Starter them = fixture.starter();
+        UUID theirs = fixture.material(them.owner(), them.campaign(), null, "ready").getFirst();
+        List<UUID> theirRuns = indexed(them.owner(), theirs, "T", 5);
+        unended.add(cJob);
+        unended.addAll(reviewingRuns);
+        unended.addAll(theirRuns);
+        // Matrix row "Failed change": A's only change ended (failed, cancelled or done: the jobs module answers it as
+        // ended).
+        UUID aJob = Ids.newId();
+        fixture.indexChange(owner, aJob, lib.a(), 0, 2);
+
+        assertThat(as(owner, () -> scopes.indexing(lib.gm().campaign(), ScopeSettings.STARTING))).isEmpty();
+        // The other campaign's own scope counts C; the other owner's counts theirs.
+        UUID other = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+        assertThat(as(owner, () -> scopes.indexing(other, ScopeSettings.STARTING))).contains(new Indexing(2));
+        assertThat(as(them.owner(), () -> scopes.indexing(them.campaign(), ScopeSettings.STARTING)))
+                .contains(new Indexing(5));
+        // A run of an unended change with no passage in it counts nothing.
+        UUID emptyRun = Ids.newId();
+        fixture.indexChange(owner, emptyRun, lib.a(), 50, 60);
+        unended.add(emptyRun);
+        assertThat(as(owner, () -> scopes.indexing(lib.gm().campaign(), ScopeSettings.STARTING))).isEmpty();
+        // An unknown campaign, or another owner's, is not found, as for resolve; and an owner is required.
+        for (UUID campaign : java.util.Arrays.asList(them.campaign(), Ids.newId(), null)) {
+            assertThatThrownBy(() -> as(owner, () -> scopes.indexing(campaign, ScopeSettings.STARTING)))
+                    .isInstanceOfSatisfying(ApiException.class,
+                            e -> assertThat(e.problem().code()).isEqualTo("request.not_found"));
+        }
+        assertThatThrownBy(() -> scopes.indexing(lib.gm().campaign(), ScopeSettings.STARTING))
+                .isInstanceOf(OwnerContext.NoOwnerException.class);
+        assertThatThrownBy(() -> new Indexing(0)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new Indexing(-1)).isInstanceOf(IllegalArgumentException.class);
     }
 
     // --- passages by id

@@ -68,11 +68,27 @@ class ConversationController {
         this.streams = streams;
     }
 
-    @Schema(name = "CurrentConversation", requiredProperties = {"campaignId", "hasSources"})
+    @Schema(name = "CurrentConversation", requiredProperties = {"campaignId", "hasSources", "indexing"})
     record CurrentView(
             @Schema(description = "The current campaign's id", format = "uuid") UUID campaignId,
             @Schema(description = "Whether the campaign's scope has an accepted source (an allowed source, or one whose"
-                    + " index change is still pending)") boolean hasSources) {
+                    + " index change is still pending)") boolean hasSources,
+            @Schema(description = "How many passages of the campaign's scope are still being prepared for search (the"
+                    + " distinct in-scope passages covered by an index change that has not ended); null when nothing in"
+                    + " scope is pending", types = {"object", "null"}, implementation = IndexingView.class)
+            IndexingView indexing) {
+
+        static CurrentView of(Conversations.Current current) {
+            return new CurrentView(current.campaignId(), current.hasSources(),
+                    current.indexing() == null ? null : new IndexingView(current.indexing().remaining()));
+        }
+    }
+
+    @Schema(name = "IndexingCount", requiredProperties = {"remaining"},
+            description = "Passages still being prepared for search")
+    record IndexingView(
+            @Schema(description = "The passages of the campaign's scope still waiting for search", format = "int32",
+                    minimum = "1", example = "2000") int remaining) {
     }
 
     @Schema(name = "NewTurn", requiredProperties = "question")
@@ -179,14 +195,15 @@ class ConversationController {
     }
 
     @GetMapping(path = CURRENT, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getCurrentConversation", summary = "The current campaign's conversation: its campaign and"
-            + " whether it has an accepted source; request.not_found (404) when the account has no campaign",
+    @Operation(operationId = "getCurrentConversation", summary = "The current campaign's conversation: its campaign,"
+            + " whether it has an accepted source, and how many of its passages are still being prepared for search"
+            + " (null when nothing is pending); request.not_found (404) when the account has no campaign",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<CurrentView> current() {
         Conversations.Current current = conversations.current();
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .body(new CurrentView(current.campaignId(), current.hasSources()));
+                .body(CurrentView.of(current));
     }
 
     @PostMapping(path = TURNS, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)

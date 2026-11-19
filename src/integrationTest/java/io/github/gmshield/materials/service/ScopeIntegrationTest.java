@@ -16,6 +16,7 @@ import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
+import io.github.gmshield.scope.service.Indexing;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.ScopedPassage;
@@ -120,12 +121,15 @@ class ScopeIntegrationTest {
         assertThat(as(owner, () -> reads.readyOfCampaign(campaign.id()))).containsExactly(a.get(1));
         assertThat(as(owner, () -> reads.readyOfSystem(system))).containsExactly(b.getFirst());
         assertThat(as(owner, () -> store.passageIds(a.get(1), 3, 5))).containsExactlyElementsOf(aPassages.subList(3, 6));
+        assertThat(as(owner, () -> store.countPassages(a.get(1), 3, 5))).isEqualTo(3L);
+        assertThat(as(owner, () -> store.countPassages(a.get(1), 0, 999))).isEqualTo(450L);
         assertThat(as(owner, () -> store.findPassages(List.of(bPassages.get(1), cPassages.getFirst(), Ids.newId()))))
                 .extracting(PassageRow::id).containsExactlyInAnyOrder(bPassages.get(1), cPassages.getFirst());
         UUID other = Ids.newId();
         assertThat(as(other, () -> store.readyOfCampaign(campaign.id()))).isEmpty();
         assertThat(as(other, () -> store.readyOfSystem(system))).isEmpty();
         assertThat(as(other, () -> store.passageIds(a.get(1), 0, 449))).isEmpty();
+        assertThat(as(other, () -> store.countPassages(a.get(1), 0, 449))).isZero();
         assertThat(as(other, () -> store.findPassages(aPassages))).isEmpty();
 
         // The scope: A in the campaign tier, B in the system tier, C absent; the second run of A pending.
@@ -133,6 +137,9 @@ class ScopeIntegrationTest {
         assertThat(scope.sources(Tier.CAMPAIGN)).containsExactly(a.get(1));
         assertThat(scope.sources(Tier.SYSTEM)).containsExactly(b.getFirst());
         assertThat(scope.pending()).containsExactlyElementsOf(aPassages.subList(200, 400));
+        // The indexing count: the 200 passages of A's pending run.
+        assertThat(as(owner, () -> scopes.indexing(campaign.id(), ScopeSettings.STARTING)))
+                .contains(new Indexing(200));
 
         List<ScopedPassage> read = as(owner, () -> scopes.passages(scope, List.of(bPassages.getFirst(),
                 aPassages.get(7), bPassages.getFirst())));

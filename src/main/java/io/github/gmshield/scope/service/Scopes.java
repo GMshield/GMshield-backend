@@ -8,6 +8,7 @@ import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Vault;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -37,6 +38,13 @@ import tools.jackson.databind.node.ObjectNode;
  *       is left out of it). A tier switched off has no source. {@code pending} names the in-scope passages whose index
  *       change has not ended. A campaign that is not found (unknown, or another owner's) is {@code request.not_found}
  *       (404).</li>
+ *   <li>{@link #indexing}: how many passages of the campaign's scope under {@code settings} are still waiting for
+ *       search, over the same sources as {@link #resolve}: the distinct passages of the in-scope versions covered by
+ *       an index change that has not ended. Counted, never read, and kept out of {@link #resolve} so a question is not
+ *       slowed. Empty when nothing in scope is pending; an unknown campaign is {@code request.not_found} (404), as for
+ *       {@link #resolve}. {@link #status} answers it with whether the scope has a source (an allowed source: a pending
+ *       passage always belongs to one), from the same one look-up of the sources; the line {@code scope.indexing} is
+ *       at DEBUG, since the GM's notice asks for it every few seconds.</li>
  *   <li>{@link #passages}: passages by id within a resolved scope, decrypted and labelled with their tier, in the
  *       order asked, each once. Every id is checked first: when any is not a passage of an allowed source that is
  *       still {@code ready} (unknown, another owner's, of a version no longer {@code ready}, or out of every tier), the
@@ -94,18 +102,9 @@ public class Scopes {
         Objects.requireNonNull(settings, "settings");
         UUID owner = OwnerContext.require();
         return reading(() -> {
-            Optional<Library.Campaign> found = campaignId == null ? Optional.empty() : library.campaign(campaignId);
-            if (found.isEmpty()) {
-                log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("reason", "request.not_found")
-                        .log("scope.campaign_not_found");
-                throw new ApiException(ApiProblem.forStatus(404));
-            }
-            Library.Campaign campaign = found.get();
-            List<UUID> campaignSources = settings.campaignTier() ? reads.readyOfCampaign(campaign.id()) : List.of();
-            List<UUID> systemSources = settings.systemTier()
-                    ? reads.readyOfSystem(campaign.system().id()).stream()
-                            .filter(source -> !campaignSources.contains(source)).toList()
-                    : List.of();
+            Library.Campaign campaign = campaignOf(campaignId);
+            List<UUID> campaignSources = campaignSources(campaign, settings);
+            List<UUID> systemSources = systemSources(campaign, settings, campaignSources);
             List<UUID> campaignPending = pendingOf(campaignSources);
             List<UUID> systemPending = pendingOf(systemSources);
             ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, campaignSources, systemSources,
@@ -116,6 +115,55 @@ public class Scopes {
                     .addKeyValue("pending", campaignPending.size() + systemPending.size()).log("scope.resolved");
             return scope;
         });
+    }
+
+    /** How many passages of the owner's campaign's scope under {@code settings} wait for search, as the class says. */
+    public Optional<Indexing> indexing(UUID campaignId, ScopeSettings settings) {
+        return Optional.ofNullable(status(campaignId, settings).indexing());
+    }
+
+    /**
+     * Whether the owner's campaign's scope under {@code settings} has a source, and how many of its passages wait for
+     * search, from one look-up of its sources and without reading a pending passage's id ({@link #indexing}).
+     */
+    public ScopeStatus status(UUID campaignId, ScopeSettings settings) {
+        Objects.requireNonNull(settings, "settings");
+        UUID owner = OwnerContext.require();
+        return reading(() -> {
+            Library.Campaign campaign = campaignOf(campaignId);
+            List<UUID> campaignSources = campaignSources(campaign, settings);
+            List<UUID> sources = new ArrayList<>(campaignSources);
+            sources.addAll(systemSources(campaign, settings, campaignSources));
+            Indexing indexing = sources.isEmpty() ? null : reads.indexing(sources)
+                    .map(count -> new Indexing(count.remaining())).orElse(null);
+            log.atDebug().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
+                    .addKeyValue("sources", sources.size())
+                    .addKeyValue("remaining", indexing == null ? 0 : indexing.remaining()).log("scope.indexing");
+            return new ScopeStatus(!sources.isEmpty(), indexing);
+        });
+    }
+
+    /** The owner's campaign with this id; {@code request.not_found} (404) for an unknown one or another owner's. */
+    private Library.Campaign campaignOf(UUID campaignId) {
+        Optional<Library.Campaign> found = campaignId == null ? Optional.empty() : library.campaign(campaignId);
+        if (found.isEmpty()) {
+            log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("reason", "request.not_found")
+                    .log("scope.campaign_not_found");
+            throw new ApiException(ApiProblem.forStatus(404));
+        }
+        return found.get();
+    }
+
+    private List<UUID> campaignSources(Library.Campaign campaign, ScopeSettings settings) {
+        return settings.campaignTier() ? reads.readyOfCampaign(campaign.id()) : List.of();
+    }
+
+    /** The system tier's sources: a version already in the campaign tier is left out of it. */
+    private List<UUID> systemSources(Library.Campaign campaign, ScopeSettings settings, List<UUID> campaignSources) {
+        return settings.systemTier()
+                ? reads.readyOfSystem(campaign.system().id()).stream()
+                        .filter(source -> !campaignSources.contains(source)).toList()
+                : List.of();
     }
 
     /** The passages with these ids within {@code scope}, as the class says. */

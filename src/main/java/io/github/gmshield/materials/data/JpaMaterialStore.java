@@ -425,6 +425,13 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public long countPassages(UUID versionId, int first, int last) {
+        return em().createQuery("select count(p) from Passage p where p.versionId = :version and p.ordinal between"
+                        + " :first and :last", Long.class).setParameter("version", versionId)
+                .setParameter("first", first).setParameter("last", last).getSingleResult();
+    }
+
+    @Override
     public List<PassageRow> passages(UUID versionId, int first, int last) {
         return em().createQuery("select p from Passage p where p.versionId = :version and p.ordinal between :first"
                         + " and :last order by p.ordinal", PassageEntity.class).setParameter("version", versionId)
