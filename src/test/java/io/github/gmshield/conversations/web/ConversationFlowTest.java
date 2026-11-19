@@ -39,6 +39,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
+import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -92,6 +93,11 @@ import tools.jackson.databind.json.JsonMapper;
  * <p>Story 2.6: every backend row of its I/O matrix: the GM's stop mid-answer, with nothing cited, before the claim,
  * after the end, then a lapse, and on a foreign turn; the batch reply's {@code stop}; exactly one final event over
  * stop-then-done, stop-then-failed and stop-then-lapse; an estimated usage stored as one.
+ *
+ * <p>Story 2.7: every backend row of its I/O matrix: a cited PDF page and the next one, a text page with its range, a
+ * superseded version still served, a version removed after the answer, a version neither ready nor superseded, a
+ * foreign turn, no such reference; and an unreadable page, the picture's bytes and headers, malformed ids and
+ * numbers, and the materials route that still refuses {@code ground=reference}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -169,6 +175,8 @@ class ConversationFlowTest {
     private MutableClock clock;
     @Autowired
     private Vault vault;
+    @Autowired
+    private FileStore files;
     @Autowired
     private PlatformTransactionManager transactions;
 
@@ -979,6 +987,297 @@ class ConversationFlowTest {
         return client.send(HttpRequest.newBuilder(uri("/api/v1/turns/" + turnId + "/stop"))
                 .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
                 .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    // --- Story 2.7: open the cited page in the source view
+
+    private static final List<Double> BOX = List.of(0.1, 0.2, 0.9, 0.3);
+    private static final List<Double> LINE_BOX = List.of(0.1, 0.2, 0.9, 0.25);
+    private static final String LINE = "Fire Bolt | 1d10 | 13";
+
+    @Test
+    void aCitedPdfPageIsServedWithItsLinesItsCitedPassageAndItsWebpPictureAndTheNextPageToo() throws Exception {
+        Gm gm = signUp();
+        Paged source = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+
+        HttpResponse<String> read = referencePage(gm, turnId, "1", "13");
+
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode page = json(read);
+        assertThat(page.path("page").asInt()).isEqualTo(13);
+        assertThat(page.path("pageTotal").asInt()).isEqualTo(14);
+        assertThat(page.path("picture").toString()).isEqualTo("{\"width\":1545,\"height\":2000}");
+        assertThat(page.path("lines").toString())
+                .isEqualTo("[{\"text\":\"" + LINE + "\",\"box\":[0.1,0.2,0.9,0.25]}]");
+        assertThat(page.path("text").isNull()).isTrue();
+        assertThat(page.path("passages").toString()).isEqualTo("[{\"id\":\"" + source.passages().getFirst()
+                + "\",\"boxes\":[[0.1,0.2,0.9,0.3]]}]");
+        assertThat(page.path("outcome").asString()).isEqualTo("read_directly");
+        assertThat(page.propertyNames()).containsExactlyInAnyOrder("page", "pageTotal", "picture", "lines", "text",
+                "passages", "outcome");
+
+        HttpResponse<byte[]> picture = referencePicture(gm, turnId, "1", "13");
+        assertThat(picture.statusCode()).isEqualTo(200);
+        assertThat(picture.body()).isEqualTo(source.pictures().get(13));
+        assertThat(picture.headers().firstValue("Content-Type").orElseThrow()).isEqualTo("image/webp");
+        assertThat(picture.headers().firstValue("Content-Length").orElseThrow())
+                .isEqualTo(String.valueOf(source.pictures().get(13).length));
+        assertThat(picture.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(picture.headers().firstValue("X-Content-Type-Options").orElseThrow()).isEqualTo("nosniff");
+
+        // The next page: served from the same version, nothing on it cited.
+        JsonNode next = json(referencePage(gm, turnId, "1", "14"));
+        assertThat(next.path("page").asInt()).isEqualTo(14);
+        assertThat(next.path("passages")).isEmpty();
+        assertThat(referencePicture(gm, turnId, "1", "14").body()).isEqualTo(source.pictures().get(14));
+        // Any page from 1 to the page total; one past it is not found.
+        assertThat(referencePage(gm, turnId, "1", "1").statusCode()).isEqualTo(200);
+        assertNotFound(referencePage(gm, turnId, "1", "15"));
+        assertThat(referencePicture(gm, turnId, "1", "15").statusCode()).isEqualTo(404);
+        // Lines carry ids and numbers, never the page's text, the name or the section.
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getFormattedMessage())
+                .isEqualTo("conversation.reference_page"));
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Fire Bolt").doesNotContain(MATERIAL_NAME)
+                .doesNotContain("Magias"));
+    }
+
+    @Test
+    void aTextPageIsServedWithItsTextAndTheCitedPassagesRangeAndHasNoPicture() throws Exception {
+        Gm gm = signUp();
+        String text = "x".repeat(40) + "Fire Bolt: a mote of fire, 1d10 Fire damage, at a target within range."
+                + "y".repeat(30);
+        Paged source = as(gm.id(), () -> {
+            Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+            Paged made = material(gm, gm.campaign(), "md", 3);
+            PassageRow passage = TestMaterials.passage(vault, Ids.newId(), gm.id(), made.versionId(), 0, 2,
+                    text.substring(40, 95), SECTION, null, List.of(40, 95), now);
+            materials.insertPassages(List.of(passage));
+            TestMaterials.textPage(materials, vault, gm.id(), made.versionId(), 2, text, now);
+            return new Paged(made.materialId(), made.versionId(), List.of(passage.id()), Map.of());
+        });
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+
+        JsonNode page = json(referencePage(gm, turnId, "1", "2"));
+
+        assertThat(page.path("picture").isNull()).isTrue();
+        assertThat(page.path("lines")).isEmpty();
+        assertThat(page.path("text").asString()).isEqualTo(text);
+        assertThat(page.path("passages").toString()).isEqualTo("[{\"id\":\"" + source.passages().getFirst()
+                + "\",\"range\":[40,95]}]");
+        assertThat(page.path("outcome").isNull()).isTrue();
+        // A text page has no picture.
+        assertNotFound(referencePicture(gm, turnId, "1", "2"));
+    }
+
+    @Test
+    void aSupersededVersionsPageIsStillServedNeverTheNewerOne() throws Exception {
+        Gm gm = signUp();
+        Paged first = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(first.passages().getFirst(), 3)));
+
+        // A newer version of the same material is accepted: the cited one is superseded.
+        byte[] newer = webp(77);
+        as(gm.id(), () -> {
+            Instant now = clock.instant().plusSeconds(60).truncatedTo(ChronoUnit.MICROS);
+            UUID second = Ids.newId();
+            materials.insertVersion(new VersionRow(second, gm.id(), first.materialId(), "ready", "pdf", 1000L, now,
+                    now, 14, "2", null));
+            TestMaterials.picturePage(materials, vault, files, gm.id(), second, 13, newer, 100, 100, List.of(), now);
+            return materials.changeVersionState(first.versionId(), "superseded", now);
+        });
+
+        JsonNode page = json(referencePage(gm, turnId, "1", "13"));
+        assertThat(page.path("picture").toString()).isEqualTo("{\"width\":1545,\"height\":2000}");
+        assertThat(page.path("passages").get(0).path("id").asString())
+                .isEqualTo(first.passages().getFirst().toString());
+        assertThat(referencePicture(gm, turnId, "1", "13").body()).isEqualTo(first.pictures().get(13));
+    }
+
+    @Test
+    void aVersionRemovedAfterTheAnswerIsNotServed() throws Exception {
+        Gm gm = signUp();
+        Paged discarded = pdf(gm, gm.campaign(), 14, 13);
+        Paged deleted = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(discarded.passages().getFirst(), 3),
+                citation(deleted.passages().getFirst(), 5)));
+        assertThat(referencePage(gm, turnId, "1", "13").statusCode()).isEqualTo(200);
+        assertThat(referencePage(gm, turnId, "2", "13").statusCode()).isEqualTo(200);
+
+        as(gm.id(), () -> {
+            materials.discardVersion(discarded.versionId(), clock.instant());
+            materials.deletePageViews(deleted.versionId());
+            materials.deletePassages(deleted.versionId());
+            materials.deleteVersion(deleted.versionId());
+            return materials.deleteMaterial(deleted.materialId());
+        });
+
+        for (String number : List.of("1", "2")) {
+            assertNotFound(referencePage(gm, turnId, number, "13"));
+            assertNotFound(referencePicture(gm, turnId, number, "13"));
+        }
+        // Its removal finished, the version stays removed.
+        as(gm.id(), () -> materials.clearRemovalPending(discarded.versionId(), clock.instant()));
+        assertNotFound(referencePage(gm, turnId, "1", "13"));
+    }
+
+    @Test
+    void aVersionNeitherReadyNorSupersededIsNotServed() throws Exception {
+        Gm gm = signUp();
+        Paged source = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+        assertThat(referencePage(gm, turnId, "1", "13").statusCode()).isEqualTo(200);
+
+        for (String state : List.of("needs_review", "processing", "failed")) {
+            as(gm.id(), () -> materials.changeVersionState(source.versionId(), state, clock.instant()));
+            assertNotFound(referencePage(gm, turnId, "1", "13"));
+            assertNotFound(referencePicture(gm, turnId, "1", "13"));
+        }
+        // Back to ready, it is served again: only the state refused it.
+        as(gm.id(), () -> materials.changeVersionState(source.versionId(), "ready", clock.instant()));
+        assertThat(referencePage(gm, turnId, "1", "13").statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void anotherOwnersTurnAnUnknownReferenceAndMalformedPathsAreAllNotFound() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Paged source = pdf(gm, gm.campaign(), 14, 13);
+        Paged other = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3),
+                citation(other.passages().getFirst(), 5)));
+        UUID silent = answered(gm, QUESTION, List.of(delta("as fontes não dizem nada sobre isso.")));
+        logged.list.clear();
+
+        // Another owner's turn: nothing is read.
+        assertNotFound(referencePage(them, turnId, "1", "13"));
+        HttpResponse<byte[]> refusedPicture = referencePicture(them, turnId, "1", "13");
+        assertThat(refusedPicture.statusCode()).isEqualTo(404);
+        // Asked for as image/webp, the refusal is still a problem detail, not a 406 or an empty body.
+        assertThat(refusedPicture.headers().firstValue("Content-Type").orElseThrow())
+                .startsWith("application/problem+json");
+        assertThat(JSON.readTree(new String(refusedPicture.body(), StandardCharsets.UTF_8)).path("code").asString())
+                .isEqualTo("request.not_found");
+        assertThat(logged.list).noneMatch(event -> "scope.reference_page".equals(event.getFormattedMessage()));
+        // No such reference: number 9 on a turn with 2, and any number on a turn with none.
+        assertNotFound(referencePage(gm, turnId, "9", "13"));
+        assertNotFound(referencePicture(gm, turnId, "3", "13"));
+        assertNotFound(referencePage(gm, silent, "1", "13"));
+        assertNotFound(referencePage(gm, Ids.newId(), "1", "13"));
+        for (String id : List.of("not-a-uuid", turnId.toString().toUpperCase().replace('-', '_'), "0")) {
+            assertNotFound(get(gm, "/api/v1/turns/" + id + "/references/1/pages/13"));
+        }
+        for (String number : List.of("0", "01", "-1", "1.0", "x", "99999999")) {
+            assertNotFound(referencePage(gm, turnId, number, "13"));
+            assertNotFound(referencePage(gm, turnId, "1", number));
+            assertThat(referencePicture(gm, turnId, "1", number).statusCode()).as(number).isEqualTo(404);
+        }
+        // Both references are served for their owner, each from its own version.
+        assertThat(json(referencePage(gm, turnId, "2", "13")).path("passages").get(0).path("id").asString())
+                .isEqualTo(other.passages().getFirst().toString());
+        assertThat(referencePicture(gm, turnId, "2", "13").body()).isEqualTo(other.pictures().get(13));
+        // The materials route still serves the review ground only: the reference ground is this path.
+        HttpResponse<String> refused = get(gm, "/api/v1/materials/" + source.materialId()
+                + "/pages/13?ground=reference");
+        assertThat(refused.statusCode()).isEqualTo(400);
+        assertThat(json(refused).path("code").asString()).isEqualTo("page.ground_unknown");
+    }
+
+    @Test
+    void anUnreadablePageWithNoViewIsServedEmptyAndAPageWithNoViewOtherwiseIsNotFound() throws Exception {
+        Gm gm = signUp();
+        Paged source = pdf(gm, gm.campaign(), 14, 13);
+        as(gm.id(), () -> {
+            TestMaterials.outcome(materials, gm.id(), source.versionId(), 2, 2, "unreadable", clock.instant());
+            return null;
+        });
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+
+        JsonNode unreadable = json(referencePage(gm, turnId, "1", "2"));
+
+        assertThat(unreadable.path("page").asInt()).isEqualTo(2);
+        assertThat(unreadable.path("pageTotal").asInt()).isEqualTo(14);
+        assertThat(unreadable.path("picture").isNull()).isTrue();
+        assertThat(unreadable.path("lines")).isEmpty();
+        assertThat(unreadable.path("text").isNull()).isTrue();
+        assertThat(unreadable.path("passages")).isEmpty();
+        assertThat(unreadable.path("outcome").asString()).isEqualTo("unreadable");
+        assertNotFound(referencePicture(gm, turnId, "1", "2"));
+        // Page 3 has no view and no outcome: not found.
+        assertNotFound(referencePage(gm, turnId, "1", "3"));
+    }
+
+    /** A material, its version, its passages and its pages' pictures by page. */
+    record Paged(UUID materialId, UUID versionId, List<UUID> passages, Map<Integer, byte[]> pictures) {
+    }
+
+    /** A ready material of {@code campaign} whose version has {@code pageTotal} pages and nothing on them yet. */
+    private Paged material(Gm gm, UUID campaign, String format, int pageTotal) {
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        UUID materialId = Ids.newId();
+        materials.insertMaterial(new MaterialRow(materialId, gm.id(),
+                TestMaterials.materialName(vault, materialId, gm.id(), MATERIAL_NAME), now, "rulebook", null,
+                campaign));
+        UUID versionId = Ids.newId();
+        materials.insertVersion(new VersionRow(versionId, gm.id(), materialId, "ready", format, 1000L, now, now,
+                pageTotal, "2", null));
+        return new Paged(materialId, versionId, List.of(), Map.of());
+    }
+
+    /**
+     * An accepted PDF of {@code campaign}: pages 1 to {@code pageTotal}, read directly, the last two with a picture and
+     * a line ({@code cited} among them), and one passage boxed on {@code cited}.
+     */
+    private Paged pdf(Gm gm, UUID campaign, int pageTotal, int cited) {
+        return as(gm.id(), () -> {
+            Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+            Paged made = material(gm, campaign, "pdf", pageTotal);
+            Map<Integer, byte[]> pictures = new LinkedHashMap<>();
+            for (int page = 1; page <= pageTotal; page++) {
+                if (page >= pageTotal - 1) {
+                    byte[] picture = webp(1000 + page);
+                    pictures.put(page, picture);
+                    TestMaterials.picturePage(materials, vault, files, gm.id(), made.versionId(), page, picture, 1545,
+                            2000, List.of(new TestMaterials.Line(LINE, LINE_BOX)), now);
+                } else if (page == 1) {
+                    TestMaterials.picturePage(materials, vault, files, gm.id(), made.versionId(), page, webp(500),
+                            1545, 2000, List.of(), now);
+                }
+            }
+            TestMaterials.outcome(materials, gm.id(), made.versionId(), pageTotal - 1, pageTotal, "read_directly", now);
+            PassageRow passage = TestMaterials.passage(vault, Ids.newId(), gm.id(), made.versionId(), 0, cited,
+                    PASSAGE_TEXT, SECTION, List.of(BOX), null, now);
+            materials.insertPassages(List.of(passage));
+            return new Paged(made.materialId(), made.versionId(), List.of(passage.id()), Map.copyOf(pictures));
+        });
+    }
+
+    /** Some bytes that start like a WebP file. */
+    private static byte[] webp(int size) {
+        byte[] bytes = new byte[size];
+        new java.util.Random(size).nextBytes(bytes);
+        System.arraycopy("RIFF".getBytes(StandardCharsets.US_ASCII), 0, bytes, 0, 4);
+        return bytes;
+    }
+
+    private HttpResponse<String> referencePage(Gm gm, UUID turnId, String number, String page) throws Exception {
+        return get(gm, "/api/v1/turns/" + turnId + "/references/" + number + "/pages/" + page);
+    }
+
+    private HttpResponse<byte[]> referencePicture(Gm gm, UUID turnId, String number, String page) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri("/api/v1/turns/" + turnId + "/references/" + number + "/pages/"
+                        + page + "/picture")).header("Authorization", "Bearer " + CREDENTIAL)
+                .header("X-Session-Token", gm.session()).header("Accept", "image/webp").GET().build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private static void assertNotFound(HttpResponse<?> answer) {
+        assertThat(answer.statusCode()).as(String.valueOf(answer.body())).isEqualTo(404);
+        if (answer.body() instanceof String body) {
+            assertThat(JSON.readTree(body).path("code").asString()).isEqualTo("request.not_found");
+        }
     }
 
     private List<UUID> accepted(Gm gm, int count) {

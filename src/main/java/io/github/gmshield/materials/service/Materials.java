@@ -410,27 +410,43 @@ public class Materials {
      * unless it is unreadable (its reading crashed: Story 1.20), which is a page with nothing on it.
      */
     public Optional<VersionPage> page(UUID materialId, int page, Ground ground) {
-        return reading(() -> served(materialId, page, ground).flatMap(version -> {
-            String outcome = materials.outcomesWithin(version.id(), page, page).stream().findFirst()
-                    .map(PageRangeRow::value).orElse(null);
-            return materials.findPageView(version.id(), page).map(view -> versionPage(version, view, outcome))
-                    .or(() -> PageRangeRow.UNREADABLE.equals(outcome) ? Optional.of(new VersionPage(page,
-                            version.pageTotal(), null, List.of(), null, List.of(), outcome)) : Optional.empty());
-        }));
+        return reading(() -> served(materialId, page, ground).flatMap(version -> versionPage(version, page)));
     }
 
     /** The picture of that page, as {@link #page} finds it; empty also for a page with no picture. */
     public Optional<Picture> picture(UUID materialId, int page, Ground ground) {
-        return reading(() -> served(materialId, page, ground).flatMap(version -> materials
-                .findPageView(version.id(), page).filter(PageViewRow::hasPicture)
-                .flatMap(view -> materials.versionFile(version.id(), view.pictureFileId()))
-                .filter(file -> VersionFileRow.PICTURE.equals(file.role())).map(Picture::new)));
+        return reading(() -> served(materialId, page, ground).flatMap(version -> versionPicture(version, page)));
     }
 
     /** The material's current version when the ground serves it and the page is one of its pages. */
     private Optional<VersionRow> served(UUID materialId, int page, Ground ground) {
         return materials.newest(materialId).map(NewestVersion::version).filter(ground::serves)
-                .filter(version -> version.pageTotal() != null && page >= 1 && page <= version.pageTotal());
+                .filter(version -> hasPage(version, page));
+    }
+
+    /** Whether {@code page} is one of the version's pages: 1 to its page total, once that is known. */
+    static boolean hasPage(VersionRow version, int page) {
+        return version.pageTotal() != null && page >= 1 && page <= version.pageTotal();
+    }
+
+    /**
+     * Page {@code page} of a version already found to be served, in the caller's read (also {@link ScopeReads}, Story
+     * 2.7): its view, or an unreadable page with no view as one with nothing on it; empty for a page with no view
+     * otherwise.
+     */
+    Optional<VersionPage> versionPage(VersionRow version, int page) {
+        String outcome = materials.outcomesWithin(version.id(), page, page).stream().findFirst()
+                .map(PageRangeRow::value).orElse(null);
+        return materials.findPageView(version.id(), page).map(view -> versionPage(version, view, outcome))
+                .or(() -> PageRangeRow.UNREADABLE.equals(outcome) ? Optional.of(new VersionPage(page,
+                        version.pageTotal(), null, List.of(), null, List.of(), outcome)) : Optional.empty());
+    }
+
+    /** The picture of page {@code page} of a version already found to be served; empty for a page with none. */
+    Optional<Picture> versionPicture(VersionRow version, int page) {
+        return materials.findPageView(version.id(), page).filter(PageViewRow::hasPicture)
+                .flatMap(view -> materials.versionFile(version.id(), view.pictureFileId()))
+                .filter(file -> VersionFileRow.PICTURE.equals(file.role())).map(Picture::new);
     }
 
     private VersionPage versionPage(VersionRow version, PageViewRow view, String outcome) {

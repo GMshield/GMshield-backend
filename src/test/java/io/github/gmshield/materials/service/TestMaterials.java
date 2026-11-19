@@ -2,7 +2,12 @@ package io.github.gmshield.materials.service;
 
 import io.github.gmshield.materials.data.IndexStore;
 import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.PageRangeRow;
+import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.VersionFileRow;
+import io.github.gmshield.shared.service.Ids;
+import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.time.Instant;
 import java.util.Collection;
@@ -29,7 +34,55 @@ public final class TestMaterials {
     public static ScopeReads scopeReads(MaterialStore materials, IndexStore index, Vault vault,
                                         Function<Collection<UUID>, Set<UUID>> unendedJobs,
                                         ObjectProvider<PlatformTransactionManager> transactions) {
-        return new ScopeReads(materials, index, vault, unendedJobs, transactions);
+        return new ScopeReads(materials, index, vault, unendedJobs, transactions, null);
+    }
+
+    /**
+     * A passage row with its place on its page (Story 2.7): its boxes on a picture page, or, when {@code boxes} is null,
+     * its code-point {@code range} in a text page's text.
+     */
+    public static PassageRow passage(Vault vault, UUID id, UUID owner, UUID versionId, int ordinal, int page,
+                                     String text, List<String> sectionPath, List<List<Double>> boxes,
+                                     List<Integer> range, Instant now) {
+        return new PassageRow(id, owner, versionId, ordinal, page, vault.encryptText(Passages.text(id, owner), text),
+                vault.encrypt(Passages.place(id, owner), Passages.placeJson(new Passages.Place(sectionPath, boxes,
+                        boxes == null ? range : null))), now);
+    }
+
+    /** A text line of a picture page, for {@link #picturePage}: its text and its box. */
+    public record Line(String text, List<Double> box) {
+    }
+
+    /**
+     * A picture page as ingestion stores it (Story 1.19), within the caller's owner and transaction: its WebP picture,
+     * one piece in the file store, a {@code picture} file of the version, and its view with its lines encrypted.
+     */
+    public static void picturePage(MaterialStore materials, Vault vault, FileStore files, UUID owner, UUID versionId,
+                                   int page, byte[] picture, int width, int height, List<Line> lines, Instant now) {
+        UUID fileId = Ids.newId();
+        files.writePiece(owner, fileId, 0, picture);
+        materials.insertVersionFile(new VersionFileRow(Ids.newId(), owner, versionId, fileId, VersionFileRow.PICTURE,
+                page, page, picture.length, 1, now));
+        UUID viewId = Ids.newId();
+        materials.insertPageView(new PageViewRow(viewId, owner, versionId, page, fileId, width, height,
+                vault.encrypt(PageViews.content(viewId, owner), PageViews.contentJson(new PageViews.Content(
+                        lines.stream().map(line -> new PageViews.Line(line.text(), line.box())).toList(), null))),
+                now));
+    }
+
+    /** A text page as ingestion stores it (a TXT or Markdown section): no picture, its text encrypted. */
+    public static void textPage(MaterialStore materials, Vault vault, UUID owner, UUID versionId, int page, String text,
+                                Instant now) {
+        UUID viewId = Ids.newId();
+        materials.insertPageView(new PageViewRow(viewId, owner, versionId, page, null, null, null,
+                vault.encrypt(PageViews.content(viewId, owner), PageViews.contentJson(new PageViews.Content(List.of(),
+                        text))), now));
+    }
+
+    /** The outcome of pages {@code first} to {@code last} of a version. */
+    public static void outcome(MaterialStore materials, UUID owner, UUID versionId, int first, int last,
+                               String outcome, Instant now) {
+        materials.insertPageOutcome(new PageRangeRow(Ids.newId(), owner, versionId, first, last, outcome, now));
     }
 
     /** A material's name encrypted as an upload stores it (binding {@code material}/{@code name}). */
