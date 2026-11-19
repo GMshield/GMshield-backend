@@ -810,7 +810,7 @@ class IngestionFlowTest {
         jobs.rows.computeIfPresent(layout.jobId(), (id, row) -> new JobRow(row.id(), row.ownerId(), row.kind(),
                 row.lane(), row.state(), row.attempt(), row.traceId(), row.offeredAt(), row.claimId(), row.grantHash(),
                 row.claimRenewAt(), Instant.now().minusSeconds(1), row.outcomeCode(), row.createdAt(),
-                row.updatedAt()));
+                row.updatedAt(), row.modelProvider(), row.modelId(), row.modelTier()));
         sweep.sweep();
         assertThat(jobs.row(layout.jobId()).state()).isEqualTo("offered");
         assertThat(offeredStep(uploaded.versionId()).jobId()).isEqualTo(layout.jobId());

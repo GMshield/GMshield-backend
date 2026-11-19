@@ -78,6 +78,8 @@ services:
       GMSHIELD_SESSION_OVERLAP: ${GMSHIELD_SESSION_OVERLAP:-60s}
       GMSHIELD_SESSION_IDLE_TIMEOUT: ${GMSHIELD_SESSION_IDLE_TIMEOUT:-24h}
       GMSHIELD_SESSION_ABSOLUTE_TIMEOUT: ${GMSHIELD_SESSION_ABSOLUTE_TIMEOUT:-7d}
+      # Story 2.10: the active model provider (the model ids keep application.yaml's defaults).
+      GMSHIELD_MODEL_PROVIDER: ${GMSHIELD_MODEL_PROVIDER:-azure-openai}
     read_only: true
     tmpfs: ["/tmp"]
     volumes: ["backend_files:/var/lib/gmshield/files"]   # the encrypted file store
@@ -126,9 +128,11 @@ services:
       GMSHIELD_REDIS_USERNAME: default
       GMSHIELD_REDIS_PASSWORD: gmshield-dev
       GMSHIELD_REDIS_TLS: "false"   # the development Redis has no TLS; production always verifies it
-      # Taken from your shell when set; otherwise a placeholder that cannot call the model.
-      # Nothing calls the model yet, but the worker refuses to start without a key.
-      GMSHIELD_ANTHROPIC_API_KEY: ${GMSHIELD_ANTHROPIC_API_KEY:-not-a-real-key}
+      # Story 2.10: taken from your shell when set; otherwise placeholders that cannot call the model. The worker
+      # refuses to start without at least one provider's key; an empty Anthropic key is no key.
+      GMSHIELD_AZURE_OPENAI_API_KEY: ${GMSHIELD_AZURE_OPENAI_API_KEY:-not-a-real-key}
+      GMSHIELD_AZURE_OPENAI_BASE_URL: ${GMSHIELD_AZURE_OPENAI_BASE_URL:-https://not-a-real-resource.openai.azure.com/openai/v1/}
+      GMSHIELD_ANTHROPIC_API_KEY: ${GMSHIELD_ANTHROPIC_API_KEY:-}
     read_only: true
     tmpfs: ["/tmp"]
     # As in production (Story 1.15): no capability and no new privileges, so the parsing child's sandbox (a seccomp

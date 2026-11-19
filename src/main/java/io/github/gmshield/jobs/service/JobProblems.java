@@ -22,6 +22,11 @@ public final class JobProblems {
     public static final String FAILED = "job.failed";
     /** The code of a job whose handler could not give its input (it failed, or it was not a JSON object). */
     public static final String INPUT_FAILED = "job.input_failed";
+    /**
+     * The code of a job whose kind calls a model through a provider the claiming worker holds no key for (Story 2.10):
+     * no attempt is used, and no other worker would hold another key.
+     */
+    public static final String PROVIDER_UNAVAILABLE = "job.provider_unavailable";
     /** The code of a job whose kind no handler of this backend knows. */
     public static final String UNKNOWN_KIND = "job.unknown_kind";
 

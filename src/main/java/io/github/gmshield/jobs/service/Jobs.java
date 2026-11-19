@@ -72,7 +72,7 @@ public class Jobs {
         }
         Instant now = clock.now();
         JobRow row = new JobRow(Ids.newId(), owner, kind, lane.code(), JobState.WAITING, 0, traceId, null, null, null,
-                null, null, null, now, now);
+                null, null, null, now, now, null, null, null);
         storage.joined().insert(row);
         JobRef job = new JobRef(row.id(), owner, kind, lane, 0, traceId);
         input.accept(job);

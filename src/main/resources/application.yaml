@@ -91,6 +91,21 @@ gmshield:
   # start unless 1 <= steps-per-page <= 100.
   ingestion:
     steps-per-page: ${GMSHIELD_INGESTION_STEPS_PER_PAGE:4}
+  # Models (limits module, Story 2.10, AD-18): the active provider (azure-openai, anthropic or openai) and each
+  # provider's model id per tier. Azure OpenAI's ids are deployment names. OpenAI has no ids, so it cannot be selected
+  # until both are set. ModelSettings refuses a start with an unknown provider, or a missing or invalid id of the active
+  # one. Every job uses the full tier until Epic 9. The keys are the worker's, never the backend's.
+  models:
+    provider: ${GMSHIELD_MODEL_PROVIDER:azure-openai}
+    azure-openai:
+      full: ${GMSHIELD_MODEL_AZURE_OPENAI_FULL:gpt-6.1-terra}
+      lightweight: ${GMSHIELD_MODEL_AZURE_OPENAI_LIGHTWEIGHT:gpt-6.1-terra}
+    anthropic:
+      full: ${GMSHIELD_MODEL_ANTHROPIC_FULL:claude-sonnet-5-5}
+      lightweight: ${GMSHIELD_MODEL_ANTHROPIC_LIGHTWEIGHT:claude-haiku-5-5}
+    openai:
+      full: ${GMSHIELD_MODEL_OPENAI_FULL:}
+      lightweight: ${GMSHIELD_MODEL_OPENAI_LIGHTWEIGHT:}
 
 server:
   port: 8080

@@ -22,6 +22,16 @@ public interface JobHandler {
     /** The lane a job of this kind is offered on, unless its creator names another. */
     Lane lane();
 
+    /**
+     * Whether a job of this kind calls a model (Story 2.10). Each claim of such a kind resolves the provider, model and
+     * tier through {@link ModelChoices}, records them on the job row and sends them with the claim; a worker that did
+     * not state that provider is refused the job ({@code job.provider_unavailable}). No production kind calls a model
+     * yet.
+     */
+    default boolean callsModel() {
+        return false;
+    }
+
     /** The input handed to the worker with a claim: everything it needs for this attempt. */
     JsonNode input(JobRef job);
 

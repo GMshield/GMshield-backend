@@ -121,6 +121,6 @@ class JobRulesTest {
 
     private static JobRow waiting(UUID owner, Instant createdAt) {
         return new JobRow(UUID.randomUUID(), owner, "probe", "ingestion", "waiting", 0, "0".repeat(31) + "1", null, null,
-                null, null, null, null, createdAt, createdAt);
+                null, null, null, null, createdAt, createdAt, null, null, null);
     }
 }

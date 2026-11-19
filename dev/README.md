@@ -34,7 +34,7 @@ data (database, Redis file, Qdrant storage).
 | Redis | 127.0.0.1:6379 | password `gmshield-dev` |
 | Qdrant | http://127.0.0.1:6333 | API key `gmshield-dev` |
 | Frontend | http://127.0.0.1:3000 (`/api/health`) | none |
-| Worker | no port: it opens none | `GMSHIELD_ANTHROPIC_API_KEY` from your shell, or the placeholder `not-a-real-key` |
+| Worker | no port: it opens none | `GMSHIELD_AZURE_OPENAI_API_KEY` and `GMSHIELD_AZURE_OPENAI_BASE_URL` from your shell, or placeholders |
 
 Every port is bound to 127.0.0.1: nothing is reachable from another machine. The credentials are
 for development on this machine only. A port that is taken can be moved for one start, for example
@@ -47,10 +47,13 @@ The backend, the frontend and the worker run here as they do in production: outs
 with their settings given in `compose.yaml`, as a non-root user on a read-only root filesystem with
 a tmpfs on `/tmp`.
 
-The worker refuses to start without `GMSHIELD_ANTHROPIC_API_KEY`. `compose.yaml` passes the value
-of that variable from the shell that runs `dev/start`, or the placeholder `not-a-real-key` when it
-is unset. Nothing calls the model yet, so the placeholder is enough; to try a real key for one
-start, `GMSHIELD_ANTHROPIC_API_KEY=... dev/start` (never write it into a file of this repository).
+The worker refuses to start without at least one model provider's key (Story 2.10). `compose.yaml` passes
+`GMSHIELD_AZURE_OPENAI_API_KEY` and `GMSHIELD_AZURE_OPENAI_BASE_URL` (the resource's
+`https://<resource>.openai.azure.com/openai/v1/`) from the shell that runs `dev/start`, or placeholders that cannot
+call the model, and `GMSHIELD_ANTHROPIC_API_KEY` only when it is set. The backend's provider is Azure OpenAI unless
+`GMSHIELD_MODEL_PROVIDER` says otherwise. No production kind calls a model yet, so the placeholders are enough; to try
+a real key for one start, `GMSHIELD_AZURE_OPENAI_API_KEY=... GMSHIELD_AZURE_OPENAI_BASE_URL=... dev/start` (never
+write it into a file of this repository).
 The backend refuses to start without a Google OAuth client. `compose.yaml` passes
 `GMSHIELD_GOOGLE_CLIENT_ID` and `GMSHIELD_GOOGLE_CLIENT_SECRET` from the shell that runs `dev/start`,
 or placeholders: the backend then starts, and Google refuses a sign-in. To sign in for real, create a
