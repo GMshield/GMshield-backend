@@ -2,7 +2,9 @@ package io.github.gmshield.library.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -13,8 +15,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 /**
  * {@code system} and {@code campaign} in memory, for tests that run without PostgreSQL. Like Hibernate's
  * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without one;
- * like the tables, it keeps the unique keys and the campaign's (owner, system) reference. A write undoes itself
- * when its transaction rolls back.
+ * like the tables, it keeps the unique keys and the campaign's (owner, system) reference, and (Story 3.1) a system's
+ * version, refusing a stale edit or a taken name as {@link LibraryConflict}. A write undoes itself when its transaction
+ * rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
 
@@ -26,13 +29,67 @@ public class InMemoryLibraryStore implements LibraryStore {
     @Override
     public synchronized void insertSystem(SystemRow row) {
         UUID owner = ownerFor(row.ownerId());
-        boolean nameTaken = systems.values().stream().anyMatch(other -> other.ownerId().equals(owner)
-                && java.util.Arrays.equals(other.nameFingerprint(), row.nameFingerprint()));
-        if (systems.containsKey(row.id()) || nameTaken) {
+        if (systems.containsKey(row.id())) {
             throw new IllegalStateException("unique key taken");
+        }
+        if (nameTaken(owner, row.nameFingerprint(), row.id())) {
+            throw new LibraryConflict(LibraryConflict.Reason.NAME_TAKEN);
         }
         systems.put(row.id(), row);
         RollbackUndo.onRollback(() -> systems.remove(row.id()));
+    }
+
+    @Override
+    public synchronized Optional<SystemRow> updateSystem(SystemChange change) {
+        Optional<SystemRow> found = findSystem(change.id());
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        SystemRow before = found.get();
+        UUID owner = ownerFor(before.ownerId());
+        if (before.version() != change.version()) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        if (nameTaken(owner, change.nameFingerprint(), change.id())) {
+            throw new LibraryConflict(LibraryConflict.Reason.NAME_TAKEN);
+        }
+        SystemRow after = new SystemRow(before.id(), owner, change.name(), change.nameFingerprint(), change.edition(),
+                change.description(), before.version() + 1, before.createdAt());
+        systems.put(after.id(), after);
+        RollbackUndo.onRollback(() -> systems.put(before.id(), before));
+        return Optional.of(after);
+    }
+
+    @Override
+    public boolean systemNameTaken(byte[] nameFingerprint, UUID except) {
+        return nameTaken(OwnerContext.require(), nameFingerprint, except);
+    }
+
+    @Override
+    public List<SystemRow> systems(UUID before, int limit) {
+        UUID owner = OwnerContext.require();
+        return systems.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && (before == null || row.id().compareTo(before) < 0))
+                .sorted(Comparator.comparing(SystemRow::id).reversed()).limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public List<CampaignRow> campaignsOf(UUID systemId, UUID before, int limit) {
+        UUID owner = OwnerContext.require();
+        return campaigns.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.systemId().equals(systemId)
+                        && (before == null || row.id().compareTo(before) < 0))
+                .sorted(Comparator.comparing(CampaignRow::id).reversed()).limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public List<UUID> campaignIdsOf(UUID systemId) {
+        return campaignsOf(systemId, null, Integer.MAX_VALUE).stream().map(CampaignRow::id).toList();
+    }
+
+    private boolean nameTaken(UUID owner, byte[] fingerprint, UUID except) {
+        return systems.values().stream().anyMatch(other -> other.ownerId().equals(owner) && !other.id().equals(except)
+                && Arrays.equals(other.nameFingerprint(), fingerprint));
     }
 
     @Override

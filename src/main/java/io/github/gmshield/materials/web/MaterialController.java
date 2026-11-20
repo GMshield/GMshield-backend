@@ -41,7 +41,8 @@ import org.springframework.web.bind.annotation.RestController;
  * WebP; a missing or unknown ground is {@code page.ground_unknown} (400). From Story 1.20, the quality report of a
  * material's newest version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
  * {@code discard}), each answering the material; an action its state does not allow is
- * {@code material.action_unavailable} (409).
+ * {@code material.action_unavailable} (409). From Story 3.1 the list takes {@code ?system=}: only the materials of that
+ * system, attached to it or to one of its campaigns; a system that is not the owner's is {@code request.not_found}.
  */
 @RestController
 @Tag(name = "materials")
@@ -210,8 +211,10 @@ class MaterialController {
 
     @GetMapping(path = MATERIALS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listMaterials", summary = "The account's materials whose newest version is in one of the"
-            + " given states, newest first, with the upload's progress on those still uploading. request.invalid (400)"
-            + " without a state, for an unknown state, a limit outside 1 to 50 or a malformed cursor;" + SESSION_SUMMARY,
+            + " given states, newest first, with the upload's progress on those still uploading; with system, only those"
+            + " attached to that system or to one of its campaigns. request.invalid (400) without a state, for an unknown"
+            + " state, a limit outside 1 to 50 or a malformed cursor; request.not_found (404) for a system that is not the"
+            + " account's (unknown, another account's or malformed);" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -225,25 +228,25 @@ class MaterialController {
                                 defaultValue = "20")),
                 @Parameter(name = "cursor", in = ParameterIn.QUERY,
                         description = "The nextCursor of the previous page", schema = @Schema(type = "string",
+                                format = "uuid")),
+                @Parameter(name = "system", in = ParameterIn.QUERY, description = "Only the materials of this system"
+                        + " (Story 3.1): attached to it or to one of its campaigns", schema = @Schema(type = "string",
                                 format = "uuid"))})
     ResponseEntity<PageView> list(@Parameter(hidden = true) @RequestParam(value = "state", required = false) List<String> states,
                                   @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
-                                  @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor) {
+                                  @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+                                  @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system) {
         if (states == null || states.isEmpty() || !Materials.STATES.containsAll(states)) {
             throw invalid();
         }
-        int size = Materials.DEFAULT_LIMIT;
-        if (limit != null) {
-            if (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Materials.MAX_LIMIT) {
-                throw invalid();
-            }
-            size = Integer.parseInt(limit);
+        if (limit != null && (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Materials.MAX_LIMIT)) {
+            throw invalid();
         }
-        UUID after = null;
-        if (cursor != null) {
-            after = parse(cursor).orElseThrow(MaterialController::invalid);
-        }
-        Materials.Page page = materials.list(states, after, size);
+        int size = limit == null ? Materials.DEFAULT_LIMIT : Integer.parseInt(limit);
+        UUID after = cursor == null ? null : parse(cursor).orElseThrow(MaterialController::invalid);
+        Materials.Page page = system == null ? materials.list(states, after, size)
+                : parse(system).flatMap(id -> materials.listOfSystem(states, id, after, size))
+                        .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(new PageView(page.items().stream().map(MaterialView::of).toList(),
                         page.nextCursor() == null ? null : page.nextCursor().toString()));

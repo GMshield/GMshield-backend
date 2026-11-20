@@ -194,6 +194,39 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - `GET /api/v1/campaigns/current` (the owner's oldest campaign, with its system), `GET
     /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
     malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
+  - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
+    (deleting one is part B). A system is `{id, name, edition, description, version}`; `edition` and `description`
+    are null when none was given.
+    - Fields, counted in code points after trimming: name 1 to 120 (`request.system_name_invalid`, 400, params `min`
+      and `max`), edition at most 60 (`request.system_edition_invalid`, params `max`), description at most 2,000
+      (`request.system_description_invalid`, params `max`); a blank edition or description is none. Each is stored
+      only encrypted, under its own field: `Binding("system", "name"|"edition"|"description", id, owner)`. Logs carry
+      ids and the version only (`library.system_created`, `library.system_changed`).
+    - Two systems of one owner are the same when name and edition match (Dalton, 2026-11-20): `name_fingerprint` is
+      the fingerprint of the name's unique form alone when there is no edition (what every starter system already
+      stores, so no row is rewritten), else of `uniqueForm(name) + U+0000 + uniqueForm(edition)`, recomputed on every
+      edit. "D&D" 5.2.1 and "D&D" 2024 are two systems; "D&D" with no edition twice is not. A duplicate is
+      `request.system_name_taken` (409): the service checks the fingerprint first, and a write that the key
+      `system_owner_name_fingerprint_key` refuses anyway is the same 409 (the store turns it into a
+      `LibraryConflict`, never the database's message).
+    - `GET /api/v1/systems?cursor&limit`: `items` and `nextCursor`, newest first by id (encrypted names cannot be
+      sorted in SQL), `limit` 1 to 50 (default 20); a bad limit or cursor is `request.invalid` (400). `POST
+      /api/v1/systems` `{name, edition?, description?}` answers 201 with the system. `GET /api/v1/systems/{id}` answers
+      every field.
+    - `PATCH /api/v1/systems/{id}` `{version, name?, edition?, description?}`: an absent or null field is unchanged,
+      a blank edition or description removes it. `version` is the row's (`system.version`, Hibernate `@Version`,
+      starting at 0): one that is not the row's is `request.stale_version` (409) and changes nothing, as is an update
+      that a concurrent edit beats at the database. It answers the system with its version raised by one. A missing or
+      negative version is `request.invalid`.
+    - `GET /api/v1/campaigns?system=&cursor&limit`: the system's campaigns as `{id, name}`, newest first; without
+      `system`, `request.invalid`. `GET /api/v1/materials?state=...&system=` (`materials`) keeps only the materials
+      attached to the system (`material_system`) or whose campaign is one of its campaigns
+      (`Library.campaignIdsOf`). An unknown, foreign or malformed id answers `request.not_found` (404) on GET, PATCH
+      and in `?system=` alike.
+    - `V21__system_details.sql` adds `system.edition bytea`, `system.description bytea` and `system.version bigint not
+      null default 0`. Additive: the previous release neither reads nor writes them, so rolling back is safe.
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.17.0). The worker does
+      not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
     start without a database and use in-memory stores (`@Primary`).

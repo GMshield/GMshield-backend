@@ -81,7 +81,7 @@ class MaterialsTest {
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
         reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
-                .collect(java.util.stream.Collectors.toSet()), new IngestionSettings(4),
+                .collect(java.util.stream.Collectors.toSet()), library::campaignIdsOf, new IngestionSettings(4),
                 beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
@@ -234,6 +234,40 @@ class MaterialsTest {
     }
 
     @Test
+    void aSystemsListHasTheMaterialsAttachedToItOrToItsCampaignsAndAnotherOwnersSystemIsNotFound() {
+        Library.Campaign starter = as(owner, () -> library.currentCampaign().orElseThrow());
+        UUID system = starter.system().id();
+        UUID otherSystem = as(owner, () -> library.createSystem(new Library.SystemFields("D&D", "2024", null))).id();
+        UUID theirSystem = as(other, () -> library.currentCampaign().orElseThrow().system().id());
+        UUID ofSystem = create(owner, "srd.pdf", new Uploads.Details(null, null, null, system.toString()));
+        UUID ofCampaign = create(owner, "notas.md", new Uploads.Details(null, null, starter.id().toString(), null));
+        create(owner, "loose.pdf", Uploads.Details.NONE);
+        UUID ofOther = create(owner, "2024.pdf", new Uploads.Details(null, null, null, otherSystem.toString()));
+        UUID ready = create(owner, "ready.pdf", new Uploads.Details(null, null, null, system.toString()));
+        setState(ready, "ready");
+        create(other, "theirs.pdf", new Uploads.Details(null, null, null, theirSystem.toString()));
+        List<String> states = List.of("uploading", "ready");
+
+        Materials.Page page = as(owner, () -> reads.listOfSystem(states, system, null, 20)).orElseThrow();
+
+        assertThat(page.items()).extracting(Materials.Material::id).containsExactly(ready, ofCampaign, ofSystem);
+        assertThat(page.nextCursor()).isNull();
+        assertThat(as(owner, () -> reads.listOfSystem(List.of("ready"), system, null, 20)).orElseThrow().items())
+                .extracting(Materials.Material::id).containsExactly(ready);
+        assertThat(as(owner, () -> reads.listOfSystem(states, otherSystem, null, 20)).orElseThrow().items())
+                .extracting(Materials.Material::id).containsExactly(ofOther);
+        Materials.Page first = as(owner, () -> reads.listOfSystem(states, system, null, 2)).orElseThrow();
+        assertThat(first.items()).extracting(Materials.Material::id).containsExactly(ready, ofCampaign);
+        assertThat(first.nextCursor()).isEqualTo(ofCampaign);
+        assertThat(as(owner, () -> reads.listOfSystem(states, system, ofCampaign, 2)).orElseThrow().items())
+                .extracting(Materials.Material::id).containsExactly(ofSystem);
+        // Another owner's system, or an unknown one, is not found: not an empty list.
+        assertThat(as(owner, () -> reads.listOfSystem(states, theirSystem, null, 20))).isEmpty();
+        assertThat(as(owner, () -> reads.listOfSystem(states, Ids.newId(), null, 20))).isEmpty();
+        assertThat(as(other, () -> reads.listOfSystem(states, theirSystem, null, 20)).orElseThrow().items()).hasSize(1);
+    }
+
+    @Test
     void pagesShowOnceThePageTotalIsKnownAndAFailureOnlyWhileTheVersionIsFailed() {
         UUID processing = create(owner, "processing.pdf", Uploads.Details.NONE);
         UUID failed = create(owner, "failed.pdf", Uploads.Details.NONE);
@@ -380,7 +414,7 @@ class MaterialsTest {
         Materials watched = new Materials(materials, uploads, vault, files, ids -> {
             asked.add(List.copyOf(ids));
             return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
-        }, new IngestionSettings(4), beansFor(transactions));
+        }, library::campaignIdsOf, new IngestionSettings(4), beansFor(transactions));
 
         assertThat(as(owner, () -> watched.find(material)).orElseThrow().pages().reading()).isEqualTo("text");
         assertThat(asked).singleElement().satisfies(ids -> assertThat(ids).containsExactly(layout));
