@@ -83,10 +83,20 @@ class JpaMaterialStore implements MaterialStore {
                 .toList();
     }
 
-    /** Story 3.1: attached to a system, or (with campaigns) to one of its campaigns. */
-    private static final String ATTACHED = " and (exists (select a.id from MaterialSystem a where a.materialId = m.id"
-            + " and a.systemId = :system)";
-    private static final String OR_CAMPAIGN = " or m.campaignId in :campaigns";
+    /**
+     * Story 3.1: attached to a system, or (with campaigns) to one of its campaigns. Four constant query texts, one per
+     * combination, so no query text is put together at run time.
+     */
+    private static final String ATTACHED_TO_SYSTEM = " and (exists (select a.id from MaterialSystem a"
+            + " where a.materialId = m.id and a.systemId = :system)";
+    private static final String ATTACHED = NEWEST + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN = NEWEST + ATTACHED_TO_SYSTEM + " or m.campaignId in :campaigns)";
+    private static final String BEFORE_NEWEST_FIRST = " and m.id < :before order by m.id desc";
+    private static final String NEWEST_FIRST = " order by m.id desc";
+    private static final String ATTACHED_FIRST = ATTACHED + NEWEST_FIRST;
+    private static final String ATTACHED_BEFORE = ATTACHED + BEFORE_NEWEST_FIRST;
+    private static final String ATTACHED_OR_CAMPAIGN_FIRST = ATTACHED_OR_CAMPAIGN + NEWEST_FIRST;
+    private static final String ATTACHED_OR_CAMPAIGN_BEFORE = ATTACHED_OR_CAMPAIGN + BEFORE_NEWEST_FIRST;
 
     @Override
     public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
@@ -95,8 +105,12 @@ class JpaMaterialStore implements MaterialStore {
             return List.of();
         }
         boolean byCampaign = !campaignIds.isEmpty();
-        String text = NEWEST + ATTACHED + (byCampaign ? OR_CAMPAIGN : "") + ")"
-                + (before == null ? "" : " and m.id < :before") + " order by m.id desc";
+        String text;
+        if (byCampaign) {
+            text = before == null ? ATTACHED_OR_CAMPAIGN_FIRST : ATTACHED_OR_CAMPAIGN_BEFORE;
+        } else {
+            text = before == null ? ATTACHED_FIRST : ATTACHED_BEFORE;
+        }
         var query = em().createQuery(text, Object[].class).setParameter("states", states)
                 .setParameter("system", systemId).setMaxResults(limit);
         if (byCampaign) {
