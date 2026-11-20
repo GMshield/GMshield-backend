@@ -42,7 +42,7 @@ import org.springframework.transaction.support.TransactionTemplate;
  * no edition (what a starter system has always stored), else of the name's and the edition's unique forms joined by
  * U+0000. A duplicate is {@code request.system_name_taken} (409). An edit names the version it was made on; an
  * earlier one is {@code request.stale_version} (409) and changes nothing. A system's campaigns are listed newest
- * first. Logs carry ids and counts only.
+ * first. Logs carry ids, counts and a system's version only.
  *
  * <p>Still to come in Epic 3: deleting a system (Story 3.1 part B), creating, renaming and switching campaigns (Story
  * 3.2). Until then the current campaign is the owner's oldest.
@@ -263,8 +263,8 @@ public class Library {
                     .orElseThrow(() -> new IllegalStateException("library.system_vanished"));
             return new GameSystem(id, name, edition, description, stored.version());
         }));
-        changed.ifPresent(system -> log.atInfo().addKeyValue("systemId", id).addKeyValue("version", system.version())
-                .log("library.system_changed"));
+        changed.ifPresent(system -> log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("systemId", id)
+                .addKeyValue("version", system.version()).log("library.system_changed"));
         return changed;
     }
 

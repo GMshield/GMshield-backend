@@ -224,7 +224,10 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       (`Library.campaignIdsOf`). An unknown, foreign or malformed id answers `request.not_found` (404) on GET, PATCH
       and in `?system=` alike.
     - `V21__system_details.sql` adds `system.edition bytea`, `system.description bytea` and `system.version bigint not
-      null default 0`. Additive: the previous release neither reads nor writes them, so rolling back is safe.
+      null default 0`. Additive: the previous release neither reads nor writes them, so rolling back is safe. What
+      users see after a rollback: two editions of one game show as two systems with the same name, descriptions are
+      not shown. (The old release has no route that creates a system, so it cannot add a same-name system without an
+      edition; only a new account's starter system is created there.)
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.17.0). The worker does
       not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's

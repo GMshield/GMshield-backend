@@ -277,10 +277,10 @@ class LibraryController {
             @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id,
             @RequestBody SystemChangeBody body) {
+        UUID systemId = parse(id).orElseThrow(LibraryController::notFound);
         if (body == null || body.version() == null || body.version() < 0) {
             throw invalid();
         }
-        UUID systemId = parse(id).orElseThrow(LibraryController::notFound);
         return found(library.changeSystem(systemId, body.version(),
                 new Library.SystemFields(body.name(), body.edition(), body.description())).map(SystemView::of));
     }

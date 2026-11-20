@@ -539,6 +539,8 @@ class LibraryFlowTest {
         refused.add(send("PATCH", "/api/v1/systems/" + aSystem, b.session(), Map.of("version", 0, "name", "Stolen")));
         refused.add(send("PATCH", "/api/v1/systems/" + UUID.randomUUID(), b.session(), Map.of("version", 0, "name", "X")));
         refused.add(send("PATCH", "/api/v1/systems/not-a-uuid", b.session(), Map.of("version", 0, "name", "X")));
+        // A malformed id is not found before its body is read: no version is no different.
+        refused.add(send("PATCH", "/api/v1/systems/not-a-uuid", b.session(), Map.of("name", "X")));
         for (String system : List.of(aSystem.toString(), UUID.randomUUID().toString(), "not-a-uuid", "")) {
             refused.add(get("/api/v1/campaigns?system=" + system, b.session()));
             refused.add(get("/api/v1/materials?state=ready&system=" + system, b.session()));

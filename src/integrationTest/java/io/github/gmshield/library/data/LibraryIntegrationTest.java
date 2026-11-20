@@ -5,6 +5,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
@@ -155,6 +159,9 @@ class LibraryIntegrationTest {
 
     @Autowired
     private EntityManagerFactory entityManagers;
+
+    @Autowired
+    private MaterialStore materials;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -448,6 +455,81 @@ class LibraryIntegrationTest {
         // A's own filters answer.
         assertThat(ok(get("/api/v1/materials?state=ready&system=" + a.systemId(), a.session())).path("items")).isEmpty();
         assertThat(ok(get("/api/v1/campaigns?system=" + a.systemId(), a.session())).path("items")).hasSize(1);
+    }
+
+    @Test
+    void theListsPageByCursorOnPostgresqlNewestFirst() throws Exception {
+        Gm gm = signUp("en");
+        Thread.sleep(2);
+        String older = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Older"))).path("id").asString();
+        Thread.sleep(2);
+        String newer = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Newer"))).path("id").asString();
+
+        JsonNode first = ok(get("/api/v1/systems?limit=1", gm.session()));
+        assertThat(first.path("items")).extracting(item -> item.path("id").asString()).containsExactly(newer);
+        assertThat(first.path("nextCursor").asString()).isEqualTo(newer);
+        JsonNode second = ok(get("/api/v1/systems?limit=1&cursor=" + newer, gm.session()));
+        assertThat(second.path("items")).extracting(item -> item.path("id").asString()).containsExactly(older);
+        JsonNode last = ok(get("/api/v1/systems?limit=1&cursor=" + older, gm.session()));
+        assertThat(last.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.systemId().toString());
+        assertThat(last.has("nextCursor")).isFalse();
+
+        // A second campaign of the starter system, newer than the starter's.
+        Thread.sleep(2);
+        UUID campaign = Ids.newId();
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                store.insertCampaign(new CampaignRow(campaign, gm.id(), gm.systemId(),
+                        vault.encryptText(new Binding("campaign", "name", campaign, gm.id()), "Second campaign"),
+                        Instant.now().truncatedTo(ChronoUnit.MICROS)))));
+        JsonNode campaigns = ok(get("/api/v1/campaigns?limit=1&system=" + gm.systemId(), gm.session()));
+        assertThat(campaigns.path("items")).extracting(item -> item.path("name").asString()).containsExactly("Second campaign");
+        assertThat(campaigns.path("nextCursor").asString()).isEqualTo(campaign.toString());
+        JsonNode lastCampaign = ok(get("/api/v1/campaigns?limit=1&system=" + gm.systemId() + "&cursor=" + campaign,
+                gm.session()));
+        assertThat(lastCampaign.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.campaignId().toString());
+        assertThat(lastCampaign.has("nextCursor")).isFalse();
+    }
+
+    @Test
+    void aSystemsMaterialsAreThoseAttachedToItOrToItsCampaignsOnPostgresql() throws Exception {
+        Gm gm = signUp("en");
+        UUID otherSystem = UUID.fromString(created(send("POST", "/api/v1/systems", gm.session(),
+                Map.of("name", "Other"))).path("id").asString());
+        UUID ofSystem = material(gm, "srd.pdf", null, gm.systemId());
+        UUID ofCampaign = material(gm, "notas.md", gm.campaignId(), null);
+        material(gm, "loose.pdf", null, null);
+        material(gm, "other.pdf", null, otherSystem);
+
+        String list = "/api/v1/materials?state=ready&system=" + gm.systemId();
+        assertThat(ok(get(list, gm.session())).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(ofCampaign.toString(), ofSystem.toString());
+        JsonNode first = ok(get(list + "&limit=1", gm.session()));
+        assertThat(first.path("items")).extracting(item -> item.path("name").asString()).containsExactly("notas.md");
+        assertThat(first.path("nextCursor").asString()).isEqualTo(ofCampaign.toString());
+        JsonNode last = ok(get(list + "&limit=1&cursor=" + ofCampaign, gm.session()));
+        assertThat(last.path("items")).extracting(item -> item.path("id").asString()).containsExactly(ofSystem.toString());
+        assertThat(last.has("nextCursor")).isFalse();
+        // A system with neither, and one with a material of its own but no campaign.
+        assertThat(ok(get("/api/v1/materials?state=ready&system=" + otherSystem, gm.session())).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("other.pdf");
+    }
+
+    /** A ready material of the owner, in its campaign or attached to a system (or neither): its id, a millisecond later. */
+    private UUID material(Gm gm, String name, UUID campaign, UUID system) throws Exception {
+        Thread.sleep(2);
+        UUID material = Ids.newId();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            materials.insertMaterial(new MaterialRow(material, gm.id(), vault.encryptText(new Binding("material", "name",
+                    material, gm.id()), name), now, null, null, campaign));
+            materials.insertVersion(new VersionRow(Ids.newId(), gm.id(), material, "ready", "pdf", 10L, now, now));
+            if (system != null) {
+                materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), gm.id(), material, system, now));
+            }
+        }));
+        return material;
     }
 
     // --- helpers ---
