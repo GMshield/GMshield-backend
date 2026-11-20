@@ -1133,6 +1133,11 @@ class IngestionFlowTest {
         assertThat(input.path("firstPage").asInt()).isEqualTo(1);
         assertThat(input.path("lastPage").asInt()).isEqualTo(25);
         assertThat(input.path("pageTotal").asInt()).isEqualTo(25);
+        // The version's cleaned original, by its name (the worker reads a PDF's bookmarks from it).
+        assertThat(input.path("original").asString()).isEqualTo("original");
+        HttpResponse<byte[]> original = input(passages.jobId(), claim, "original");
+        assertThat(original.statusCode()).isEqualTo(200);
+        assertThat(original.body()).isEqualTo(readBack(gm.id(), cleaned.original(), 1));
         List<VersionFileRow> texts = OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId()))
                 .stream().filter(file -> file.role().equals("text")).toList();
         List<String> names = new ArrayList<>();
@@ -1243,6 +1248,9 @@ class IngestionFlowTest {
         JsonNode passagesClaim = claim(passages.jobId());
         assertThat(passagesClaim.path("input").path("format").asString()).isEqualTo("markdown");
         assertThat(input(passages.jobId(), passagesClaim, "text-" + pages).body()).isEqualTo(pagesJson);
+        // Only a PDF's original is named and served (for its bookmarks): a text upload's is not.
+        assertThat(passagesClaim.path("input").has("original")).isFalse();
+        assertThat(input(passages.jobId(), passagesClaim, "original").statusCode()).isEqualTo(404);
         report(passages, passagesClaim, passagesReport(
                 "{\"page\":1,\"sectionPath\":[\"A\"],\"text\":\"# A\\n\\nUnder A.\",\"range\":[0,13]}",
                 "{\"page\":2,\"sectionPath\":[\"A\",\"B\"],\"text\":\"## B\\n\\nUnder B.\",\"range\":[0,14]}")
@@ -1336,6 +1344,16 @@ class IngestionFlowTest {
         assertThat(input(passages.jobId(), claim, "text-" + textFileOf(gm, uploaded)).statusCode()).isEqualTo(200);
         // A text file of the same owner's other version is not this step's input.
         assertThat(input(passages.jobId(), claim, "text-" + theirs).statusCode()).isEqualTo(404);
+        // Its original is this version's own, never the other version's.
+        UUID mine = originalOf(gm, uploaded);
+        assertThat(mine).isNotEqualTo(originalOf(gm, other));
+        assertThat(input(passages.jobId(), claim, "original").body()).isEqualTo(readBack(gm.id(), mine, 1));
+        assertThat(input(passages.jobId(), claim, "text-" + mine).statusCode()).isEqualTo(404);
+    }
+
+    private UUID originalOf(Gm gm, Uploaded uploaded) {
+        return OwnerContext.callAs(gm.id(), () -> materials.versionFiles(uploaded.versionId())).stream()
+                .filter(file -> file.role().equals("original")).findFirst().orElseThrow().fileId();
     }
 
     private UUID textFileOf(Gm gm, Uploaded uploaded) {
