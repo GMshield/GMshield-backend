@@ -31,6 +31,12 @@ read_only = true
 user = "10001:10001"
 cap_drop = ["ALL"]
 tmpfs = ["/tmp"]
+# Story 1.22 (measured on roberto-server 2026-11-18; docs/INFRASTRUCTURE.md, "Measured ingestion"):
+# memory = the backend's docker stats peak, 1,160 MiB during the 650 MB scan upload, x 1.3, rounded up to
+# 256m. The JVM's heap ceiling is 75% of it (1,152 MiB), and G1 stays the collector at this size (checked).
+# cpus = 2: the measured peak was 0.5 CPU, but start-up and the JVM's GC and compiler threads use more.
+memory = "1536m"
+cpus = 2
 # Story 1.7: the encrypted file store (GMSHIELD_FILES_DIR). Production: the named volume
 # gmshield-backend-files on the encrypted volume; staging: a throwaway volume of the run.
 mounts = [{ name = "files", target = "/var/lib/gmshield/files" }]

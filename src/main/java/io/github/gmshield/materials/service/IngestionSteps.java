@@ -62,7 +62,9 @@ import tools.jackson.databind.node.ObjectNode;
  *       ({@value #SOURCE}), which {@link #openInput} streams, and, when that input is a file of the version, its id
  *       and the pages it holds. A step over every text file of the version (Story 1.18) gets the input
  *       {@value #TEXTS} instead and {@code texts}, the name ({@code text-<fileId>}) and pages of each text file of
- *       the version in page order, each of which {@link #openInput} streams to that step only. A step of an image set
+ *       the version in page order, each of which {@link #openInput} streams to that step only; when a PDF version
+ *       has a cleaned original, {@code original} names it too ({@value #ORIGINAL_INPUT}), so the worker reads its
+ *       bookmarks (the retrieval-quality fix). A step of an image set
  *       whose input is not a file of the version (Story 1.21) gets the input {@value #IMAGES_INPUT} instead and
  *       {@code inputs}, the name ({@code image-<uploadId>}) and format of each complete image of the set in its
  *       order, each of which {@link #openInput} streams to that step only.</li>
@@ -112,6 +114,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     /** A step's input that is every text file of its version (Story 1.18); each one's input name is its prefix. */
     public static final String TEXTS = "texts";
     static final String TEXT_INPUT = "text-";
+    /**
+     * The input name, for a step over every text file, of its version's cleaned original (the retrieval-quality fix):
+     * the worker reads a PDF's bookmarks from it.
+     */
+    static final String ORIGINAL_INPUT = "original";
     /** The first stage of an image set (Story 1.21): assemble its images, in order, into one PDF. */
     public static final String IMAGES_STAGE = "images";
     /** A step's input that is every image of its set (Story 1.21); each one's input name is its prefix. */
@@ -220,6 +227,9 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             ArrayNode texts = input.putArray("texts");
             textFiles(version.id()).forEach(file -> texts.addObject().put("name", TEXT_INPUT + file.fileId())
                     .put("firstPage", file.firstPage()).put("lastPage", file.lastPage()));
+            if (bookmarkSource(version).isPresent()) {
+                input.put("original", ORIGINAL_INPUT);
+            }
         } else if (readsImages(step, version)) {
             input.put("input", IMAGES_INPUT);
             ArrayNode images = input.putArray("inputs");
@@ -257,6 +267,14 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 file.role())).isEmpty());
     }
 
+    /**
+     * The cleaned original a step over every text file may read, for its bookmarks: a PDF version's only (a text
+     * upload's or an image set's has none to give).
+     */
+    private Optional<VersionFileRow> bookmarkSource(VersionRow version) {
+        return Format.PDF.code().equals(version.format()) ? original(version.id()) : Optional.empty();
+    }
+
     /** The version's text files, in page order. */
     private List<VersionFileRow> textFiles(UUID versionId) {
         return materials.versionFiles(versionId, Set.of(VersionFileRow.TEXT)).stream()
@@ -273,9 +291,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         }
         UUID owner = job.ownerId();
         if (step.get().inputTexts()) {
-            // A step over every text file reads those files, by name, and nothing else.
-            return textFiles(version.get().id()).stream().filter(file -> (TEXT_INPUT + file.fileId()).equals(name))
-                    .findFirst().map(file -> new StoredFile(owner, file.fileId(), file.sizeBytes(), file.pieceCount()));
+            // A step over every text file reads those files, by name, and its version's cleaned original; nothing else.
+            Optional<VersionFileRow> file = ORIGINAL_INPUT.equals(name) ? bookmarkSource(version.get())
+                    : textFiles(version.get().id()).stream().filter(text -> (TEXT_INPUT + text.fileId()).equals(name))
+                            .findFirst();
+            return file.map(found -> new StoredFile(owner, found.fileId(), found.sizeBytes(), found.pieceCount()));
         }
         if (readsImages(step.get(), version.get())) {
             // A step over the images of a set reads them, by name, and nothing else.

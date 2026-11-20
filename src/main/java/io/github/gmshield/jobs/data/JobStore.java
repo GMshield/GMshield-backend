@@ -35,6 +35,24 @@ public interface JobStore {
     /** Those of {@code ids} that are jobs of {@code owner} now {@code offered} or {@code running} (Story 1.17). */
     List<UUID> inProgress(Collection<UUID> ids, UUID owner);
 
+    /**
+     * Those of {@code ids} that are jobs of {@code owner} that have not ended: {@code waiting}, {@code offered} or
+     * {@code running} (Story 2.1).
+     */
+    List<UUID> unended(Collection<UUID> ids, UUID owner);
+
+    /** Those of {@code ids} that are jobs of {@code owner} that ended {@code failed} (indexing at worker start). */
+    List<UUID> failed(Collection<UUID> ids, UUID owner);
+
+    /** The ids of {@code owner}'s jobs of {@code kind} that ended {@code failed} (the index retry sweep). */
+    List<UUID> failedOfKind(String kind, UUID owner);
+
+    /**
+     * The owners with a job of {@code kind} that ended {@code failed}, of every owner: ids only, for a sweep that then
+     * visits each owner as that owner (indexing at worker start).
+     */
+    List<UUID> ownersWithFailed(String kind);
+
     /** Whether a job of the lane is {@code offered} or {@code running}. */
     boolean busy(String lane);
 

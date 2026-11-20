@@ -121,6 +121,35 @@ class JobRulesTest {
 
     private static JobRow waiting(UUID owner, Instant createdAt) {
         return new JobRow(UUID.randomUUID(), owner, "probe", "ingestion", "waiting", 0, "0".repeat(31) + "1", null, null,
-                null, null, null, null, createdAt, createdAt);
+                null, null, null, null, createdAt, createdAt, null, null, null);
+    }
+
+    @Test
+    void aStatedRecipeIsPublishedOnceUntilANewOneAndAFailedPublicationIsPublishedAgainAtTheNextStatement() {
+        List<Object> published = new java.util.ArrayList<>();
+        boolean[] failing = {true};
+        JobClaims claims = new JobClaims(null, null, null, null, null, null, null, event -> {
+            if (failing[0]) {
+                throw new IllegalStateException("listener down");
+            }
+            published.add(event);
+        }, null, null);
+
+        // The listener throws: the statement still succeeds, and the recipe is not recorded as stated.
+        claims.stateRecipe("1");
+        assertThat(published).isEmpty();
+        failing[0] = false;
+        claims.stateRecipe("1");
+        claims.stateRecipe("1");
+        claims.stateRecipe("2");
+        claims.stateRecipe("2");
+        assertThat(published).containsExactly(new IndexRecipeStated("1"), new IndexRecipeStated("2"));
+
+        for (String bad : new String[] {null, "", "two words", "x".repeat(33), "é"}) {
+            assertThatThrownBy(() -> claims.stateRecipe(bad)).as(String.valueOf(bad))
+                    .isInstanceOfSatisfying(io.github.gmshield.shared.service.ApiException.class,
+                            e -> assertThat(e.problem().status()).isEqualTo(400));
+        }
+        assertThat(published).hasSize(2);
     }
 }

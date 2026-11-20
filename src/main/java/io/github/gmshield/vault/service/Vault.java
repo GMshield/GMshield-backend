@@ -114,6 +114,17 @@ public class Vault {
         }
     }
 
+    /**
+     * The owner's key for the token numbers of the keyword index (Story 2.1, AD-10): 32 bytes, derived by HKDF from
+     * the index key under the domain {@code ("index-token", ownerId)}, the same for the owner on every call and another
+     * for every other owner. It goes to the worker with an index job's input and nowhere else: it is never logged, kept
+     * or stored, and each call answers a new copy.
+     */
+    public byte[] ownerTokenKey(UUID ownerId) {
+        Objects.requireNonNull(ownerId, "ownerId");
+        return VaultCrypto.hkdf(keys.index(), INDEX_SALT, VaultCrypto.lengthPrefixed("index-token", ownerId.toString()));
+    }
+
     /** The PKCE code challenge of a verifier (RFC 7636, method S256): Base64url of its SHA-256, unpadded. */
     public String pkceChallenge(String verifier) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(

@@ -8,6 +8,7 @@ import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -24,7 +25,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * {@link OwnerContext}: when that transaction rolls back there is no job and no message. After the commit the job
  * is offered on its lane's stream (an interactive job at once; an ingestion job when the lane is free). If Redis
  * fails then, the job is still recorded and the sweep offers it. A job can be cancelled in its owner's transaction
- * (Story 1.16).
+ * (Story 1.16), and its row locked there (Story 2.6).
  */
 @Service
 public class Jobs {
@@ -72,7 +73,7 @@ public class Jobs {
         }
         Instant now = clock.now();
         JobRow row = new JobRow(Ids.newId(), owner, kind, lane.code(), JobState.WAITING, 0, traceId, null, null, null,
-                null, null, null, now, now);
+                null, null, null, now, now, null, null, null);
         storage.joined().insert(row);
         JobRef job = new JobRef(row.id(), owner, kind, lane, 0, traceId);
         input.accept(job);
@@ -125,6 +126,59 @@ public class Jobs {
     public Set<UUID> inProgress(Collection<UUID> jobIds) {
         UUID owner = OwnerContext.require();
         return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().inProgress(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * Those of {@code jobIds} that are jobs of the bound owner that have not ended ({@code waiting}, {@code offered} or
+     * {@code running}; Story 2.1), in one read joined to the caller's transaction: another owner's job, an unknown one
+     * or an ended one is left out.
+     */
+    public Set<UUID> unended(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().unended(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * Those of {@code jobIds} that are jobs of the bound owner that ended {@code failed} (indexing at worker start), in
+     * one read joined to the caller's transaction: another owner's job, an unknown one or one in any other state is
+     * left out.
+     */
+    public Set<UUID> failed(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return jobIds.isEmpty() ? Set.of() : Set.copyOf(storage.joined().failed(Set.copyOf(jobIds), owner));
+    }
+
+    /**
+     * The ids of the bound owner's jobs of {@code kind} that ended {@code failed}, in one read joined to the caller's
+     * transaction (the index retry sweep).
+     */
+    public Set<UUID> failedOfKind(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        UUID owner = OwnerContext.require();
+        return Set.copyOf(storage.joined().failedOfKind(kind, owner));
+    }
+
+    /**
+     * The owners, of every owner, with a job of {@code kind} that ended {@code failed}, in one read of its own: ids only,
+     * for a sweep that then visits each one as that owner (indexing at worker start).
+     */
+    public List<UUID> ownersWithFailed(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        return storage.separately(store -> store.ownersWithFailed(kind));
+    }
+
+    /**
+     * Locks the row of a job of the bound owner (Story 2.6), inside the caller's transaction, and answers its state:
+     * the same lock its event batches and its outcome take first, so what the caller does next is strictly ordered
+     * with them. Empty when the job is unknown or another owner's.
+     */
+    public Optional<String> lock(UUID jobId) {
+        Objects.requireNonNull(jobId, "jobId");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("jobs.transaction_required");
+        }
+        UUID owner = OwnerContext.require();
+        return storage.joined().findForUpdate(jobId).filter(row -> row.ownerId().equals(owner)).map(JobRow::state);
     }
 
     /**

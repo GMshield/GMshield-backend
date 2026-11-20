@@ -6,9 +6,18 @@
  * encrypted piece by piece as it arrives. From Story 1.15 a completed PDF starts its ingestion chain, a job of the
  * {@code jobs} module per step; the steps ({@code ingestion_step}) and the files they store for the version
  * ({@code version_file}) are library tables too. From Story 1.20 the GM accepts, reprocesses, retries or discards a
- * version; a discarded version is removed by a recorded process, and the one read of a library table without an owner
- * is the removal sweep's list of the ids of versions whose removal is pending ({@code data.PendingRemovals}). Another
- * owner's item is "not found", exactly like an unknown one.
+ * version; a discarded version is removed by a recorded process. From Story 2.1 an accepted version gets index jobs
+ * ({@code index_change}) and a discarded one the removal of its points ({@code index_removal}). The reads of a library
+ * table without an owner are two lists of ids: the removal sweep's versions whose removal is pending
+ * ({@code data.PendingRemovals}) and the reconcile's owners with a version indexed under another recipe
+ * ({@code data.StaleIndexes}). Another owner's item is "not found", exactly like an unknown one.
+ *
+ * <p>From Story 2.2, {@code service.ScopeReads} is the one public read of library items for a campaign: the ready
+ * versions by campaign and by system, the pending passage ids of a set of versions, and checked passage reads by id,
+ * over the owner-scoped store queries {@code readyOfCampaign}, {@code readyOfSystem}, {@code passageIds} and
+ * {@code findPassages}; from Story 2.7, a page and picture of a given cited version, through the review ground's
+ * read. It is this module's only named interface, and only the {@code scope} module may use it
+ * ({@code ModuleBoundaryTest}).
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
         allowedDependencies = {"shared :: service", "vault :: service", "jobs :: service", "library :: service"})

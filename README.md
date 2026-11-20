@@ -39,13 +39,17 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Seven modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Ten modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
 campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
-files, below; it may use `shared`, `vault` and `library`) and `accounts` (sign-in with Google, accounts and
-sessions, below; it may use `shared`, `vault`, `audit` and `library`).
+files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
+use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
+`jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
+`scope`, `library` and `vault`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+`library`). `ModuleBoundaryTest` also fails the build when a class outside
+`materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
 - **APIs.** Public under `/api/v1`, internal under `/internal/v1`, camelCase JSON.
 - **Credentials.** `/api/v1` requires the frontend's service credential (Story 1.10, below), and
@@ -306,7 +310,11 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   reads the stage name (the worker's `passages`).
   - The claim input of a `texts` step has `input: "texts"` and `texts: [{name: "text-<fileId>", firstPage,
     lastPage}]`, the version's text files in page order; `GET …/inputs/text-<fileId>` streams one of them to that step
-    only (404 for anything else, `source` included).
+    only (404 for anything else, `source` included). When a PDF version has a cleaned original, the claim input also
+    has `original: "original"`, and `GET …/inputs/original` streams it to that step; the worker reads its
+    bookmarks for the section paths (pipeline "7"), and an older worker ignores it. A text upload's or an image
+    set's step gets neither the key nor the file (404). The internal contract does not
+    change: the claim input is a free-form object.
   - A report may add `passages: [{page, sectionPath, text, boxes | range}]` in reading order and `outline: [{level,
     title, page}]`. It is refused with `job.result_invalid` (detail codes `ingestion.passage_invalid`,
     `ingestion.outline_invalid`, or `ingestion.pages_invalid` for a page) when a page is outside 1 to the page total,
@@ -428,6 +436,259 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
   - `V14__image_sets.sql`: `upload.position`, `upload.name` (encrypted), `upload.failure_code`, the state `failed`,
     and the version format `images`. Rolling back past V14 is safe only while no failed upload or `images` version
     exists.
+- **Index an accepted material (`materials`, Story 2.1, AD-10, internal contract 1.7.0).** The worker alone writes
+  Qdrant; the backend records index jobs and their inputs, never a vector.
+  - `IndexChanges`, kind `index.change` on the ingestion lane. The accept (`MaterialActions`) gives the version one
+    job per run of at most 200 passages by ordinal, in the accept's transaction (an `index_change` row per job:
+    owner, version, first and last ordinal). At the claim the input is `{source, owner, kind, language, tokenKey,
+    passages: "passages"}`: the version's id, its owner, the material's kind and language (null when not given),
+    and Base64 of `Vault.ownerTokenKey(owner)` (HKDF of the index key under `("index-token", owner)`, 32 bytes,
+    never logged or stored). `GET …/inputs/passages` serves the run as JSON Lines `{id, ordinal, page, title,
+    text}` (`title`: the last element of the section path, or empty), decrypted for that run only. Unlike a file
+    input, the run is not streamed piece by piece: it is decrypted and buffered whole in the input's read transaction
+    (at most 200 passages of at most 16,384 code points) and served from memory. The result must
+    carry `indexRecipe` (`[A-Za-z0-9._-]{1,32}`, else `job.result_invalid`); it is kept on the row, and when no
+    index change of the version is left unended and every row of its set reports one recipe,
+    `material_version.index_recipe` records it. A superseded version keeps its points and its jobs run on.
+  - The recipe (AD-10): `POST …/claims` takes an optional body `{indexRecipe}` (400 `request.invalid` for one that is
+    not a recipe). A recipe other than the last one stated since the start (the first one always) publishes
+    `jobs.service.IndexRecipeStated` after the claim, whatever its answer. `IndexReconcile` then runs off the
+    request, one reconcile at a time: for each owner with a `ready` version under another recipe or none
+    (`StaleIndexes`, the other read of a library table without an owner: ids only), in a transaction of its own as
+    that owner, each such version with no unended index change gets a new set (its earlier rows go and its recipe
+    is cleared). A claim without a body (a worker before 1.7.0) states nothing. A failed change leaves the version
+    without a recipe; the retry sweep gives the failed run a new job (below), and once its retries are used, the next
+    start's reconcile indexes the version again.
+  - **Indexing at worker start (internal contract 1.12.0, public contract 1.16.0, migration V20).**
+    - `PUT /internal/v1/index-recipe` takes `{indexRecipe}` (schema `IndexRecipeStatement`) and answers 204, or 400
+      `request.invalid` for one that is not a recipe. It needs the worker's credential and no grant. It goes through
+      `JobClaims.stateRecipe`, the same comparison as a claim: `IndexRecipeStated` is published only when the recipe
+      differs from the last one stated (a claim's or a statement's), and the state is reset when publishing throws.
+      The worker (from internal contract 1.12.0) states its recipe at every compatible check (at its start, then every
+      30 s), so after a deploy the reconcile runs within one check, with no job claimed; restating every 30 s also
+      covers a backend redeployed while the worker keeps running (the last recipe is kept in memory only).
+    - A run is failed when its `index_change` row's job ended `failed` (`Jobs.failed`); a `cancelled` run is not.
+      `ScopeReads.pendingPassages` counts failed runs as pending, so the keyword fallback still reads their passages;
+      `ScopeReads.indexing` does not.
+    - `IndexRetrySweep` (every `GMSHIELD_INDEX_RETRY_EVERY`, 10 min, the first one period after the start; switched off
+      by `gmshield.materials.index-retry-sweep.enabled=false`) visits each owner with a failed `index.change` job
+      (`Jobs.ownersWithFailed`: ids only) as that owner, in a transaction of its own. Each run of a `ready` or
+      `superseded` version whose job failed and whose `retries < 3` gets, under the version lock, a new
+      `index.change` job for the same ordinal range: the row moves to the new job (`job_id` is the key; the failed job
+      row stays as history) and `retries` goes up by 1 (line `index.change_retried`). It never starts a whole version
+      again, and never reads a worker's failure code. `IndexChanges.start` (an accept, a reconcile) begins every row at
+      0, so a run that used its 3 retries is indexed again by the next reconcile only.
+    - `V20__index_change_retries.sql` adds `index_change.retries smallint not null default 0` (0 to 3). Additive: the
+      previous release keeps working on it.
+    - `CurrentConversation.indexingFailed` (schema `IndexingFailure`, required and nullable) is `{passages, retrying}`:
+      the distinct in-scope passages of the merged failed runs (at least 1), and whether any of those runs has
+      `retries < 3`; null when none failed. `indexing` is unchanged.
+    - `Scopes.MAX_PENDING` is 5,000 per tier (the worker reads them within a time budget); the line
+      `scope.question_input` logs `pendingLeftOut`, the pending passages past it.
+    - **Deploy order: backend, then frontend (its minimum public contract becomes 1.16.0), then worker (it states its
+      recipe only to a backend at 1.12.0 or later; its minimum stays 1.11.0).** The worker and the frontend do not
+      depend on each other here. Roll back in the reverse order.
+  - `IndexRemovals`, kind `index.removal` on the ingestion lane: a discard cancels the version's unended index
+    changes and creates one in its transaction (Story 3.4's delete will reuse it); its input is `{source, owner}`,
+    and the worker deletes the points by a filter on both.
+  - `V15__index_jobs.sql`: `material_version.index_recipe`, `index_change` and `index_removal` (library tables, every
+    key with the owner; `index_removal` has no reference to the version so it outlives a deleted one). This release
+    writes them at once (Dalton, 2026-11-18: no earlier release holds an index row). **A backend rolled back below
+    this release must first cancel every unended `index.change` and `index.removal` job**, as `Jobs.cancel` ends a
+    job (the grant and claim times cleared, the claim id kept), with the backend stopped, as `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind in ('index.change', 'index.removal') and state in ('waiting', 'offered', 'running');
+    ```
+
+    Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
+- **What a campaign may use (`scope`, Story 2.2, AD-9, internal contract 1.8.0).** The one resolver: no other module
+  reads library items for a campaign.
+  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge)`, a parameter of every resolve and stored
+    nowhere (Story 2.4 freezes it with a job, Story 3.5 stores it per campaign). `ScopeSettings.STARTING` is campaign
+    and system on, other and model knowledge off; `otherTier = true` is refused (`IllegalArgumentException`) until
+    Story 3.5.
+  - `Scopes.resolve(campaignId, settings)`, as the bound owner in one read transaction, answers a `ResolvedScope`
+    (made only by `Scopes`): the campaign tier is the `ready` version of each material whose `campaign_id` is the
+    campaign; the system tier the `ready` version of each material attached through `material_system` to the
+    campaign's system (one already in the campaign tier is left out); a tier switched off has none. A source is a
+    version id, the `source` of the Qdrant payload. `pending` is the ids of the in-scope passages whose ordinal falls
+    in the run of an `index.change` job that has not ended, kept by tier (`pending(tier)`). A campaign not found
+    (unknown, or another owner's) is 404 `request.not_found`.
+  - `Scopes.passages(scope, ids)` checks every id first: any id that is not a passage of an allowed source still
+    `ready` (unknown, another owner's, a version no longer `ready`, out of every tier) refuses the whole request with
+    403 `scope.passage_refused`, which names no id, before anything is decrypted. Otherwise it answers
+    `{id, tier, text, sectionPath, page}` in the order asked, each id once.
+  - It reads the library only through `materials.service.ScopeReads` (the ready versions by campaign and by system,
+    the pending passage ids of a set of versions, checked passage reads by id; JPQL, filtered by the owner, no
+    migration). `ScopeReads` and its `Passage` are the only types of `materials`' named interface `service`, and
+    `Materials.passage(UUID)` is package-private. Lines carry ids and counts, never a text or a title.
+  - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`jobs`), with `X-Job-Grant`: body `{ids: [uuid]}`, 1
+    to 100 non-null ids. A malformed body or an id that is not a UUID is 400 `request.invalid` before anything else;
+    then the grant is checked (403 `job.grant_refused`), then the ids (400 `job.passages_invalid` for none, more than
+    100 or a null one). As the job's owner, in a read-only transaction, the job's handler answers through
+    `JobHandler.passages(JobRef, ids)`, whose default is 403 `job.passages_refused`; through `Scopes`, a job whose
+    campaign is gone is 404 `request.not_found` and any id out of the scope 403 `scope.passage_refused`. The answer
+    is `{passages: [{id, tier, text, sectionPath, page}]}` (`JobPassage`), never cached. From Story 2.4 the
+    production kind `question.answer` implements it through `Scopes`; a test-only handler (`ScopedPassagesFlowTest`)
+    proves the path too.
+  - **The question input (Story 2.3).** `Scopes.questionInput(scope, question)` is the one builder of the input of a
+    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
+    sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
+    source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
+    (5,000 from indexing at worker start, 100 before; the worker reads them 100 at a time within a time budget) in
+    order, so a re-index of a whole library never fills the claim reply (the total is logged as a count, `pending`,
+    beside `pendingListed` and `pendingLeftOut`); `owner` is the scope's owner, for the worker's Qdrant
+    filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
+    use `vault :: service`). The question is 1 to 4,000 characters (code points), else
+    `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier come
+    with the claim (Story 2.10, `model`), never in this input. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
+    (no claim schema change). Lines (`scope.question_input`) carry counts, never the question or the key. No
+    production kind carries a question until Story 2.4; the test-only kind `test.question` (`ScopedPassagesFlowTest`)
+    proves that the claim reply carries the input and that the passages route serves the ids the worker found. The
+    worker's search (`GMshield-worker`, `retrieval/search.py`) needs contract 1.8.0, unchanged here.
+- **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
+  the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
+  provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
+  deployment names). An unknown provider, or a missing or invalid id (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) of the
+  active one, stops the start with `setting.invalid` naming only the variables; the other providers' ids are not
+  read. `ModelProviders` (`jobs.service.ModelChoices`) resolves `(provider, model, tier)` for an attempt: every job
+  uses the `full` tier until Epic 9. There is no fallback provider, no price and no usage here (Story 9.2). The
+  keys are the worker's: the backend holds none.
+- **Ask a question (`conversations`, Story 2.4, public contract 1.11.0, internal contract 1.10.0).** The tenth module;
+  it may use `shared`, `jobs`, `scope`, `library` and `vault`. `/api/v1/conversations/**` and `/api/v1/turns/**` join
+  the library routes (`LibraryOwnerFilter`): the session's account is the owner.
+  - `GET /api/v1/conversations/current` answers `{campaignId, hasSources, indexing}`: the current campaign, whether
+    `Scopes.resolve(campaign, STARTING)` has an allowed source or a pending passage (from public contract 1.15.0, read
+    through `Scopes.status`: an allowed source), and how many of that scope's passages are still waiting for search. No
+    campaign is 404 `request.not_found`.
+  - `POST /api/v1/campaigns/{campaignId}/turns` with `{question}` (1 to 4,000 code points, not blank; else 400
+    `request.invalid`) answers 201 `{id, conversationId, language}`. In one transaction: the campaign's one
+    conversation (made on the first question), the turn with the question encrypted (binding `turn`/`question`),
+    `ScopeSettings.STARTING` frozen on it and its language, and its job of kind `question.answer` on the interactive
+    lane. Another owner's campaign, an unknown one or a malformed id is 404, with nothing recorded. The language is
+    `pt-BR`, `en` or null when unsure (`Languages`: a count of each language's short words, no library, no model).
+    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10.
+  - `GET /api/v1/turns/{turnId}/events` is `text/event-stream` (`TurnStreams`): the stored events after
+    `Last-Event-ID` (0 when absent or not a number), then new ones, each `id:` its sequence (1, 2, … per turn) and
+    named `delta {text}`, `citation {passageId, offset}`, `done {silent, references}` (Story 2.5, below) or
+    `error {code}` (the public document names `TurnDeltaEvent`, `TurnCitationEvent`, `TurnDoneEvent` and
+    `TurnErrorEvent`). A comment `: keep-alive` goes out
+    after 15 s without an event (`gmshield.conversations.keep-alive`); the stream closes after `done` or `error`, or
+    after 30 min (`gmshield.conversations.stream-timeout`). The database is the stream's truth: each stream runs on a
+    virtual thread as the turn's owner (captured before it starts), is woken after each commit that stores an event,
+    and polls every second (`gmshield.conversations.poll`) as a backstop, so replay, a reopened stream and a second
+    instance need nothing more. A client that leaves never touches the job. Another owner's turn is 404.
+  - `AnswerJobs` (`question.answer`, interactive, `callsModel()`): its input is `Scopes.questionInput` of the turn's
+    campaign under its frozen settings, its passages `Scopes.passages` within that scope.
+  - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/events` (`jobs`), with `X-Job-Grant`: `{batch, events: [{type:
+    delta, text} | {type: citation, passageId, offset}], usage: [{callId, responseId?, input, cacheRead, cacheWrite,
+    output, reasoning, estimated?}]}` answers `{stop}`: true once the GM stopped the answer (Story 2.6, below). A
+    malformed body is 400 `request.invalid`
+    first; then the grant (403 `job.grant_refused`); then the batch (400 `job.events_invalid`: a number below 1, more
+    than 500 events, a delta of 0 or more than 16,384 code points, a citation without its id or with a negative
+    offset, more than 16 usages, a usage without its call id or with a negative count). On the job's locked row, as the
+    owner, `JobHandler.events(job, batch)` stores it (default 403 `job.events_refused`, so `jobs` depends on no feature
+    module): `batch` starts at 1 per claim; a repeated `(claim, batch)` is accepted and stored once; a gap is 409
+    `job.batch_out_of_order` with nothing stored. Each batch is one encrypted JSON array (binding
+    `turn_event_batch`/`payload`) whose events take the turn's next sequences. Its usage goes, in the same
+    transaction, to `jobs.service.UsageReports`, which `limits` implements (`ModelUsage`): one `model_call_usage` row
+    per call id (`ON CONFLICT DO NOTHING`) with the job, owner, the attempt's provider, model and tier, the response id
+    and the token counts, and whether they are the worker's estimate (`estimated`, Story 2.6); no price (Story 9.2).
+  - The end: `completed` stores the turn's source references (below), then appends `done`; the job's end in
+    `failed` appends `error {code}` and stores no reference (a failed attempt that is retried appends nothing). **No splice:** once a turn has a posted batch holding an event (`JobHandler.delivered`; usage alone shows the GM nothing), a failed outcome
+    ends the job as with `retry: false`, and a lapsed claim ends it `failed` with `job.claim_lapsed`: it is never offered
+    again.
+  - **Sources under every answer (Story 2.5, public contract 1.12.0; the internal contract stays 1.10.0).** In
+    `AnswerJobs.completed`, inside the transaction that appends `done`, the passage ids of the turn's stored citations
+    (in sequence order) are read again within the turn's scope, rebuilt from its frozen settings:
+    `Scopes.references(scope, ids)` (through `ScopeReads.places`) keeps only the passages of the owner whose version
+    is an allowed source still `ready`, and decrypts only the section path and the material's name, never a passage's
+    text. An unknown, foreign or out-of-scope id is dropped, never refused; the line `conversation.references_stored`
+    carries the cited, dropped and stored counts only (`cited` and `dropped` count distinct cited passage ids, not
+    citation events). One reference per distinct place `(versionId, sectionPath,
+    page)`, numbered 1…n by first citation, each with its `passageIds`. They are stored by value in `turn_reference`
+    (`V18__turn_references.sql`, a library table): turn, number, version id, material id, page, passage ids, and the
+    material's name and the section path encrypted (bindings `turn_reference`/`material_name` and
+    `turn_reference`/`section_path`). No reference row points at `material_version` or `material`.
+  - The `done` event's data is built when it is streamed, from `turn_reference`: `{silent, references: [{number,
+    materialName, sectionPath: […], page, passageIds: […], removed}]}` (`TurnDoneEvent`, `TurnSourceReference`).
+    `silent` is true exactly when `references` is empty: the frontend then shows the one "the sources say nothing"
+    sentence. `removed` is true when the reference's version is gone, `discarded` or pending removal, or its material
+    is gone (`Scopes.removedVersions`), as of the moment it is sent, so a replay from `Last-Event-ID` shows the current
+    state. Delta, citation and error data do not change. While a turn's model knowledge is off (always, until Epic 3),
+    every completed turn therefore has a reference or is silent. Rolling back below this release: roll the frontend
+    back first (the reverse of the deploy order; the 2.5 frontend requires public contract 1.12.0 and reports
+    unhealthy against an older backend), then the backend; `turn_reference` is then left unread.
+  - **Stop an answer (Story 2.6, public contract 1.13.0, internal contract 1.11.0).** `POST /api/v1/turns/{turnId}/stop`
+    answers 204 for any turn of the owner, whatever its state (so repeating it is safe), and 404 `request.not_found` for
+    anything else. `Conversations.stop` runs in the owner's transaction and first locks the turn's job row (`Jobs.lock`:
+    the lock the batch and outcome paths take first, so a stop and a batch are strictly ordered). A `waiting` or
+    `offered` job is cancelled (`Jobs.cancel`); a `running` one keeps its claim, so the worker can still post usage and
+    report. Unless the turn already has a final event, `AnswerJobs.stop` then stores the references of the citations so
+    far (as `completed` does), appends `done` marked stopped (stored as `{"type": "done", "stopped": true}`) and sets
+    `turn.stopped_at`: the GM's stream ends at once, before the worker hears of it. From then on: a batch stores no
+    event (its usage is still recorded; line `conversation.batch_after_stop`), the reply to each batch is `{stop: true}`
+    (`JobHandler.stopRequested`, read in the batch's locked transaction), `completed` and `failed` add no event and no
+    reference (line `conversation.turn_already_ended`), and `delivered` is true, so a stopped job is never offered
+    again, whether its claim lapses (`job.claim_lapsed`) or a failure is reported. A disconnect never stops a job: only
+    this route does. The `done` event's data gains `stopped` (always present), and `silent` is true exactly when the
+    answer was not stopped and has no reference: a stopped answer is never the silent one. A usage may say `estimated`
+    (default false), stored in `model_call_usage.estimated`: the worker estimates a call it stopped before the provider
+    sent its usage. `V19__answer_stop.sql` adds `turn.stopped_at timestamptz null` and `model_call_usage.estimated
+    boolean not null default false`; both are additive, so the previous release keeps working on this schema. **Deploy
+    order: backend, then worker (its minimum internal contract becomes 1.11.0), then frontend (its minimum public
+    contract becomes 1.13.0).** Roll back in the reverse order. The `job.failed` line of a lapsed claim now logs its
+    real code (`job.claim_lapsed` or `job.attempts_exhausted`).
+  - **Open the cited page (Story 2.7, public contract 1.14.0; the internal contract and the worker do not change).**
+    `GET /api/v1/turns/{turnId}/references/{number}/pages/{page}` answers one page of the version a stored source
+    reference names, with the same shape as `MaterialPageView` (the OpenAPI document points at that schema), and `GET
+    …/pages/{page}/picture` streams its WebP picture (`image/webp`, `Content-Length`, `nosniff`); both `no-store`. The
+    path is the ground (AD-9): "a source reference stored with a turn of that campaign". `Conversations` checks that the
+    owner's turn exists, that its conversation's campaign is the owner's and that the turn has a reference with that
+    number; `Scopes.referencePage`/`referencePicture` then serve the page from the stored `versionId` and `materialId`
+    through `ScopeReads.versionPage`/`versionPicture`, which reuse `Materials.versionPage` (the review ground's read).
+    The cited version is served even when a newer one was accepted since (`superseded`), never once it is removed
+    (`Scopes.removedVersions`' rule) or neither `ready` nor `superseded`; any page from 1 to its page total, one per
+    request. Everything else is 404 `request.not_found`: another owner's turn, a malformed or unknown id or number, no
+    such reference, a removed version, a page out of range, a page with no view (an unreadable page with no view answers
+    `picture: null`, `outcome: unreadable`, as on the review ground) and, for the picture, a page with no picture. No
+    page is ever served on a passage or material id the client sends. The materials route keeps `?ground=review` only
+    (`ground=reference` stays 400). Lines (`conversation.reference_page`, `conversation.reference_picture`,
+    `scope.reference_page`) carry ids and numbers only. No migration. **Deploy order: backend, then frontend (its
+    minimum public contract becomes 1.14.0).** Roll back in the reverse order.
+  - **The indexing count (public contract 1.15.0; the internal contract and the worker do not change).**
+    `CurrentConversation.indexing` (schema `IndexingCount`) is `{remaining}` (an integer, at least 1), or null when
+    nothing in scope is pending. The frontend shows it as "Preparando as fontes para busca: faltam {remaining} trechos".
+    Polling: while the tab is visible, every 5 s, the frontend reads `current` again; a failed read keeps the number;
+    polling stops after 10 minutes of unchanged successful reads, and resumes on a new count from the page.
+    `current` now asks `Scopes.status(campaign, STARTING)` instead of `resolve`: one look-up of the in-scope sources
+    (the campaign and system tiers' `ready` versions, as `resolve` takes them), `hasSources` from those sources alone
+    (a pending passage always belongs to one, so its meaning is unchanged), and `indexing` from `ScopeReads.indexing`;
+    no pending passage id is loaded (`Scopes.indexing` answers the count alone). `remaining` is the number of distinct
+    passages of those versions covered by an unended (`waiting`, `offered` or `running`) `index.change`: one `count`
+    query per run's ordinal range (`MaterialStore.countPassages(version, first, last)`, overlapping runs merged first),
+    so no passage id or text is loaded. It only falls as runs end, unless something new is accepted. An ended (`done`,
+    `failed`, `cancelled`) change, a version of another campaign or of a switched-off tier, and another owner's are not
+    counted. The line `scope.indexing` carries ids and counts only, at DEBUG (it comes every 5 s per open tab). No migration.
+    - Indexing starts at the worker's start since internal contract 1.12.0, and failed changes are reported apart
+      (`indexingFailed`; "Indexing at worker start" above).
+    - **Deploy order: backend, then frontend (its minimum public contract becomes 1.15.0).** Roll back in the reverse
+      order.
+  - `V17__conversations.sql`: `conversation`, `turn`, `turn_event_batch` (library tables, every key with the owner;
+    `(claim_id, batch)` unique; a final event has no claim or number) and `model_call_usage` (keyed by call id, written
+    through `JdbcClient` in the caller's transaction). **A backend rolled back below this release must first cancel
+    every unended `question.answer` job**, with the backend stopped, as `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind = 'question.answer' and state in ('waiting', 'offered', 'running');
+    ```
+
+  - Lines carry ids, counts and codes, never a question, an answer's text or a passage's text.
 - **Audit log (`audit`, Story 1.10).** `AuditLog.append(action, accountId, details)` adds one row to
   `audit_entry` (`V3__audit_entry.sql`): id, time, action, account id, trace id and a JSON of details
   that may hold only ids, whole numbers, flags and short lower-case codes, so a token, a hash, an
@@ -456,7 +717,8 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     `offered` or `running`), the next being the oldest job of the owner after the one offered last.
   - The worker claims with `POST /internal/v1/jobs/{id}/claims` (201): `claimId`, `attempt`, `renewAt`,
     `lapsesAt`, a random `grant` (32 bytes, Base64url; only `vault.tokenHash("grant", …)` is stored), the
-    `kind`, the handler's `input` and the job's `traceparent`. A live claim answers `409 job.claimed`; a job
+    `kind`, the handler's `input`, the job's `traceparent` and, for a kind that calls a model, its `model`
+    (Story 2.10, below). The optional body states the worker's `indexRecipe` (Story 2.1) and `providers`. A live claim answers `409 job.claimed`; a job
     that is waiting, done, failed or cancelled `409 job.not_offered`. It renews with `POST …/claims/{claimId}/renewals`
     and reports with `POST …/claims/{claimId}/outcome` (`{outcome: done|failed, code?, result?}`, 204),
     both with `X-Job-Grant`: a wrong, expired or replaced grant, or another job's, is `403 job.grant_refused`.
@@ -472,6 +734,17 @@ sessions, below; it may use `shared`, `vault`, `audit` and `library`).
     (`DataSourceTransactionManager` over a `DelegatingDataSource`), because a JPA transaction needs an owner.
   - Every backend line about a job carries the trace id of the request that created it; the worker logs
     under it and sends it back in `traceparent`.
+  - **Models (Story 2.10, AD-18, internal contract 1.9.0).** A `JobHandler` whose `callsModel()` is true (default
+    false; `question.answer` from Story 2.4) gets a model per attempt. A claim may state `providers` (at most 8, each
+    `^[a-z0-9-]{1,32}$`, else 400 `request.invalid` before the claim): those the worker holds a key for. For such a
+    kind each claim asks `jobs.service.ModelChoices` (implemented by `limits`) for the provider, model and tier,
+    records them on the job row (`model_provider`, `model_id`, `model_tier`, `V16__job_model.sql`; overwritten at
+    every claim, so a retry resolves them again, and kept once the job ends, naming the model that answered) and
+    answers them as `model: {provider, model, tier}`. When the worker did not state that provider (no `providers`
+    means none), the claim rolls back without using an attempt and the job ends `failed` with
+    `job.provider_unavailable`, as a job whose input failed does; the claim is answered `409 job.not_offered`. A kind
+    that calls no model claims as before, with no `model` in the answer, whatever the providers. `job.claimed` logs
+    `modelProvider` and `modelTier` (`none` for other kinds).
   - Test mode only: the `probe` kind and `POST /internal/v1/test-mode/probe-jobs` (`{lane, workMs, failTimes}`,
     owned by a fixed test-mode owner; `GET …/{id}` shows its state), with the table `job_probe` from the
     test-mode migration location. Left out of both OpenAPI documents.
@@ -508,9 +781,14 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_JOB_SWEEP_EVERY` | how often the job sweep runs (default `10s`) |
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
+| `GMSHIELD_INDEX_RETRY_EVERY` | how often the index changes whose job failed get a new job, each run at most 3 times (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |
+| `GMSHIELD_MODEL_PROVIDER` | the active model provider (Story 2.10): `azure-openai` (default), `anthropic` or `openai`; there is no fallback. Its two model ids below must be set and valid, else `setting.invalid` |
+| `GMSHIELD_MODEL_AZURE_OPENAI_FULL`, `GMSHIELD_MODEL_AZURE_OPENAI_LIGHTWEIGHT` | Azure OpenAI's deployment per tier (default `gpt-6.1-terra` for both) |
+| `GMSHIELD_MODEL_ANTHROPIC_FULL`, `GMSHIELD_MODEL_ANTHROPIC_LIGHTWEIGHT` | Anthropic's model per tier (default `claude-sonnet-5-5` and `claude-haiku-5-5`) |
+| `GMSHIELD_MODEL_OPENAI_FULL`, `GMSHIELD_MODEL_OPENAI_LIGHTWEIGHT` | OpenAI's model per tier (no default: OpenAI cannot be selected until both are set) |
 | `GMSHIELD_SESSION_RENEW_AFTER` | when the frontend renews a token (default `15m`; Spring durations such as `20s`, `15m`, `PT15M`) |
 | `GMSHIELD_SESSION_OVERLAP` | how long the previous token still serves after a renewal (default `60s`) |
 | `GMSHIELD_SESSION_IDLE_TIMEOUT` | a session ends after this long without a call (default `24h`) |

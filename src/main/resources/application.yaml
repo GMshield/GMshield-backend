@@ -82,15 +82,32 @@ gmshield:
     output-claim-max-bytes: ${GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES:8GB}
   # Materials (materials module, Story 1.13), a Spring duration: how often unfinished uploads past their 6 hours are
   # discarded, and removals that stopped half way are finished. From Story 1.20, how often the removals of discarded
-  # versions that stopped half way (a restart, a failure) are finished.
+  # versions that stopped half way (a restart, a failure) are finished. From indexing at worker start (2026-11-19), how
+  # often the index changes whose job failed get a new job (each run at most 3 times).
   materials:
     upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
     version-removal-sweep-every: ${GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY:10m}
+    index-retry-every: ${GMSHIELD_INDEX_RETRY_EVERY:10m}
   # Ingestion (materials module, Story 1.15): a version may have at most steps-per-page x its pages + 1 steps; a report
   # whose next steps would pass that fails the version with ingestion.too_many_steps. IngestionSettings refuses a
   # start unless 1 <= steps-per-page <= 100.
   ingestion:
     steps-per-page: ${GMSHIELD_INGESTION_STEPS_PER_PAGE:4}
+  # Models (limits module, Story 2.10, AD-18): the active provider (azure-openai, anthropic or openai) and each
+  # provider's model id per tier. Azure OpenAI's ids are deployment names. OpenAI has no ids, so it cannot be selected
+  # until both are set. ModelSettings refuses a start with an unknown provider, or a missing or invalid id of the active
+  # one. Every job uses the full tier until Epic 9. The keys are the worker's, never the backend's.
+  models:
+    provider: ${GMSHIELD_MODEL_PROVIDER:azure-openai}
+    azure-openai:
+      full: ${GMSHIELD_MODEL_AZURE_OPENAI_FULL:gpt-6.1-terra}
+      lightweight: ${GMSHIELD_MODEL_AZURE_OPENAI_LIGHTWEIGHT:gpt-6.1-terra}
+    anthropic:
+      full: ${GMSHIELD_MODEL_ANTHROPIC_FULL:claude-sonnet-5-5}
+      lightweight: ${GMSHIELD_MODEL_ANTHROPIC_LIGHTWEIGHT:claude-haiku-5-5}
+    openai:
+      full: ${GMSHIELD_MODEL_OPENAI_FULL:}
+      lightweight: ${GMSHIELD_MODEL_OPENAI_LIGHTWEIGHT:}
 
 server:
   port: 8080

@@ -57,6 +57,7 @@ import tools.jackson.databind.json.JsonMapper;
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
             "gmshield.materials.upload-sweep.enabled=false",
             "gmshield.materials.version-removal-sweep.enabled=false",
+            "gmshield.materials.index-retry-sweep.enabled=false",
             "gmshield.files.dir=${java.io.tmpdir}/gmshield-job-it",
             "gmshield.jobs.output-max-bytes=6MB", "gmshield.jobs.output-claim-max-bytes=10MB"})
 @ActiveProfiles("test-mode")
@@ -91,12 +92,50 @@ class JobIntegrationTest {
         }
     }
 
+    /** A test-only kind that calls a model (Story 2.10): no production kind does yet. */
+    static final String TEST_MODEL = "test.model";
+
     @TestConfiguration
     static class Clocks {
         @Bean
         @Primary
         TestClock testClock() {
             return new TestClock();
+        }
+
+        @Bean
+        io.github.gmshield.jobs.service.JobHandler modelHandler() {
+            return new io.github.gmshield.jobs.service.JobHandler() {
+                @Override
+                public String kind() {
+                    return TEST_MODEL;
+                }
+
+                @Override
+                public Lane lane() {
+                    return Lane.INTERACTIVE;
+                }
+
+                @Override
+                public boolean callsModel() {
+                    return true;
+                }
+
+                @Override
+                public JsonNode input(JobRef job) {
+                    return null;
+                }
+
+                @Override
+                public void completed(JobRef job, JsonNode result) {
+                    // Nothing to record: the kind exists for the claim rules only.
+                }
+
+                @Override
+                public void failed(JobRef job, String code) {
+                    // Nothing to record: the kind exists for the claim rules only.
+                }
+            };
         }
     }
 
@@ -193,6 +232,31 @@ class JobIntegrationTest {
         assertThat(state(a)).isEqualTo("done");
         assertProblem(post("/internal/v1/jobs/" + a + "/claims", null), 409, "job.not_offered");
         assertProblem(get("/internal/v1/version", false), 401, "service.unauthenticated");
+    }
+
+    @Test
+    void aModelKindsClaimRecordsItsModelOnTheRowAndAWorkerWithoutItsProviderEndsTheJobWithoutAnAttempt()
+            throws Exception {
+        UUID answered = createModelJob();
+        UUID refused = createModelJob();
+
+        JsonNode claim = json(post("/internal/v1/jobs/" + answered + "/claims", "{\"providers\":[\"azure-openai\"]}"),
+                201);
+        assertProblem(post("/internal/v1/jobs/" + refused + "/claims", "{\"providers\":[]}"), 409, "job.not_offered");
+
+        assertThat(claim.path("model").path("provider").asString()).isEqualTo("azure-openai");
+        assertThat(model(answered)).containsExactly("azure-openai", "gpt-6.1-terra", "full");
+        String outcome = "/internal/v1/jobs/" + answered + "/claims/" + claim.path("claimId").asString() + "/outcome";
+        assertThat(post(outcome, "{\"outcome\":\"done\"}", "X-Job-Grant", claim.path("grant").asString()).statusCode())
+                .isEqualTo(204);
+        assertThat(state(answered)).isEqualTo("done");
+        assertThat(model(answered)).containsExactly("azure-openai", "gpt-6.1-terra", "full");
+
+        assertThat(state(refused)).isEqualTo("failed");
+        assertThat(jdbc.sql("select outcome_code from job where id = ?").param(refused).query(String.class).single())
+                .isEqualTo("job.provider_unavailable");
+        assertThat(jdbc.sql("select attempt from job where id = ?").param(refused).query(Integer.class).single()).isZero();
+        assertThat(model(refused)).containsExactly(null, null, null);
     }
 
     @Test
@@ -388,6 +452,16 @@ class JobIntegrationTest {
             JobRef job = jobs.create(ProbeJobs.KIND, Lane.INGESTION, ref -> probes.insert(new ProbeJobRow(ref.id(), 0, 0)));
             return job.id();
         }));
+    }
+
+    private UUID createModelJob() {
+        return OwnerContext.callAs(UUID.randomUUID(), () -> new TransactionTemplate(transactions).execute(status ->
+                jobs.create(TEST_MODEL, ref -> { }).id()));
+    }
+
+    private List<String> model(UUID id) {
+        return jdbc.sql("select model_provider, model_id, model_tier from job where id = ?").param(id)
+                .query((rs, n) -> java.util.Arrays.asList(rs.getString(1), rs.getString(2), rs.getString(3))).single();
     }
 
     private String state(UUID id) {

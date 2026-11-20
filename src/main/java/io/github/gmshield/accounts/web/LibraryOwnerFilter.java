@@ -19,7 +19,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 /**
  * The request edge of the library routes (Story 1.11): the owner of a request to {@code /api/v1/systems/**},
  * {@code /api/v1/campaigns/**}, {@code /api/v1/uploads/**} (Story 1.13), {@code /api/v1/materials/**} (Story 1.14) or
- * {@code /api/v1/image-sets/**} (Story 1.21) is the account of its session ({@code X-Session-Token}), and nothing else.
+ * {@code /api/v1/image-sets/**} (Story 1.21), {@code /api/v1/conversations/**} or {@code /api/v1/turns/**} (Story 2.4)
+ * is the account of its session ({@code X-Session-Token}), and nothing else.
  * The owner is bound for the rest of the request through {@link OwnerContext#callAs} and unbound afterwards,
  * whatever happens. Without a session the request ends here with the session's problem
  * ({@code session.required}, {@code session.renewal_required}), answered as the service-credential filter
@@ -30,7 +31,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
 class LibraryOwnerFilter extends OncePerRequestFilter {
 
     static final List<String> LIBRARY_ROUTES = List.of("/api/v1/systems", "/api/v1/campaigns", "/api/v1/uploads",
-            "/api/v1/materials", "/api/v1/image-sets");
+            "/api/v1/materials", "/api/v1/image-sets", "/api/v1/conversations", "/api/v1/turns");
 
     private final Sessions sessions;
 

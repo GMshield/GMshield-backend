@@ -149,6 +149,18 @@ public interface MaterialStore {
     /** The current owner's passages of a version, in reading order. */
     List<PassageRow> passages(UUID versionId);
 
+    /** The ordinals of the current owner's passages of a version, ascending (Story 2.1). */
+    List<Integer> passageOrdinals(UUID versionId);
+
+    /**
+     * How many of the current owner's passages of a version have an ordinal from {@code first} to {@code last}, counted
+     * without reading one; 0 for another owner's.
+     */
+    long countPassages(UUID versionId, int first, int last);
+
+    /** The current owner's passages of a version from ordinal {@code first} to {@code last}, in order (Story 2.1). */
+    List<PassageRow> passages(UUID versionId, int first, int last);
+
     /** Deletes the current owner's passages of a version; answers how many went. */
     int deletePassages(UUID versionId);
 
@@ -203,6 +215,34 @@ public interface MaterialStore {
 
     /** The removal of the current owner's discarded version has finished; false when there is no such version. */
     boolean clearRemovalPending(UUID id, Instant now);
+
+    // --- the index (Story 2.1)
+
+    /** Records the index recipe of the current owner's version, or clears it with null; false when there is none. */
+    boolean recordIndexRecipe(UUID id, String recipe);
+
+    /** The current owner's {@code ready} versions whose index recipe is not {@code recipe} (null counts as not). */
+    List<VersionRow> readyOutside(String recipe);
+
+    // --- scope (Story 2.2): what a campaign may use, read only through materials.service.ScopeReads
+
+    /**
+     * The current owner's {@code ready} versions of the materials whose campaign is {@code campaignId}, oldest first;
+     * empty for an unknown campaign or another owner's.
+     */
+    List<VersionRow> readyOfCampaign(UUID campaignId);
+
+    /**
+     * The current owner's {@code ready} versions of the materials that belong to the game system {@code systemId}
+     * ({@code material_system}), oldest first; empty for an unknown system or another owner's.
+     */
+    List<VersionRow> readyOfSystem(UUID systemId);
+
+    /** The ids of the current owner's passages of a version from ordinal {@code first} to {@code last}, in order. */
+    List<UUID> passageIds(UUID versionId, int first, int last);
+
+    /** The current owner's passages with these ids, in no set order; an unknown id or another owner's is left out. */
+    List<PassageRow> findPassages(Collection<UUID> ids);
 
     /** Deletes the current owner's version; false when there is none. */
     boolean deleteVersion(UUID id);

@@ -23,6 +23,8 @@ import org.springframework.stereotype.Repository;
 @Repository
 class JpaMaterialStore implements MaterialStore {
 
+    private static final String READY = "ready";
+
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
 
@@ -417,6 +419,27 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<Integer> passageOrdinals(UUID versionId) {
+        return em().createQuery("select p.ordinal from Passage p where p.versionId = :version order by p.ordinal",
+                Integer.class).setParameter("version", versionId).getResultList();
+    }
+
+    @Override
+    public long countPassages(UUID versionId, int first, int last) {
+        return em().createQuery("select count(p) from Passage p where p.versionId = :version and p.ordinal between"
+                        + " :first and :last", Long.class).setParameter("version", versionId)
+                .setParameter("first", first).setParameter("last", last).getSingleResult();
+    }
+
+    @Override
+    public List<PassageRow> passages(UUID versionId, int first, int last) {
+        return em().createQuery("select p from Passage p where p.versionId = :version and p.ordinal between :first"
+                        + " and :last order by p.ordinal", PassageEntity.class).setParameter("version", versionId)
+                .setParameter("first", first).setParameter("last", last).getResultList().stream()
+                .map(PassageEntity::row).toList();
+    }
+
+    @Override
     public int deletePassages(UUID versionId) {
         List<PassageEntity> found = passageEntities(versionId);
         found.forEach(em()::remove);
@@ -550,6 +573,57 @@ class JpaMaterialStore implements MaterialStore {
             em().flush();
         });
         return version.isPresent();
+    }
+
+    @Override
+    public boolean recordIndexRecipe(UUID id, String recipe) {
+        Optional<MaterialVersionEntity> version = version(id);
+        version.ifPresent(entity -> {
+            entity.recordIndexRecipe(recipe);
+            em().flush();
+        });
+        return version.isPresent();
+    }
+
+    @Override
+    public List<VersionRow> readyOutside(String recipe) {
+        return em().createQuery("select v from MaterialVersion v where v.state = 'ready' and (v.indexRecipe is null"
+                        + " or v.indexRecipe <> :recipe) order by v.createdAt, v.id", MaterialVersionEntity.class)
+                .setParameter("recipe", recipe).getResultList().stream().map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
+    public List<VersionRow> readyOfCampaign(UUID campaignId) {
+        return em().createQuery("select v from MaterialVersion v join Material m on m.id = v.materialId"
+                        + " where m.campaignId = :campaign and v.state = :state order by v.createdAt, v.id",
+                        MaterialVersionEntity.class)
+                .setParameter("campaign", campaignId).setParameter("state", READY).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
+    public List<VersionRow> readyOfSystem(UUID systemId) {
+        return em().createQuery("select v from MaterialVersion v join MaterialSystem s on s.materialId = v.materialId"
+                        + " where s.systemId = :system and v.state = :state order by v.createdAt, v.id",
+                        MaterialVersionEntity.class)
+                .setParameter("system", systemId).setParameter("state", READY).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
+    public List<UUID> passageIds(UUID versionId, int first, int last) {
+        return em().createQuery("select p.id from Passage p where p.versionId = :version and p.ordinal between :first"
+                        + " and :last order by p.ordinal", UUID.class).setParameter("version", versionId)
+                .setParameter("first", first).setParameter("last", last).getResultList();
+    }
+
+    @Override
+    public List<PassageRow> findPassages(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select p from Passage p where p.id in :ids", PassageEntity.class)
+                .setParameter("ids", ids).getResultList().stream().map(PassageEntity::row).toList();
     }
 
     @Override

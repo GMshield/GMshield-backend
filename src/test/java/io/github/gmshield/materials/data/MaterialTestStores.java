@@ -22,6 +22,18 @@ public class MaterialTestStores {
 
     @Bean
     @Primary
+    InMemoryIndexStore inMemoryIndex(InMemoryMaterialStore materials) {
+        return new InMemoryIndexStore(materials);
+    }
+
+    @Bean
+    @Primary
+    InMemoryStaleIndexes inMemoryStaleIndexes(InMemoryMaterialStore materials) {
+        return new InMemoryStaleIndexes(materials);
+    }
+
+    @Bean
+    @Primary
     InMemoryUploadStorage inMemoryUploads() {
         return new InMemoryUploadStorage();
     }
