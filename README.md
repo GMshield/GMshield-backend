@@ -310,7 +310,11 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   reads the stage name (the worker's `passages`).
   - The claim input of a `texts` step has `input: "texts"` and `texts: [{name: "text-<fileId>", firstPage,
     lastPage}]`, the version's text files in page order; `GET …/inputs/text-<fileId>` streams one of them to that step
-    only (404 for anything else, `source` included).
+    only (404 for anything else, `source` included). When a PDF version has a cleaned original, the claim input also
+    has `original: "original"`, and `GET …/inputs/original` streams it to that step; the worker reads its
+    bookmarks for the section paths (pipeline "7"), and an older worker ignores it. A text upload's or an image
+    set's step gets neither the key nor the file (404). The internal contract does not
+    change: the claim input is a free-form object.
   - A report may add `passages: [{page, sectionPath, text, boxes | range}]` in reading order and `outline: [{level,
     title, page}]`. It is refused with `job.result_invalid` (detail codes `ingestion.passage_invalid`,
     `ingestion.outline_invalid`, or `ingestion.pages_invalid` for a page) when a page is outside 1 to the page total,
