@@ -30,6 +30,13 @@ public interface MaterialStore {
      */
     List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit);
 
+    /**
+     * As {@link #newestIn}, only the materials attached to the system {@code systemId} ({@code material_system}) or
+     * whose campaign is one of {@code campaignIds} (Story 3.1: a system's materials).
+     */
+    List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds, UUID before,
+                                       int limit);
+
     /** The current owner's material with this id and its newest version; empty for an unknown id or another owner's. */
     Optional<NewestVersion> newest(UUID materialId);
 

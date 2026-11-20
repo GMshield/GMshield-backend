@@ -92,6 +92,17 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                              UUID before, int limit) {
+        UUID owner = OwnerContext.require();
+        return newestIn(states, before, Integer.MAX_VALUE).stream()
+                .filter(found -> (found.material().campaignId() != null && campaignIds.contains(found.material().campaignId()))
+                        || systems.values().stream().anyMatch(row -> row.ownerId().equals(owner)
+                                && row.materialId().equals(found.material().id()) && row.systemId().equals(systemId)))
+                .limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
     public Optional<NewestVersion> newest(UUID materialId) {
         return findMaterial(materialId).flatMap(this::newestOf);
     }

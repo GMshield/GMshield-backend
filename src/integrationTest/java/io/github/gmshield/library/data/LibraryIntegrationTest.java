@@ -5,6 +5,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
@@ -43,7 +47,9 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * Story 1.11 against a real PostgreSQL and Redis (test mode: postgres:5432, redis:6379): the starter library of
  * a first sign-in and its rollback with the account, the vault's data key that survives it, the owner of every
- * library query, and the cross-owner tests of a system and a campaign through HTTP.
+ * library query, and the cross-owner tests of a system and a campaign through HTTP. Story 3.1: systems by name and
+ * edition, stored only encrypted, edited by version (the store's conflicts on PostgreSQL's key and version), and
+ * another owner's system on every new route and on {@code ?system=}.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application itself never reads a library
  * table with native SQL.
@@ -93,6 +99,31 @@ class LibraryIntegrationTest {
         }
 
         @Override
+        public Optional<SystemRow> updateSystem(SystemChange change) {
+            return real.updateSystem(change);
+        }
+
+        @Override
+        public boolean systemNameTaken(byte[] nameFingerprint, UUID except) {
+            return real.systemNameTaken(nameFingerprint, except);
+        }
+
+        @Override
+        public List<SystemRow> systems(UUID before, int limit) {
+            return real.systems(before, limit);
+        }
+
+        @Override
+        public List<CampaignRow> campaignsOf(UUID systemId, UUID before, int limit) {
+            return real.campaignsOf(systemId, before, limit);
+        }
+
+        @Override
+        public List<UUID> campaignIdsOf(UUID systemId) {
+            return real.campaignIdsOf(systemId);
+        }
+
+        @Override
         public Optional<SystemRow> findSystem(UUID id) {
             return real.findSystem(id);
         }
@@ -128,6 +159,9 @@ class LibraryIntegrationTest {
 
     @Autowired
     private EntityManagerFactory entityManagers;
+
+    @Autowired
+    private MaterialStore materials;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -283,14 +317,219 @@ class LibraryIntegrationTest {
                 .satisfies(failure -> assertThat(messages(failure))
                         .anyMatch(message -> message.contains("campaign_system_fkey")));
         assertThat(count("select count(*) from campaign where id = ?", refusedCampaign)).isZero();
-        // A second system with the same name, whatever its case and spacing, is refused within one owner.
+        // A second system with the same name, whatever its case and spacing, is refused within one owner: the database's
+        // key, read as the store's conflict (Story 3.1), never its message.
         UUID duplicate = Ids.newId();
         assertThatThrownBy(() -> OwnerContext.runAs(a.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(
                 status -> store.insertSystem(new SystemRow(duplicate, a.id(), new byte[] {1},
                         vault.fingerprint("system", "name", Library.uniqueForm("  UNTITLED System ")), now)))))
-                .satisfies(failure -> assertThat(messages(failure))
-                        .anyMatch(message -> message.contains("system_owner_name_fingerprint_key")));
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.NAME_TAKEN))
+                .hasMessage("library.name_taken");
         assertThat(count("select count(*) from system where id = ?", duplicate)).isZero();
+    }
+
+    // --- Story 3.1: systems ---
+
+    @Test
+    void systemsAreCreatedByNameAndEditionStoredOnlyEncryptedAndEditedByVersion() throws Exception {
+        Gm gm = signUp("pt-BR");
+        // The starter row of V4 now reads with no edition, no description and version 0.
+        JsonNode starter = ok(get("/api/v1/systems/" + gm.systemId(), gm.session()));
+        assertThat(starter.path("edition").isNull()).isTrue();
+        assertThat(starter.path("version").asLong()).isZero();
+
+        // Matrix rows "Create", "Other edition" and "Duplicate".
+        JsonNode fifth = created(send("POST", "/api/v1/systems", gm.session(),
+                Map.of("name", "D&D", "edition", "5.2.1", "description", "Livro do jogador e SRD.")));
+        Thread.sleep(2);
+        JsonNode newer = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "D&D", "edition", "2024")));
+        HttpResponse<String> duplicate = send("POST", "/api/v1/systems", gm.session(), Map.of("name", " d&d ", "edition", "5.2.1"));
+        assertThat(duplicate.statusCode()).isEqualTo(409);
+        assertThat(json(duplicate).path("code").asString()).isEqualTo("request.system_name_taken");
+        assertThat(count("select count(*) from system where owner_id = ?", gm.id())).isEqualTo(3);
+        HttpResponse<String> invalid = send("POST", "/api/v1/systems", gm.session(), Map.of("name", "x".repeat(121)));
+        assertThat(json(invalid).path("code").asString()).isEqualTo("request.system_name_invalid");
+        assertThat(count("select count(*) from system where owner_id = ?", gm.id())).isEqualTo(3);
+        assertThat(ok(get("/api/v1/systems", gm.session())).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(newer.path("id").asString(), fifth.path("id").asString(), gm.systemId().toString());
+
+        // The row holds no plain text, and each field decrypts only under its own binding.
+        UUID id = UUID.fromString(fifth.path("id").asString());
+        Map<String, Object> row = jdbc.sql("select name, edition, description, version from system where id = ?").param(id)
+                .query().singleRow();
+        for (String column : List.of("name", "edition", "description")) {
+            assertThat(new String((byte[]) row.get(column), StandardCharsets.ISO_8859_1)).as(column)
+                    .doesNotContain("D&D").doesNotContain("5.2.1").doesNotContain("jogador");
+        }
+        assertThat(vault.decryptText(new Binding("system", "edition", id, gm.id()), (byte[]) row.get("edition")))
+                .isEqualTo("5.2.1");
+        assertThat(vault.decryptText(new Binding("system", "description", id, gm.id()), (byte[]) row.get("description")))
+                .isEqualTo("Livro do jogador e SRD.");
+        assertThat(row.get("version")).isEqualTo(0L);
+        assertThat(jdbc.sql("select edition from system where id = ?").param(UUID.fromString(newer.path("id").asString()))
+                .query(byte[].class).single()).isNotNull();
+
+        // Matrix rows "Rename to own name" and "Stale edit".
+        JsonNode described = ok(send("PATCH", "/api/v1/systems/" + id, gm.session(), Map.of("version", 0, "description", "SRD.")));
+        assertThat(described.path("version").asLong()).isEqualTo(1);
+        assertThat(described.path("name").asString()).isEqualTo("D&D");
+        HttpResponse<String> stale = send("PATCH", "/api/v1/systems/" + id, gm.session(), Map.of("version", 0, "name", "Outro"));
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        assertThat(jdbc.sql("select version from system where id = ?").param(id).query(Long.class).single()).isEqualTo(1L);
+        assertThat(ok(get("/api/v1/systems/" + id, gm.session())).path("description").asString()).isEqualTo("SRD.");
+        // An edit to the other edition's name and edition is taken; dropping the edition is free.
+        HttpResponse<String> taken = send("PATCH", "/api/v1/systems/" + id, gm.session(), Map.of("version", 1, "edition", "2024"));
+        assertThat(json(taken).path("code").asString()).isEqualTo("request.system_name_taken");
+        JsonNode bare = ok(send("PATCH", "/api/v1/systems/" + id, gm.session(), Map.of("version", 1, "edition", " ")));
+        assertThat(bare.path("edition").isNull()).isTrue();
+        assertThat(bare.path("version").asLong()).isEqualTo(2);
+        assertThat(jdbc.sql("select edition is null from system where id = ?").param(id).query(Boolean.class).single()).isTrue();
+        // The context bar's next load shows a new name of the current campaign's system.
+        ok(send("PATCH", "/api/v1/systems/" + gm.systemId(), gm.session(), Map.of("version", 0, "name", "Tormenta20")));
+        assertThat(ok(get("/api/v1/campaigns/current", gm.session())).path("system").path("name").asString())
+                .isEqualTo("Tormenta20");
+        // A system's campaigns: the starter's one, none for a new system.
+        JsonNode campaigns = ok(get("/api/v1/campaigns?system=" + gm.systemId(), gm.session()));
+        assertThat(campaigns.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.campaignId().toString());
+        assertThat(ok(get("/api/v1/campaigns?system=" + id, gm.session())).path("items")).isEmpty();
+    }
+
+    @Test
+    void theStoreRefusesAStaleVersionAndATakenNameAsConflictsAndWritesNothing() throws Exception {
+        Gm gm = signUp("en");
+        JsonNode other = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "GURPS", "edition", "4e")));
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        byte[] name = vault.encryptText(new Binding("system", "name", gm.systemId(), gm.id()), "GURPS");
+        byte[] takenFingerprint = vault.fingerprint("system", "name", "gurps\u00004e");
+        byte[] edition = vault.encryptText(new Binding("system", "edition", gm.systemId(), gm.id()), "4e");
+
+        assertThatThrownBy(() -> OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                store.updateSystem(new SystemChange(gm.systemId(), 3, name, takenFingerprint, edition, null, now)))))
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.STALE_VERSION));
+        // The key on (owner, name_fingerprint) refuses what the service would have checked first.
+        assertThatThrownBy(() -> OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                store.updateSystem(new SystemChange(gm.systemId(), 0, name, takenFingerprint, edition, null, now)))))
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.NAME_TAKEN));
+        assertThat(jdbc.sql("select version from system where id = ?").param(gm.systemId()).query(Long.class).single())
+                .isZero();
+        assertThat(jdbc.sql("select edition is null from system where id = ?").param(gm.systemId()).query(Boolean.class).single())
+                .isTrue();
+        // Another owner's system is not there for an edit.
+        UUID b = Ids.newId();
+        Optional<SystemRow> foreign = OwnerContext.callAs(b, () -> new TransactionTemplate(transactions).execute(status ->
+                store.updateSystem(new SystemChange(gm.systemId(), 0, name, new byte[] {1}, null, null, now))));
+        assertThat(foreign).isEmpty();
+        // An edit at the right version is written, and its version rises.
+        Optional<SystemRow> written = OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions).execute(
+                status -> store.updateSystem(new SystemChange(gm.systemId(), 0, name,
+                        vault.fingerprint("system", "name", "gurps"), null, null, now))));
+        assertThat(written).hasValueSatisfying(row -> assertThat(row.version()).isEqualTo(1));
+        assertThat(other.path("version").asLong()).isZero();
+    }
+
+    @Test
+    void anotherOwnersSystemIsNotFoundOnEveryNewRouteAndFilter() throws Exception {
+        Gm a = signUp("en");
+        Gm b = signUp("pt-BR");
+        JsonNode unknown = notFound(get("/api/v1/systems/" + Ids.newId(), b.session()));
+
+        List<HttpResponse<String>> refused = List.of(
+                send("PATCH", "/api/v1/systems/" + a.systemId(), b.session(), Map.of("version", 0, "name", "Stolen")),
+                get("/api/v1/campaigns?system=" + a.systemId(), b.session()),
+                get("/api/v1/materials?state=ready&state=uploading&system=" + a.systemId(), b.session()),
+                get("/api/v1/campaigns?system=not-a-uuid", b.session()),
+                get("/api/v1/materials?state=ready&system=" + Ids.newId(), b.session()));
+        for (HttpResponse<String> response : refused) {
+            assertThat(withoutTraceId(notFound(response))).isEqualTo(withoutTraceId(unknown));
+            assertThat(response.body()).doesNotContain(a.systemId().toString()).doesNotContain("Untitled system")
+                    .doesNotContain("First campaign");
+        }
+        assertThat(jdbc.sql("select version from system where id = ?").param(a.systemId()).query(Long.class).single()).isZero();
+        assertThat(ok(get("/api/v1/systems", b.session())).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(b.systemId().toString());
+        // A's own filters answer.
+        assertThat(ok(get("/api/v1/materials?state=ready&system=" + a.systemId(), a.session())).path("items")).isEmpty();
+        assertThat(ok(get("/api/v1/campaigns?system=" + a.systemId(), a.session())).path("items")).hasSize(1);
+    }
+
+    @Test
+    void theListsPageByCursorOnPostgresqlNewestFirst() throws Exception {
+        Gm gm = signUp("en");
+        Thread.sleep(2);
+        String older = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Older"))).path("id").asString();
+        Thread.sleep(2);
+        String newer = created(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Newer"))).path("id").asString();
+
+        JsonNode first = ok(get("/api/v1/systems?limit=1", gm.session()));
+        assertThat(first.path("items")).extracting(item -> item.path("id").asString()).containsExactly(newer);
+        assertThat(first.path("nextCursor").asString()).isEqualTo(newer);
+        JsonNode second = ok(get("/api/v1/systems?limit=1&cursor=" + newer, gm.session()));
+        assertThat(second.path("items")).extracting(item -> item.path("id").asString()).containsExactly(older);
+        JsonNode last = ok(get("/api/v1/systems?limit=1&cursor=" + older, gm.session()));
+        assertThat(last.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.systemId().toString());
+        assertThat(last.has("nextCursor")).isFalse();
+
+        // A second campaign of the starter system, newer than the starter's.
+        Thread.sleep(2);
+        UUID campaign = Ids.newId();
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                store.insertCampaign(new CampaignRow(campaign, gm.id(), gm.systemId(),
+                        vault.encryptText(new Binding("campaign", "name", campaign, gm.id()), "Second campaign"),
+                        Instant.now().truncatedTo(ChronoUnit.MICROS)))));
+        JsonNode campaigns = ok(get("/api/v1/campaigns?limit=1&system=" + gm.systemId(), gm.session()));
+        assertThat(campaigns.path("items")).extracting(item -> item.path("name").asString()).containsExactly("Second campaign");
+        assertThat(campaigns.path("nextCursor").asString()).isEqualTo(campaign.toString());
+        JsonNode lastCampaign = ok(get("/api/v1/campaigns?limit=1&system=" + gm.systemId() + "&cursor=" + campaign,
+                gm.session()));
+        assertThat(lastCampaign.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.campaignId().toString());
+        assertThat(lastCampaign.has("nextCursor")).isFalse();
+    }
+
+    @Test
+    void aSystemsMaterialsAreThoseAttachedToItOrToItsCampaignsOnPostgresql() throws Exception {
+        Gm gm = signUp("en");
+        UUID otherSystem = UUID.fromString(created(send("POST", "/api/v1/systems", gm.session(),
+                Map.of("name", "Other"))).path("id").asString());
+        UUID ofSystem = material(gm, "srd.pdf", null, gm.systemId());
+        UUID ofCampaign = material(gm, "notas.md", gm.campaignId(), null);
+        material(gm, "loose.pdf", null, null);
+        material(gm, "other.pdf", null, otherSystem);
+
+        String list = "/api/v1/materials?state=ready&system=" + gm.systemId();
+        assertThat(ok(get(list, gm.session())).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(ofCampaign.toString(), ofSystem.toString());
+        JsonNode first = ok(get(list + "&limit=1", gm.session()));
+        assertThat(first.path("items")).extracting(item -> item.path("name").asString()).containsExactly("notas.md");
+        assertThat(first.path("nextCursor").asString()).isEqualTo(ofCampaign.toString());
+        JsonNode last = ok(get(list + "&limit=1&cursor=" + ofCampaign, gm.session()));
+        assertThat(last.path("items")).extracting(item -> item.path("id").asString()).containsExactly(ofSystem.toString());
+        assertThat(last.has("nextCursor")).isFalse();
+        // A system with neither, and one with a material of its own but no campaign.
+        assertThat(ok(get("/api/v1/materials?state=ready&system=" + otherSystem, gm.session())).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("other.pdf");
+    }
+
+    /** A ready material of the owner, in its campaign or attached to a system (or neither): its id, a millisecond later. */
+    private UUID material(Gm gm, String name, UUID campaign, UUID system) throws Exception {
+        Thread.sleep(2);
+        UUID material = Ids.newId();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            materials.insertMaterial(new MaterialRow(material, gm.id(), vault.encryptText(new Binding("material", "name",
+                    material, gm.id()), name), now, null, null, campaign));
+            materials.insertVersion(new VersionRow(Ids.newId(), gm.id(), material, "ready", "pdf", 10L, now, now));
+            if (system != null) {
+                materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), gm.id(), material, system, now));
+            }
+        }));
+        return material;
     }
 
     // --- helpers ---
@@ -361,6 +600,22 @@ class LibraryIntegrationTest {
         assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
         assertThat(response.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
         return json(response);
+    }
+
+    private static JsonNode created(HttpResponse<String> response) {
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+        assertThat(response.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        return json(response);
+    }
+
+    private HttpResponse<String> send(String method, String path, String session, Map<String, Object> body) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                .header("Authorization", "Bearer " + CREDENTIAL).header("Content-Type", "application/json")
+                .method(method, HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)));
+        if (session != null) {
+            request.header("X-Session-Token", session);
+        }
+        return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     private static JsonNode notFound(HttpResponse<String> response) {

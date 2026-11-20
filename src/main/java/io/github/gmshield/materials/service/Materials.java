@@ -3,6 +3,7 @@ package io.github.gmshield.materials.service;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.NewestVersion;
 import io.github.gmshield.jobs.service.Jobs;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.PageViewRow;
@@ -52,8 +53,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * its newest version allows now: {@link #actions}, the one place of that rule), the quality report of a version that
  * needs review or is ready ({@link #report}), each page's outcome, an unreadable page with no view answered as one with
  * nothing on it, and only passages of a {@code ready} version.
- * Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an unknown one.
- * Nothing here logs a name.
+ * From Story 3.1, the list of a system's materials ({@link #listOfSystem}): those attached to it and those of its
+ * campaigns. Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an
+ * unknown one. Nothing here logs a name.
  */
 @Service
 public class Materials {
@@ -82,6 +84,7 @@ public class Materials {
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final JobsInProgress inProgress;
+    private final CampaignsOfSystem campaignsOfSystem;
     private final FileStore files;
     private final IngestionSettings settings;
 
@@ -91,14 +94,25 @@ public class Materials {
         Set<UUID> of(Collection<UUID> jobIds);
     }
 
+    /**
+     * The ids of the campaigns of the bound owner's system, empty for a system that is not the owner's
+     * ({@link Library#campaignIdsOf}, Story 3.1).
+     */
+    @FunctionalInterface
+    interface CampaignsOfSystem {
+        Optional<List<UUID>> of(UUID systemId);
+    }
+
     @Autowired
-    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs,
+    Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs, Library library,
               IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, files, jobs::inProgress, settings, transactions);
+        this(materials, uploads, vault, files, jobs::inProgress, library::campaignIdsOf, settings, transactions);
     }
 
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
-              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+              CampaignsOfSystem campaignsOfSystem, IngestionSettings settings,
+              ObjectProvider<PlatformTransactionManager> transactions) {
+        this.campaignsOfSystem = campaignsOfSystem;
         this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
@@ -307,15 +321,30 @@ public class Materials {
      * {@code cursor} when it is given, at most {@code limit} (1 to {@value #MAX_LIMIT}).
      */
     public Page list(Collection<String> states, UUID cursor, int limit) {
+        checkList(states, limit);
+        return reading(() -> page(materials.newestIn(Set.copyOf(states), cursor, limit + 1), limit));
+    }
+
+    /**
+     * As {@link #list}, only the materials of the owner's system {@code systemId} (Story 3.1): those attached to it, and
+     * those of its campaigns. Empty for an unknown system or another owner's.
+     */
+    public Optional<Page> listOfSystem(Collection<String> states, UUID systemId, UUID cursor, int limit) {
+        checkList(states, limit);
+        return reading(() -> campaignsOfSystem.of(systemId).map(campaigns -> page(
+                materials.newestAttached(Set.copyOf(states), systemId, campaigns, cursor, limit + 1), limit)));
+    }
+
+    private static void checkList(Collection<String> states, int limit) {
         if (states.isEmpty() || !STATES.containsAll(states) || limit < 1 || limit > MAX_LIMIT) {
             throw new IllegalArgumentException("materials.list_invalid");
         }
-        return reading(() -> {
-            List<NewestVersion> found = materials.newestIn(Set.copyOf(states), cursor, limit + 1);
-            List<NewestVersion> page = found.size() > limit ? found.subList(0, limit) : found;
-            UUID next = found.size() > limit ? page.getLast().material().id() : null;
-            return new Page(views(page), next);
-        });
+    }
+
+    private Page page(List<NewestVersion> found, int limit) {
+        List<NewestVersion> page = found.size() > limit ? found.subList(0, limit) : found;
+        UUID next = found.size() > limit ? page.getLast().material().id() : null;
+        return new Page(views(page), next);
     }
 
     /** The owner's material with this id; empty for an unknown id or another owner's. */

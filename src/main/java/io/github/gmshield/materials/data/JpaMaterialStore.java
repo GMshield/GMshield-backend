@@ -83,6 +83,33 @@ class JpaMaterialStore implements MaterialStore {
                 .toList();
     }
 
+    /** Story 3.1: attached to a system, or (with campaigns) to one of its campaigns. */
+    private static final String ATTACHED = " and (exists (select a.id from MaterialSystem a where a.materialId = m.id"
+            + " and a.systemId = :system)";
+    private static final String OR_CAMPAIGN = " or m.campaignId in :campaigns";
+
+    @Override
+    public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                              UUID before, int limit) {
+        if (states.isEmpty() || limit < 1) {
+            return List.of();
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        String text = NEWEST + ATTACHED + (byCampaign ? OR_CAMPAIGN : "") + ")"
+                + (before == null ? "" : " and m.id < :before") + " order by m.id desc";
+        var query = em().createQuery(text, Object[].class).setParameter("states", states)
+                .setParameter("system", systemId).setMaxResults(limit);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        if (before != null) {
+            query.setParameter("before", before);
+        }
+        return query.getResultList().stream()
+                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
     @Override
     public Optional<NewestVersion> newest(UUID materialId) {
         return material(materialId).flatMap(material -> em()
