@@ -19,8 +19,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * {@code system} and {@code campaign} in memory, for tests that run without PostgreSQL. Like Hibernate's
  * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without one;
  * like the tables, it keeps the unique keys and the campaign's (owner, system) reference, and (Story 3.1) a system's
- * version, refusing a stale edit or a taken name as {@link LibraryConflict}. A write undoes itself when its transaction
- * rolls back.
+ * version, refusing a stale edit or a taken name as {@link LibraryConflict}; from Story 3.2 a campaign's version, archive,
+ * choice and name key (owner, system, fingerprint) as well. A write undoes itself when its transaction rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
 
@@ -80,17 +80,22 @@ public class InMemoryLibraryStore implements LibraryStore {
     }
 
     @Override
-    public List<CampaignRow> campaignsOf(UUID systemId, UUID before, int limit) {
+    public List<CampaignRow> campaigns(UUID systemId, boolean archived, UUID before, int limit) {
         UUID owner = OwnerContext.require();
         return campaigns.values().stream()
-                .filter(row -> row.ownerId().equals(owner) && row.systemId().equals(systemId)
-                        && !deleting.contains(systemId) && (before == null || row.id().compareTo(before) < 0))
+                .filter(row -> row.ownerId().equals(owner) && (systemId == null || row.systemId().equals(systemId))
+                        && !deleting.contains(row.systemId()) && row.archived() == archived
+                        && (before == null || row.id().compareTo(before) < 0))
                 .sorted(Comparator.comparing(CampaignRow::id).reversed()).limit(Math.max(limit, 0)).toList();
     }
 
     @Override
     public List<UUID> campaignIdsOf(UUID systemId) {
-        return campaignsOf(systemId, null, Integer.MAX_VALUE).stream().map(CampaignRow::id).toList();
+        UUID owner = OwnerContext.require();
+        return campaigns.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.systemId().equals(systemId)
+                        && !deleting.contains(systemId))
+                .sorted(Comparator.comparing(CampaignRow::id).reversed()).map(CampaignRow::id).toList();
     }
 
     private boolean nameTaken(UUID owner, byte[] fingerprint, UUID except) {
@@ -108,8 +113,88 @@ public class InMemoryLibraryStore implements LibraryStore {
         if (campaigns.containsKey(row.id()) || system == null || !system.ownerId().equals(owner)) {
             throw new IllegalStateException("key or reference refused");
         }
+        if (campaignTaken(owner, row.systemId(), row.nameFingerprint(), row.id())) {
+            throw new LibraryConflict(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN);
+        }
         campaigns.put(row.id(), row);
         RollbackUndo.onRollback(() -> campaigns.remove(row.id()));
+    }
+
+    @Override
+    public synchronized Optional<CampaignRow> updateCampaign(CampaignChange change) {
+        Optional<CampaignRow> found = findCampaign(change.id());
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        CampaignRow before = found.get();
+        UUID owner = ownerFor(before.ownerId());
+        if (before.version() != change.version()) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        if (campaignTaken(owner, before.systemId(), change.nameFingerprint(), change.id())) {
+            throw new LibraryConflict(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN);
+        }
+        Instant archivedAt;
+        Instant chosenAt = before.chosenAt();
+        if (change.archived() && before.archivedAt() == null) {
+            archivedAt = change.at();
+            chosenAt = null;
+        } else {
+            archivedAt = change.archived() ? before.archivedAt() : null;
+        }
+        CampaignRow after = new CampaignRow(before.id(), owner, before.systemId(), change.name(), change.nameFingerprint(),
+                archivedAt, chosenAt, before.version() + 1, before.createdAt());
+        campaigns.put(after.id(), after);
+        RollbackUndo.onRollback(() -> campaigns.put(before.id(), before));
+        return Optional.of(after);
+    }
+
+    @Override
+    public synchronized boolean chooseCampaign(UUID id, Instant at) {
+        Optional<CampaignRow> found = findCampaign(id).filter(row -> !row.archived());
+        found.ifPresent(before -> {
+            ownerFor(before.ownerId());
+            campaigns.put(id, new CampaignRow(id, before.ownerId(), before.systemId(), before.name(),
+                    before.nameFingerprint(), null, at, before.version(), before.createdAt()));
+            RollbackUndo.onRollback(() -> campaigns.put(id, before));
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean campaignNameTaken(UUID systemId, byte[] nameFingerprint, UUID except) {
+        return campaignTaken(OwnerContext.require(), systemId, nameFingerprint, except);
+    }
+
+    @Override
+    public List<CampaignRow> campaignsWithoutFingerprint(UUID systemId) {
+        UUID owner = OwnerContext.require();
+        return campaigns.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.nameFingerprint() == null
+                        && (systemId == null || row.systemId().equals(systemId)) && !deleting.contains(row.systemId()))
+                .sorted(Comparator.comparing(CampaignRow::id)).toList();
+    }
+
+    @Override
+    public synchronized boolean fillCampaignFingerprint(UUID id, byte[] nameFingerprint) {
+        Optional<CampaignRow> found = findCampaign(id).filter(row -> row.nameFingerprint() == null);
+        found.ifPresent(before -> {
+            UUID owner = ownerFor(before.ownerId());
+            if (campaignTaken(owner, before.systemId(), nameFingerprint, id)) {
+                throw new LibraryConflict(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN);
+            }
+            campaigns.put(id, new CampaignRow(id, owner, before.systemId(), before.name(), nameFingerprint,
+                    before.archivedAt(), before.chosenAt(), before.version(), before.createdAt()));
+            RollbackUndo.onRollback(() -> campaigns.put(id, before));
+        });
+        return found.isPresent();
+    }
+
+    /** Like the key on (owner, system, name fingerprint), which ignores a null fingerprint. */
+    private boolean campaignTaken(UUID owner, UUID systemId, byte[] fingerprint, UUID except) {
+        return fingerprint != null && campaigns.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                && other.systemId().equals(systemId) && !other.id().equals(except)
+                && Arrays.equals(other.nameFingerprint(), fingerprint));
     }
 
     @Override
@@ -126,10 +211,12 @@ public class InMemoryLibraryStore implements LibraryStore {
     }
 
     @Override
-    public Optional<CampaignRow> firstCampaign() {
+    public Optional<CampaignRow> currentCampaign() {
         UUID owner = OwnerContext.require();
-        return campaigns.values().stream().filter(row -> row.ownerId().equals(owner) && !deleting.contains(row.systemId()))
-                .min(Comparator.comparing(CampaignRow::createdAt).thenComparing(CampaignRow::id));
+        return campaigns.values().stream().filter(row -> row.ownerId().equals(owner) && !deleting.contains(row.systemId())
+                        && !row.archived())
+                .min(Comparator.comparing(CampaignRow::chosenAt, Comparator.nullsLast(Comparator.reverseOrder()))
+                        .thenComparing(CampaignRow::createdAt).thenComparing(CampaignRow::id));
     }
 
     @Override

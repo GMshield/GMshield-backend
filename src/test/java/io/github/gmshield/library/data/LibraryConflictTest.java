@@ -32,6 +32,11 @@ class LibraryConflictTest {
                     assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.NAME_TAKEN);
                     assertThat(conflict).hasMessage("library.name_taken").hasNoCause();
                 });
+        // Story 3.2: the campaign's key on (owner, system, name fingerprint).
+        assertThat(JpaLibraryStore.conflictOf(new PersistenceException(
+                new ConstraintViolationException("insert refused", sql, "campaign_owner_system_name_fingerprint_key"))))
+                .hasValueSatisfying(conflict -> assertThat(conflict.reason())
+                        .isEqualTo(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN));
         assertThat(JpaLibraryStore.conflictOf(new ConstraintViolationException("insert refused", sql, "system_pkey"))).isEmpty();
         assertThat(JpaLibraryStore.conflictOf(new ConstraintViolationException("insert refused", sql, null))).isEmpty();
         assertThat(JpaLibraryStore.conflictOf(new IllegalStateException("other"))).isEmpty();

@@ -5,7 +5,8 @@
  * through {@code vault}. Another owner's item is "not found", exactly like an unknown one. From Story 3.1 part B a
  * system's deletion is recorded in {@code deletion}, which is not a library table (ids and times only, JDBC); each
  * module that owns part of what goes removes it through {@code service.SystemDeletionHandler}, so this module still
- * depends on {@code shared} and {@code vault} only.
+ * depends on {@code shared} and {@code vault} only. From Story 3.2 the GM creates, renames, archives, restores and
+ * chooses campaigns; the current campaign is stored with the campaign ({@code chosen_at}), never in the browser.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Library",
         allowedDependencies = {"shared :: service", "vault :: service"})

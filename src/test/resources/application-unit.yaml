@@ -41,3 +41,6 @@ gmshield:
   library:
     deletion-sweep:
       enabled: false
+    # Nor does the campaign fingerprint fill at start (Story 3.2): the tests run it.
+    campaign-fingerprints:
+      enabled: false

@@ -39,7 +39,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 /**
  * The GM's conversation (Story 2.4): the current conversation, a new turn, a turn's answer as server-sent events, and
  * the GM's stop of an answer (Story 2.6), and from Story 2.7 a page of the version a stored source reference names, as
- * JSON with the same shape as {@code MaterialPageView}, and its picture, streamed as WebP with {@code nosniff}.
+ * JSON with the same shape as {@code MaterialPageView}, and its picture, streamed as WebP with {@code nosniff}. From
+ * Story 3.2, a campaign's conversation with its question count.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -49,6 +50,7 @@ class ConversationController {
 
     static final String CURRENT = "/api/v1/conversations/current";
     static final String TURNS = "/api/v1/campaigns/{campaignId}/turns";
+    static final String OF_CAMPAIGN = "/api/v1/campaigns/{campaignId}/conversation";
     static final String EVENTS = "/api/v1/turns/{turnId}/events";
     static final String STOP = "/api/v1/turns/{turnId}/stop";
     static final String REFERENCE_PAGE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}";
@@ -89,6 +91,14 @@ class ConversationController {
                     current.indexingFailed() == null ? null : new IndexingFailureView(
                             current.indexingFailed().passages(), current.indexingFailed().retrying()));
         }
+    }
+
+    @Schema(name = "CampaignConversation", requiredProperties = {"id", "questions"},
+            description = "A campaign's conversation (contract 1.19.0)")
+    record OfCampaignView(
+            @Schema(description = "The conversation's id", format = "uuid") UUID id,
+            @Schema(description = "How many questions it holds", format = "int64", minimum = "0", example = "3")
+            long questions) {
     }
 
     @Schema(name = "IndexingFailure", requiredProperties = {"passages", "retrying"},
@@ -220,6 +230,21 @@ class ConversationController {
         Conversations.Current current = conversations.current();
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(CurrentView.of(current));
+    }
+
+    @GetMapping(path = OF_CAMPAIGN, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getCampaignConversation", summary = "The campaign's conversation (a campaign has at most"
+            + " one) and how many questions it holds, for an archived campaign too; request.not_found (404) when the"
+            + " campaign has none or is not the account's (unknown, another account's or malformed)",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<OfCampaignView> ofCampaign(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId) {
+        Conversations.OfCampaign found = parse(campaignId).flatMap(conversations::ofCampaign)
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new OfCampaignView(found.id(),
+                found.questions()));
     }
 
     @PostMapping(path = TURNS, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)

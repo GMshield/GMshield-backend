@@ -19,6 +19,9 @@ public interface ConversationStore {
 
     Optional<ConversationRow> findConversation(UUID id);
 
+    /** How many turns the current owner's conversation has (Story 3.2); 0 for an unknown one or another owner's. */
+    long turnCount(UUID conversationId);
+
     void insertTurn(TurnRow row);
 
     Optional<TurnRow> findTurn(UUID id);

@@ -45,6 +45,11 @@ public class InMemoryConversationStore implements ConversationStore {
     }
 
     @Override
+    public long turnCount(UUID conversationId) {
+        return owned(turns).filter(row -> row.conversationId().equals(conversationId)).count();
+    }
+
+    @Override
     public synchronized void insertTurn(TurnRow row) {
         ownerFor(row.ownerId());
         ConversationRow conversation = conversations.get(row.conversationId());
