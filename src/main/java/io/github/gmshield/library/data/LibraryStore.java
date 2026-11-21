@@ -39,25 +39,62 @@ public interface LibraryStore {
     List<SystemRow> systems(UUID before, int limit);
 
     /**
-     * The current owner's campaigns of the system {@code systemId}, newest first (descending id), only those whose id
-     * is below {@code before} when it is given, at most {@code limit}; empty for another owner's system.
+     * The current owner's campaigns of ready systems (Story 3.2), of the system {@code systemId} only when it is given,
+     * archived ones when {@code archived} is true and the others when it is false; newest first (descending id), only
+     * those whose id is below {@code before} when it is given, at most {@code limit}; empty for another owner's system.
      */
-    List<CampaignRow> campaignsOf(UUID systemId, UUID before, int limit);
+    List<CampaignRow> campaigns(UUID systemId, boolean archived, UUID before, int limit);
 
-    /** The ids of all the current owner's campaigns of the system {@code systemId}, newest first. */
+    /** The ids of all the current owner's campaigns of the system {@code systemId}, archived ones included, newest first. */
     List<UUID> campaignIdsOf(UUID systemId);
 
-    /** Stores a new campaign of the current owner; joins the caller's transaction, which must exist. */
+    /**
+     * Stores a new campaign of the current owner; joins the caller's transaction, which must exist. Throws
+     * {@link LibraryConflict} ({@code CAMPAIGN_NAME_TAKEN}) when another campaign of the system has its name fingerprint.
+     */
     void insertCampaign(CampaignRow row);
+
+    /**
+     * Writes an edit of the current owner's campaign (Story 3.2) and answers the row as stored, its version raised by
+     * one; empty for an unknown id, another owner's or a campaign of a deleting system. Throws {@link LibraryConflict}:
+     * {@code STALE_VERSION} when the row is not at {@code change.version()} (nothing is written),
+     * {@code CAMPAIGN_NAME_TAKEN} when another campaign of the system has the new name fingerprint. Joins the caller's
+     * transaction, which must exist.
+     */
+    Optional<CampaignRow> updateCampaign(CampaignChange change);
+
+    /**
+     * The current owner's campaign {@code id}, of a ready system and not archived, was chosen at {@code at} (Story 3.2):
+     * its version stays. False, and nothing changes, for any other id. Joins the caller's transaction, which must exist.
+     */
+    boolean chooseCampaign(UUID id, Instant at);
+
+    /** Whether a campaign of the current owner's system {@code systemId} other than {@code except} has this fingerprint. */
+    boolean campaignNameTaken(UUID systemId, byte[] nameFingerprint, UUID except);
+
+    /**
+     * The current owner's campaigns of ready systems that have no name fingerprint yet (rows from before V23), of the
+     * system {@code systemId} only when it is given, archived ones included.
+     */
+    List<CampaignRow> campaignsWithoutFingerprint(UUID systemId);
+
+    /**
+     * Fills the missing name fingerprint of the current owner's campaign {@code id}; its version stays. False when there
+     * is no such campaign or it already has one. Joins the caller's transaction, which must exist.
+     */
+    boolean fillCampaignFingerprint(UUID id, byte[] nameFingerprint);
 
     /** The current owner's system with this id; empty for an unknown id or another owner's. */
     Optional<SystemRow> findSystem(UUID id);
 
-    /** The current owner's campaign with this id; empty for an unknown id or another owner's. */
+    /** The current owner's campaign with this id, archived or not; empty for an unknown id or another owner's. */
     Optional<CampaignRow> findCampaign(UUID id);
 
-    /** The current owner's oldest campaign (the earliest id on a tie), if the owner has one. */
-    Optional<CampaignRow> firstCampaign();
+    /**
+     * The current owner's current campaign (Story 3.2): of the ready, not archived campaigns, the one chosen last, else
+     * the oldest (the earliest id on a tie); empty when there is none.
+     */
+    Optional<CampaignRow> currentCampaign();
 
     // --- deletion (Story 3.1 part B)
 

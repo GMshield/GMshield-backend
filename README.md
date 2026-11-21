@@ -191,7 +191,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     sem nome" / "Primeira campanha", or "Untitled system" / "First campaign". A failure leaves neither and
     keeps the attempt for a retry with the same account id. The vault's data-key insert commits in its own
     transaction (`REQUIRES_NEW`, on its own connection), because a stored key is cached at once.
-  - `GET /api/v1/campaigns/current` (the owner's oldest campaign, with its system), `GET
+  - `GET /api/v1/campaigns/current` (the owner's current campaign, with its system: Story 3.2, below), `GET
     /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
     malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
   - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
@@ -218,8 +218,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       starting at 0): one that is not the row's is `request.stale_version` (409) and changes nothing, as is an update
       that a concurrent edit beats at the database. It answers the system with its version raised by one. A missing or
       negative version is `request.invalid`.
-    - `GET /api/v1/campaigns?system=&cursor&limit`: the system's campaigns as `{id, name}`, newest first; without
-      `system`, `request.invalid`. `GET /api/v1/materials?state=...&system=` (`materials`) keeps only the materials
+    - `GET /api/v1/campaigns?system=&cursor&limit`: the system's campaigns, newest first (from Story 3.2 `system` is
+      optional, below). `GET /api/v1/materials?state=...&system=` (`materials`) keeps only the materials
       attached to the system (`material_system`) or whose campaign is one of its campaigns
       (`Library.campaignIdsOf`). An unknown, foreign or malformed id answers `request.not_found` (404) on GET, PATCH
       and in `?system=` alike.
@@ -273,6 +273,58 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       same name and edition can be created again).
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.18.0). The worker does
       not change: `index.removal` per version already exists.
+  - **Campaigns (Story 3.2 part A, public contract 1.19.0, migration V23).** The GM lists, creates, renames, archives,
+    restores and chooses campaigns (deleting one is part B). A campaign is `{id, name, system, archived, version}`;
+    a list item is `{id, name, system: {id, name, edition}, archived}`.
+    - Name: 1 to 120 code points after trimming (`request.campaign_name_invalid`, 400, params `min` and `max`), stored
+      only encrypted (`Binding("campaign", "name", id, owner)`). Its system is set at creation and never changes. A new
+      campaign starts with the starting scope (`ScopeSettings.STARTING`, which the resolver already reads for every
+      campaign; nothing is stored until Story 3.5).
+    - **Unique per system** (Dalton, 2026-11-20): `campaign.name_fingerprint` is the fingerprint of the name's unique
+      form (as a system's, under `campaign`/`name`), unique on `(owner_id, system_id, name_fingerprint)`
+      (`campaign_owner_system_name_fingerprint_key`). A duplicate on POST or PATCH is `request.campaign_name_taken`
+      (409); the service checks first and a write the key refuses anyway is the same 409. The same name in another
+      system is fine. An archived campaign keeps its name, so its name stays taken until it is renamed (part B: deleted). A first sign-in stores the starter campaign's fingerprint.
+    - **Rows from before V23** have no fingerprint (SQL cannot compute a keyed one, and the key ignores nulls). V23
+      lists their owners in `campaign_fingerprint_backfill` (owner ids only, not a library table); once the application
+      is ready, `library.service.CampaignFingerprints` fills each listed owner's rows as that owner (decrypt, then
+      fingerprint, through JPA), then removes the owner (`JdbcClient`). Repeatable: a start with nobody listed does
+      nothing, an owner whose fill fails stays for the next start (`library.campaign_fingerprints_failed`), and a row
+      whose name another campaign of its system already holds keeps none (`library.campaign_fingerprint_duplicate`).
+      Until then a create or a rename also compares the name with the system's campaigns that have no fingerprint.
+      Switched off by `gmshield.library.campaign-fingerprints.enabled=false` (the unit tests).
+    - `GET /api/v1/campaigns?system=&archived=&cursor&limit`: every campaign of the owner's ready systems, or the
+      system's only; `archived=false` (the default) leaves archived ones out, `archived=true` lists only them; newest
+      first by id; a bad `archived`, limit or cursor is `request.invalid` (400). An unknown, foreign or malformed
+      `system` is `request.not_found`. The system page's campaigns are this list with `system`.
+    - `POST /api/v1/campaigns` `{name, systemId}` answers 201 with the campaign, which becomes the current one. An
+      unknown, foreign, malformed or deleting system is 404; no `systemId` is `request.invalid`.
+    - `PATCH /api/v1/campaigns/{id}` `{version, name?, archived?}`: renames, archives (`archived: true`) or restores
+      (`false`) on the row's `version` (Hibernate `@Version`, from 0); a stale one is `request.stale_version` (409) and
+      changes nothing, and neither `name` nor `archived` is `request.invalid` (400). Without a name the stored name and
+      fingerprint stay as they are (no uniqueness check), so a row from before V23 is archived and restored as it is. Archiving keeps every row and sets `archived_at`: the campaign leaves the lists, the switcher and
+      the current position, still opens by id (`GET /api/v1/campaigns/{id}`, its conversation, stored references,
+      questions asked on it) and can be restored. Archive and restore are reversible, so the frontend asks no
+      confirmation. Logs: `library.campaign_created`, `library.campaign_changed` (ids, version, archived).
+    - **Current campaign:** `PUT /api/v1/campaigns/current` `{campaignId}` sets the campaign's `chosen_at` and answers
+      it (200); an archived, foreign, unknown or malformed id is 404 `request.not_found`, and nothing changes. It does
+      not raise the version (`@OptimisticLock(excluded = true)`), so a switch never makes an open rename stale. The
+      current campaign is the ready, not archived campaign with the latest `chosen_at`, else the oldest (created
+      first, then the smallest id); none when there is none (`GET .../current` and `GET /api/v1/conversations/current`
+      are then 404, which the frontend shows as the composer disabled). Archiving clears `chosen_at`, so archiving or
+      deleting the chosen campaign falls back by itself and a restored campaign does not come back as current. Nothing
+      about the current campaign is kept in the browser.
+    - `GET /api/v1/campaigns/{id}/conversation` (`conversations`) answers `{id, questions}`: the campaign's one
+      conversation and its turn count; 404 when it has none or the campaign is not the owner's.
+    - A system's deletion still counts and removes its archived campaigns (`campaignIdsOf` and the deletion's own reads
+      ignore the archive).
+    - `V23__campaign_management.sql` adds `campaign.version bigint not null default 0`, `archived_at`, `chosen_at`,
+      `name_fingerprint bytea`, the key, and `campaign_fingerprint_backfill`. Additive: the previous release neither
+      reads nor writes them. What users see after a rollback: archived campaigns show again, the current campaign is
+      the oldest again, and a starter made meanwhile has no fingerprint (filled at the next roll forward only when its
+      owner is listed; otherwise it is still compared by name on every create and rename).
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.19.0). The worker does
+      not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
     start without a database and use in-memory stores (`@Primary`).

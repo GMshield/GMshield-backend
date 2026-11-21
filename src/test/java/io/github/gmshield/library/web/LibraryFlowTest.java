@@ -59,6 +59,10 @@ import tools.jackson.databind.json.JsonMapper;
  * <p>Story 3.1: the list of systems and its pages, a new system, a duplicate by name and edition, the field limits,
  * an edit by version and a stale one, a system's campaigns, and another owner's system on every new route and on
  * {@code ?system=}: each route and each problem.
+ *
+ * <p>Story 3.2: a new campaign, its name's limits and uniqueness within its system, the list of every campaign and of the
+ * archived ones, a rename by version and a stale one, archive and restore, the current campaign (chosen, archived when
+ * chosen, of a system being deleted, none), and another owner's campaign and system on every campaign route.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -502,12 +506,13 @@ class LibraryFlowTest {
             assertThat(json(response).path("code").asString()).isEqualTo("request.invalid");
         }
 
-        // The starter system's campaign, as {id, name}; a new system has none.
+        // The starter system's campaign, with its system (Story 3.2); a new system has none.
         JsonNode campaigns = ok(get("/api/v1/campaigns?system=" + starter, gm.session()));
         assertThat(campaigns.path("items")).hasSize(1);
         assertThat(campaigns.path("items").get(0).path("id").asString()).isEqualTo(onlyCampaignOf(gm.id()).id().toString());
         assertThat(campaigns.path("items").get(0).path("name").asString()).isEqualTo("First campaign");
-        assertThat(campaigns.path("items").get(0).has("system")).isFalse();
+        assertThat(campaigns.path("items").get(0).path("system").path("id").asString()).isEqualTo(starter.toString());
+        assertThat(campaigns.path("items").get(0).path("archived").asBoolean()).isFalse();
         assertThat(campaigns.has("nextCursor")).isFalse();
         assertThat(ok(get("/api/v1/campaigns?system=" + created.getFirst(), gm.session())).path("items")).isEmpty();
         UUID newer = Ids.newId();
@@ -520,7 +525,7 @@ class LibraryFlowTest {
         assertThat(paged.path("nextCursor").asString()).isEqualTo(newer.toString());
         assertThat(ok(get("/api/v1/campaigns?system=" + starter + "&cursor=" + newer, gm.session())).path("items")
                 .get(0).path("name").asString()).isEqualTo("First campaign");
-        for (String query : List.of("", "?limit=0&system=" + starter, "?cursor=x&system=" + starter)) {
+        for (String query : List.of("?archived=yes", "?limit=0&system=" + starter, "?cursor=x&system=" + starter)) {
             HttpResponse<String> response = get("/api/v1/campaigns" + query, gm.session());
             assertThat(response.statusCode()).as(query).isEqualTo(400);
             assertThat(json(response).path("code").asString()).isEqualTo("request.invalid");
@@ -562,6 +567,299 @@ class LibraryFlowTest {
         assertThat(send("POST", "/api/v1/systems", null, Map.of("name", "X")).statusCode()).isEqualTo(401);
         assertThat(send("PATCH", "/api/v1/systems/" + aSystem, null, Map.of("version", 0, "name", "X")).statusCode())
                 .isEqualTo(401);
+    }
+
+    // --- Story 3.2: campaigns ---
+
+    @Test
+    void aNewCampaignIsStoredEncryptedBecomesCurrentAndItsNameIsUniqueWithinItsSystem() throws Exception {
+        Gm gm = signUp("pt-BR");
+        UUID starterSystem = onlySystemOf(gm.id()).id();
+        UUID starter = onlyCampaignOf(gm.id()).id();
+
+        // Matrix row "Create".
+        pause();
+        HttpResponse<String> response = send("POST", "/api/v1/campaigns", gm.session(),
+                Map.of("name", "  Mesa de quinta ", "systemId", starterSystem.toString()));
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+        assertThat(response.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode created = json(response);
+        UUID id = UUID.fromString(created.path("id").asString());
+        assertThat(created.path("name").asString()).isEqualTo("Mesa de quinta");
+        assertThat(created.path("system").path("id").asString()).isEqualTo(starterSystem.toString());
+        assertThat(created.path("system").path("name").asString()).isEqualTo("Sistema sem nome");
+        assertThat(created.path("archived").asBoolean()).isFalse();
+        assertThat(created.path("version").asLong()).isZero();
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(id.toString());
+        assertThat(ok(get("/api/v1/campaigns/" + id, gm.session()))).isEqualTo(created);
+        // Stored only encrypted, fingerprinted in the unique form; the starter's name has its fingerprint too.
+        CampaignRow row = library.campaigns.get(id);
+        assertThat(new String(row.name(), StandardCharsets.ISO_8859_1)).doesNotContain("Mesa");
+        assertThat(vault.decryptText(new Binding("campaign", "name", id, gm.id()), row.name())).isEqualTo("Mesa de quinta");
+        assertThat(row.nameFingerprint()).isEqualTo(vault.fingerprint("campaign", "name", "mesa de quinta"));
+        assertThat(library.campaigns.get(starter).nameFingerprint())
+                .isEqualTo(vault.fingerprint("campaign", "name", "primeira campanha"));
+        // Every campaign of the account, newest first, each with its system.
+        JsonNode all = ok(get("/api/v1/campaigns", gm.session()));
+        assertThat(all.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(id.toString(), starter.toString());
+        assertThat(all.path("items").get(0).path("system").path("name").asString()).isEqualTo("Sistema sem nome");
+        assertThat(all.path("items").get(0).path("system").has("description")).isFalse();
+        assertThat(all.path("items").get(0).path("archived").asBoolean()).isFalse();
+
+        // Matrix row "Duplicate name": trimmed, whatever the case; the starter's name as well.
+        int campaigns = library.campaigns.size();
+        for (String name : List.of(" mesa de QUINTA ", "PRIMEIRA campanha")) {
+            HttpResponse<String> duplicate = send("POST", "/api/v1/campaigns", gm.session(),
+                    Map.of("name", name, "systemId", starterSystem.toString()));
+            assertThat(duplicate.statusCode()).as(name).isEqualTo(409);
+            assertThat(json(duplicate).path("code").asString()).isEqualTo("request.campaign_name_taken");
+            assertThat(duplicate.body()).doesNotContain("quinta").doesNotContain("QUINTA");
+        }
+        assertThat(library.campaigns).hasSize(campaigns);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(id.toString());
+
+        // Matrix row "Same name, other system".
+        UUID other = UUID.fromString(json(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "D&D")))
+                .path("id").asString());
+        JsonNode elsewhere = json(send("POST", "/api/v1/campaigns", gm.session(),
+                Map.of("name", "Mesa de quinta", "systemId", other.toString())));
+        assertThat(elsewhere.path("system").path("id").asString()).isEqualTo(other.toString());
+        assertThat(ok(get("/api/v1/campaigns?system=" + other, gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(elsewhere.path("id").asString());
+        // Another owner may have the same name.
+        Gm them = signUp("pt-BR");
+        assertThat(send("POST", "/api/v1/campaigns", them.session(), Map.of("name", "Mesa de quinta",
+                "systemId", onlySystemOf(them.id()).id().toString())).statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    void anInvalidNameOrSystemStoresNothing() throws Exception {
+        Gm gm = signUp("en");
+        String system = onlySystemOf(gm.id()).id().toString();
+        int campaigns = library.campaigns.size();
+
+        // Matrix row "Invalid name".
+        for (Map<String, Object> body : List.<Map<String, Object>>of(Map.of("name", "  ", "systemId", system),
+                Map.of("name", "x".repeat(121), "systemId", system), Map.of("systemId", system))) {
+            HttpResponse<String> refused = send("POST", "/api/v1/campaigns", gm.session(), body);
+            assertThat(refused.statusCode()).isEqualTo(400);
+            JsonNode problem = json(refused);
+            assertThat(problem.path("code").asString()).isEqualTo("request.campaign_name_invalid");
+            assertThat(problem.path("params").path("min").asInt()).isEqualTo(1);
+            assertThat(problem.path("params").path("max").asInt()).isEqualTo(120);
+        }
+        assertThat(json(send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", "X"))).path("code").asString())
+                .isEqualTo("request.invalid");
+        assertThat(json(sendText("POST", "/api/v1/campaigns", gm.session(), "{\"name\":")).path("code").asString())
+                .isEqualTo("request.invalid");
+        for (String unknown : List.of(UUID.randomUUID().toString(), "not-a-uuid")) {
+            notFound(send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", "X", "systemId", unknown)));
+        }
+        assertThat(library.campaigns).hasSize(campaigns);
+        // A system being deleted takes no campaign.
+        UUID going = UUID.fromString(json(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Going")))
+                .path("id").asString());
+        library.deleting.add(going);
+        notFound(send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", "X", "systemId", going.toString())));
+        assertThat(library.campaigns).hasSize(campaigns);
+        // 120 code points are fine.
+        assertThat(send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", "\uD83C\uDFB2".repeat(120),
+                "systemId", system)).statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    void theCurrentCampaignIsTheOneChosenLastWhileItIsInUseElseTheOldest() throws Exception {
+        Gm gm = signUp("en");
+        UUID system = onlySystemOf(gm.id()).id();
+        UUID starter = onlyCampaignOf(gm.id()).id();
+        pause();
+        UUID first = created(gm, "First table", system);
+        pause();
+        UUID second = created(gm, "Second table", system);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(second.toString());
+
+        // Matrix row "Switch": the choice never raises the version.
+        JsonNode chosen = ok(send("PUT", "/api/v1/campaigns/current", gm.session(), Map.of("campaignId", first.toString())));
+        assertThat(chosen.path("id").asString()).isEqualTo(first.toString());
+        assertThat(chosen.path("version").asLong()).isZero();
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(first.toString());
+        assertThat(library.campaigns.get(first).version()).isZero();
+
+        // Matrix row "Archive current": it leaves the lists, and the one chosen before it is current.
+        JsonNode archived = ok(send("PATCH", "/api/v1/campaigns/" + first, gm.session(),
+                Map.of("version", 0, "archived", true)));
+        assertThat(archived.path("archived").asBoolean()).isTrue();
+        assertThat(archived.path("version").asLong()).isEqualTo(1);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(second.toString());
+        assertThat(ok(get("/api/v1/campaigns", gm.session())).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(second.toString(), starter.toString());
+        assertThat(ok(get("/api/v1/campaigns?system=" + system, gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(second.toString(), starter.toString());
+        JsonNode archivedList = ok(get("/api/v1/campaigns?archived=true", gm.session()));
+        assertThat(archivedList.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(first.toString());
+        assertThat(archivedList.path("items").get(0).path("archived").asBoolean()).isTrue();
+        // It still opens by id.
+        assertThat(ok(get("/api/v1/campaigns/" + first, gm.session())).path("archived").asBoolean()).isTrue();
+
+        // Matrix row "Switch to archived": refused, nothing changes.
+        notFound(send("PUT", "/api/v1/campaigns/current", gm.session(), Map.of("campaignId", first.toString())));
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(second.toString());
+
+        // Matrix row "Restore": back in the lists, not current.
+        JsonNode restored = ok(send("PATCH", "/api/v1/campaigns/" + first, gm.session(),
+                Map.of("version", 1, "archived", false)));
+        assertThat(restored.path("archived").asBoolean()).isFalse();
+        assertThat(restored.path("version").asLong()).isEqualTo(2);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(second.toString());
+        assertThat(ok(get("/api/v1/campaigns", gm.session())).path("items")).hasSize(3);
+        assertThat(ok(get("/api/v1/campaigns?archived=true", gm.session())).path("items")).isEmpty();
+
+        // A chosen campaign whose system is being deleted falls back too.
+        UUID otherSystem = UUID.fromString(json(send("POST", "/api/v1/systems", gm.session(), Map.of("name", "Other")))
+                .path("id").asString());
+        UUID going = created(gm, "Going", otherSystem);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(going.toString());
+        library.deleting.add(otherSystem);
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(second.toString());
+        notFound(send("PUT", "/api/v1/campaigns/current", gm.session(), Map.of("campaignId", going.toString())));
+
+        // Nothing chosen in use: the oldest. Matrix row "No campaign": none at all.
+        ok(send("PATCH", "/api/v1/campaigns/" + second, gm.session(), Map.of("version", 0, "archived", true)));
+        ok(send("PATCH", "/api/v1/campaigns/" + first, gm.session(), Map.of("version", 2, "archived", true)));
+        assertThat(current(gm.session(), 200).path("id").asString()).isEqualTo(starter.toString());
+        ok(send("PATCH", "/api/v1/campaigns/" + starter, gm.session(), Map.of("version", 0, "archived", true)));
+        assertThat(current(gm.session(), 404).path("code").asString()).isEqualTo("request.not_found");
+        assertThat(ok(get("/api/v1/campaigns", gm.session())).path("items")).isEmpty();
+        // Bad choices.
+        for (String body : List.of("{}", "{\"campaignId\":", "{\"campaignId\":null}")) {
+            HttpResponse<String> refused = sendText("PUT", "/api/v1/campaigns/current", gm.session(), body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        }
+        notFound(send("PUT", "/api/v1/campaigns/current", gm.session(), Map.of("campaignId", "nope")));
+    }
+
+    @Test
+    void aRenameNamesItsVersionAndAStaleOneChangesNothing() throws Exception {
+        Gm gm = signUp("en");
+        UUID system = onlySystemOf(gm.id()).id();
+        UUID starter = onlyCampaignOf(gm.id()).id();
+        UUID table = created(gm, "Thursday table", system);
+
+        JsonNode renamed = ok(send("PATCH", "/api/v1/campaigns/" + table, gm.session(),
+                Map.of("version", 0, "name", " Friday table ")));
+        assertThat(renamed.path("name").asString()).isEqualTo("Friday table");
+        assertThat(renamed.path("version").asLong()).isEqualTo(1);
+        assertThat(library.campaigns.get(table).nameFingerprint())
+                .isEqualTo(vault.fingerprint("campaign", "name", "friday table"));
+        // Its own name in another case is fine.
+        assertThat(ok(send("PATCH", "/api/v1/campaigns/" + table, gm.session(), Map.of("version", 1, "name", "FRIDAY table")))
+                .path("version").asLong()).isEqualTo(2);
+
+        // Matrix row "Stale rename".
+        HttpResponse<String> stale = send("PATCH", "/api/v1/campaigns/" + table, gm.session(),
+                Map.of("version", 1, "name", "Elsewhere"));
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        assertThat(ok(get("/api/v1/campaigns/" + table, gm.session())).path("name").asString()).isEqualTo("FRIDAY table");
+        // The starter's name is taken; a bad name and a missing or negative version are refused.
+        HttpResponse<String> taken = send("PATCH", "/api/v1/campaigns/" + table, gm.session(),
+                Map.of("version", 2, "name", "first CAMPAIGN"));
+        assertThat(taken.statusCode()).isEqualTo(409);
+        assertThat(json(taken).path("code").asString()).isEqualTo("request.campaign_name_taken");
+        assertThat(json(send("PATCH", "/api/v1/campaigns/" + table, gm.session(), Map.of("version", 2, "name", " ")))
+                .path("code").asString()).isEqualTo("request.campaign_name_invalid");
+        // A version with neither a name nor an archive changes nothing, so it raises no version either.
+        for (Map<String, Object> body : List.<Map<String, Object>>of(Map.of("name", "X"), Map.of("version", -1),
+                Map.of("version", 2))) {
+            HttpResponse<String> refused = send("PATCH", "/api/v1/campaigns/" + table, gm.session(), body);
+            assertThat(refused.statusCode()).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        }
+        assertThat(library.campaigns.get(table).version()).isEqualTo(2);
+        // A choice in between leaves the version as it is: the rename still applies.
+        ok(send("PUT", "/api/v1/campaigns/current", gm.session(), Map.of("campaignId", starter.toString())));
+        assertThat(ok(send("PATCH", "/api/v1/campaigns/" + table, gm.session(), Map.of("version", 2, "name", "Saturday")))
+                .path("version").asLong()).isEqualTo(3);
+        // The context bar shows the current campaign's new name on its next load.
+        ok(send("PATCH", "/api/v1/campaigns/" + starter, gm.session(), Map.of("version", 0, "name", "Renamed")));
+        assertThat(current(gm.session(), 200).path("name").asString()).isEqualTo("Renamed");
+    }
+
+    @Test
+    void allCampaignsComeInPagesNewestFirst() throws Exception {
+        Gm gm = signUp("en");
+        UUID system = onlySystemOf(gm.id()).id();
+        UUID starter = onlyCampaignOf(gm.id()).id();
+        List<UUID> made = new java.util.ArrayList<>();
+        for (String name : List.of("A", "B", "C")) {
+            pause();
+            made.addFirst(created(gm, name, system));
+        }
+
+        JsonNode first = ok(get("/api/v1/campaigns?limit=2", gm.session()));
+        assertThat(first.path("items")).extracting(item -> item.path("name").asString()).containsExactly("C", "B");
+        assertThat(first.path("nextCursor").asString()).isEqualTo(made.get(1).toString());
+        JsonNode second = ok(get("/api/v1/campaigns?limit=2&cursor=" + made.get(1), gm.session()));
+        assertThat(second.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(made.get(2).toString(), starter.toString());
+        assertThat(second.has("nextCursor")).isFalse();
+        ok(send("PATCH", "/api/v1/campaigns/" + made.get(0), gm.session(), Map.of("version", 0, "archived", true)));
+        ok(send("PATCH", "/api/v1/campaigns/" + made.get(2), gm.session(), Map.of("version", 0, "archived", true)));
+        JsonNode archived = ok(get("/api/v1/campaigns?archived=true&limit=1", gm.session()));
+        assertThat(archived.path("items")).extracting(item -> item.path("name").asString()).containsExactly("C");
+        assertThat(ok(get("/api/v1/campaigns?archived=true&limit=1&cursor=" + archived.path("nextCursor").asString(),
+                gm.session())).path("items")).extracting(item -> item.path("name").asString()).containsExactly("A");
+        assertThat(ok(get("/api/v1/campaigns?archived=false", gm.session())).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("B", "First campaign");
+    }
+
+    @Test
+    void anotherOwnersCampaignOrSystemIsNotFoundOnEveryCampaignRoute() throws Exception {
+        Gm a = signUp("en");
+        Gm b = signUp("pt-BR");
+        UUID aSystem = onlySystemOf(a.id()).id();
+        UUID aCampaign = onlyCampaignOf(a.id()).id();
+        int campaigns = library.campaigns.size();
+
+        JsonNode expected = notFound(get("/api/v1/campaigns/" + UUID.randomUUID(), b.session()));
+        List<HttpResponse<String>> refused = new java.util.ArrayList<>();
+        refused.add(send("PATCH", "/api/v1/campaigns/" + aCampaign, b.session(), Map.of("version", 0, "name", "Stolen")));
+        refused.add(send("PATCH", "/api/v1/campaigns/" + aCampaign, b.session(), Map.of("version", 0, "archived", true)));
+        refused.add(send("PATCH", "/api/v1/campaigns/not-a-uuid", b.session(), Map.of("name", "X")));
+        refused.add(send("PUT", "/api/v1/campaigns/current", b.session(), Map.of("campaignId", aCampaign.toString())));
+        refused.add(send("POST", "/api/v1/campaigns", b.session(), Map.of("name", "Stolen", "systemId", aSystem.toString())));
+        refused.add(get("/api/v1/campaigns?system=" + aSystem, b.session()));
+        refused.add(get("/api/v1/campaigns?archived=true&system=" + aSystem, b.session()));
+        for (HttpResponse<String> response : refused) {
+            assertThat(withoutTraceId(notFound(response))).isEqualTo(withoutTraceId(expected));
+            assertThat(response.body()).doesNotContain(aCampaign.toString()).doesNotContain(aSystem.toString())
+                    .doesNotContain("First campaign").doesNotContain("Untitled system");
+        }
+        assertThat(library.campaigns).hasSize(campaigns);
+        assertThat(library.campaigns.get(aCampaign).version()).isZero();
+        assertThat(library.campaigns.get(aCampaign).chosenAt()).isNull();
+        // B's list and current campaign are B's.
+        assertThat(ok(get("/api/v1/campaigns", b.session())).path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Primeira campanha");
+        assertThat(current(b.session(), 200).path("name").asString()).isEqualTo("Primeira campanha");
+        // Every new route needs a session.
+        assertThat(get("/api/v1/campaigns", null).statusCode()).isEqualTo(401);
+        assertThat(send("POST", "/api/v1/campaigns", null, Map.of("name", "X", "systemId", aSystem.toString()))
+                .statusCode()).isEqualTo(401);
+        assertThat(send("PATCH", "/api/v1/campaigns/" + aCampaign, null, Map.of("version", 0)).statusCode()).isEqualTo(401);
+        assertThat(send("PUT", "/api/v1/campaigns/current", null, Map.of("campaignId", aCampaign.toString())).statusCode())
+                .isEqualTo(401);
+    }
+
+    /** A new campaign of the GM's system, through the API: its id. */
+    private UUID created(Gm gm, String name, UUID system) throws Exception {
+        HttpResponse<String> response = send("POST", "/api/v1/campaigns", gm.session(),
+                Map.of("name", name, "systemId", system.toString()));
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+        return UUID.fromString(json(response).path("id").asString());
     }
 
     // --- helpers ---

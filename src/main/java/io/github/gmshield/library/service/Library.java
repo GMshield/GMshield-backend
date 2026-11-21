@@ -1,5 +1,6 @@
 package io.github.gmshield.library.service;
 
+import io.github.gmshield.library.data.CampaignChange;
 import io.github.gmshield.library.data.CampaignRow;
 import io.github.gmshield.library.data.LibraryConflict;
 import io.github.gmshield.library.data.LibraryStore;
@@ -15,6 +16,7 @@ import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -46,11 +48,21 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 3.1 part B: a system being deleted ({@link SystemDeletion}) and its campaigns are "not found" to every read
  * and write here, from the commit of the GM's delete: the system list, {@link #system}, {@link #changeSystem},
- * {@link #campaignsOf}, {@link #campaignIdsOf}, {@link #campaign} and {@link #currentCampaign}. When the deleted system
+ * {@link #campaigns}, {@link #campaignIdsOf}, {@link #campaign} and {@link #currentCampaign}. When the deleted system
  * held the owner's only campaign, there is no current campaign.
  *
- * <p>Still to come in Epic 3: creating, renaming and switching campaigns (Story 3.2). Until then the current campaign
- * is the owner's oldest of a ready system.
+ * <p>Story 3.2: the GM lists, creates, renames, archives, restores and chooses campaigns. A campaign's name is 1 to
+ * {@value #NAME_MAX} code points after trimming ({@code request.campaign_name_invalid}, 400), encrypted under the field
+ * {@code name}; its system is set at creation and never changes. Two campaigns of one system cannot share a name (Dalton,
+ * 2026-11-20): the campaign's {@code name_fingerprint}, unique per owner and system, is the fingerprint of the name's
+ * {@link #uniqueForm}; a duplicate is {@code request.campaign_name_taken} (409). Rows from before V23 have no fingerprint
+ * until {@link #fillCampaignFingerprints} runs for their owner ({@link CampaignFingerprints}, at start), so a new or
+ * renamed campaign is also compared with the system's campaigns that have none yet. A new campaign starts with the
+ * starting scope (nothing is stored for it) and becomes the current one. An archived campaign keeps every row, leaves the
+ * lists and the current position, still opens by id ({@link #campaign}) and can be restored; a rename, an archive or a
+ * restore names the version it was made on ({@code request.stale_version}, 409, when it is stale). The current campaign
+ * is the ready, not archived campaign the GM chose last ({@link #chooseCampaign}), else the oldest ready, not archived
+ * one; none when there is none. Choosing never raises a campaign's version, and archiving forgets that it was chosen.
  */
 @Service
 public class Library {
@@ -86,14 +98,6 @@ public class Library {
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
-    /** A campaign by its id and its name, decrypted. */
-    public record Named(UUID id, String name) {
-        @Override
-        public String toString() {
-            return "Named[id=" + id + "]";
-        }
-    }
-
     /** A system with its name, edition and description, decrypted (null when none), and its version. */
     public record GameSystem(UUID id, String name, String edition, String description, long version) {
         @Override
@@ -102,11 +106,11 @@ public class Library {
         }
     }
 
-    /** A campaign with its system. */
-    public record Campaign(UUID id, String name, GameSystem system) {
+    /** A campaign with its system, whether it is archived, and its version (Story 3.2). */
+    public record Campaign(UUID id, String name, GameSystem system, boolean archived, long version) {
         @Override
         public String toString() {
-            return "Campaign[id=" + id + ", system=" + system + "]";
+            return "Campaign[id=" + id + ", system=" + system + ", archived=" + archived + ", version=" + version + "]";
         }
     }
 
@@ -125,8 +129,8 @@ public class Library {
     public record SystemPage(List<GameSystem> items, UUID nextCursor) {
     }
 
-    /** One page of a system's campaigns, and the cursor of the next one (null on the last). */
-    public record CampaignPage(List<Named> items, UUID nextCursor) {
+    /** One page of campaigns, and the cursor of the next one (null on the last). */
+    public record CampaignPage(List<Campaign> items, UUID nextCursor) {
     }
 
     /**
@@ -146,17 +150,24 @@ public class Library {
                 names[0]), nameFingerprint(names[0], null), now));
         UUID campaignId = Ids.newId();
         store.insertCampaign(new CampaignRow(campaignId, owner, systemId,
-                vault.encryptText(binding(CAMPAIGN, FIELD_NAME, campaignId, owner), names[1]), now));
+                vault.encryptText(binding(CAMPAIGN, FIELD_NAME, campaignId, owner), names[1]),
+                campaignFingerprint(names[1]), null, null, 0, now));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("systemId", systemId).addKeyValue("campaignId", campaignId)
                 .log("library.starter_created");
     }
 
-    /** The owner's current campaign with its system: in this release, the owner's oldest campaign of a ready system. */
+    /**
+     * The owner's current campaign with its system (Story 3.2): of the ready, not archived campaigns, the one chosen
+     * last, else the oldest; empty when there is none.
+     */
     public Optional<Campaign> currentCampaign() {
-        return reading(() -> store.firstCampaign().map(this::open));
+        return reading(() -> store.currentCampaign().map(this::open));
     }
 
-    /** The owner's campaign with this id, with its system; empty for an unknown id or another owner's. */
+    /**
+     * The owner's campaign with this id, with its system, archived or not; empty for an unknown id, another owner's or a
+     * campaign of a system being deleted.
+     */
     public Optional<Campaign> campaign(UUID id) {
         return reading(() -> store.findCampaign(id).map(this::open));
     }
@@ -181,18 +192,23 @@ public class Library {
     }
 
     /**
-     * The campaigns of the owner's system {@code systemId}, newest first, after the campaign {@code cursor} when it is
-     * given, at most {@code limit} (1 to {@value #MAX_LIMIT}); empty for an unknown system or another owner's.
+     * The owner's campaigns (Story 3.2), of the system {@code systemId} only when it is given, the archived ones when
+     * {@code archived} is true, else the others; newest first, after the campaign {@code cursor} when it is given, at
+     * most {@code limit} (1 to {@value #MAX_LIMIT}); empty for an unknown system or another owner's.
      */
-    public Optional<CampaignPage> campaignsOf(UUID systemId, UUID cursor, int limit) {
+    public Optional<CampaignPage> campaigns(UUID systemId, boolean archived, UUID cursor, int limit) {
         checkLimit(limit);
-        return reading(() -> store.findSystem(systemId).map(system -> {
-            List<CampaignRow> found = store.campaignsOf(system.id(), cursor, limit + 1);
+        return reading(() -> {
+            if (systemId != null && store.findSystem(systemId).isEmpty()) {
+                return Optional.<CampaignPage>empty();
+            }
+            List<CampaignRow> found = store.campaigns(systemId, archived, cursor, limit + 1);
             List<CampaignRow> page = found.size() > limit ? found.subList(0, limit) : found;
             UUID next = found.size() > limit ? page.getLast().id() : null;
-            return new CampaignPage(page.stream().map(row -> new Named(row.id(),
-                    vault.decryptText(binding(CAMPAIGN, FIELD_NAME, row.id(), row.ownerId()), row.name()))).toList(), next);
-        }));
+            Map<UUID, GameSystem> systems = new HashMap<>();
+            return Optional.of(new CampaignPage(page.stream().map(row -> open(row, systems.computeIfAbsent(row.systemId(),
+                    this::systemOf))).toList(), next));
+        });
     }
 
     /**
@@ -211,7 +227,7 @@ public class Library {
      * nothing is stored then.
      */
     public GameSystem createSystem(SystemFields fields) {
-        String name = name(fields.name());
+        String name = name(fields.name(), LibraryProblems.SYSTEM_NAME_INVALID);
         String edition = optional(fields.edition(), EDITION_MAX, LibraryProblems.SYSTEM_EDITION_INVALID);
         String description = optional(fields.description(), DESCRIPTION_MAX, LibraryProblems.SYSTEM_DESCRIPTION_INVALID);
         UUID owner = OwnerContext.require();
@@ -243,7 +259,7 @@ public class Library {
      * nothing changes then.
      */
     public Optional<GameSystem> changeSystem(UUID id, long version, SystemFields fields) {
-        String newName = fields.name() == null ? null : name(fields.name());
+        String newName = fields.name() == null ? null : name(fields.name(), LibraryProblems.SYSTEM_NAME_INVALID);
         String newEdition = fields.edition() == null ? null
                 : optional(fields.edition(), EDITION_MAX, LibraryProblems.SYSTEM_EDITION_INVALID);
         String newDescription = fields.description() == null ? null
@@ -273,6 +289,129 @@ public class Library {
         return changed;
     }
 
+    /**
+     * A new campaign of the owner's system {@code systemId} (Story 3.2), named {@code typedName}: it becomes the current
+     * campaign. Empty, and nothing is stored, for an unknown system, another owner's or one being deleted. Throws
+     * {@code request.campaign_name_invalid} (400) for a name outside its limits and {@code request.campaign_name_taken}
+     * (409) when another campaign of the system has the same name; nothing is stored then.
+     */
+    public Optional<Campaign> createCampaign(UUID systemId, String typedName) {
+        String name = name(typedName, LibraryProblems.CAMPAIGN_NAME_INVALID);
+        UUID owner = OwnerContext.require();
+        UUID id = Ids.newId();
+        byte[] fingerprint = campaignFingerprint(name);
+        Optional<Campaign> created = writing(() -> store.findSystem(systemId).map(system -> {
+            if (campaignNameTaken(system.id(), name, fingerprint, id)) {
+                throw new ApiException(LibraryProblems.CAMPAIGN_NAME_TAKEN);
+            }
+            Instant now = now();
+            CampaignRow row = new CampaignRow(id, owner, system.id(),
+                    vault.encryptText(binding(CAMPAIGN, FIELD_NAME, id, owner), name), fingerprint, null, now, 0, now);
+            conflicts(() -> {
+                store.insertCampaign(row);
+                return row;
+            });
+            return new Campaign(id, name, open(system), false, row.version());
+        }));
+        created.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", id)
+                .addKeyValue("systemId", systemId).log("library.campaign_created"));
+        return created;
+    }
+
+    /**
+     * Changes the owner's campaign {@code id} (Story 3.2) on the version {@code version}: a {@code typedName} that is not
+     * null renames it (checked for uniqueness), an {@code archived} that is not null archives or restores it; without a
+     * name the stored name and fingerprint are kept as they are. Answers the campaign as stored, its
+     * version raised by one; empty for an unknown campaign, another owner's or one of a system being deleted. Throws
+     * {@code request.campaign_name_invalid} (400), {@code request.stale_version} (409) when the campaign is no longer at
+     * {@code version}, and {@code request.campaign_name_taken} (409) when another campaign of its system has the new
+     * name; nothing changes then.
+     */
+    public Optional<Campaign> changeCampaign(UUID id, long version, String typedName, Boolean archived) {
+        String newName = typedName == null ? null : name(typedName, LibraryProblems.CAMPAIGN_NAME_INVALID);
+        Optional<Campaign> changed = writing(() -> store.findCampaign(id).map(row -> {
+            if (row.version() != version) {
+                throw new ApiException(LibraryProblems.STALE_VERSION);
+            }
+            boolean archive = archived == null ? row.archived() : archived;
+            CampaignChange change;
+            if (newName == null) {
+                // No rename: the stored name and fingerprint (null on a row the fill has not reached) stay as they are.
+                change = new CampaignChange(id, version, row.name(), row.nameFingerprint(), archive, now());
+            } else {
+                byte[] fingerprint = campaignFingerprint(newName);
+                if (campaignNameTaken(row.systemId(), newName, fingerprint, id)) {
+                    throw new ApiException(LibraryProblems.CAMPAIGN_NAME_TAKEN);
+                }
+                change = new CampaignChange(id, version,
+                        vault.encryptText(binding(CAMPAIGN, FIELD_NAME, id, row.ownerId()), newName), fingerprint, archive, now());
+            }
+            CampaignRow stored = conflicts(() -> store.updateCampaign(change))
+                    .orElseThrow(() -> new IllegalStateException("library.campaign_vanished"));
+            return open(stored, systemOf(stored.systemId()));
+        }));
+        changed.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("campaignId", id)
+                .addKeyValue("version", campaign.version()).addKeyValue("archived", campaign.archived())
+                .log("library.campaign_changed"));
+        return changed;
+    }
+
+    /**
+     * The owner's campaign {@code id} becomes the current one (Story 3.2); its version stays. Answers it; empty, and
+     * nothing changes, for an archived campaign, an unknown one, another owner's or one of a system being deleted.
+     */
+    public Optional<Campaign> chooseCampaign(UUID id) {
+        Optional<Campaign> chosen = writing(() -> store.chooseCampaign(id, now())
+                ? store.findCampaign(id).map(this::open) : Optional.<Campaign>empty());
+        chosen.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("campaignId", id)
+                .log("library.campaign_chosen"));
+        return chosen;
+    }
+
+    /**
+     * Fills the name fingerprint of the owner's campaigns that have none yet (rows from before V23, Story 3.2), in one
+     * transaction. A campaign whose name another campaign of its system already holds keeps none (logged by id), so the
+     * fill never fails on the key. Answers how many it filled.
+     */
+    public int fillCampaignFingerprints() {
+        UUID owner = OwnerContext.require();
+        int filled = writing(() -> {
+            int count = 0;
+            for (CampaignRow row : store.campaignsWithoutFingerprint(null)) {
+                byte[] fingerprint = campaignFingerprint(campaignName(row));
+                if (store.campaignNameTaken(row.systemId(), fingerprint, row.id())) {
+                    log.atWarn().addKeyValue("ownerId", owner).addKeyValue("campaignId", row.id())
+                            .log("library.campaign_fingerprint_duplicate");
+                } else if (store.fillCampaignFingerprint(row.id(), fingerprint)) {
+                    count++;
+                }
+            }
+            return count;
+        });
+        if (filled > 0) {
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaigns", filled).log("library.campaign_fingerprints_filled");
+        }
+        return filled;
+    }
+
+    /**
+     * Whether another campaign of the system has this name: by its fingerprint, or, for a campaign that has none yet, by
+     * its decrypted name's unique form.
+     */
+    private boolean campaignNameTaken(UUID systemId, String name, byte[] fingerprint, UUID except) {
+        if (store.campaignNameTaken(systemId, fingerprint, except)) {
+            return true;
+        }
+        String form = uniqueForm(name);
+        return store.campaignsWithoutFingerprint(systemId).stream()
+                .anyMatch(row -> !row.id().equals(except) && uniqueForm(campaignName(row)).equals(form));
+    }
+
+    /** A campaign's name fingerprint (Story 3.2): of the name's unique form. */
+    byte[] campaignFingerprint(String name) {
+        return vault.fingerprint(CAMPAIGN, FIELD_NAME, uniqueForm(name));
+    }
+
     /** The form whose fingerprint is unique per owner: trimmed, NFC, lower case in the root locale. */
     public static String uniqueForm(String name) {
         return Normalizer.normalize(name.strip(), Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
@@ -287,12 +426,12 @@ public class Library {
         return vault.fingerprint(SYSTEM, FIELD_NAME, form);
     }
 
-    /** A system's name, trimmed, or {@code request.system_name_invalid}. */
-    private static String name(String typed) {
+    /** A system's or a campaign's name, trimmed, or {@code invalid}. */
+    private static String name(String typed, ApiProblem invalid) {
         String name = typed == null ? "" : typed.strip();
         int length = name.codePointCount(0, name.length());
         if (length < 1 || length > NAME_MAX) {
-            throw new ApiException(LibraryProblems.SYSTEM_NAME_INVALID);
+            throw new ApiException(invalid);
         }
         return name;
     }
@@ -321,11 +460,20 @@ public class Library {
     }
 
     private Campaign open(CampaignRow row) {
-        // The database keeps a campaign's system within its owner: a missing one is a broken row, not a 404.
-        SystemRow system = store.findSystem(row.systemId())
-                .orElseThrow(() -> new IllegalStateException("library.campaign_without_system"));
-        return new Campaign(row.id(), vault.decryptText(binding(CAMPAIGN, FIELD_NAME, row.id(), row.ownerId()), row.name()),
-                open(system));
+        return open(row, systemOf(row.systemId()));
+    }
+
+    private Campaign open(CampaignRow row, GameSystem system) {
+        return new Campaign(row.id(), campaignName(row), system, row.archived(), row.version());
+    }
+
+    /** A campaign's system: the database keeps it within its owner, so a missing one is a broken row, not a 404. */
+    private GameSystem systemOf(UUID systemId) {
+        return open(store.findSystem(systemId).orElseThrow(() -> new IllegalStateException("library.campaign_without_system")));
+    }
+
+    private String campaignName(CampaignRow row) {
+        return vault.decryptText(binding(CAMPAIGN, FIELD_NAME, row.id(), row.ownerId()), row.name());
     }
 
     private GameSystem open(SystemRow row) {
@@ -338,8 +486,11 @@ public class Library {
         try {
             return write.get();
         } catch (LibraryConflict conflict) {
-            throw new ApiException(conflict.reason() == LibraryConflict.Reason.NAME_TAKEN
-                    ? LibraryProblems.SYSTEM_NAME_TAKEN : LibraryProblems.STALE_VERSION);
+            throw new ApiException(switch (conflict.reason()) {
+                case NAME_TAKEN -> LibraryProblems.SYSTEM_NAME_TAKEN;
+                case CAMPAIGN_NAME_TAKEN -> LibraryProblems.CAMPAIGN_NAME_TAKEN;
+                case STALE_VERSION -> LibraryProblems.STALE_VERSION;
+            });
         }
     }
 

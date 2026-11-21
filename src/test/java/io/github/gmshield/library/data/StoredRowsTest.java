@@ -36,5 +36,29 @@ class StoredRowsTest {
         assertThat(row).isNotEqualTo(new CampaignRow(ROW, OWNER, OWNER, row.name(), AT));
         assertThat(row.toString()).contains("name=3 bytes").contains(SYSTEM.toString())
                 .doesNotContain("c0ffee").doesNotContain("[B@");
+        // Story 3.2: the fingerprint, the archive, the choice and the version count too.
+        CampaignRow full = new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, new byte[] {(byte) 0xc0, (byte) 0xde}, AT,
+                null, 2, AT);
+        assertThat(full).isEqualTo(new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, new byte[] {(byte) 0xc0, (byte) 0xde},
+                AT, null, 2, AT));
+        assertThat(full).isNotEqualTo(new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, new byte[] {9}, AT, null, 2, AT));
+        assertThat(full).isNotEqualTo(new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, full.nameFingerprint(), null,
+                null, 2, AT));
+        assertThat(full).isNotEqualTo(new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, full.nameFingerprint(), AT, AT,
+                2, AT));
+        assertThat(full).isNotEqualTo(new CampaignRow(ROW, OWNER, SYSTEM, new byte[] {1}, full.nameFingerprint(), AT,
+                null, 3, AT));
+        assertThat(full.archived()).isTrue();
+        assertThat(row.archived()).isFalse();
+        assertThat(full.toString()).contains("nameFingerprint=2 bytes", "archived=true", "version=2")
+                .doesNotContain("c0de").doesNotContain("[B@");
+        CampaignChange change = new CampaignChange(ROW, 2, new byte[] {(byte) 0xc0, (byte) 0xff, (byte) 0xee}, new byte[] {7},
+                true, AT);
+        assertThat(change).isEqualTo(new CampaignChange(ROW, 2, new byte[] {(byte) 0xc0, (byte) 0xff, (byte) 0xee},
+                new byte[] {7}, true, AT)).hasSameHashCodeAs(new CampaignChange(ROW, 2,
+                new byte[] {(byte) 0xc0, (byte) 0xff, (byte) 0xee}, new byte[] {7}, true, AT));
+        assertThat(change).isNotEqualTo(new CampaignChange(ROW, 2, change.name(), new byte[] {7}, false, AT));
+        assertThat(change.toString()).contains("name=3 bytes", "nameFingerprint=1 bytes", "archived=true").doesNotContain("c0ffee")
+                .doesNotContain("[B@");
     }
 }

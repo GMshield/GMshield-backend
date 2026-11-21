@@ -47,6 +47,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       ({@link Scopes#indexing}; null when nothing in it is pending), and how many could not be prepared for search,
  *       with whether a retry remains ({@link Scopes#status}; null when none). No campaign is
  *       {@code request.not_found}.</li>
+ *   <li>{@link #ofCampaign} (Story 3.2): the owner's campaign's conversation (each campaign has at most one) and how
+ *       many questions it holds; empty when the campaign has none or is not the owner's. An archived campaign's
+ *       conversation is found too.</li>
  *   <li>{@link #ask}: a question of 1 to {@value Scopes#MAX_QUESTION} code points, not blank (else
  *       {@code request.invalid}, nothing recorded), on a campaign of the owner (else {@code request.not_found}). In one
  *       transaction: the campaign's one conversation (made on the first question), the turn with the question
@@ -112,6 +115,10 @@ public class Conversations {
     public record Current(UUID campaignId, boolean hasSources, Indexing indexing, IndexingFailure indexingFailed) {
     }
 
+    /** A campaign's conversation and how many questions it holds (Story 3.2). */
+    public record OfCampaign(UUID id, long questions) {
+    }
+
     /** A recorded turn: its id, its conversation and its language (null when unsure). */
     public record Asked(UUID turnId, UUID conversationId, String language) {
     }
@@ -128,6 +135,15 @@ public class Conversations {
             ScopeStatus status = scopes.status(campaign.id(), ScopeSettings.STARTING);
             return new Current(campaign.id(), status.hasSources(), status.indexing(), status.failed());
         });
+    }
+
+    /** The owner's campaign's conversation, as the class says. */
+    public Optional<OfCampaign> ofCampaign(UUID campaignId) {
+        if (campaignId == null) {
+            return Optional.empty();
+        }
+        return reading(() -> library.campaign(campaignId).flatMap(campaign -> store.conversationOfCampaign(campaign.id()))
+                .map(conversation -> new OfCampaign(conversation.id(), store.turnCount(conversation.id()))));
     }
 
     /** Records a question on the owner's campaign, as the class says. */

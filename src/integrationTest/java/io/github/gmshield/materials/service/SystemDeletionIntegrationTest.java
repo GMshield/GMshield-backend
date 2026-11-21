@@ -4,8 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 import io.github.gmshield.conversations.service.Conversations;
-import io.github.gmshield.library.data.CampaignRow;
-import io.github.gmshield.library.data.LibraryStore;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
@@ -16,7 +14,6 @@ import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
-import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayInputStream;
@@ -68,8 +65,6 @@ class SystemDeletionIntegrationTest {
     @Autowired
     private Library library;
     @Autowired
-    private LibraryStore libraryStore;
-    @Autowired
     private SystemDeletion deletion;
     @Autowired
     private List<SystemDeletionHandler> handlers;
@@ -110,8 +105,8 @@ class SystemDeletionIntegrationTest {
         Owner a = owner();
         UUID system = as(a.id(), () -> library.createSystem(new Library.SystemFields("Tormenta", "20", null))).id();
         UUID other = as(a.id(), () -> library.createSystem(new Library.SystemFields("Old Dragon", null, null))).id();
-        UUID first = campaign(a.id(), system);
-        UUID second = campaign(a.id(), system);
+        UUID first = campaign(a.id(), system, "Mesa de quinta");
+        UUID second = campaign(a.id(), system, "Mesa de sexta");
         UUID turn = as(a.id(), () -> conversations.ask(first, "Quanto dano?")).turnId();
         UUID again = as(a.id(), () -> conversations.ask(first, "E o alcance?")).turnId();
         UUID secondTurn = as(a.id(), () -> conversations.ask(second, "Quem age primeiro?")).turnId();
@@ -128,6 +123,8 @@ class SystemDeletionIntegrationTest {
                 new Uploads.Details("other", "pt-BR", a.campaign().toString(), null))).uploadId());
         UUID openMaterial = materialOf(a.id(), open);
         List<UUID> goingVersions = List.of(ofCampaign.versionId(), versionOf(openMaterial));
+        // Story 3.2: an archived campaign still counts and goes with its system.
+        assertThat(as(a.id(), () -> library.changeCampaign(second, 0, null, true)).orElseThrow().archived()).isTrue();
 
         SystemDeletion.Counts counts = as(a.id(), () -> deletion.preview(system)).orElseThrow();
         assertThat(counts).isEqualTo(new SystemDeletion.Counts(2, 2, 2));
@@ -298,13 +295,9 @@ class SystemDeletionIntegrationTest {
         });
     }
 
-    /** A campaign of the owner's system, as Story 3.2 will create one. */
-    private UUID campaign(UUID owner, UUID system) throws Exception {
-        UUID id = Ids.newId();
-        write(owner, () -> libraryStore.insertCampaign(new CampaignRow(id, owner, system,
-                vault.encryptText(new Binding("campaign", "name", id, owner), "Mesa"),
-                Instant.now().truncatedTo(ChronoUnit.MICROS))));
-        return id;
+    /** A new campaign of the owner's system, as the GM creates one (Story 3.2); it becomes the current one. */
+    private UUID campaign(UUID owner, UUID system, String name) throws Exception {
+        return as(owner, () -> library.createCampaign(system, name)).orElseThrow().id();
     }
 
     /** A verified PDF with its details: its version is waiting, its first step offered. */

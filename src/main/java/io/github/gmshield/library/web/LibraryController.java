@@ -25,6 +25,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -41,6 +42,13 @@ import org.springframework.web.bind.annotation.RestController;
  * own 400 problem ({@code request.system_name_invalid}, {@code request.system_edition_invalid},
  * {@code request.system_description_invalid}); a name and edition the owner already has is
  * {@code request.system_name_taken} (409). A malformed body, limit or cursor is {@code request.invalid} (400).
+ *
+ * <p>Story 3.2: the list of the account's campaigns ({@code ?system=} now optional, {@code ?archived=} false by default),
+ * a new campaign (201; it becomes the current one), a campaign's rename, archive or restore by its version, and the
+ * choice of the current campaign ({@code PUT .../current}). A campaign's name outside its limits is
+ * {@code request.campaign_name_invalid} (400), a name another campaign of the system has is
+ * {@code request.campaign_name_taken} (409); an archived campaign cannot become the current one
+ * ({@code request.not_found}).
  *
  * <p>Story 3.1 part B: what goes with a system ({@code GET .../deletion}), and its deletion ({@code DELETE}, 202 with
  * no body; {@link SystemDeletion}). A system being deleted is {@code request.not_found} on every route, as another
@@ -94,31 +102,57 @@ class LibraryController {
         }
     }
 
-    @Schema(name = "Campaign", requiredProperties = {"id", "name", "system"})
-    record CampaignView(
-            @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
+    @Schema(name = "SystemSummary", requiredProperties = {"id", "name", "edition"})
+    record SystemSummaryView(
+            @Schema(description = "The system's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000001")
             String id,
-            @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
-            @Schema(description = "The campaign's system") SystemView system) {
+            @Schema(description = "The system's name", example = "Sistema sem nome") String name,
+            @Schema(description = "The system's edition, null when it has none", types = {"string", "null"},
+                    example = "5.2.1") String edition) {
 
-        static CampaignView of(Library.Campaign campaign) {
-            return new CampaignView(campaign.id().toString(), campaign.name(), SystemView.of(campaign.system()));
+        static SystemSummaryView of(Library.GameSystem system) {
+            return new SystemSummaryView(system.id().toString(), system.name(), system.edition());
         }
 
         @Override
         public String toString() {
-            return "CampaignView[id=" + id + "]";
+            return "SystemSummaryView[id=" + id + "]";
         }
     }
 
-    @Schema(name = "CampaignSummary", requiredProperties = {"id", "name"})
+    @Schema(name = "Campaign", requiredProperties = {"id", "name", "system", "archived", "version"})
+    record CampaignView(
+            @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
+            String id,
+            @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
+            @Schema(description = "The campaign's system") SystemView system,
+            @Schema(description = "Whether the GM archived it (contract 1.19.0)") boolean archived,
+            @Schema(description = "The campaign's version: a rename, an archive or a restore names it and raises it by"
+                    + " one; choosing the campaign does not (contract 1.19.0)", format = "int64", example = "0")
+            long version) {
+
+        static CampaignView of(Library.Campaign campaign) {
+            return new CampaignView(campaign.id().toString(), campaign.name(), SystemView.of(campaign.system()),
+                    campaign.archived(), campaign.version());
+        }
+
+        @Override
+        public String toString() {
+            return "CampaignView[id=" + id + ", version=" + version + "]";
+        }
+    }
+
+    @Schema(name = "CampaignSummary", requiredProperties = {"id", "name", "system", "archived"})
     record CampaignSummaryView(
             @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
             String id,
-            @Schema(description = "The campaign's name", example = "Primeira campanha") String name) {
+            @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
+            @Schema(description = "The campaign's system (contract 1.19.0)") SystemSummaryView system,
+            @Schema(description = "Whether the GM archived it (contract 1.19.0)") boolean archived) {
 
-        static CampaignSummaryView of(Library.Named campaign) {
-            return new CampaignSummaryView(campaign.id().toString(), campaign.name());
+        static CampaignSummaryView of(Library.Campaign campaign) {
+            return new CampaignSummaryView(campaign.id().toString(), campaign.name(),
+                    SystemSummaryView.of(campaign.system()), campaign.archived());
         }
 
         @Override
@@ -189,25 +223,79 @@ class LibraryController {
         }
     }
 
+    @Schema(name = "NewCampaign", requiredProperties = {"name", "systemId"})
+    record NewCampaign(
+            @Schema(description = "1 to 120 code points after trimming; unique within the system, whatever the case",
+                    minLength = 1, maxLength = 120, example = "Mesa de quinta") String name,
+            @Schema(description = "The account's system the campaign belongs to; it never changes", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000001") String systemId) {
+
+        @Override
+        public String toString() {
+            return "NewCampaign[systemId=" + systemId + "]";
+        }
+    }
+
+    @Schema(name = "CampaignChange", requiredProperties = "version")
+    record CampaignChangeBody(
+            @Schema(description = "The version the edit was made on, as the campaign was read", format = "int64",
+                    minimum = "0", example = "0") Long version,
+            @Schema(description = "The new name, 1 to 120 code points after trimming; absent or null: unchanged",
+                    minLength = 1, maxLength = 120, example = "Mesa de sexta") String name,
+            @Schema(description = "True archives the campaign, false restores it; absent or null: unchanged",
+                    example = "true") Boolean archived) {
+
+        @Override
+        public String toString() {
+            return "CampaignChangeBody[version=" + version + ", archived=" + archived + "]";
+        }
+    }
+
+    @Schema(name = "CurrentCampaignChoice", requiredProperties = "campaignId")
+    record CurrentCampaignBody(
+            @Schema(description = "The account's campaign to make current; not an archived one", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000002") String campaignId) {
+    }
+
     @GetMapping(path = CURRENT_CAMPAIGN, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getCurrentCampaign", summary = "The current campaign with its system; session.required"
-            + " (401) without a session, request.not_found (404) when the account has no campaign",
+    @Operation(operationId = "getCurrentCampaign", summary = "The current campaign with its system: of the account's"
+            + " campaigns that are not archived, the one chosen last (PUT), else the oldest; session.required (401)"
+            + " without a session, request.not_found (404) when the account has no such campaign",
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<CampaignView> currentCampaign() {
         return found(library.currentCampaign().map(CampaignView::of));
     }
 
+    @PutMapping(path = CURRENT_CAMPAIGN, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "chooseCurrentCampaign", summary = "Makes one of the account's campaigns the current one and"
+            + " answers it; its version does not change. request.not_found (404) for an archived campaign or any other"
+            + " id (unknown, another account's or malformed), request.invalid (400) without a campaignId or for a"
+            + " malformed body; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<CampaignView> chooseCurrentCampaign(@RequestBody CurrentCampaignBody body) {
+        if (body == null || body.campaignId() == null) {
+            throw invalid();
+        }
+        return found(parse(body.campaignId()).flatMap(library::chooseCampaign).map(CampaignView::of));
+    }
+
     @GetMapping(path = CAMPAIGNS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "listCampaigns", summary = "The campaigns of one of the account's systems, newest first."
+    @Operation(operationId = "listCampaigns", summary = "The account's campaigns, of one of its systems when system is"
+            + " given, newest first, each with its system; the archived ones only with archived=true, else the others."
             + " request.not_found (404) for a system that is not the account's (unknown, another account's or"
-            + " malformed); request.invalid (400) without a system, for a limit outside 1 to 50 or a malformed cursor;"
-            + SESSION_SUMMARY,
+            + " malformed); request.invalid (400) for an archived other than true or false, a limit outside 1 to 50 or a"
+            + " malformed cursor;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
-                @Parameter(name = "system", in = ParameterIn.QUERY, required = true, description = "The system's id",
+                @Parameter(name = "system", in = ParameterIn.QUERY, description = "Only this system's campaigns",
                         schema = @Schema(type = "string", format = "uuid")),
+                @Parameter(name = "archived", in = ParameterIn.QUERY, description = "true: only the archived campaigns;"
+                        + " false (the default): only the others",
+                        schema = @Schema(type = "boolean", defaultValue = "false")),
                 @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
                         schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
                                 defaultValue = "20")),
@@ -215,22 +303,64 @@ class LibraryController {
                         schema = @Schema(type = "string", format = "uuid"))})
     ResponseEntity<CampaignPageView> campaigns(
             @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system,
+            @Parameter(hidden = true) @RequestParam(value = "archived", required = false) String archived,
             @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
             @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor) {
-        if (system == null) {
-            throw invalid();
-        }
+        boolean onlyArchived = flag(archived);
         int size = limit(limit);
         UUID after = cursor(cursor);
-        Library.CampaignPage page = parse(system).flatMap(id -> library.campaignsOf(id, after, size))
+        UUID systemId = system == null ? null : parse(system).orElseThrow(LibraryController::notFound);
+        Library.CampaignPage page = library.campaigns(systemId, onlyArchived, after, size)
                 .orElseThrow(LibraryController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new CampaignPageView(
                 page.items().stream().map(CampaignSummaryView::of).toList(), text(page.nextCursor())));
     }
 
+    @PostMapping(path = CAMPAIGNS, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseStatus(HttpStatus.CREATED)
+    @Operation(operationId = "createCampaign", summary = "A new campaign of one of the account's systems (201), with the"
+            + " starting scope; it becomes the current campaign. request.campaign_name_invalid (400) for a name outside"
+            + " its limits (params min and max), request.campaign_name_taken (409) when the system has a campaign with"
+            + " the same name (trimmed, whatever the case; an archived campaign keeps its name), request.not_found (404) for a system that is not the"
+            + " account's (unknown, another account's, malformed or being deleted), request.invalid (400) without a"
+            + " systemId or for a malformed body; nothing is stored then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<CampaignView> createCampaign(@RequestBody NewCampaign body) {
+        if (body == null || body.systemId() == null) {
+            throw invalid();
+        }
+        UUID systemId = parse(body.systemId()).orElseThrow(LibraryController::notFound);
+        Library.Campaign created = library.createCampaign(systemId, body.name()).orElseThrow(LibraryController::notFound);
+        return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore()).body(CampaignView.of(created));
+    }
+
+    @PatchMapping(path = CAMPAIGN, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "changeCampaign", summary = "Renames, archives or restores one of the account's campaigns on"
+            + " the version it names: the campaign as stored, its version raised by one. An archived campaign leaves the"
+            + " lists and the current position but keeps everything and still opens by id. request.stale_version (409)"
+            + " when the campaign has left that version, request.campaign_name_taken (409) when another campaign of its"
+            + " system has the new name (an archived campaign keeps its name), request.campaign_name_invalid (400) for a"
+            + " name outside its limits, request.invalid (400) without a version, with neither name nor archived, or for"
+            + " a malformed body, request.not_found (404) for any other id; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<CampaignView> changeCampaign(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @RequestBody CampaignChangeBody body) {
+        UUID campaignId = parse(id).orElseThrow(LibraryController::notFound);
+        if (body == null || body.version() == null || body.version() < 0 || (body.name() == null && body.archived() == null)) {
+            throw invalid();
+        }
+        return found(library.changeCampaign(campaignId, body.version(), body.name(), body.archived())
+                .map(CampaignView::of));
+    }
+
     @GetMapping(path = CAMPAIGN, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getCampaign", summary = "One of the account's campaigns, with its system;"
-            + " request.not_found (404) for any other id",
+    @Operation(operationId = "getCampaign", summary = "One of the account's campaigns, with its system, archived or"
+            + " not; request.not_found (404) for any other id",
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<CampaignView> campaign(
@@ -343,6 +473,17 @@ class LibraryController {
     /** A malformed id is no different from an unknown one. */
     private static Optional<UUID> parse(String id) {
         return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
+    }
+
+    /** A yes-or-no query parameter: false without one, else true or false, or {@code request.invalid}. */
+    private static boolean flag(String value) {
+        if (value == null || "false".equals(value)) {
+            return false;
+        }
+        if ("true".equals(value)) {
+            return true;
+        }
+        throw invalid();
     }
 
     /** A page's size: the default without one, else 1 to 50, or {@code request.invalid}. */

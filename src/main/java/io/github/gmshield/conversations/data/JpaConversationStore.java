@@ -47,6 +47,12 @@ class JpaConversationStore implements ConversationStore {
     }
 
     @Override
+    public long turnCount(UUID conversationId) {
+        return em().createQuery("select count(t) from Turn t where t.conversationId = :conversation", Long.class)
+                .setParameter("conversation", conversationId).getSingleResult();
+    }
+
+    @Override
     public void insertTurn(TurnRow row) {
         EntityManager em = em();
         em.persist(new TurnEntity(row));

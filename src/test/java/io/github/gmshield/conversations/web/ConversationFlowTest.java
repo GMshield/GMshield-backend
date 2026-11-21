@@ -608,6 +608,31 @@ class ConversationFlowTest {
     }
 
     @Test
+    void aCampaignsConversationCountsItsQuestionsAndIsNotFoundWithoutOneOrForAnotherOwner() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/conversation";
+
+        // Story 3.2: no question yet, no conversation.
+        assertProblem(get(gm, path), 404, "request.not_found");
+        UUID conversation = UUID.fromString(json(ask(gm, gm.campaign(), QUESTION)).path("conversationId").asString());
+        ask(gm, gm.campaign(), "Outra pergunta?");
+
+        HttpResponse<String> found = get(gm, path);
+        assertThat(found.statusCode()).as(found.body()).isEqualTo(200);
+        assertThat(found.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(found).path("id").asString()).isEqualTo(conversation.toString());
+        assertThat(json(found).path("questions").asLong()).isEqualTo(2);
+        // Another owner's campaign, an unknown one and a malformed id are the same not found.
+        for (String other : List.of("/api/v1/campaigns/" + gm.campaign() + "/conversation",
+                "/api/v1/campaigns/" + UUID.randomUUID() + "/conversation", "/api/v1/campaigns/nope/conversation")) {
+            HttpResponse<String> refused = get(them, other);
+            assertProblem(refused, 404, "request.not_found");
+            assertThat(refused.body()).doesNotContain(conversation.toString());
+        }
+    }
+
+    @Test
     void aBlankOrTooLongQuestionRecordsNothing() throws Exception {
         Gm gm = signUp();
         int turns = conversations.turns.size();
