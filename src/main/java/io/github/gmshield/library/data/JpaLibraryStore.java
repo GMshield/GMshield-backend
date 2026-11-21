@@ -6,6 +6,7 @@ import jakarta.persistence.LockModeType;
 import jakarta.persistence.OptimisticLockException;
 import jakarta.persistence.TypedQuery;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -56,6 +57,9 @@ class JpaLibraryStore implements LibraryStore {
     private static final String CAMPAIGN_IDS_OF = "select c.id from LibraryCampaign c where c.systemId = :system and"
             + READY_CAMPAIGN + " order by c.id desc";
     private static final String CAMPAIGN_BY_ID = "select c from LibraryCampaign c where c.id = :id and" + READY_CAMPAIGN;
+    /** Story 3.3: the places of a page of materials, in one read. */
+    private static final String CAMPAIGNS_BY_IDS = "select c from LibraryCampaign c where c.id in :ids and"
+            + READY_CAMPAIGN;
     /** Story 3.2: the ready, not archived campaign chosen last, else the oldest. */
     private static final String CURRENT_CAMPAIGN = "select c from LibraryCampaign c where c.archivedAt is null and"
             + READY_CAMPAIGN + " order by c.chosenAt desc nulls last, c.createdAt, c.id";
@@ -207,6 +211,26 @@ class JpaLibraryStore implements LibraryStore {
     @Override
     public Optional<CampaignRow> findCampaign(UUID id) {
         return campaign(id).map(CampaignEntity::row);
+    }
+
+    @Override
+    public List<SystemRow> findSystems(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select s from LibrarySystem s where s.id in :ids and s.state = :state",
+                        SystemEntity.class)
+                .setParameter("ids", ids).setParameter("state", READY).getResultList().stream()
+                .map(SystemEntity::row).toList();
+    }
+
+    @Override
+    public List<CampaignRow> findCampaigns(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(CAMPAIGNS_BY_IDS, CampaignEntity.class).setParameter("ids", ids).getResultList()
+                .stream().map(CampaignEntity::row).toList();
     }
 
     @Override

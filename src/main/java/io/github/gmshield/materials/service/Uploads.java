@@ -79,6 +79,8 @@ public class Uploads {
     static final String DISCARDED = "discarded";
     /** The most images an image set may hold (Story 1.21); its bytes in all are at most {@link #MAX_LENGTH}. */
     public static final int MAX_IMAGES = 500;
+    /** The most systems a material may belong to (Story 3.3). */
+    public static final int MAX_SYSTEMS = 100;
     /** The longest name a material may have, in characters. */
     static final int MAX_NAME = 255;
     /** What a material may be (Story 1.14). */
@@ -114,11 +116,21 @@ public class Uploads {
     /**
      * What the GM said about a file (Story 1.14), as the tus metadata gave it: each may be null (an older frontend sends
      * none). {@code kind} is one of {@link #KINDS}; {@code language} one of {@link #LANGUAGES} or {@value #DETECT};
-     * {@code campaign} or {@code system} the id of one of the owner's, never both. {@code toString} shows nothing.
+     * {@code campaign} the id of one of the owner's campaigns, or {@code systems} (Story 3.3: one to
+     * {@value #MAX_SYSTEMS}) ids of the owner's systems, never both. {@code toString} shows nothing.
      */
-    public record Details(String kind, String language, String campaign, String system) {
+    public record Details(String kind, String language, String campaign, List<String> systems) {
 
-        public static final Details NONE = new Details(null, null, null, null);
+        public static final Details NONE = new Details(null, null, null, (List<String>) null);
+
+        /** One system, or none when {@code system} is null (Story 1.14's single {@code system} key). */
+        public Details(String kind, String language, String campaign, String system) {
+            this(kind, language, campaign, system == null ? null : List.of(system));
+        }
+
+        public Details {
+            systems = systems == null ? null : java.util.Collections.unmodifiableList(new java.util.ArrayList<>(systems));
+        }
 
         @Override
         public String toString() {
@@ -126,8 +138,18 @@ public class Uploads {
         }
     }
 
-    /** The details once checked: the language null when left to detection. */
-    record Checked(String kind, String language, UUID campaign, UUID system) {
+    /**
+     * The details once checked: the language null when left to detection; the campaign, or the systems (each once, in
+     * the order given; empty for none).
+     */
+    record Checked(String kind, String language, UUID campaign, List<UUID> systems) {
+    }
+
+    /**
+     * Where a material belongs once checked (Story 3.3): one campaign, or one or more systems (each once, in the order
+     * given), or neither.
+     */
+    record Place(UUID campaign, List<UUID> systems) {
     }
 
     /** A new upload: its id and when it expires. */
@@ -183,8 +205,8 @@ public class Uploads {
         materials.insertMaterial(new MaterialRow(materialId, owner,
                 vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), name), now,
                 checked.kind(), checked.language(), checked.campaign()));
-        if (checked.system() != null) {
-            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, checked.system(), now));
+        for (UUID system : checked.systems()) {
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, system, now));
         }
         materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
     }
@@ -561,9 +583,9 @@ public class Uploads {
     }
 
     /**
-     * The details checked against the owner's library: a campaign or a system must be the owner's (another owner's id
-     * reads like an unknown one). The check comes before the transaction; the database's owner-scoped keys still hold
-     * should the item go meanwhile.
+     * The details checked against the owner's library: a campaign or the systems must be the owner's (another owner's
+     * id reads like an unknown one), never both, and at most {@value #MAX_SYSTEMS} systems. The check comes before the
+     * transaction; the database's owner-scoped keys still hold should the item go meanwhile.
      */
     Checked checked(Details details) {
         if (details.kind() != null && !KINDS.contains(details.kind())) {
@@ -573,26 +595,49 @@ public class Uploads {
         if (language != null && !language.equals(DETECT) && !LANGUAGES.contains(language)) {
             throw UploadProblems.metadataInvalid();
         }
-        if (details.campaign() != null && details.system() != null) {
+        List<String> systems = details.systems() == null ? List.of() : details.systems();
+        if (details.campaign() != null && !systems.isEmpty()) {
             throw UploadProblems.metadataInvalid();
         }
-        UUID campaign = id(details.campaign());
-        UUID system = id(details.system());
-        if (campaign != null && library.campaign(campaign).isEmpty()) {
-            throw UploadProblems.metadataInvalid();
-        }
-        if (system != null && library.system(system).isEmpty()) {
-            throw UploadProblems.metadataInvalid();
-        }
-        return new Checked(details.kind(), DETECT.equals(language) ? null : language, campaign, system);
+        Place place = place(details.campaign(), systems, UploadProblems::metadataInvalid);
+        return new Checked(details.kind(), DETECT.equals(language) ? null : language, place.campaign(), place.systems());
     }
 
-    private static UUID id(String text) {
+    /**
+     * Where a material belongs, checked against the owner's library in one read (Story 3.3): {@code campaign} (the id
+     * of one of the owner's campaigns, archived or not), or {@code systems} (at most {@value #MAX_SYSTEMS} ids as sent;
+     * a repeated id is stored once), or neither. Any malformed, unknown, another owner's or deleting id, or more than
+     * {@value #MAX_SYSTEMS} ids as sent, is {@code invalid}. The caller refuses a campaign with systems.
+     */
+    Place place(String campaign, List<String> systems, Supplier<ApiException> invalid) {
+        if (systems.size() > MAX_SYSTEMS) {
+            throw invalid.get();
+        }
+        UUID campaignId = id(campaign, invalid);
+        java.util.LinkedHashSet<UUID> systemIds = new java.util.LinkedHashSet<>();
+        for (String system : systems) {
+            if (system == null) {
+                throw invalid.get();
+            }
+            systemIds.add(id(system, invalid));
+        }
+        if (campaignId == null && systemIds.isEmpty()) {
+            return new Place(null, List.of());
+        }
+        Library.Places found = library.places(campaignId == null ? List.of() : List.of(campaignId), systemIds);
+        if ((campaignId != null && !found.campaigns().containsKey(campaignId))
+                || !found.systems().keySet().containsAll(systemIds)) {
+            throw invalid.get();
+        }
+        return new Place(campaignId, List.copyOf(systemIds));
+    }
+
+    private static UUID id(String text, Supplier<ApiException> invalid) {
         if (text == null) {
             return null;
         }
         if (!UUID_TEXT.matcher(text).matches()) {
-            throw UploadProblems.metadataInvalid();
+            throw invalid.get();
         }
         return UUID.fromString(text);
     }

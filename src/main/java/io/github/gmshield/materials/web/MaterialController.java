@@ -2,6 +2,7 @@ package io.github.gmshield.materials.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.materials.service.MaterialActions;
+import io.github.gmshield.materials.service.MaterialBelongings;
 import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.materials.service.PageProblems;
 import io.github.gmshield.shared.service.ApiException;
@@ -27,8 +28,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -43,6 +46,8 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code discard}), each answering the material; an action its state does not allow is
  * {@code material.action_unavailable} (409). From Story 3.1 the list takes {@code ?system=}: only the materials of that
  * system, attached to it or to one of its campaigns; a system that is not the owner's is {@code request.not_found}.
+ * From Story 3.3 a material carries its version, size and where it belongs; the list takes every state when none is
+ * given; and {@code PATCH} changes where a material belongs ({@link MaterialBelongings}).
  */
 @RestController
 @Tag(name = "materials")
@@ -67,10 +72,12 @@ class MaterialController {
 
     private final Materials materials;
     private final MaterialActions actions;
+    private final MaterialBelongings belongings;
 
-    MaterialController(Materials materials, MaterialActions actions) {
+    MaterialController(Materials materials, MaterialActions actions, MaterialBelongings belongings) {
         this.materials = materials;
         this.actions = actions;
+        this.belongings = belongings;
     }
 
     @Schema(name = "MaterialUpload", requiredProperties = {"id", "offset", "length", "expiresAt"})
@@ -164,8 +171,57 @@ class MaterialController {
         }
     }
 
+    @Schema(name = "MaterialPlace", requiredProperties = {"id", "name"})
+    record PlaceView(
+            @Schema(description = "The system's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000001")
+            String id,
+            @Schema(description = "The system's name", example = "D&D 5e") String name) {
+
+        static PlaceView of(Materials.Place place) {
+            return new PlaceView(place.id().toString(), place.name());
+        }
+
+        @Override
+        public String toString() {
+            return "PlaceView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "MaterialCampaign", requiredProperties = {"id", "name", "system"})
+    record CampaignPlaceView(
+            @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
+            String id,
+            @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
+            @Schema(description = "The campaign's system") PlaceView system) {
+
+        static CampaignPlaceView of(Materials.CampaignPlace campaign) {
+            return new CampaignPlaceView(campaign.id().toString(), campaign.name(), PlaceView.of(campaign.system()));
+        }
+
+        @Override
+        public String toString() {
+            return "CampaignPlaceView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "MaterialBelonging", requiredProperties = {"campaign", "systems"}, description = "Where the"
+            + " material belongs (contract 1.21.0): one campaign, or one or more systems; both empty for a material"
+            + " uploaded with no place. Only places that are not being deleted are named")
+    record BelongingView(
+            @Schema(description = "The campaign it belongs to; null when it belongs to systems or to nothing",
+                    types = {"object", "null"}, implementation = CampaignPlaceView.class) CampaignPlaceView campaign,
+            @ArraySchema(arraySchema = @Schema(description = "The systems it belongs to, oldest attachment first; empty"
+                    + " when it belongs to a campaign or to nothing"),
+                    schema = @Schema(implementation = PlaceView.class)) List<PlaceView> systems) {
+
+        static BelongingView of(Materials.Belonging belonging) {
+            return new BelongingView(belonging.campaign() == null ? null : CampaignPlaceView.of(belonging.campaign()),
+                    belonging.systems().stream().map(PlaceView::of).toList());
+        }
+    }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions"})
+    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions", "version", "belonging"})
     record MaterialView(
             @Schema(description = "The material's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
@@ -185,14 +241,21 @@ class MaterialController {
                     schema = @Schema(type = "string", allowableValues = {"accept", "reprocess", "retry", "discard"}))
             List<String> actions,
             @Schema(description = "The image set still uploading (Story 1.21), only while the state is uploading;"
-                    + " upload is then absent") ImageSetView imageSet) {
+                    + " upload is then absent") ImageSetView imageSet,
+            @Schema(description = "The material's version: a change of where it belongs names it and raises it by one"
+                    + " (contract 1.21.0)", format = "int64", example = "0") long version,
+            @Schema(description = "The newest version's size in bytes, once known (contract 1.21.0)", format = "int64",
+                    example = "134217728") Long size,
+            @JsonInclude(JsonInclude.Include.ALWAYS)
+            @Schema(description = "Where the material belongs (contract 1.21.0)") BelongingView belonging) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
                     material.upload() == null ? null : UploadView.of(material.upload()),
                     material.pages() == null ? null : PagesView.of(material.pages()),
                     material.failure(), material.actions(),
-                    material.imageSet() == null ? null : ImageSetView.of(material.imageSet()));
+                    material.imageSet() == null ? null : ImageSetView.of(material.imageSet()), material.version(),
+                    material.size(), BelongingView.of(material.belonging()));
         }
 
         @Override
@@ -211,15 +274,17 @@ class MaterialController {
 
     @GetMapping(path = MATERIALS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listMaterials", summary = "The account's materials whose newest version is in one of the"
-            + " given states, newest first, with the upload's progress on those still uploading; with system, only those"
-            + " attached to that system or to one of its campaigns. request.invalid (400) without a state, for an unknown"
-            + " state, a limit outside 1 to 50 or a malformed cursor; request.not_found (404) for a system that is not the"
-            + " account's (unknown, another account's or malformed);" + SESSION_SUMMARY,
+            + " given states (every material without a state), newest first, with the upload's progress on those still"
+            + " uploading; with system, only those attached to that system or to one of its campaigns. A material whose"
+            + " every place is being deleted is left out, so a page may hold fewer than the limit. request.invalid (400)"
+            + " for an unknown state, a limit outside 1 to 50 or a malformed cursor; request.not_found (404) for a system"
+            + " that is not the account's (unknown, another account's or malformed);" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
-                @Parameter(name = "state", in = ParameterIn.QUERY, required = true,
-                        description = "A state of the newest version; repeat it for several",
+                @Parameter(name = "state", in = ParameterIn.QUERY,
+                        description = "A state of the newest version; repeat it for several; absent: every state"
+                                + " (contract 1.21.0)",
                         array = @ArraySchema(minItems = 1, schema = @Schema(type = "string",
                                 allowableValues = {"uploading", "waiting", "processing", "needs_review", "ready",
                                     "superseded", "failed", "discarded"}))),
@@ -236,7 +301,7 @@ class MaterialController {
                                   @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
                                   @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
                                   @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system) {
-        if (states == null || states.isEmpty() || !Materials.STATES.containsAll(states)) {
+        if (states != null && (states.isEmpty() || !Materials.STATES.containsAll(states))) {
             throw invalid();
         }
         if (limit != null && (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Materials.MAX_LIMIT)) {
@@ -261,6 +326,58 @@ class MaterialController {
             @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id) {
         return parse(id).flatMap(materials::find).map(MaterialView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    @Schema(name = "MaterialBelongingChange", description = "Exactly one of campaign and systems")
+    record BelongingBody(
+            @Schema(description = "One of the account's campaigns (archived or not)", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000002") String campaign,
+            @ArraySchema(minItems = 1, maxItems = 100, arraySchema = @Schema(description = "One to 100 of the account's"
+                    + " systems, at most 100 ids as sent; a repeated id is stored once"),
+                    schema = @Schema(type = "string", format = "uuid")) List<String> systems) {
+
+        @Override
+        public String toString() {
+            return "BelongingBody[]";
+        }
+    }
+
+    @Schema(name = "MaterialChange", requiredProperties = {"version", "belonging"})
+    record MaterialChangeBody(
+            @Schema(description = "The version the change was made on, as the material was read", format = "int64",
+                    minimum = "0", example = "0") Long version,
+            @Schema(description = "Where the material belongs from now on") BelongingBody belonging) {
+
+        @Override
+        public String toString() {
+            return "MaterialChangeBody[version=" + version + "]";
+        }
+    }
+
+    @PatchMapping(path = MATERIAL, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "changeMaterial", summary = "Changes where one of the account's materials belongs, on the"
+            + " version it names (contract 1.21.0): one campaign, or one to 100 systems. It applies from the next"
+            + " question; nothing is processed again. Answers the material as stored, its version raised by one."
+            + " request.stale_version (409) when the material has left that version; material.belonging_invalid (400)"
+            + " for both campaign and systems, neither, an empty or over-long list, or a campaign or system that is not"
+            + " the account's (unknown, another account's, malformed or being deleted); request.invalid (400) without a"
+            + " version or for a malformed body; request.not_found (404) for any other material id, one whose every"
+            + " place is being deleted included; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> change(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @RequestBody MaterialChangeBody body) {
+        UUID materialId = parse(id).orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+        if (body == null || body.version() == null || body.version() < 0) {
+            throw invalid();
+        }
+        BelongingBody belonging = body.belonging() == null ? new BelongingBody(null, null) : body.belonging();
+        return belongings.change(materialId, body.version(), belonging.campaign(), belonging.systems())
+                .map(MaterialView::of)
                 .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
                 .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
     }

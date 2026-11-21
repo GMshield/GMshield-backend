@@ -81,6 +81,58 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return systems.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && materialIds.contains(row.materialId()))
+                .sorted(Comparator.comparing(MaterialSystemRow::materialId).thenComparing(MaterialSystemRow::createdAt)
+                        .thenComparing(MaterialSystemRow::id)).toList();
+    }
+
+    /** How many times {@link #changeBelonging} wrote (Story 3.3). */
+    public final AtomicInteger belongingChanges = new AtomicInteger();
+
+    @Override
+    public synchronized Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId,
+                                                              List<MaterialSystemRow> wanted, Instant now) {
+        Optional<MaterialRow> found = findMaterial(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        MaterialRow before = found.get();
+        UUID owner = ownerFor(before.ownerId());
+        if (before.version() != version) {
+            throw new StaleMaterialVersion();
+        }
+        List<MaterialSystemRow> rows = campaignId == null ? wanted : List.of();
+        java.util.Set<UUID> wantedIds = new java.util.HashSet<>();
+        rows.forEach(row -> wantedIds.add(row.systemId()));
+        java.util.Set<UUID> kept = new java.util.HashSet<>();
+        for (MaterialSystemRow link : List.copyOf(systems.values())) {
+            if (!link.ownerId().equals(owner) || !link.materialId().equals(id)) {
+                continue;
+            }
+            if (wantedIds.contains(link.systemId())) {
+                kept.add(link.systemId());
+            } else {
+                systems.remove(link.id());
+                RollbackUndo.onRollback(() -> systems.put(link.id(), link));
+            }
+        }
+        for (MaterialSystemRow row : rows) {
+            if (kept.add(row.systemId())) {
+                insertMaterialSystem(row);
+            }
+        }
+        MaterialRow after = new MaterialRow(before.id(), before.ownerId(), before.name(), before.createdAt(),
+                before.kind(), before.language(), campaignId, before.version() + 1);
+        materials.put(id, after);
+        RollbackUndo.onRollback(() -> materials.put(id, before));
+        belongingChanges.incrementAndGet();
+        return Optional.of(after);
+    }
+
+    @Override
     public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
         UUID owner = OwnerContext.require();
         return materials.values().stream()

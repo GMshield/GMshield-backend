@@ -81,7 +81,7 @@ class MaterialsTest {
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> started.add(version));
         reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
-                .collect(java.util.stream.Collectors.toSet()), library::campaignIdsOf, new IngestionSettings(4),
+                .collect(java.util.stream.Collectors.toSet()), library, new IngestionSettings(4),
                 beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
@@ -97,7 +97,7 @@ class MaterialsTest {
     void aKindACampaignOfTheOwnerAndDetectStoreTheKindTheCampaignAndNoLanguage() {
         UUID campaign = as(owner, () -> library.currentCampaign().orElseThrow().id());
 
-        UUID material = create(owner, "Livro do Jogador.pdf", new Uploads.Details("rulebook", "detect", campaign.toString(), null));
+        UUID material = create(owner, "Livro do Jogador.pdf", new Uploads.Details("rulebook", "detect", campaign.toString(), (String) null));
 
         MaterialRow row = materials.materials.get(material);
         assertThat(row.kind()).isEqualTo("rulebook");
@@ -121,9 +121,9 @@ class MaterialsTest {
             assertThat(link.ownerId()).isEqualTo(owner);
             assertThat(link.systemId()).isEqualTo(system);
         });
-        assertThat(create(owner, "notes.md", new Uploads.Details("campaign_notes", "en", null, null))).isNotNull();
+        assertThat(create(owner, "notes.md", new Uploads.Details("campaign_notes", "en", null, (String) null))).isNotNull();
         for (String kind : Uploads.KINDS) {
-            assertThat(create(owner, kind + ".txt", new Uploads.Details(kind, null, null, null))).isNotNull();
+            assertThat(create(owner, kind + ".txt", new Uploads.Details(kind, null, null, (String) null))).isNotNull();
         }
     }
 
@@ -134,24 +134,24 @@ class MaterialsTest {
         UUID theirs = as(other, () -> library.currentCampaign().orElseThrow().id());
         UUID theirSystem = as(other, () -> library.currentCampaign().orElseThrow().system().id());
         List<Uploads.Details> refused = List.of(
-                new Uploads.Details(null, null, theirs.toString(), null),
+                new Uploads.Details(null, null, theirs.toString(), (String) null),
                 new Uploads.Details(null, null, null, theirSystem.toString()),
-                new Uploads.Details(null, null, UUID.randomUUID().toString(), null),
+                new Uploads.Details(null, null, UUID.randomUUID().toString(), (String) null),
                 new Uploads.Details(null, null, mine.toString(), mySystem.toString()),
-                new Uploads.Details(null, null, "not-a-uuid", null),
-                new Uploads.Details(null, null, "", null),
+                new Uploads.Details(null, null, "not-a-uuid", (String) null),
+                new Uploads.Details(null, null, "", (String) null),
                 new Uploads.Details(null, null, null, mySystem.toString().toUpperCase() + "0"),
-                new Uploads.Details("novel", null, null, null),
-                new Uploads.Details("", null, null, null),
-                new Uploads.Details("Rulebook", null, null, null),
-                new Uploads.Details(null, "pt", null, null),
-                new Uploads.Details(null, "DETECT", null, null),
-                new Uploads.Details(null, "", null, null));
+                new Uploads.Details("novel", null, null, (String) null),
+                new Uploads.Details("", null, null, (String) null),
+                new Uploads.Details("Rulebook", null, null, (String) null),
+                new Uploads.Details(null, "pt", null, (String) null),
+                new Uploads.Details(null, "DETECT", null, (String) null),
+                new Uploads.Details(null, "", null, (String) null));
         List<ApiException> problems = new ArrayList<>();
         for (Uploads.Details details : refused) {
             Throwable thrown = catchThrowable(() -> as(owner, () -> service.create(10, "a.pdf", details)));
             assertThat(thrown)
-                    .as(details.kind() + " " + details.language() + " " + details.campaign() + " " + details.system())
+                    .as(details.kind() + " " + details.language() + " " + details.campaign() + " " + details.systems())
                     .satisfies(problem("upload.metadata_invalid", 400));
             problems.add((ApiException) thrown);
         }
@@ -199,7 +199,7 @@ class MaterialsTest {
 
     @Test
     void theListHasTheMaterialsWhoseNewestVersionIsInTheStatesNewestFirstWithTheUploadOnlyWhileUploading() {
-        UUID uploading = create(owner, "uploading.pdf", new Uploads.Details("rulebook", null, null, null));
+        UUID uploading = create(owner, "uploading.pdf", new Uploads.Details("rulebook", null, null, (String) null));
         UUID waiting = create(owner, "waiting.pdf", Uploads.Details.NONE);
         UUID processing = create(owner, "processing.pdf", Uploads.Details.NONE);
         UUID ready = create(owner, "ready.pdf", Uploads.Details.NONE);
@@ -240,7 +240,7 @@ class MaterialsTest {
         UUID otherSystem = as(owner, () -> library.createSystem(new Library.SystemFields("D&D", "2024", null))).id();
         UUID theirSystem = as(other, () -> library.currentCampaign().orElseThrow().system().id());
         UUID ofSystem = create(owner, "srd.pdf", new Uploads.Details(null, null, null, system.toString()));
-        UUID ofCampaign = create(owner, "notas.md", new Uploads.Details(null, null, starter.id().toString(), null));
+        UUID ofCampaign = create(owner, "notas.md", new Uploads.Details(null, null, starter.id().toString(), (String) null));
         create(owner, "loose.pdf", Uploads.Details.NONE);
         UUID ofOther = create(owner, "2024.pdf", new Uploads.Details(null, null, null, otherSystem.toString()));
         UUID ready = create(owner, "ready.pdf", new Uploads.Details(null, null, null, system.toString()));
@@ -414,7 +414,7 @@ class MaterialsTest {
         Materials watched = new Materials(materials, uploads, vault, files, ids -> {
             asked.add(List.copyOf(ids));
             return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
-        }, library::campaignIdsOf, new IngestionSettings(4), beansFor(transactions));
+        }, library, new IngestionSettings(4), beansFor(transactions));
 
         assertThat(as(owner, () -> watched.find(material)).orElseThrow().pages().reading()).isEqualTo("text");
         assertThat(asked).singleElement().satisfies(ids -> assertThat(ids).containsExactly(layout));
@@ -694,7 +694,7 @@ class MaterialsTest {
 
     @Test
     void oneMaterialIsTheOwnersOnlyAndAnotherOwnersReadsLikeAnUnknownOne() {
-        UUID mine = create(owner, "Livro do Jogador.pdf", new Uploads.Details("homebrew", null, null, null));
+        UUID mine = create(owner, "Livro do Jogador.pdf", new Uploads.Details("homebrew", null, null, (String) null));
         setState(mine, "waiting");
 
         Materials.Material found = as(owner, () -> reads.find(mine)).orElseThrow();

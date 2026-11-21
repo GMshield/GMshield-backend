@@ -112,7 +112,7 @@ class SystemDeletionIntegrationTest {
         UUID secondTurn = as(a.id(), () -> conversations.ask(second, "Quem age primeiro?")).turnId();
         eventsAndReference(a.id(), turn);
         UUID starterTurn = as(a.id(), () -> conversations.ask(a.campaign(), "Outra pergunta")).turnId();
-        Completed ofCampaign = completed(a.id(), new Uploads.Details("rulebook", "pt-BR", first.toString(), null));
+        Completed ofCampaign = completed(a.id(), new Uploads.Details("rulebook", "pt-BR", first.toString(), (String) null));
         List<UUID> pieces = versionFileAndPassage(a.id(), ofCampaign.versionId());
         UUID open = uploads(a.id(), new Uploads.Details("supplement", "pt-BR", null, system.toString()));
         UUID shared = materialOf(a.id(), as(a.id(), () -> uploads.create(10, "shared.pdf",
@@ -120,7 +120,7 @@ class SystemDeletionIntegrationTest {
         write(a.id(), () -> store.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), a.id(), shared, other,
                 Instant.now().truncatedTo(ChronoUnit.MICROS))));
         UUID starter = materialOf(a.id(), as(a.id(), () -> uploads.create(10, "starter.pdf",
-                new Uploads.Details("other", "pt-BR", a.campaign().toString(), null))).uploadId());
+                new Uploads.Details("other", "pt-BR", a.campaign().toString(), (String) null))).uploadId());
         UUID openMaterial = materialOf(a.id(), open);
         List<UUID> goingVersions = List.of(ofCampaign.versionId(), versionOf(openMaterial));
         // Story 3.2: an archived campaign still counts and goes with its system.
@@ -207,12 +207,12 @@ class SystemDeletionIntegrationTest {
     void theRemovalWaitsForARunningClaimTakesAnUploadOfTheWaitAndAFailedPassIsFinishedByTheNextOnPostgres()
             throws Exception {
         Owner b = owner();
-        Completed running = completed(b.id(), new Uploads.Details("rulebook", "pt-BR", b.campaign().toString(), null));
+        Completed running = completed(b.id(), new Uploads.Details("rulebook", "pt-BR", b.campaign().toString(), (String) null));
         io.github.gmshield.jobs.service.JobClaims.Claim claim = claims.claim(running.jobId());
         // An upload whose last part arrived before the delete, and whose completion comes during the wait.
         byte[] late = pdf(3 * KIB);
         UUID lateUpload = as(b.id(), () -> uploads.create(late.length, "late.pdf",
-                new Uploads.Details("rulebook", "pt-BR", b.campaign().toString(), null))).uploadId();
+                new Uploads.Details("rulebook", "pt-BR", b.campaign().toString(), (String) null))).uploadId();
         as(b.id(), () -> uploads.patch(lateUpload, 0, late.length, sha256(late), new ByteArrayInputStream(late)));
 
         assertThat(as(b.id(), () -> deletion.delete(b.system()))).isTrue();
