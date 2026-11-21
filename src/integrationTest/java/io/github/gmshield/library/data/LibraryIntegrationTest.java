@@ -59,6 +59,7 @@ import tools.jackson.databind.json.JsonMapper;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
             "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false",
+            "gmshield.library.deletion-sweep.enabled=false",
             "gmshield.materials.index-retry-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class LibraryIntegrationTest {
@@ -136,6 +137,26 @@ class LibraryIntegrationTest {
         @Override
         public Optional<CampaignRow> firstCampaign() {
             return real.firstCampaign();
+        }
+
+        @Override
+        public boolean markDeleting(UUID id, Instant at) {
+            return real.markDeleting(id, at);
+        }
+
+        @Override
+        public boolean deleting(UUID id) {
+            return real.deleting(id);
+        }
+
+        @Override
+        public List<UUID> campaignIdsOfDeleting(UUID systemId) {
+            return real.campaignIdsOfDeleting(systemId);
+        }
+
+        @Override
+        public boolean deleteDeleting(UUID id) {
+            return real.deleteDeleting(id);
         }
     }
 

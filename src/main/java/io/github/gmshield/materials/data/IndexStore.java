@@ -46,4 +46,7 @@ public interface IndexStore {
 
     /** The current owner's {@code index.removal} input of this job; empty for an unknown job or another owner's. */
     Optional<IndexRemovalRow> findRemoval(UUID jobId);
+
+    /** Whether the current owner's version has an {@code index.removal} input already (Story 3.1 part B). */
+    boolean hasRemoval(UUID versionId);
 }

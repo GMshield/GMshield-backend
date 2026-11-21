@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -110,6 +111,50 @@ class JpaConversationStore implements ConversationStore {
         return em().createQuery("select b from TurnEventBatch b where b.turnId = :turn and b.lastSequence > :after"
                         + " order by b.firstSequence", TurnEventBatchEntity.class).setParameter("turn", turnId)
                 .setParameter("after", sequence).getResultList().stream().map(TurnEventBatchEntity::row).toList();
+    }
+
+    @Override
+    public List<ConversationRow> conversationsOfCampaigns(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select c from Conversation c where c.campaignId in :campaigns order by c.createdAt, c.id",
+                        ConversationEntity.class).setParameter("campaigns", campaignIds).getResultList().stream()
+                .map(ConversationEntity::row).toList();
+    }
+
+    @Override
+    public List<TurnRow> turnsOf(UUID conversationId) {
+        return em().createQuery("select t from Turn t where t.conversationId = :conversation order by t.createdAt, t.id",
+                        TurnEntity.class).setParameter("conversation", conversationId).getResultList().stream()
+                .map(TurnEntity::row).toList();
+    }
+
+    @Override
+    public boolean deleteTurn(UUID turnId) {
+        EntityManager em = em();
+        Optional<TurnEntity> found = em.createQuery("select t from Turn t where t.id = :id", TurnEntity.class)
+                .setParameter("id", turnId).getResultList().stream().findFirst();
+        found.ifPresent(turn -> {
+            em.createQuery("select b from TurnEventBatch b where b.turnId = :turn", TurnEventBatchEntity.class)
+                    .setParameter("turn", turnId).getResultList().forEach(em::remove);
+            em.flush();
+            em.remove(turn);
+            em.flush();
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean deleteConversation(UUID id) {
+        EntityManager em = em();
+        Optional<ConversationEntity> found = em.createQuery("select c from Conversation c where c.id = :id",
+                ConversationEntity.class).setParameter("id", id).getResultList().stream().findFirst();
+        found.ifPresent(conversation -> {
+            em.remove(conversation);
+            em.flush();
+        });
+        return found.isPresent();
     }
 
     /** The shared, transaction-bound entity manager: each transaction (or each call outside one) has its own session. */

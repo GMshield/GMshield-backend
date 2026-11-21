@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.data;
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -141,5 +142,48 @@ public class InMemoryConversationStore implements ConversationStore {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException("no transaction");
         }
+    }
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    @Override
+    public List<ConversationRow> conversationsOfCampaigns(Collection<UUID> campaignIds) {
+        return owned(conversations).filter(row -> campaignIds.contains(row.campaignId()))
+                .sorted(Comparator.comparing(ConversationRow::createdAt).thenComparing(ConversationRow::id)).toList();
+    }
+
+    @Override
+    public List<TurnRow> turnsOf(UUID conversationId) {
+        return owned(turns).filter(row -> row.conversationId().equals(conversationId))
+                .sorted(Comparator.comparing(TurnRow::createdAt).thenComparing(TurnRow::id)).toList();
+    }
+
+    @Override
+    public synchronized boolean deleteTurn(UUID turnId) {
+        Optional<TurnRow> found = findTurn(turnId);
+        found.ifPresent(turn -> {
+            ownerFor(turn.ownerId());
+            for (EventBatchRow batch : owned(batches).filter(row -> row.turnId().equals(turnId)).toList()) {
+                batches.remove(batch.id());
+                RollbackUndo.onRollback(() -> batches.put(batch.id(), batch));
+            }
+            turns.remove(turnId);
+            RollbackUndo.onRollback(() -> turns.put(turnId, turn));
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public synchronized boolean deleteConversation(UUID id) {
+        Optional<ConversationRow> found = findConversation(id);
+        found.ifPresent(conversation -> {
+            ownerFor(conversation.ownerId());
+            if (turns.values().stream().anyMatch(turn -> turn.conversationId().equals(id))) {
+                throw new IllegalStateException("a turn still names the conversation");
+            }
+            conversations.remove(id);
+            RollbackUndo.onRollback(() -> conversations.put(id, conversation));
+        });
+        return found.isPresent();
     }
 }

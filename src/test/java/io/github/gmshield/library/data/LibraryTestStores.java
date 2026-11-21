@@ -5,7 +5,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 
-/** The library's store in memory and a transaction manager, for Spring tests that run without PostgreSQL. */
+/** The library's stores in memory (from Story 3.1 part B, {@code deletion} too) and a transaction manager, for Spring tests that run without PostgreSQL. */
 @TestConfiguration(proxyBeanMethods = false)
 public class LibraryTestStores {
 
@@ -13,6 +13,12 @@ public class LibraryTestStores {
     @Primary
     InMemoryLibraryStore inMemoryLibrary() {
         return new InMemoryLibraryStore();
+    }
+
+    @Bean
+    @Primary
+    InMemoryDeletionStore inMemoryDeletions() {
+        return new InMemoryDeletionStore();
     }
 
     @Bean

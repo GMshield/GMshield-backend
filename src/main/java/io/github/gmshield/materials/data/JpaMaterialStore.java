@@ -688,6 +688,54 @@ class JpaMaterialStore implements MaterialStore {
         return material.isPresent();
     }
 
+    /** Story 3.1 part B: attached to the system, and to no other system or to another one as well. */
+    private static final String ATTACHED_HERE = "select m from Material m where exists (select a.id from MaterialSystem a"
+            + " where a.materialId = m.id and a.systemId = :system)";
+    private static final String ONLY_OF_SYSTEM = ATTACHED_HERE + " and not exists (select o.id from MaterialSystem o"
+            + " where o.materialId = m.id and o.systemId <> :system) order by m.id";
+    private static final String ALSO_OF_OTHER_SYSTEMS = ATTACHED_HERE + " and exists (select o.id from MaterialSystem o"
+            + " where o.materialId = m.id and o.systemId <> :system) order by m.id";
+
+    @Override
+    public List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select m from Material m where m.campaignId in :campaigns order by m.id",
+                        MaterialEntity.class).setParameter("campaigns", campaignIds).getResultList().stream()
+                .map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsOnlyOfSystem(UUID systemId) {
+        return em().createQuery(ONLY_OF_SYSTEM, MaterialEntity.class).setParameter("system", systemId).getResultList()
+                .stream().map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId) {
+        return em().createQuery(ALSO_OF_OTHER_SYSTEMS, MaterialEntity.class).setParameter("system", systemId)
+                .getResultList().stream().map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public boolean detachSystem(UUID materialId, UUID systemId) {
+        List<MaterialSystemEntity> found = systemEntitiesOf(materialId).stream()
+                .filter(entity -> entity.row().systemId().equals(systemId)).toList();
+        found.forEach(em()::remove);
+        em().flush();
+        return !found.isEmpty();
+    }
+
+    @Override
+    public int deleteSteps(UUID versionId) {
+        List<IngestionStepEntity> found = em().createQuery("select s from IngestionStep s where s.versionId = :version",
+                IngestionStepEntity.class).setParameter("version", versionId).getResultList();
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
+    }
+
     private Optional<MaterialEntity> material(UUID id) {
         return em().createQuery("select m from Material m where m.id = :id", MaterialEntity.class)
                 .setParameter("id", id).getResultList().stream().findFirst();

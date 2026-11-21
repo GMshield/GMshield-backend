@@ -14,4 +14,7 @@ public interface TurnReferenceStore {
 
     /** The current owner's references of a turn, by number; empty for an unknown turn or another owner's. */
     List<TurnReferenceRow> references(UUID turnId);
+
+    /** Deletes the current owner's references of a turn (Story 3.1 part B: its campaign goes); answers how many went. */
+    int deleteReferences(UUID turnId);
 }

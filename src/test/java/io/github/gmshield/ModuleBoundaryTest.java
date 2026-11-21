@@ -177,6 +177,26 @@ class ModuleBoundaryTest {
                 .doesNotThrowAnyException();
     }
 
+    /**
+     * Story 3.1 part B: a system's deletion reaches {@code materials} and {@code conversations} only through the
+     * {@code library.service.SystemDeletionHandler} each implements, so {@code library} still depends on no feature
+     * module, and both handlers are there.
+     */
+    @Test
+    void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
+        String base = GmshieldApplication.class.getPackageName();
+        JavaClasses application = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS).importPackages(base);
+
+        noClasses().that().resideInAPackage(base + ".library..").should().dependOnClassesThat()
+                .resideInAnyPackage(base + ".materials..", base + ".conversations..", base + ".jobs..",
+                        base + ".scope..", base + ".accounts..", base + ".audit..", base + ".limits..")
+                .because("library depends on shared and vault only").check(application);
+        List<String> handlers = application.get(io.github.gmshield.library.service.SystemDeletionHandler.class)
+                .getAllSubclasses().stream().map(JavaClass::getPackageName).sorted().toList();
+        assertThat(handlers).containsExactly(base + ".conversations.service", base + ".materials.service");
+    }
+
     @Test
     void fixtureWithoutAViolationPasses() {
         assertThatCode(() -> ApplicationModules.of(FIXTURES + "valid").verify()).doesNotThrowAnyException();

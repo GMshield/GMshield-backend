@@ -2,6 +2,7 @@ package io.github.gmshield.library.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
@@ -9,6 +10,7 @@ import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.util.List;
 import java.util.Optional;
@@ -18,6 +20,7 @@ import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -38,6 +41,10 @@ import org.springframework.web.bind.annotation.RestController;
  * own 400 problem ({@code request.system_name_invalid}, {@code request.system_edition_invalid},
  * {@code request.system_description_invalid}); a name and edition the owner already has is
  * {@code request.system_name_taken} (409). A malformed body, limit or cursor is {@code request.invalid} (400).
+ *
+ * <p>Story 3.1 part B: what goes with a system ({@code GET .../deletion}), and its deletion ({@code DELETE}, 202 with
+ * no body; {@link SystemDeletion}). A system being deleted is {@code request.not_found} on every route, as another
+ * owner's is.
  */
 @RestController
 @Tag(name = "library")
@@ -48,6 +55,7 @@ class LibraryController {
     static final String CAMPAIGN = "/api/v1/campaigns/{id}";
     static final String SYSTEMS = "/api/v1/systems";
     static final String SYSTEM = "/api/v1/systems/{id}";
+    static final String SYSTEM_DELETION = "/api/v1/systems/{id}/deletion";
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
@@ -56,9 +64,11 @@ class LibraryController {
     private static final String CURSOR_EXAMPLE = "0190a0b0-0000-7000-8000-000000000001";
 
     private final Library library;
+    private final SystemDeletion deletion;
 
-    LibraryController(Library library) {
+    LibraryController(Library library, SystemDeletion deletion) {
         this.library = library;
+        this.deletion = deletion;
     }
 
     @Schema(name = "System", requiredProperties = {"id", "name", "edition", "description", "version"})
@@ -131,6 +141,20 @@ class LibraryController {
             @ArraySchema(schema = @Schema(implementation = CampaignSummaryView.class)) List<CampaignSummaryView> items,
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
                     example = "0190a0b0-0000-7000-8000-000000000002") String nextCursor) {
+    }
+
+    @Schema(name = "SystemDeletion", requiredProperties = {"campaigns", "conversations", "materials"})
+    record SystemDeletionView(
+            @Schema(description = "How many campaigns of the system go with it", format = "int64", minimum = "0",
+                    example = "2") long campaigns,
+            @Schema(description = "How many conversations of those campaigns go with it", format = "int64",
+                    minimum = "0", example = "3") long conversations,
+            @Schema(description = "How many materials go with it: those of its campaigns, and those attached to it and"
+                    + " to no other system", format = "int64", minimum = "0", example = "1") long materials) {
+
+        static SystemDeletionView of(SystemDeletion.Counts counts) {
+            return new SystemDeletionView(counts.campaigns(), counts.conversations(), counts.materials());
+        }
     }
 
     @Schema(name = "NewSystem", requiredProperties = "name")
@@ -283,6 +307,37 @@ class LibraryController {
         }
         return found(library.changeSystem(systemId, body.version(),
                 new Library.SystemFields(body.name(), body.edition(), body.description())).map(SystemView::of));
+    }
+
+    @GetMapping(path = SYSTEM_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getSystemDeletion", summary = "What goes with one of the account's game systems if it is"
+            + " deleted: how many campaigns, conversations and materials (those of its campaigns, and those attached to"
+            + " it and to no other system). request.not_found (404) for any other id, a system being deleted"
+            + " included;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<SystemDeletionView> systemDeletion(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return found(parse(id).flatMap(deletion::preview).map(SystemDeletionView::of));
+    }
+
+    @DeleteMapping(path = SYSTEM)
+    @Operation(operationId = "deleteSystem", summary = "Deletes one of the account's game systems (202, no body): from"
+            + " now on it and its campaigns are not found, and its campaigns, their conversations and the materials"
+            + " attached only to it are removed in the background; a material also attached to another system stays"
+            + " and only loses this attachment. Cannot be undone. request.not_found (404) for any other id, a system"
+            + " already being deleted included;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion started"))
+    ResponseEntity<Void> deleteSystem(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        if (!parse(id).map(deletion::delete).orElse(false)) {
+            throw notFound();
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 
     /** A malformed id is no different from an unknown one. */

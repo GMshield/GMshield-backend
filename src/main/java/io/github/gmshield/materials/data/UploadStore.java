@@ -105,4 +105,7 @@ public interface UploadStore {
      * nobody can finish any more (their complete members included), oldest expiry first.
      */
     List<UploadRow> abandonedSets(Instant now, int limit);
+
+    /** Every upload of {@code owner}'s version, whatever its state (Story 3.1 part B: the version goes). */
+    List<UploadRow> allOfVersion(UUID owner, UUID versionId);
 }
