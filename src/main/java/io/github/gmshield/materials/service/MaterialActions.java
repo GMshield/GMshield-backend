@@ -1,7 +1,8 @@
 package io.github.gmshield.materials.service;
 
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialStore;
-import io.github.gmshield.materials.data.NewestVersion;
+import io.github.gmshield.materials.data.CurrentVersion;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.UploadStorage;
 import io.github.gmshield.materials.data.VersionRow;
@@ -20,7 +21,8 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * The GM's actions on a material's newest version (Story 1.20), for the owner of the work ({@link OwnerContext}). Each
+ * The GM's actions on a material's current version (Story 1.20; from Story 3.4 the newest one that is not
+ * {@code discarded}: {@link MaterialStore#current}), for the owner of the work ({@link OwnerContext}). Each
  * locks that version and acts only from a state that allows it ({@link Materials#actions}, the one place of that rule),
  * in one transaction; anything else is {@code material.action_unavailable} (409) and changes nothing:
  *
@@ -29,7 +31,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       material before it becomes {@code superseded} (it keeps its points); from Story 2.1 the version's passages get
  *       their index changes ({@link IndexChanges#start}) in the same transaction;</li>
  *   <li>{@value Materials#REPROCESS}: the unreadable pages of a {@code needs_review} version are read again
- *       ({@link IngestionSteps#reprocess});</li>
+ *       ({@link IngestionSteps#reprocess}); from Story 3.4, a {@code ready} version is read again as a new version of
+ *       its material, from a copy of its cleaned original ({@link IngestionSteps#reprocessAccepted}), after the check
+ *       of {@link NewVersions#lockReady} with the material locked; the ready version is not changed;</li>
  *   <li>{@value Materials#RETRY}: a {@code failed} version starts again ({@link IngestionSteps#retry});</li>
  *   <li>{@value Materials#DISCARD}: a {@code needs_review} or {@code failed} version becomes {@code discarded} with its
  *       removal pending, its unended steps cancelled; from Story 2.1 its unended index changes are cancelled and the
@@ -53,12 +57,15 @@ public class MaterialActions {
     private final IndexRemovals indexRemovals;
     private final Materials reads;
     private final IngestionSettings settings;
+    private final Library library;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
     MaterialActions(MaterialStore materials, UploadStorage uploads, IngestionSteps ingestion, VersionRemoval removal,
                     IndexChanges indexChanges, IndexRemovals indexRemovals, Materials reads, IngestionSettings settings,
-                    ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+                    Library library, ObjectProvider<PlatformTransactionManager> transactions,
+                    ObjectProvider<Clock> clock) {
+        this.library = library;
         this.indexChanges = indexChanges;
         this.indexRemovals = indexRemovals;
         this.settings = settings;
@@ -78,11 +85,11 @@ public class MaterialActions {
         }
         OwnerContext.require();
         Optional<VersionRow> acted = new TransactionTemplate(transactions.getObject()).execute(status -> {
-            Optional<NewestVersion> newest = materials.newest(materialId);
-            if (newest.isEmpty()) {
+            Optional<CurrentVersion> current = materials.current(materialId);
+            if (current.isEmpty()) {
                 return Optional.<VersionRow>empty();
             }
-            VersionRow version = materials.lockVersion(newest.get().version().id())
+            VersionRow version = materials.lockVersion(current.get().version().id())
                     .orElseThrow(MaterialProblems::actionUnavailable);
             IngestionSteps.RetryCheck retry = IngestionSteps.retryCheck(materials, uploads, settings, version);
             if (Materials.RETRY.equals(action) && retry == IngestionSteps.RetryCheck.PAST_CAP) {
@@ -93,7 +100,7 @@ public class MaterialActions {
             }
             switch (action) {
                 case Materials.ACCEPT -> accept(version);
-                case Materials.REPROCESS -> ingestion.reprocess(version);
+                case Materials.REPROCESS -> reprocess(version);
                 case Materials.RETRY -> ingestion.retry(version);
                 default -> discard(version);
             }
@@ -129,6 +136,16 @@ public class MaterialActions {
         }
         materials.changeVersionState(version.id(), Materials.READY, now);
         indexChanges.start(version);
+    }
+
+    /** In place while the version needs review; as a new version while it is ready (Story 3.4). */
+    private void reprocess(VersionRow version) {
+        if (Materials.READY.equals(version.state())) {
+            NewVersions.Ready ready = NewVersions.lockReady(materials, library, version.materialId());
+            ingestion.reprocessAccepted(ready.version());
+        } else {
+            ingestion.reprocess(version);
+        }
     }
 
     private void discard(VersionRow version) {

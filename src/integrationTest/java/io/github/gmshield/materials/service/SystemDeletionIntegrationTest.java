@@ -204,6 +204,45 @@ class SystemDeletionIntegrationTest {
     }
 
     @Test
+    void aSystemDeletionRemovesEveryVersionOfAReplacedMaterialOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID system = as(a.id(), () -> library.createSystem(new Library.SystemFields("Tormenta", "20", null))).id();
+        Completed first = completed(a.id(), new Uploads.Details("rulebook", "pt-BR", null, system.toString()));
+        freeTheIngestionLane();
+        List<UUID> firstPieces = versionFileAndPassage(a.id(), first.versionId());
+        // Story 3.4: its first version superseded by a second, ready, and a replacement of it uploading.
+        UUID second = Ids.newId();
+        write(a.id(), () -> {
+            Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+            store.changeVersionState(first.versionId(), "superseded", now);
+            store.insertVersion(new io.github.gmshield.materials.data.VersionRow(second, a.id(), first.materialId(),
+                    "ready", "pdf", 10L, now, now));
+        });
+        List<UUID> secondPieces = versionFileAndPassage(a.id(), second);
+        UUID replacement = as(a.id(), () -> uploads.create(10, "novo.pdf",
+                Uploads.Details.replacing(first.materialId().toString()))).uploadId();
+        UUID third = jdbc.sql("select version_id from upload where id = ?").param(replacement).query(UUID.class)
+                .single();
+        assertThat(count("material_version", "material_id = ?", first.materialId())).isEqualTo(3);
+        assertThat(as(a.id(), () -> deletion.preview(system)).orElseThrow().materials()).isOne();
+
+        assertThat(as(a.id(), () -> deletion.delete(system))).isTrue();
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(system).query(UUID.class)
+                .single();
+        assertThat(deletion.run(a.id(), deletionId)).isTrue();
+
+        assertThat(count("material", "id = ?", first.materialId())).isZero();
+        assertThat(count("material_version", "material_id = ?", first.materialId())).isZero();
+        for (UUID version : List.of(first.versionId(), second, third)) {
+            for (String table : List.of("upload", "ingestion_step", "version_file", "passage")) {
+                assertThat(count(table, "version_id = ?", version)).as(table).isZero();
+            }
+        }
+        assertThat(firstPieces).allSatisfy(file -> assertThat(files.fileExists(a.id(), file)).isFalse());
+        assertThat(secondPieces).allSatisfy(file -> assertThat(files.fileExists(a.id(), file)).isFalse());
+    }
+
+    @Test
     void theRemovalWaitsForARunningClaimTakesAnUploadOfTheWaitAndAFailedPassIsFinishedByTheNextOnPostgres()
             throws Exception {
         Owner b = owner();

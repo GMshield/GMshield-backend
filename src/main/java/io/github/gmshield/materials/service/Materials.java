@@ -1,7 +1,7 @@
 package io.github.gmshield.materials.service;
 
 import io.github.gmshield.materials.data.MaterialStore;
-import io.github.gmshield.materials.data.NewestVersion;
+import io.github.gmshield.materials.data.CurrentVersion;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
@@ -40,7 +40,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The owner's materials as the interface shows them (Story 1.14): each with its name, decrypted, and the state of its
- * newest version, which is the material's state; while that version is {@code uploading}, the upload's progress too;
+ * current version, which is the material's state; while that version is {@code uploading}, the upload's progress too;
  * from Story 1.15, its pages once the page total is known and the failure code of a failed version; from Story 1.16,
  * the pages done are the pages its chain gave an outcome; from Story 1.17, the pages of each layer and how many of them
  * have an outcome, and the pages of each outcome, all derived here from the recorded ranges; and {@code reading}, the
@@ -51,13 +51,16 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 1.19, one page of a material on a {@link Ground} ({@link #page}): its picture's size, its lines or text, and its
  * passages' places, and the picture itself ({@link #picture}), streamed piece by piece. From Story 1.20, each
  * material's {@code actions} (those of {@value #ACCEPT}, {@value #REPROCESS}, {@value #RETRY} and {@value #DISCARD}
- * its newest version allows now: {@link #actions}, the one place of that rule), the quality report of a version that
+ * its current version allows now: {@link #actions}, the one place of that rule), the quality report of a version that
  * needs review or is ready ({@link #report}), each page's outcome, an unreadable page with no view answered as one with
  * nothing on it, and only passages of a {@code ready} version.
  * From Story 3.1, the list of a system's materials ({@link #listOfSystem}): those attached to it and those of its
  * campaigns. From Story 3.3, each material's version, size and where it belongs ({@link Belonging}: only ready places,
  * names decrypted, read for a whole page at once), every material when no state is given, and a list leaves out a
- * material that belongs somewhere but whose every place is being deleted. Everything acts for the owner of the work
+ * material that belongs somewhere but whose every place is being deleted. From Story 3.4 a material has several
+ * versions: everything above reads its current version ({@link MaterialStore#current}: the newest one that is not
+ * {@code discarded}, or the newest one when every version is), and a material whose {@code ready} version is not its
+ * current one shows that version as {@link Serving}. Everything acts for the owner of the work
  * ({@link OwnerContext}): another owner's material reads like an unknown one. Nothing here logs a name.
  */
 @Service
@@ -69,7 +72,7 @@ public class Materials {
     static final String FAILED = "failed";
     static final String READY = "ready";
     static final String SUPERSEDED = "superseded";
-    /** The GM's actions on a material's newest version (Story 1.20), in the order the interface shows them. */
+    /** The GM's actions on a material's current version (Story 1.20), in the order the interface shows them. */
     public static final String ACCEPT = "accept";
     public static final String REPROCESS = "reprocess";
     public static final String RETRY = "retry";
@@ -170,18 +173,33 @@ public class Materials {
     /**
      * A material: {@code kind} may be null, {@code upload} is there only while the state is {@code uploading},
      * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed};
-     * {@code actions}, the GM's actions its newest version allows now (Story 1.20), in {@link #ACTIONS} order; from
+     * {@code actions}, the GM's actions its current version allows now (Story 1.20), in {@link #ACTIONS} order; from
      * Story 1.21, {@code imageSet} only while an image set is uploading (then {@code upload} is null). From Story 3.3,
-     * its {@code version} (a change of where it belongs names it), {@code size} (the newest version's bytes, null until
-     * known) and where it {@code belongs}.
+     * its {@code version} (a change of where it belongs names it), {@code size} (the current version's bytes, null until
+     * known) and where it {@code belongs}. From Story 3.4, {@code serving}: its {@code ready} version while that is
+     * not its current one (a new version is being processed), else null.
      */
     public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
                            String failure, List<String> actions, ImageSet imageSet, long version, Long size,
-                           Belonging belonging) {
+                           Belonging belonging, Serving serving) {
+
+        /** A material with no other version serving. */
+        public Material(UUID id, String name, String state, String kind, Upload upload, Pages pages, String failure,
+                        List<String> actions, ImageSet imageSet, long version, Long size, Belonging belonging) {
+            this(id, name, state, kind, upload, pages, failure, actions, imageSet, version, size, belonging, null);
+        }
+
         @Override
         public String toString() {
             return "Material[id=" + id + ", state=" + state + ", version=" + version + "]";
         }
+    }
+
+    /**
+     * The {@code ready} version of a material that keeps serving while a newer one is processed (Story 3.4): its page
+     * total (null when not known) and its size in bytes (null when not known).
+     */
+    public record Serving(Integer pages, Long size) {
     }
 
     /** A system a material belongs to, or a campaign's system (Story 3.3): its id and its name, decrypted. */
@@ -347,7 +365,7 @@ public class Materials {
     }
 
     /**
-     * The owner's materials whose newest version is in one of {@code states} (from Story 3.3, in any state when it is
+     * The owner's materials whose current version is in one of {@code states} (from Story 3.3, in any state when it is
      * null), newest first, after the material {@code cursor} when it is given, at most {@code limit} (1 to
      * {@value #MAX_LIMIT}). A material whose every place is being deleted is left out (a page may then be shorter).
      */
@@ -363,8 +381,8 @@ public class Materials {
     public Page list(Collection<String> states, UUID cursor, int offset, int limit) {
         checkList(states, cursor, offset, limit);
         Set<String> in = statesOrAll(states);
-        return reading(() -> page(offset > 0 ? materials.newestFrom(in, offset, limit + 1)
-                : materials.newestIn(in, cursor, limit + 1), limit, materials.newestCount(in)));
+        return reading(() -> page(offset > 0 ? materials.currentFrom(in, offset, limit + 1)
+                : materials.currentIn(in, cursor, limit + 1), limit, materials.currentCount(in)));
     }
 
     /**
@@ -380,9 +398,9 @@ public class Materials {
         checkList(states, cursor, offset, limit);
         Set<String> in = statesOrAll(states);
         return reading(() -> library.campaignIdsOf(systemId).map(campaigns -> page(
-                offset > 0 ? materials.newestAttachedFrom(in, systemId, campaigns, offset, limit + 1)
-                        : materials.newestAttached(in, systemId, campaigns, cursor, limit + 1),
-                limit, materials.newestAttachedCount(in, systemId, campaigns))));
+                offset > 0 ? materials.currentAttachedFrom(in, systemId, campaigns, offset, limit + 1)
+                        : materials.currentAttached(in, systemId, campaigns, cursor, limit + 1),
+                limit, materials.currentAttachedCount(in, systemId, campaigns))));
     }
 
     private static void checkList(Collection<String> states, UUID cursor, int offset, int limit) {
@@ -396,15 +414,15 @@ public class Materials {
         return states == null ? STATES : Set.copyOf(states);
     }
 
-    private Page page(List<NewestVersion> found, int limit, long total) {
-        List<NewestVersion> page = found.size() > limit ? found.subList(0, limit) : found;
+    private Page page(List<CurrentVersion> found, int limit, long total) {
+        List<CurrentVersion> page = found.size() > limit ? found.subList(0, limit) : found;
         UUID next = found.size() > limit ? page.getLast().material().id() : null;
         return new Page(views(page, true), next, total);
     }
 
     /** The owner's material with this id; empty for an unknown id or another owner's. */
     public Optional<Material> find(UUID id) {
-        return reading(() -> materials.newest(id).map(found -> views(List.of(found), false).getFirst()));
+        return reading(() -> materials.current(id).map(found -> views(List.of(found), false).getFirst()));
     }
 
     /**
@@ -439,13 +457,13 @@ public class Materials {
     }
 
     /**
-     * The quality report of the owner's material (Story 1.20): its newest version's, while that version needs review
+     * The quality report of the owner's material (Story 1.20): its current version's, while that version needs review
      * or is ready; empty for an unknown material, another owner's, or a version in any other state. The warnings:
      * {@value #PAGES_UNREADABLE} (the unreadable pages), {@value #PAGES_UNOPENED} (those of them with no page view: their
      * reading crashed) and {@value #OUTLINE_EMPTY} (no section was found), each only when it holds.
      */
     public Optional<Report> report(UUID materialId) {
-        return reading(() -> materials.newest(materialId).map(NewestVersion::version)
+        return reading(() -> materials.current(materialId).map(CurrentVersion::version)
                 .filter(version -> REVIEWED.contains(version.state())).map(version -> {
                     List<Section> outline = materials.findOutline(version.id()).map(row -> Passages.outline(
                                     vault.decrypt(Passages.outline(row.id(), row.ownerId()), row.outline())).stream()
@@ -504,7 +522,7 @@ public class Materials {
 
     /** The material's current version when the ground serves it and the page is one of its pages. */
     private Optional<VersionRow> served(UUID materialId, int page, Ground ground) {
-        return materials.newest(materialId).map(NewestVersion::version).filter(ground::serves)
+        return materials.current(materialId).map(CurrentVersion::version).filter(ground::serves)
                 .filter(version -> hasPage(version, page));
     }
 
@@ -550,12 +568,12 @@ public class Materials {
      * The materials as the interface shows them, with every read done once for all of them. {@code listed}: a material
      * that belongs somewhere but whose every place is being deleted is left out.
      */
-    private List<Material> views(List<NewestVersion> found, boolean listed) {
+    private List<Material> views(List<CurrentVersion> found, boolean listed) {
         UUID owner = OwnerContext.require();
-        Map<UUID, Belonging> belongings = belongings(found.stream().map(NewestVersion::material).toList());
-        List<NewestVersion> rows = listed
+        Map<UUID, Belonging> belongings = belongings(found.stream().map(CurrentVersion::material).toList());
+        List<CurrentVersion> rows = listed
                 ? found.stream().filter(row -> belongings.containsKey(row.material().id())).toList() : found;
-        List<UUID> uploading = rows.stream().map(NewestVersion::version)
+        List<UUID> uploading = rows.stream().map(CurrentVersion::version)
                 .filter(version -> Uploads.UPLOADING.equals(version.state())).map(version -> version.id()).toList();
         // A plain upload's one open row; a set's members are grouped apart, by version (Story 1.21).
         Map<UUID, UploadRow> open = uploads.joined().openForVersions(owner, uploading).stream()
@@ -563,7 +581,7 @@ public class Materials {
                 .collect(Collectors.toMap(UploadRow::versionId, Function.identity(), (first, second) -> first));
         Map<UUID, List<UploadRow>> sets = uploads.joined().membersOf(owner, uploading).stream()
                 .collect(Collectors.groupingBy(UploadRow::versionId));
-        List<UUID> counted = rows.stream().map(NewestVersion::version).filter(version -> version.pageTotal() != null)
+        List<UUID> counted = rows.stream().map(CurrentVersion::version).filter(version -> version.pageTotal() != null)
                 .map(version -> version.id()).toList();
         // One read per kind of range for all the listed versions; the counts are derived here.
         Map<UUID, List<PageRangeRow>> layers = byVersion(materials.pageLayers(counted));
@@ -576,6 +594,11 @@ public class Materials {
                 : inProgress.of(unended.stream().map(StepRow::jobId).toList());
         Map<UUID, List<StepRow>> current = unended.stream().filter(step -> running.contains(step.jobId()))
                 .collect(Collectors.groupingBy(StepRow::versionId));
+        // Story 3.4: the ready version that keeps serving, for the materials whose current version is another one.
+        List<UUID> replacing = rows.stream().filter(row -> !READY.equals(row.version().state()))
+                .map(row -> row.material().id()).toList();
+        Map<UUID, VersionRow> serving = materials.readyOf(replacing).stream()
+                .collect(Collectors.toMap(VersionRow::materialId, Function.identity(), (first, second) -> second));
         return rows.stream().map(row -> {
             UploadRow upload = Uploads.UPLOADING.equals(row.version().state()) ? open.get(row.version().id()) : null;
             Integer total = row.version().pageTotal();
@@ -592,8 +615,13 @@ public class Materials {
                             IngestionSteps.retryCheck(materials, uploads, settings,
                                     row.version()) == IngestionSteps.RetryCheck.ALLOWED),
                     imageSet(row.version(), sets.get(row.version().id())), row.material().version(),
-                    row.version().sizeBytes(), belongings.getOrDefault(row.material().id(), Belonging.NOWHERE));
+                    row.version().sizeBytes(), belongings.getOrDefault(row.material().id(), Belonging.NOWHERE),
+                    serving(serving.get(row.material().id())));
         }).toList();
+    }
+
+    private static Serving serving(VersionRow ready) {
+        return ready == null ? null : new Serving(ready.pageTotal(), ready.sizeBytes());
     }
 
     /**
@@ -602,6 +630,11 @@ public class Materials {
      * deleted) is left out of the map.
      */
     Map<UUID, Belonging> belongings(List<MaterialRow> rows) {
+        return belongings(materials, library, rows);
+    }
+
+    /** {@link #belongings(List)} from these stores, for a service that has no {@link Materials} (Story 3.4). */
+    static Map<UUID, Belonging> belongings(MaterialStore materials, Library library, List<MaterialRow> rows) {
         if (rows.isEmpty()) {
             return Map.of();
         }
@@ -642,11 +675,18 @@ public class Materials {
      * The GM's actions a version allows now (Story 1.20), in {@link #ACTIONS} order: {@value #ACCEPT} while it needs
      * review, {@value #REPROCESS} while it needs review with an unreadable page, {@value #RETRY} while it is failed and
      * would be retried ({@code retryable}: {@link IngestionSteps#retryCheck}), and {@value #DISCARD}
-     * while it needs review or is failed. A {@code ready} version is never reprocessed nor discarded in place (AD-15).
+     * while it needs review or is failed; all of them on the material's current version. {@value #REPROCESS} is in
+     * place while the version needs review ({@link IngestionSteps#reprocess}); from Story 3.4 it is also offered while
+     * the version is {@code ready}, and then reads a new version of the material from the ready one's cleaned original
+     * ({@link IngestionSteps#reprocessAccepted}): a {@code ready} version is never reprocessed nor discarded in place
+     * (AD-15).
      */
     static List<String> actions(String state, int unreadable, boolean retryable) {
         if (IngestionSteps.NEEDS_REVIEW.equals(state)) {
             return unreadable > 0 ? List.of(ACCEPT, REPROCESS, DISCARD) : List.of(ACCEPT, DISCARD);
+        }
+        if (READY.equals(state)) {
+            return List.of(REPROCESS);
         }
         if (FAILED.equals(state)) {
             return retryable ? List.of(RETRY, DISCARD) : List.of(DISCARD);

@@ -36,18 +36,20 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The owner's materials (Story 1.14): a list by the state of each material's newest version, and one material. The
+ * The owner's materials (Story 1.14): a list by the state of each material's current version, and one material. The
  * owner is the session's account, set by the request edge ({@code accounts.web}) before any of these runs; nothing
  * here takes an owner from the request. Another owner's id, an unknown id and a malformed id are the same
  * {@code request.not_found} (404). Every answer is {@code no-store}. From Story 1.19, one page of a material on a
  * ground ({@code ?ground=review}: the owner reviewing its current version), as JSON, and its picture, streamed as
  * WebP; a missing or unknown ground is {@code page.ground_unknown} (400). From Story 1.20, the quality report of a
- * material's newest version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
+ * material's current version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
  * {@code discard}), each answering the material; an action its state does not allow is
  * {@code material.action_unavailable} (409). From Story 3.1 the list takes {@code ?system=}: only the materials of that
  * system, attached to it or to one of its campaigns; a system that is not the owner's is {@code request.not_found}.
  * From Story 3.3 a material carries its version, size and where it belongs; the list takes every state when none is
- * given; and {@code PATCH} changes where a material belongs ({@link MaterialBelongings}).
+ * given; and {@code PATCH} changes where a material belongs ({@link MaterialBelongings}). From Story 3.4 a material
+ * has versions: everything here reads its current version (the newest one that is not discarded), a ready material may
+ * be reprocessed as a new version, and {@code serving} names the ready version that keeps serving meanwhile.
  */
 @RestController
 @Tag(name = "materials")
@@ -222,13 +224,29 @@ class MaterialController {
         }
     }
 
+    @Schema(name = "MaterialServing", requiredProperties = {"pages", "size"}, description = "The material's ready"
+            + " version, which keeps serving every scope while a newer version is processed (contract 1.23.0)")
+    record ServingView(
+            @Schema(description = "Its page total; null when not known", types = {"integer", "null"}, format = "int32",
+                    example = "320") Integer pages,
+            @Schema(description = "Its size in bytes; null when not known", types = {"integer", "null"},
+                    format = "int64", example = "134217728") Long size) {
+
+        static ServingView of(Materials.Serving serving) {
+            return serving == null ? null : new ServingView(serving.pages(), serving.size());
+        }
+    }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions", "version", "belonging"})
+    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions", "version", "belonging",
+        "serving"})
     record MaterialView(
             @Schema(description = "The material's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
             @Schema(description = "The material's name", example = "Livro do Jogador.pdf") String name,
-            @Schema(description = "The state of the material's newest version", example = "waiting",
+            @Schema(description = "The state of the material's current version: its newest version that is not"
+                    + " discarded, or its newest one when every version is discarded (contract 1.23.0)",
+                    example = "waiting",
                     allowableValues = {"uploading", "waiting", "processing", "needs_review", "ready", "superseded",
                         "failed", "discarded"}) String state,
             @Schema(description = "What the material is, when the GM said", example = "rulebook",
@@ -237,19 +255,24 @@ class MaterialController {
             @Schema(description = "Pages done of the total, once the total is known") PagesView pages,
             @Schema(description = "Why the version failed (category.reason), only when the state is failed",
                     example = "ingestion.password_required") String failure,
-            @ArraySchema(arraySchema = @Schema(description = "The actions the newest version allows now, in this"
+            @ArraySchema(arraySchema = @Schema(description = "The actions the current version allows now, in this"
                     + " order: accept and discard while it needs review, reprocess too when a page is unreadable;"
-                    + " retry (when it can start again) and discard while it is failed; none otherwise"),
+                    + " retry (when it can start again) and discard while it is failed; reprocess while it is ready"
+                    + " (contract 1.23.0: a new version, read from its cleaned original); none otherwise"),
                     schema = @Schema(type = "string", allowableValues = {"accept", "reprocess", "retry", "discard"}))
             List<String> actions,
             @Schema(description = "The image set still uploading (Story 1.21), only while the state is uploading;"
                     + " upload is then absent") ImageSetView imageSet,
             @Schema(description = "The material's version: a change of where it belongs names it and raises it by one"
                     + " (contract 1.21.0)", format = "int64", example = "0") long version,
-            @Schema(description = "The newest version's size in bytes, once known (contract 1.21.0)", format = "int64",
+            @Schema(description = "The current version's size in bytes, once known (contract 1.21.0)", format = "int64",
                     example = "134217728") Long size,
             @JsonInclude(JsonInclude.Include.ALWAYS)
-            @Schema(description = "Where the material belongs (contract 1.21.0)") BelongingView belonging) {
+            @Schema(description = "Where the material belongs (contract 1.21.0)") BelongingView belonging,
+            @JsonInclude(JsonInclude.Include.ALWAYS)
+            @Schema(description = "The ready version that keeps serving while the current version is another one"
+                    + " (a replacement or a reprocess on its way); null otherwise (contract 1.23.0)",
+                    types = {"object", "null"}, implementation = ServingView.class) ServingView serving) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
@@ -257,7 +280,7 @@ class MaterialController {
                     material.pages() == null ? null : PagesView.of(material.pages()),
                     material.failure(), material.actions(),
                     material.imageSet() == null ? null : ImageSetView.of(material.imageSet()), material.version(),
-                    material.size(), BelongingView.of(material.belonging()));
+                    material.size(), BelongingView.of(material.belonging()), ServingView.of(material.serving()));
         }
 
         @Override
@@ -278,7 +301,7 @@ class MaterialController {
     }
 
     @GetMapping(path = MATERIALS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "listMaterials", summary = "The account's materials whose newest version is in one of the"
+    @Operation(operationId = "listMaterials", summary = "The account's materials whose current version is in one of the"
             + " given states (every material without a state), newest first, with the upload's progress on those still"
             + " uploading; with system, only those attached to that system or to one of its campaigns. A material whose"
             + " every place is being deleted is left out, so a page may hold fewer than the limit. A page starts after a"
@@ -290,7 +313,7 @@ class MaterialController {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
                 @Parameter(name = "state", in = ParameterIn.QUERY,
-                        description = "A state of the newest version; repeat it for several; absent: every state"
+                        description = "A state of the current version; repeat it for several; absent: every state"
                                 + " (contract 1.21.0)",
                         array = @ArraySchema(minItems = 1, schema = @Schema(type = "string",
                                 allowableValues = {"uploading", "waiting", "processing", "needs_review", "ready",
@@ -336,7 +359,7 @@ class MaterialController {
     }
 
     @GetMapping(path = MATERIAL, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getMaterial", summary = "One of the account's materials, with the state of its newest"
+    @Operation(operationId = "getMaterial", summary = "One of the account's materials, with the state of its current"
             + " version. request.not_found (404) for any other id;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -588,7 +611,7 @@ class MaterialController {
 
     @GetMapping(path = REPORT, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getMaterialReport", summary = "The quality report of one of the account's materials:"
-            + " its newest version's outline, unreadable pages and warnings, while that version needs review or is"
+            + " its current version's outline, unreadable pages and warnings, while that version needs review or is"
             + " ready (the counts are the material's pages). request.not_found (404) for another owner's material,"
             + " an unknown or malformed id, or a version in any other state;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
@@ -602,13 +625,13 @@ class MaterialController {
     }
 
     private static final String ACTION_SUMMARY = " Takes no body and answers the material."
-            + " material.action_unavailable (409) when the newest version's state does not allow it now (see the"
+            + " material.action_unavailable (409) when the current version's state does not allow it now (see the"
             + " material's actions); request.not_found (404) for another owner's material or an unknown or malformed"
             + " id, and nothing changes;" + SESSION_SUMMARY;
     private static final String SESSION_HEADER = "X-Session-Token";
 
     @PostMapping(path = ACCEPT, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "acceptMaterial", summary = "Accepts the newest version of one of the account's materials:"
+    @Operation(operationId = "acceptMaterial", summary = "Accepts the current version of one of the account's materials:"
             + " needs_review becomes ready, and a ready version of it before becomes superseded." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -619,10 +642,13 @@ class MaterialController {
     }
 
     @PostMapping(path = REPROCESS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "reprocessMaterial", summary = "Reads again the unreadable pages of the newest version of"
+    @Operation(operationId = "reprocessMaterial", summary = "Reads again the unreadable pages of the current version of"
             + " one of the account's materials, which needs review: it becomes processing, and needs review again"
             + " once they are read. ingestion.too_many_steps (409) when the new steps would pass the version's step"
-            + " cap." + ACTION_SUMMARY,
+            + " cap. From contract 1.23.0, on a ready material: a new version, waiting, read from a copy of the ready"
+            + " version's cleaned original, which keeps serving unchanged until the new one is accepted;"
+            + " material.version_in_progress (409) while another version is on its way; request.not_found (404) also"
+            + " for a material whose every place is being deleted." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<MaterialView> reprocess(
@@ -632,7 +658,7 @@ class MaterialController {
     }
 
     @PostMapping(path = RETRY, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "retryMaterial", summary = "Starts again the failed newest version of one of the account's"
+    @Operation(operationId = "retryMaterial", summary = "Starts again the failed current version of one of the account's"
             + " materials, from its cleaned original or its uploaded file: it becomes processing."
             + " ingestion.too_many_steps (409) when a new step would pass the version's step cap." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
@@ -644,9 +670,10 @@ class MaterialController {
     }
 
     @PostMapping(path = DISCARD, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "discardMaterial", summary = "Discards the newest version of one of the account's"
+    @Operation(operationId = "discardMaterial", summary = "Discards the current version of one of the account's"
             + " materials, which needs review or failed: it becomes discarded, and its pages, passages, outline and"
-            + " files are removed (a removal that resumes after a restart)." + ACTION_SUMMARY,
+            + " files are removed (a removal that resumes after a restart); a ready version of it before stays the"
+            + " material's (contract 1.23.0)." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<MaterialView> discard(

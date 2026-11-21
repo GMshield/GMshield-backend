@@ -4,8 +4,9 @@ import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 
 /**
- * The answers of the review actions (Story 1.20): accept, reprocess, retry and discard on a material's newest version;
- * from Story 3.3, those of a change of where a material belongs. Params carry nothing.
+ * The answers of the review actions (Story 1.20): accept, reprocess, retry and discard on a material's current version;
+ * from Story 3.3, those of a change of where a material belongs; from Story 3.4, those of a new version (a replacement
+ * upload or a reprocess of an accepted version). Params carry nothing.
  */
 public final class MaterialProblems {
 
@@ -23,6 +24,12 @@ public final class MaterialProblems {
     static final ApiProblem STALE_VERSION = ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version",
             "Stale version");
 
+    /** Story 3.4: a new version is refused while another version of the material is still on its way. */
+    static final ApiProblem VERSION_IN_PROGRESS = ApiProblem.of(409, CATEGORY, "version_in_progress",
+            "Material version in progress");
+    /** Story 3.4: a new version is refused when the material has no ready version (every version discarded). */
+    static final ApiProblem NOT_READY = ApiProblem.of(409, CATEGORY, "not_ready", "Material not ready");
+
     private MaterialProblems() {
     }
 
@@ -34,6 +41,16 @@ public final class MaterialProblems {
     /** Where the material should belong is not valid (Story 3.3); it never says why. */
     static ApiException belongingInvalid() {
         return new ApiException(BELONGING_INVALID);
+    }
+
+    /** Another version of the material is uploading, waiting, processing, needs review or failed (Story 3.4). */
+    static ApiException versionInProgress() {
+        return new ApiException(VERSION_IN_PROGRESS);
+    }
+
+    /** The material has no ready version to replace or read again (Story 3.4). */
+    static ApiException notReady() {
+        return new ApiException(NOT_READY);
     }
 
     /** The steps the action would add take the version past its step cap; nothing changed. */

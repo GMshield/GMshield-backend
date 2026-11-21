@@ -102,6 +102,16 @@ final class ScopeFixture {
         });
     }
 
+    /** A newer version of the owner's material in {@code state} (Story 3.4: a replacement); answers its id. */
+    UUID version(UUID owner, UUID materialId, String state) {
+        return as(owner, () -> {
+            UUID versionId = Ids.newId();
+            Instant at = next();
+            materials.insertVersion(new VersionRow(versionId, owner, materialId, state, "pdf", 1000L, at, at));
+            return versionId;
+        });
+    }
+
     /** {@code count} passages of the version, by ordinal from 0; answers their ids in that order. */
     List<UUID> passages(UUID owner, UUID versionId, String tag, int count) {
         return as(owner, () -> {

@@ -402,6 +402,29 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - `material` and `material_version` (`V6__materials.sql`) are library tables (`@TenantId`, JPA only);
     `upload` is a working table through `JdbcClient` with no content, no name and no hash. Another owner's
     id, an unknown id and a malformed id all answer `request.not_found` (404).
+  - **A replacement (Story 3.4, public contract 1.23.0).** `Upload-Metadata` may name `material` (the id of one of
+    the owner's materials) beside `filename` and nothing else: with `kind`, `language`, `campaign`, `system` or
+    `systems`, or an empty id, it is `upload.metadata_invalid` (400). It inserts only a `material_version` in
+    `uploading` and its upload; the material keeps its name, kind, language and place. `NewVersions.lockReady`
+    checks it in the same transaction, with the material locked (`MaterialStore.lockMaterial`, a `PESSIMISTIC_WRITE`
+    refresh as a change of where it belongs takes): another owner's, an unknown, a malformed or a deleting material is
+    `request.not_found` (404); a version in `uploading`, `waiting`, `processing`, `needs_review` or `failed` is
+    `material.version_in_progress` (409); no `ready` version (every one discarded) is `material.not_ready` (409).
+    `ImageSetRequest.material` does the same for an image set. The new version goes through ingestion and review; a
+    refused format deletes only it, and a mismatch, an expiry or a discard leaves the material `ready` on the old
+    one, which serves every scope meanwhile.
+  - **The current version (Story 3.4).** A material shows its current version: its newest version (latest
+    `created_at`, then greatest id) that is not `discarded`, or its newest one when every version is discarded
+    (`MaterialStore.current`, `currentIn`, `currentAttached`; one JPQL rule). It decides the material's state, size,
+    report, actions, review page and the list's `state` filter. `Material.serving` (`{pages, size}`) is the
+    material's `ready` version while that is not the current one, else null.
+  - Deploy order for public contract 1.23.0 (no migration): the backend first, then the frontend (its health check
+    fails against a 1.22.0 backend). The worker does not change. **A backend rollback below 1.23.0 is not safe once a
+    replacement exists**: a 1.22 backend reads a material's newest version as its state, so a discarded or expired
+    replacement makes a serving material read `discarded` (and offer no action), and its refused-format path deletes
+    the whole material, the serving version included. Nothing guards against it in code: before rolling back, check
+    that no material has more than one version (`select material_id from material_version group by material_id
+    having count(*) > 1`), or accept that loss.
 - **The guided upload's details and the materials list (`materials`, Story 1.14).** `Upload-Metadata` at creation
   may also carry `kind` (`rulebook`, `supplement`, `homebrew`, `campaign_notes`, `other`), `language` (`pt-BR`,
   `en`, or `detect`, stored as null for a later read stage), and `campaign` or `system` (the id of one of the
@@ -418,7 +441,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - `GET /api/v1/materials?state=…&limit=&cursor=`: the owner's materials whose newest version (latest
     `created_at`, then greatest id) is in one of the given states, newest material first (descending id),
     `{items, nextCursor}`. `state` is repeatable and required, `limit` 1 to 50 (default 20), `cursor` the previous
-    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`). From Story 3.3
+    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`, `currentIn` from Story 3.4). From Story 3.3
     `state` is optional: without it, every material.
   - `GET /api/v1/materials/{id}`: one material. Another owner's id, an unknown id and a malformed id all answer
     `request.not_found` (404).
@@ -595,6 +618,13 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     - retry (`IngestionSteps.retry`): from the cleaned original as a pipeline restart does (the restart's job-free
       core, `startOver`), or without one from the complete raw upload as the first step does; the version becomes
       `processing`. Past the step cap of a known page total: `ingestion.too_many_steps` (409).
+    - reprocess of a `ready` version (Story 3.4, `IngestionSteps.reprocessAccepted`; `actions` lists `reprocess` for
+      `ready`): after the check of a replacement (`NewVersions.lockReady`, material locked), a new version of the
+      material, `waiting`, with the ready version's format, size and page total. Its `original` version file is a
+      copy of the ready version's cleaned original under a new file id (`version_file` file ids are unique per
+      owner; the copy goes if the transaction rolls back), and its first step is the format's start stage over that
+      copy, as a pipeline restart. The ready version, its files, passages and points are not touched, and it serves
+      until the new one is accepted. Any other state keeps the rules above (`needs_review`: in place).
     - discard: the version becomes `discarded` with `material_version.removal_pending` set, and its unended steps
       are cancelled. After the commit `VersionRemoval` runs once, as the owner, in three parts each safe to repeat:
       the page views, passages, outline, layers and outcomes (one transaction); the pieces of every version file;
@@ -746,6 +776,12 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     the pending passage ids of a set of versions, checked passage reads by id; JPQL, filtered by the owner, no
     migration). `ScopeReads` and its `Passage` are the only types of `materials`' named interface `service`, and
     `Materials.passage(UUID)` is package-private. Lines carry ids and counts, never a text or a title.
+  - **A replaced material (Story 3.4).** The tiers read every `ready` version, and a material has at most one: a new
+    version starts only while the material is `ready` with nothing else on its way, and accepting it supersedes the
+    old one. So the old version serves every scope while its replacement is processed, and the new one alone after
+    the accept; a reference stored with a turn still opens the superseded version (`CITED`). `scope.passage_refused`
+    stays non-retryable: an accept in the middle of a question fails that one answer clearly rather than quietly
+    changing the sources under it.
   - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`jobs`), with `X-Job-Grant`: body `{ids: [uuid]}`, 1
     to 100 non-null ids. A malformed body or an id that is not a UUID is 400 `request.invalid` before anything else;
     then the grant is checked (403 `job.grant_refused`), then the ids (400 `job.passages_invalid` for none, more than

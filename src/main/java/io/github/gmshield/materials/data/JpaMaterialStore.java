@@ -28,6 +28,7 @@ import org.springframework.stereotype.Repository;
 class JpaMaterialStore implements MaterialStore {
 
     private static final String READY = "ready";
+    private static final String DISCARDED = "discarded";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -122,30 +123,35 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     /**
-     * The newest version of a material is the one no other version of it follows (later, or as late with a greater id).
-     * Two constant query texts rather than a null parameter, whose type PostgreSQL could not tell.
+     * Story 3.4: the current version of a material is its newest version that is not {@code discarded}, or, when every
+     * version is discarded, its newest one; newest means the latest created, then the greatest id. So {@code v} is
+     * current when no other version {@code n} of its material beats it: a version not discarded beats a discarded one
+     * and a newer one not discarded; a discarded one beats only a newer discarded one. Two constant query texts rather
+     * than a null parameter, whose type PostgreSQL could not tell.
      */
-    private static final String NEWEST_FROM = " from Material m join MaterialVersion v on v.materialId = m.id"
+    private static final String NEWER = "(n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id))";
+    private static final String CURRENT_FROM = " from Material m join MaterialVersion v on v.materialId = m.id"
             + " where v.state in :states"
             + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
-            + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))";
-    /** The materials with their newest version in the states asked: what the lists read, and what their totals count. */
-    private static final String NEWEST = "select m, v" + NEWEST_FROM;
-    private static final String NEWEST_COUNT = "select count(m)" + NEWEST_FROM;
-    private static final String NEWEST_IN = NEWEST + " order by m.id desc";
-    private static final String NEWEST_IN_BEFORE = NEWEST + " and m.id < :before order by m.id desc";
+            + " and ((n.state <> 'discarded' and (v.state = 'discarded' or " + NEWER + "))"
+            + " or (v.state = 'discarded' and " + NEWER + ")))";
+    /** The materials with their current version in the states asked: what the lists read, and what their totals count. */
+    private static final String CURRENT = "select m, v" + CURRENT_FROM;
+    private static final String CURRENT_COUNT = "select count(m)" + CURRENT_FROM;
+    private static final String CURRENT_IN = CURRENT + " order by m.id desc";
+    private static final String CURRENT_IN_BEFORE = CURRENT + " and m.id < :before order by m.id desc";
 
     @Override
-    public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
+    public List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit) {
         if (states.isEmpty() || limit < 1) {
             return List.of();
         }
-        var query = em().createQuery(before == null ? NEWEST_IN : NEWEST_IN_BEFORE, Object[].class).setParameter("states", states).setMaxResults(limit);
+        var query = em().createQuery(before == null ? CURRENT_IN : CURRENT_IN_BEFORE, Object[].class).setParameter("states", states).setMaxResults(limit);
         if (before != null) {
             query.setParameter("before", before);
         }
         return query.getResultList().stream()
-                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
     }
 
@@ -155,20 +161,20 @@ class JpaMaterialStore implements MaterialStore {
      */
     private static final String ATTACHED_TO_SYSTEM = " and (exists (select a.id from MaterialSystem a"
             + " where a.materialId = m.id and a.systemId = :system)";
-    private static final String ATTACHED = NEWEST + ATTACHED_TO_SYSTEM + ")";
-    private static final String ATTACHED_OR_CAMPAIGN = NEWEST + ATTACHED_TO_SYSTEM + " or m.campaignId in :campaigns)";
+    private static final String ATTACHED = CURRENT + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN = CURRENT + ATTACHED_TO_SYSTEM + " or m.campaignId in :campaigns)";
     private static final String BEFORE_NEWEST_FIRST = " and m.id < :before order by m.id desc";
     private static final String NEWEST_FIRST = " order by m.id desc";
     private static final String ATTACHED_FIRST = ATTACHED + NEWEST_FIRST;
     private static final String ATTACHED_BEFORE = ATTACHED + BEFORE_NEWEST_FIRST;
     private static final String ATTACHED_OR_CAMPAIGN_FIRST = ATTACHED_OR_CAMPAIGN + NEWEST_FIRST;
     private static final String ATTACHED_OR_CAMPAIGN_BEFORE = ATTACHED_OR_CAMPAIGN + BEFORE_NEWEST_FIRST;
-    private static final String ATTACHED_COUNT = NEWEST_COUNT + ATTACHED_TO_SYSTEM + ")";
-    private static final String ATTACHED_OR_CAMPAIGN_COUNT = NEWEST_COUNT + ATTACHED_TO_SYSTEM
+    private static final String ATTACHED_COUNT = CURRENT_COUNT + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN_COUNT = CURRENT_COUNT + ATTACHED_TO_SYSTEM
             + " or m.campaignId in :campaigns)";
 
     @Override
-    public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+    public List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
                                               UUID before, int limit) {
         if (states.isEmpty() || limit < 1) {
             return List.of();
@@ -189,31 +195,31 @@ class JpaMaterialStore implements MaterialStore {
             query.setParameter("before", before);
         }
         return query.getResultList().stream()
-                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
     }
 
     @Override
-    public List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit) {
+    public List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit) {
         if (states.isEmpty() || limit < 1 || offset < 0) {
             return List.of();
         }
-        return em().createQuery(NEWEST_IN, Object[].class).setParameter("states", states).setFirstResult(offset)
+        return em().createQuery(CURRENT_IN, Object[].class).setParameter("states", states).setFirstResult(offset)
                 .setMaxResults(limit).getResultList().stream()
-                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
     }
 
     @Override
-    public long newestCount(Collection<String> states) {
+    public long currentCount(Collection<String> states) {
         if (states.isEmpty()) {
             return 0;
         }
-        return em().createQuery(NEWEST_COUNT, Long.class).setParameter("states", states).getSingleResult();
+        return em().createQuery(CURRENT_COUNT, Long.class).setParameter("states", states).getSingleResult();
     }
 
     @Override
-    public List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+    public List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
                                                   int offset, int limit) {
         if (states.isEmpty() || limit < 1 || offset < 0) {
             return List.of();
@@ -226,12 +232,12 @@ class JpaMaterialStore implements MaterialStore {
             query.setParameter("campaigns", campaignIds);
         }
         return query.getResultList().stream()
-                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
     }
 
     @Override
-    public long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+    public long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
         if (states.isEmpty()) {
             return 0;
         }
@@ -245,12 +251,33 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
-    public Optional<NewestVersion> newest(UUID materialId) {
-        return material(materialId).flatMap(material -> em()
-                .createQuery("select v from MaterialVersion v where v.materialId = :id order by v.createdAt desc, v.id desc",
-                        MaterialVersionEntity.class)
-                .setParameter("id", materialId).setMaxResults(1).getResultList().stream().findFirst()
-                .map(version -> new NewestVersion(material.row(), version.row())));
+    public Optional<CurrentVersion> current(UUID materialId) {
+        return material(materialId).flatMap(material -> currentOf(versionsOf(materialId))
+                .map(version -> new CurrentVersion(material.row(), version)));
+    }
+
+    /** The current version among a material's versions, oldest first: the last not discarded, else the last. */
+    static Optional<VersionRow> currentOf(List<VersionRow> oldestFirst) {
+        return oldestFirst.stream().filter(version -> !DISCARDED.equals(version.state())).reduce((first, second) -> second)
+                .or(() -> oldestFirst.stream().reduce((first, second) -> second));
+    }
+
+    @Override
+    public Optional<MaterialRow> lockMaterial(UUID id) {
+        Optional<MaterialEntity> found = material(id);
+        found.ifPresent(entity -> em().refresh(entity, LockModeType.PESSIMISTIC_WRITE));
+        return found.map(MaterialEntity::row);
+    }
+
+    @Override
+    public List<VersionRow> readyOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select v from MaterialVersion v where v.materialId in :ids and v.state = :state"
+                        + " order by v.createdAt, v.id", MaterialVersionEntity.class)
+                .setParameter("ids", materialIds).setParameter("state", READY).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
     }
 
     @Override

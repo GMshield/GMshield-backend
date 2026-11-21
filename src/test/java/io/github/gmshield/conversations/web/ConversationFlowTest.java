@@ -1290,6 +1290,29 @@ class ConversationFlowTest {
     }
 
     @Test
+    void aReferenceToAVersionSupersededByTheGmsAcceptStillOpensItsOldPage() throws Exception {
+        Gm gm = signUp();
+        Paged first = pdf(gm, gm.campaign(), 14, 13);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(first.passages().getFirst(), 3)));
+        // Story 3.4: a replacement reached review; the GM accepts it through the material's action.
+        as(gm.id(), () -> {
+            Instant now = clock.instant().plusSeconds(60).truncatedTo(ChronoUnit.MICROS);
+            materials.insertVersion(new VersionRow(Ids.newId(), gm.id(), first.materialId(), "needs_review", "pdf",
+                    1000L, now, now, 14, "2", null));
+            return true;
+        });
+
+        HttpResponse<String> accepted = send(gm, "POST", "/api/v1/materials/" + first.materialId() + "/accept", "");
+
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("superseded");
+        JsonNode page = json(referencePage(gm, turnId, "1", "13"));
+        assertThat(page.path("passages").get(0).path("id").asString())
+                .isEqualTo(first.passages().getFirst().toString());
+        assertThat(referencePicture(gm, turnId, "1", "13").body()).isEqualTo(first.pictures().get(13));
+    }
+
+    @Test
     void aVersionRemovedAfterTheAnswerIsNotServed() throws Exception {
         Gm gm = signUp();
         Paged discarded = pdf(gm, gm.campaign(), 14, 13);

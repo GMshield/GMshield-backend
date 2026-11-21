@@ -1955,14 +1955,15 @@ class IngestionFlowTest {
         assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
         assertThat(accepted.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
         assertThat(json(accepted).path("state").asString()).isEqualTo("ready");
-        assertThat(json(accepted).path("actions").size()).isZero();
+        assertThat(json(accepted).path("actions").toString()).isEqualTo("[\"reprocess\"]");
         assertThat(json(accepted).path("id").asString()).isEqualTo(uploaded.materialId());
         assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, passageId))).isPresent();
         // The report stays readable, and so do the pages.
         assertThat(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report").statusCode()).isEqualTo(200);
 
-        // Matrix row "Accept twice"; and a ready version is never reprocessed nor discarded in place (AD-15).
-        for (String action : List.of("accept", "reprocess", "retry", "discard")) {
+        // Matrix row "Accept twice"; and a ready version is never discarded in place (AD-15). Story 3.4: its
+        // reprocess is a new version (acceptedVersionReprocessIsANewVersionFromACopiedOriginal).
+        for (String action : List.of("accept", "retry", "discard")) {
             refused(act(gm, uploaded, action), "material.action_unavailable");
         }
         assertThat(state(gm, uploaded)).isEqualTo("ready");
@@ -1989,6 +1990,275 @@ class IngestionFlowTest {
 
         assertThat(materials.versions.get(newer).state()).isEqualTo("ready");
         assertThat(materials.versions.get(uploaded.versionId()).state()).isEqualTo("superseded");
+    }
+
+    // --- Story 3.4: replace a material, reprocess an accepted version
+
+    @Test
+    void aReplacementGoesThroughReviewWhileTheOldVersionServesAndItsAcceptSupersedesTheOldOne() throws Exception {
+        Gm gm = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of(1));
+        accept(gm, first);
+        // Its index changes would hold the ingestion lane: this test reads ingestion only.
+        endEveryUnendedJob();
+        UUID oldPassage = passages(first.versionId()).getFirst().id();
+
+        // Matrix row "Replace": a new uploading version of the same material, which the material shows.
+        Uploaded second = replace(gm, first.materialId(), pdf(MIB + 5), "Livro 2a impressao.pdf");
+
+        assertThat(second.materialId()).isEqualTo(first.materialId());
+        assertThat(second.versionId()).isNotEqualTo(first.versionId());
+        assertThat(materials.materials).containsKey(UUID.fromString(first.materialId()));
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("ready");
+        JsonNode waiting = json(get(gm, "/api/v1/materials/" + first.materialId()));
+        assertThat(waiting.path("state").asString()).isEqualTo("waiting");
+        assertThat(waiting.path("name").asString()).isEqualTo("Livro.pdf");
+        assertThat(waiting.path("size").asLong()).isEqualTo(MIB + 5);
+        assertThat(waiting.path("serving").toString()).isEqualTo("{\"pages\":1,\"size\":" + MIB + "}");
+        assertThat(waiting.path("actions").size()).isZero();
+        // The old version keeps serving while the new one is processed.
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, oldPassage))).isPresent();
+
+        cleanReport(second.jobId(), claim(second.jobId()), 1, "2", true);
+        readUntilReview(gm, second, List.of(), List.of(1));
+        JsonNode review = json(get(gm, "/api/v1/materials/" + first.materialId()));
+        assertThat(review.path("state").asString()).isEqualTo("needs_review");
+        assertThat(review.path("serving").path("pages").asInt()).isEqualTo(1);
+        assertThat(actions(gm, second)).containsExactly("accept", "discard");
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, oldPassage))).isPresent();
+        UUID newPassage = passages(second.versionId()).getFirst().id();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, newPassage))).isEmpty();
+        // The review ground serves the version under review.
+        assertThat(pageOf(gm, second, 1, "review").statusCode()).isEqualTo(200);
+
+        // Matrix row "Accept replacement": new ready, old superseded with its rows kept.
+        HttpResponse<String> accepted = act(gm, second, "accept");
+
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+        assertThat(json(accepted).path("state").asString()).isEqualTo("ready");
+        assertThat(json(accepted).path("serving").isNull()).isTrue();
+        assertThat(json(accepted).path("actions").toString()).isEqualTo("[\"reprocess\"]");
+        assertThat(materials.versions.get(second.versionId()).state()).isEqualTo("ready");
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("superseded");
+        assertThat(passages(first.versionId())).extracting(PassageRow::id).containsExactly(oldPassage);
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, newPassage))).isPresent();
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, oldPassage))).isEmpty();
+        assertThat(indexChanges(second.versionId())).isNotEmpty();
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("impressao")
+                || String.valueOf(event.getKeyValuePairs()).contains("impressao"));
+    }
+
+    @Test
+    void aDiscardedOrExpiredReplacementLeavesTheMaterialReadyOnTheOldVersion() throws Exception {
+        Gm gm = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of(1));
+        accept(gm, first);
+        // Its index changes would hold the ingestion lane: this test reads ingestion only.
+        endEveryUnendedJob();
+        UUID oldPassage = passages(first.versionId()).getFirst().id();
+
+        // Matrix row "Discard replacement".
+        Uploaded second = replace(gm, first.materialId(), pdf(MIB), "Livro.pdf");
+        cleanReport(second.jobId(), claim(second.jobId()), 1, "2", true);
+        readUntilReview(gm, second, List.of(), List.of(1));
+        HttpResponse<String> discarded = act(gm, second, "discard");
+
+        assertThat(discarded.statusCode()).as(discarded.body()).isEqualTo(200);
+        assertThat(json(discarded).path("state").asString()).isEqualTo("ready");
+        assertThat(json(discarded).path("serving").isNull()).isTrue();
+        assertThat(json(discarded).path("actions").toString()).isEqualTo("[\"reprocess\"]");
+        assertThat(materials.versions.get(second.versionId()).state()).isEqualTo("discarded");
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("ready");
+        assertThat(OwnerContext.callAs(gm.id(), () -> TestMaterials.passage(reads, oldPassage))).isPresent();
+        assertThat(pageOf(gm, first, 1, "review").statusCode()).isEqualTo(200);
+        List<String> ready = new ArrayList<>();
+        json(get(gm, "/api/v1/materials?state=ready")).path("items")
+                .forEach(item -> ready.add(item.path("id").asString()));
+        assertThat(ready).contains(first.materialId());
+
+        // An unfinished replacement that the upload sweep expires.
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", replacementMetadata("Livro.pdf", first.materialId()));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(state(gm, first)).isEqualTo("uploading");
+        String location = created.headers().firstValue("Location").orElseThrow();
+        UUID open = UUID.fromString(location.substring(location.lastIndexOf('/') + 1));
+        uploads.change(open, row -> expiring(row, Instant.now().minusSeconds(1)));
+        uploadSweep.sweep();
+
+        assertThat(state(gm, first)).isEqualTo("ready");
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("ready");
+        assertThat(json(get(gm, "/api/v1/materials/" + first.materialId())).path("serving").isNull()).isTrue();
+    }
+
+    @Test
+    void aReplacementIsRefusedWhileAVersionIsOnItsWayOrWhenNoneIsReady() throws Exception {
+        Gm gm = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        int versions = materials.versions.size();
+
+        // Matrix row "Busy": the first version is still on its way (waiting, then needs review).
+        refused(replacement(gm, first.materialId()), "material.version_in_progress");
+        cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of());
+        refused(replacement(gm, first.materialId()), "material.version_in_progress");
+        assertThat(materials.versions).hasSize(versions);
+
+        // Matrix row "Not ready": every version discarded.
+        assertThat(act(gm, first, "discard").statusCode()).isEqualTo(200);
+        refused(replacement(gm, first.materialId()), "material.not_ready");
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(state(gm, first)).isEqualTo("discarded");
+    }
+
+    @Test
+    void acceptedVersionReprocessIsANewVersionFromACopiedOriginal() throws Exception {
+        Gm gm = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        Cleaned cleaned = cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of());
+        accept(gm, first);
+        // Its index changes would hold the ingestion lane: this test reads ingestion only.
+        endEveryUnendedJob();
+        VersionRow acceptedRow = materials.versions.get(first.versionId());
+        List<VersionFileRow> acceptedFiles = materials.files.values().stream()
+                .filter(file -> file.versionId().equals(first.versionId())).toList();
+        List<PassageRow> acceptedPassages = passages(first.versionId());
+        List<IndexChangeRow> acceptedChanges = indexChanges(first.versionId());
+        byte[] original = readBack(gm.id(), cleaned.original(), 1);
+
+        // Matrix row "Reprocess accepted".
+        HttpResponse<String> reprocessed = act(gm, first, "reprocess");
+
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(200);
+        assertThat(json(reprocessed).path("state").asString()).isEqualTo("waiting");
+        assertThat(json(reprocessed).path("serving").toString()).isEqualTo("{\"pages\":1,\"size\":" + MIB + "}");
+        assertThat(json(reprocessed).path("actions").size()).isZero();
+        VersionRow fresh = materials.versions.values().stream()
+                .filter(version -> version.materialId().toString().equals(first.materialId())
+                        && !version.id().equals(first.versionId())).findFirst().orElseThrow();
+        assertThat(fresh.state()).isEqualTo("waiting");
+        assertThat(fresh.format()).isEqualTo("pdf");
+        assertThat(fresh.pageTotal()).isEqualTo(1);
+        assertThat(fresh.pipelineVersion()).isNull();
+        VersionFileRow copy = materials.files.values().stream().filter(file -> file.versionId().equals(fresh.id()))
+                .collect(java.util.stream.Collectors.collectingAndThen(java.util.stream.Collectors.toList(),
+                        List::getFirst));
+        assertThat(copy.role()).isEqualTo("original");
+        assertThat(copy.fileId()).isNotEqualTo(cleaned.original());
+        assertThat(readBack(gm.id(), copy.fileId(), copy.pieceCount())).isEqualTo(original);
+        // The accepted version is not changed in any way.
+        assertThat(materials.versions.get(first.versionId())).isEqualTo(acceptedRow);
+        assertThat(materials.files.values().stream().filter(file -> file.versionId().equals(first.versionId())))
+                .containsExactlyInAnyOrderElementsOf(acceptedFiles);
+        assertThat(readBack(gm.id(), cleaned.original(), 1)).isEqualTo(original);
+        assertThat(passages(first.versionId())).isEqualTo(acceptedPassages);
+        assertThat(indexChanges(first.versionId())).isEqualTo(acceptedChanges);
+        // While it is on its way, neither another reprocess nor a replacement starts.
+        refused(act(gm, first, "reprocess"), "material.action_unavailable");
+        refused(replacement(gm, first.materialId()), "material.version_in_progress");
+
+        // Its first step reads the copy as a restart does: the clean stage, from the stored original.
+        StepRow step = steps(fresh.id()).getFirst();
+        assertThat(step.stage()).isEqualTo("clean");
+        assertThat(step.inputFileId()).isEqualTo(copy.fileId());
+        JsonNode claim = claim(step.jobId());
+        assertThat(claim.path("input").path("input").asString()).isEqualTo("source");
+        assertThat(claim.path("input").path("inputFileId").asString()).isEqualTo(copy.fileId().toString());
+        assertThat(claim.path("input").has("pipelineVersion")).isFalse();
+        assertThat(input(step.jobId(), claim, "source").body()).isEqualTo(original);
+        Uploaded again = new Uploaded(first.materialId(), fresh.id(), null, step.jobId());
+        cleanReport(step.jobId(), claim, 1, "2", true);
+        // The clean report's original replaces the copy, whose pieces go.
+        assertThat(files.fileExists(gm.id(), copy.fileId())).isFalse();
+        assertThat(files.fileExists(gm.id(), cleaned.original())).isTrue();
+        readUntilReview(gm, again, List.of(), List.of());
+        accept(gm, again);
+
+        assertThat(materials.versions.get(fresh.id()).state()).isEqualTo("ready");
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("superseded");
+        assertThat(passages(first.versionId())).isEqualTo(acceptedPassages);
+    }
+
+    @Test
+    void anotherOwnersMaterialIsNeverReplacedNorReprocessed() throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of());
+        accept(gm, first);
+        // Its index changes would hold the ingestion lane: this test reads ingestion only.
+        endEveryUnendedJob();
+        int versions = materials.versions.size();
+
+        // Matrix row "Other owner".
+        HttpResponse<String> replaced = replacement(other, first.materialId());
+        assertThat(replaced.statusCode()).as(replaced.body()).isEqualTo(404);
+        assertThat(json(replaced).path("code").asString()).isEqualTo("request.not_found");
+        HttpResponse<String> set = send("POST", "/api/v1/image-sets", ("{\"name\":\"Fotos\",\"material\":\""
+                + first.materialId() + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}")
+                .getBytes(StandardCharsets.UTF_8), session(other), "Content-Type", "application/json");
+        assertThat(set.statusCode()).as(set.body()).isEqualTo(404);
+        HttpResponse<String> reprocessed = act(other, first, "reprocess");
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(404);
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(state(gm, first)).isEqualTo("ready");
+    }
+
+    @Test
+    void anImageSetReplacesAMaterialAsANewVersionOfIt() throws Exception {
+        Gm gm = signUp();
+        Uploaded first = upload(gm, pdf(MIB), "Livro.pdf", null);
+        cleanReport(first.jobId(), claim(first.jobId()), 1, "2", true);
+        readUntilReview(gm, first, List.of(), List.of());
+        accept(gm, first);
+        // Its index changes would hold the ingestion lane: this test reads ingestion only.
+        endEveryUnendedJob();
+        int materialsBefore = materials.materials.size();
+
+        HttpResponse<String> created = send("POST", "/api/v1/image-sets", ("{\"name\":\"Livro.pdf\",\"material\":\""
+                + first.materialId() + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":1000}]}")
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json");
+
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(json(created).path("materialId").asString()).isEqualTo(first.materialId());
+        UUID setId = UUID.fromString(json(created).path("id").asString());
+        assertThat(materials.versions.get(setId).materialId()).hasToString(first.materialId());
+        assertThat(materials.materials).hasSize(materialsBefore);
+        UUID member = UUID.fromString(json(created).path("images").get(0).path("uploadId").asString());
+        assertThat(sendImage(gm, member, jpeg(1000)).statusCode()).isEqualTo(201);
+        assertThat(materials.versions.get(setId).state()).isEqualTo("waiting");
+        assertThat(json(get(gm, "/api/v1/materials/" + first.materialId())).path("serving").path("pages").asInt())
+                .isEqualTo(1);
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("ready");
+        // A set that names the material with anything else said about it is refused.
+        HttpResponse<String> mixed = send("POST", "/api/v1/image-sets", ("{\"name\":\"x\",\"kind\":\"other\","
+                + "\"material\":\"" + first.materialId() + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}")
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json");
+        assertThat(mixed.statusCode()).as(mixed.body()).isEqualTo(400);
+        assertThat(json(mixed).path("code").asString()).isEqualTo("upload.metadata_invalid");
+    }
+
+    /** A replacement of the material {@code materialId}, completed: as {@link #upload}, its new version's ids. */
+    private Uploaded replace(Gm gm, String materialId, byte[] content, String name) throws Exception {
+        return upload(gm, content, name, null, replacementMetadata(name, materialId));
+    }
+
+    /** The creation of a 1000-byte replacement of {@code materialId}, as answered. */
+    private HttpResponse<String> replacement(Gm gm, String materialId) throws Exception {
+        return send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS, "Upload-Length", "1000",
+                "Upload-Metadata", replacementMetadata("Livro.pdf", materialId));
+    }
+
+    private static String replacementMetadata(String name, String materialId) {
+        Base64.Encoder base64 = Base64.getEncoder();
+        return "filename " + base64.encodeToString(name.getBytes(StandardCharsets.UTF_8)) + ",material "
+                + base64.encodeToString(materialId.getBytes(StandardCharsets.UTF_8));
     }
 
     @Test
@@ -3666,9 +3936,13 @@ class IngestionFlowTest {
     // --- helpers
 
     private Uploaded upload(Gm gm, byte[] content, String name, String trace) throws Exception {
+        return upload(gm, content, name, trace, "filename "
+                + Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private Uploaded upload(Gm gm, byte[] content, String name, String trace, String metadata) throws Exception {
         HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
-                "Upload-Length", Integer.toString(content.length), "Upload-Metadata", "filename "
-                        + Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8)));
+                "Upload-Length", Integer.toString(content.length), "Upload-Metadata", metadata);
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
         String location = created.headers().firstValue("Location").orElseThrow();
         UUID uploadId = UUID.fromString(location.substring(location.lastIndexOf('/') + 1));

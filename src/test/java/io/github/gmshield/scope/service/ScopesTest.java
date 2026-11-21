@@ -539,6 +539,52 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.passages(scope, List.of(lib.bPassages().getFirst())))).hasSize(1);
     }
 
+    // --- Story 3.4: a material replaced
+
+    @Test
+    void theOldVersionServesWhileItsReplacementIsProcessedAndOnlyTheNewOneAfterItIsAccepted() {
+        Library2 lib = twoTiers();
+        UUID materialId = materials.versions.get(lib.a()).materialId();
+        UUID replacement = fixture.version(lib.gm().owner(), materialId, "processing");
+        List<UUID> newPassages = fixture.passages(lib.gm().owner(), replacement, "N", 2);
+
+        for (String state : List.of("processing", "needs_review")) {
+            fixture.state(lib.gm().owner(), replacement, state);
+            ResolvedScope during = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                    ScopeSettings.STARTING));
+            assertThat(during.sources(Tier.CAMPAIGN)).as(state).containsExactly(lib.a());
+            assertThat(as(lib.gm().owner(), () -> scopes.passages(during, List.of(lib.aPassages().getFirst()))))
+                    .as(state).extracting(ScopedPassage::id).containsExactly(lib.aPassages().getFirst());
+            assertRefused(lib.gm().owner(), during, List.of(newPassages.getFirst()));
+        }
+
+        // The accept: the new version ready, the old one superseded.
+        fixture.state(lib.gm().owner(), replacement, "ready");
+        fixture.state(lib.gm().owner(), lib.a(), "superseded");
+        ResolvedScope after = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+
+        assertThat(after.sources(Tier.CAMPAIGN)).containsExactly(replacement);
+        assertThat(after.allowedSources()).doesNotContain(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(after, List.of(newPassages.getFirst()))))
+                .extracting(ScopedPassage::id).containsExactly(newPassages.getFirst());
+        assertRefused(lib.gm().owner(), after, List.of(lib.aPassages().getFirst()));
+    }
+
+    @Test
+    void aDiscardedReplacementLeavesTheOldVersionServing() {
+        Library2 lib = twoTiers();
+        UUID materialId = materials.versions.get(lib.a()).materialId();
+        UUID replacement = fixture.version(lib.gm().owner(), materialId, "needs_review");
+        fixture.passages(lib.gm().owner(), replacement, "N", 2);
+
+        fixture.discard(lib.gm().owner(), replacement);
+
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        assertThat(scope.sources(Tier.CAMPAIGN)).containsExactly(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(scope, List.of(lib.aPassages().getFirst()))))
+                .hasSize(1);
+    }
+
     // --- Story 3.3: where a material belongs changes
 
     @Test

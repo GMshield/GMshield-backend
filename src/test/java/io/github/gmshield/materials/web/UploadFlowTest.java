@@ -629,6 +629,100 @@ class UploadFlowTest {
         assertThat(refused.statusCode()).isEqualTo(404);
     }
 
+    // --- Story 3.4: a replacement names a material and nothing else
+
+    @Test
+    void aReplacementNamesOnlyTheMaterialAndAnythingElseIsInvalidMetadata() throws Exception {
+        Gm gm = signUp();
+        JsonNode current = json(get(gm, "/api/v1/campaigns/current"));
+        String campaign = current.path("id").asString();
+        String system = current.path("system").path("id").asString();
+        String materialId = ready(gm, uploaded(gm, ",kind " + b64("rulebook") + ",campaign " + b64(campaign)));
+        int versions = materials.versions.size();
+        String named = ",material " + b64(materialId);
+
+        // Matrix row "Bad metadata".
+        for (String details : List.of(named + ",kind " + b64("rulebook"), named + ",language " + b64("en"),
+                named + ",campaign " + b64(campaign), named + ",system " + b64(system),
+                named + ",systems " + b64(system), ",material")) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                    "Upload-Length", "1000", "Upload-Metadata", metadata("novo.pdf") + details);
+            assertProblem(response, 400, "upload.metadata_invalid");
+        }
+        for (String field : List.of("\"kind\":\"rulebook\"", "\"language\":\"en\"", "\"campaign\":\"" + campaign
+                + "\"", "\"system\":\"" + system + "\"", "\"systems\":[\"" + system + "\"]")) {
+            HttpResponse<String> response = sendJson(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Fotos\","
+                    + field + ",\"material\":\"" + materialId + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}");
+            assertThat(response.statusCode()).as(field).isEqualTo(400);
+            assertThat(json(response).path("code").asString()).isEqualTo("upload.metadata_invalid");
+        }
+        assertThat(materials.versions).hasSize(versions);
+
+        // A valid one: a new version of the same material, which keeps its name, kind and place.
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "2000", "Upload-Metadata", metadata("novo.pdf") + named);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(materials.versions).hasSize(versions + 1);
+        JsonNode material = json(get(gm, "/api/v1/materials/" + materialId));
+        assertThat(material.path("state").asString()).isEqualTo("uploading");
+        assertThat(material.path("name").asString()).isEqualTo("material.pdf");
+        assertThat(material.path("kind").asString()).isEqualTo("rulebook");
+        assertThat(material.path("belonging").path("campaign").path("id").asString()).isEqualTo(campaign);
+        assertThat(material.path("upload").path("length").asLong()).isEqualTo(2000);
+        assertThat(material.path("serving").toString()).isEqualTo("{\"pages\":null,\"size\":1000}");
+        // Matrix row "Busy": a second one waits for the first, by tus and by image set.
+        HttpResponse<String> busy = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", metadata("outro.pdf") + named);
+        assertProblem(busy, 409, "material.version_in_progress");
+        HttpResponse<String> busySet = sendJson(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Fotos\",\"material\":\""
+                + materialId + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}");
+        assertThat(busySet.statusCode()).isEqualTo(409);
+        assertThat(json(busySet).path("code").asString()).isEqualTo("material.version_in_progress");
+        assertThat(materials.versions).hasSize(versions + 1);
+
+        // A refused format ends the new version alone: the material stays, ready on its old one.
+        String location = created.headers().firstValue("Location").orElseThrow();
+        byte[] notAFile = new byte[2000];
+        assertProblem(patch(gm, location, 0, notAFile), 415, "upload.format_refused");
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(json(get(gm, "/api/v1/materials/" + materialId)).path("state").asString()).isEqualTo("ready");
+    }
+
+    @Test
+    void anotherOwnersUnknownMalformedOrDeletingMaterialIsNotFoundForAReplacement() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String system = json(get(a, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String mine = ready(a, uploaded(a, ""));
+        String going = system(a, "Indo");
+        String gone = ready(a, uploaded(a, ",systems " + b64(going)));
+        assertThat(send("DELETE", "/api/v1/systems/" + going, null, session(a)).statusCode()).isEqualTo(202);
+        int versions = materials.versions.size();
+
+        // Matrix row "Other owner", and an unknown, a malformed or a deleting material: one answer.
+        for (Object[] attempt : new Object[][] {{b, mine}, {a, UUID.randomUUID().toString()}, {a, "not-a-uuid"},
+            {a, gone}}) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session((Gm) attempt[0]),
+                    "Tus-Resumable", TUS, "Upload-Length", "1000", "Upload-Metadata", metadata("novo.pdf")
+                            + ",material " + b64((String) attempt[1]));
+            assertProblem(response, 404, "request.not_found");
+            assertThat(response.body()).doesNotContain(mine);
+        }
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(system).isNotBlank();
+    }
+
+    /** The material's only version becomes ready, as an accept leaves it: its id. */
+    private String ready(Gm gm, String materialId) {
+        UUID id = UUID.fromString(materialId);
+        materials.versions.replaceAll((versionId, row) -> row.materialId().equals(id)
+                ? new io.github.gmshield.materials.data.VersionRow(row.id(), row.ownerId(), row.materialId(), "ready",
+                        row.format(), row.sizeBytes(), row.createdAt(), row.updatedAt(), row.pageTotal(),
+                        row.pipelineVersion(), row.failureCode())
+                : row);
+        return materialId;
+    }
+
     private String system(Gm gm, String name) throws Exception {
         HttpResponse<String> created = sendJson(gm, "POST", "/api/v1/systems", "{\"name\":\"" + name + "\"}");
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);

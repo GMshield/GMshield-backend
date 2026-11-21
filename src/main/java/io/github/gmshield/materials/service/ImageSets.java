@@ -35,7 +35,11 @@ import org.springframework.stereotype.Service;
  *       ({@link Uploads#startIfReady}), after a member's completion or a drop.</li>
  * </ul>
  *
- * Another owner's set, an unknown one and a set that is no longer uploading are all "not found"; a place whose image
+ * From Story 3.4 a set may replace one of the owner's materials ({@link Uploads.Details#material}): it is then a new
+ * version of that material, checked and inserted as {@link Uploads#insertReplacement} does, and the material keeps its
+ * name, kind, language and place (the set's name is checked and not stored).
+ *
+ * <p>Another owner's set, an unknown one and a set that is no longer uploading are all "not found"; a place whose image
  * has not failed is {@code upload.image_not_failed} (409). Nothing here logs a name.
  */
 @Service
@@ -97,14 +101,22 @@ public class ImageSets {
             throw UploadProblems.setTooLarge();
         }
         String material = Uploads.validName(name);
-        Uploads.Checked checked = service.checked(details == null ? Uploads.Details.NONE : details);
+        Uploads.Details given = details == null ? Uploads.Details.NONE : details;
+        UUID replaced = given.material() == null ? null : Uploads.replaced(given);
+        // A replacement keeps what its material says: nothing of its own is checked or stored.
+        Uploads.Checked checked = replaced == null ? service.checked(given)
+                : new Uploads.Checked(null, null, null, List.of());
         Instant now = service.now();
         Instant expiresAt = now.plus(Uploads.LIFETIME);
-        UUID materialId = Ids.newId();
+        UUID materialId = replaced == null ? Ids.newId() : replaced;
         UUID versionId = Ids.newId();
         List<Member> members = new ArrayList<>(images.size());
         service.inTransaction(() -> {
-            service.insertMaterial(owner, materialId, versionId, material, checked, now);
+            if (replaced == null) {
+                service.insertMaterial(owner, materialId, versionId, material, checked, now);
+            } else {
+                service.insertReplacement(owner, materialId, versionId, now);
+            }
             for (int index = 0; index < images.size(); index++) {
                 UUID uploadId = Ids.newId();
                 uploads.joined().insert(member(uploadId, owner, versionId, images.get(index).length(), index + 1,
@@ -115,7 +127,7 @@ public class ImageSets {
         });
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("materialId", materialId)
                 .addKeyValue("versionId", versionId).addKeyValue("images", images.size()).addKeyValue("length", total)
-                .log("upload.set_created");
+                .addKeyValue("replacement", replaced != null).log("upload.set_created");
         return new Created(versionId, materialId, expiresAt, List.copyOf(members));
     }
 

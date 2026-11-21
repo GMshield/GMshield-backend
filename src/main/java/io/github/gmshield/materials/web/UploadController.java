@@ -89,12 +89,18 @@ class UploadController {
 
     @PostMapping(path = UPLOADS)
     @Operation(operationId = "createUpload", summary = "tus 1.0.0 creation: a material, its version in uploading and an"
-            + " upload that expires after 6 hours. upload.too_large (413) outside 1 byte to 2 GiB;"
+            + " upload that expires after 6 hours; with material (contract 1.23.0), only a new version in uploading of"
+            + " that material and its upload. upload.too_large (413) outside 1 byte to 2 GiB;"
             + " upload.metadata_invalid (400) without a valid filename, for a kind, language, campaign or system that is"
             + " not valid, for a campaign or system that is not the account's, for more than 100 systems, or for a"
-            + " campaign with systems, or system with systems (it never says which); request.invalid (400) for a"
+            + " campaign with systems, or system with systems, or a material with any of kind, language, campaign, system"
+            + " or systems (it never says which); request.invalid (400) for a"
             + " missing or malformed Upload-Length; upload.tus_version (412) without"
-            + " Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
+            + " Tus-Resumable: 1.0.0. With material (contract 1.23.0) the upload is a new version of that material,"
+            + " which must be ready: material.version_in_progress (409) while another version of it is uploading,"
+            + " waiting, processing, needs review or failed; material.not_ready (409) when every version of it is"
+            + " discarded; request.not_found (404) for another account's material, an unknown or malformed one, or one"
+            + " whose every place is being deleted;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -108,7 +114,10 @@ class UploadController {
                                 + " is required. Optional: kind (rulebook, supplement, homebrew, campaign_notes, other),"
                                 + " language (pt-BR, en, detect), and campaign (the id of one of the account's"
                                 + " campaigns) or systems (one to 100 ids of the account's systems, comma-separated;"
-                                + " contract 1.21.0), never both. The single key system still names one system",
+                                + " contract 1.21.0), never both. The single key system still names one system. Or,"
+                                + " instead of all of these, material (contract 1.23.0): the id of one of the"
+                                + " account's materials this file replaces; it keeps its name, kind, language and"
+                                + " place",
                         schema = @Schema(type = "string", example = "filename cnVsZXMucGRm"))},
             responses = @ApiResponse(responseCode = "201", description = "Created",
                     headers = {
@@ -282,15 +291,20 @@ class UploadController {
         }
     }
 
-    /** The keys of what the GM said about a file (Story 1.14; {@code systems} from Story 3.3). */
-    private static final Set<String> DETAIL_KEYS = Set.of("kind", "language", "campaign", "system", "systems");
+    /**
+     * The keys of what the GM said about a file (Story 1.14; {@code systems} from Story 3.3; {@code material}, the
+     * material a file replaces, from Story 3.4).
+     */
+    private static final Set<String> DETAIL_KEYS = Set.of("kind", "language", "campaign", "system", "systems",
+            "material");
 
     /**
      * tus's {@code Upload-Metadata}: comma-separated pairs of a key and its value in Base64 (a key may stand alone).
      * Keys are unique. {@code filename} is required; {@code kind}, {@code language}, {@code campaign} and
      * {@code system} (Story 1.14) are optional, and a known key standing alone has an empty value, which the service
      * refuses. From Story 3.3 {@code systems} holds one or more system ids, comma-separated (an empty one is refused);
-     * {@code system} still names one, and the two together are refused. Other keys are ignored.
+     * {@code system} still names one, and the two together are refused. From Story 3.4 {@code material} names the
+     * material a file replaces; the service refuses it with any other detail. Other keys are ignored.
      */
     static Metadata metadata(String metadata) {
         if (metadata == null || metadata.isBlank()) {
@@ -326,7 +340,7 @@ class UploadController {
             named = List.of(system);
         }
         return new Metadata(filename, new Uploads.Details(details.get("kind"), details.get("language"),
-                details.get("campaign"), named));
+                details.get("campaign"), named, details.get("material")));
     }
 
     private static String utf8(String base64) {
