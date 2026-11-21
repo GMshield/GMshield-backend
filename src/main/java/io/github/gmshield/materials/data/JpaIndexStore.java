@@ -107,6 +107,33 @@ class JpaIndexStore implements IndexStore {
                 .setParameter("job", jobId).getResultList().stream().findFirst().map(IndexRemovalEntity::row);
     }
 
+    @Override
+    public List<IndexRemovalRow> removals(Collection<UUID> jobIds) {
+        if (jobIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from IndexRemoval r where r.jobId in :ids order by r.jobId",
+                        IndexRemovalEntity.class)
+                .setParameter("ids", List.copyOf(jobIds)).getResultList().stream().map(IndexRemovalEntity::row).toList();
+    }
+
+    @Override
+    public Optional<IndexRemovalRow> moveRemoval(UUID jobId, UUID newJobId) {
+        Optional<IndexRemovalEntity> found = em().createQuery("select r from IndexRemoval r where r.jobId = :job",
+                IndexRemovalEntity.class).setParameter("job", jobId).getResultList().stream().findFirst();
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        IndexRemovalRow before = found.get().row();
+        IndexRemovalRow moved = new IndexRemovalRow(newJobId, before.ownerId(), before.versionId());
+        EntityManager em = em();
+        em.remove(found.get());
+        em.flush();
+        em.persist(new IndexRemovalEntity(moved));
+        em.flush();
+        return Optional.of(moved);
+    }
+
     private Optional<IndexChangeEntity> change(UUID jobId) {
         return em().createQuery("select c from IndexChange c where c.jobId = :job", IndexChangeEntity.class)
                 .setParameter("job", jobId).getResultList().stream().findFirst();

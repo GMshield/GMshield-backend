@@ -29,8 +29,25 @@ public class InMemoryDeletionStore implements DeletionStore {
     }
 
     @Override
+    public synchronized boolean insertIfAbsent(DeletionRow row) {
+        boolean taken = rows.values().stream().anyMatch(other -> other.ownerId().equals(row.ownerId())
+                && other.kind().equals(row.kind()) && other.targetId().equals(row.targetId()));
+        if (taken) {
+            return false;
+        }
+        insert(row);
+        return true;
+    }
+
+    @Override
     public Optional<DeletionRow> find(UUID ownerId, UUID id) {
         return Optional.ofNullable(rows.get(id)).filter(row -> row.ownerId().equals(ownerId));
+    }
+
+    @Override
+    public Optional<DeletionRow> findTarget(UUID ownerId, String kind, UUID targetId) {
+        return rows.values().stream().filter(row -> row.ownerId().equals(ownerId) && row.kind().equals(kind)
+                && row.targetId().equals(targetId)).findFirst();
     }
 
     @Override

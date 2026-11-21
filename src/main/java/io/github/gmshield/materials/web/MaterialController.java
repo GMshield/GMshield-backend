@@ -3,6 +3,7 @@ package io.github.gmshield.materials.web;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.materials.service.MaterialActions;
 import io.github.gmshield.materials.service.MaterialBelongings;
+import io.github.gmshield.materials.service.MaterialDeletions;
 import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.materials.service.PageProblems;
 import io.github.gmshield.shared.service.ApiException;
@@ -27,6 +28,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -49,7 +51,11 @@ import org.springframework.web.bind.annotation.RestController;
  * From Story 3.3 a material carries its version, size and where it belongs; the list takes every state when none is
  * given; and {@code PATCH} changes where a material belongs ({@link MaterialBelongings}). From Story 3.4 a material
  * has versions: everything here reads its current version (the newest one that is not discarded), a ready material may
- * be reprocessed as a new version, and {@code serving} names the ready version that keeps serving meanwhile.
+ * be reprocessed as a new version, and {@code serving} names the ready version that keeps serving meanwhile. From
+ * Story 3.4 part B a material names its superseded versions ({@code superseded}); {@code DELETE} deletes a material
+ * and {@code DELETE .../versions/{versionId}} removes a superseded version, each a recorded deletion that answers 202
+ * and runs in the background ({@link MaterialDeletions}); {@code GET .../deletion} counts what a material's deletion
+ * takes.
  */
 @RestController
 @Tag(name = "materials")
@@ -64,6 +70,8 @@ class MaterialController {
     static final String REPROCESS = "/api/v1/materials/{id}/reprocess";
     static final String RETRY = "/api/v1/materials/{id}/retry";
     static final String DISCARD = "/api/v1/materials/{id}/discard";
+    static final String DELETION = "/api/v1/materials/{id}/deletion";
+    static final String VERSION = "/api/v1/materials/{id}/versions/{versionId}";
     static final String WEBP = "image/webp";
     /** A page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is a page nowhere. */
     private static final Pattern PAGE_NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
@@ -77,11 +85,14 @@ class MaterialController {
     private final Materials materials;
     private final MaterialActions actions;
     private final MaterialBelongings belongings;
+    private final MaterialDeletions deletions;
 
-    MaterialController(Materials materials, MaterialActions actions, MaterialBelongings belongings) {
+    MaterialController(Materials materials, MaterialActions actions, MaterialBelongings belongings,
+                       MaterialDeletions deletions) {
         this.materials = materials;
         this.actions = actions;
         this.belongings = belongings;
+        this.deletions = deletions;
     }
 
     @Schema(name = "MaterialUpload", requiredProperties = {"id", "offset", "length", "expiresAt"})
@@ -237,9 +248,27 @@ class MaterialController {
         }
     }
 
+    @Schema(name = "MaterialSuperseded", requiredProperties = {"id", "createdAt", "pages", "size"},
+            description = "A superseded version of the material, which the GM may remove (contract 1.24.0)")
+    record SupersededView(
+            @Schema(description = "The version's id: DELETE /api/v1/materials/{id}/versions/{versionId} removes it",
+                    format = "uuid", example = "0190a0b0-0000-7000-8000-00000000000a") String id,
+            @Schema(description = "When the version was uploaded", format = "date-time",
+                    example = "2026-11-10T14:00:00Z") String createdAt,
+            @Schema(description = "Its page total; null when not known", types = {"integer", "null"}, format = "int32",
+                    example = "320") Integer pages,
+            @Schema(description = "Its size in bytes; null when not known", types = {"integer", "null"},
+                    format = "int64", example = "134217728") Long size) {
+
+        static SupersededView of(Materials.Superseded version) {
+            return new SupersededView(version.id().toString(), version.createdAt().toString(), version.pages(),
+                    version.size());
+        }
+    }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
     @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions", "version", "belonging",
-        "serving"})
+        "serving", "superseded"})
     record MaterialView(
             @Schema(description = "The material's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
@@ -272,7 +301,10 @@ class MaterialController {
             @JsonInclude(JsonInclude.Include.ALWAYS)
             @Schema(description = "The ready version that keeps serving while the current version is another one"
                     + " (a replacement or a reprocess on its way); null otherwise (contract 1.23.0)",
-                    types = {"object", "null"}, implementation = ServingView.class) ServingView serving) {
+                    types = {"object", "null"}, implementation = ServingView.class) ServingView serving,
+            @ArraySchema(arraySchema = @Schema(description = "The material's superseded versions, newest first; a"
+                    + " version whose removal is recorded is left out; empty when there is none (contract 1.24.0)"),
+                    schema = @Schema(implementation = SupersededView.class)) List<SupersededView> superseded) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
@@ -280,7 +312,8 @@ class MaterialController {
                     material.pages() == null ? null : PagesView.of(material.pages()),
                     material.failure(), material.actions(),
                     material.imageSet() == null ? null : ImageSetView.of(material.imageSet()), material.version(),
-                    material.size(), BelongingView.of(material.belonging()), ServingView.of(material.serving()));
+                    material.size(), BelongingView.of(material.belonging()), ServingView.of(material.serving()),
+                    material.superseded().stream().map(SupersededView::of).toList());
         }
 
         @Override
@@ -680,6 +713,78 @@ class MaterialController {
             @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id) {
         return act(id, Materials.DISCARD);
+    }
+
+    @Schema(name = "MaterialDeletion", requiredProperties = {"versions", "pages"}, description = "What goes with a"
+            + " material if it is deleted (contract 1.24.0)")
+    record DeletionView(
+            @Schema(description = "Its versions that are not discarded", format = "int64", example = "2") long versions,
+            @Schema(description = "The sum of those versions' page totals (a total not known counts 0)",
+                    format = "int64", example = "640") long pages) {
+
+        static DeletionView of(MaterialDeletions.Count count) {
+            return new DeletionView(count.versions(), count.pages());
+        }
+    }
+
+    @GetMapping(path = DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getMaterialDeletion", summary = "What goes with one of the account's materials if it is"
+            + " deleted (contract 1.24.0): how many of its versions are not discarded, and their pages."
+            + " request.not_found (404) for another owner's material, an unknown or malformed id, one whose every"
+            + " place is being deleted, or one whose deletion is recorded already;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<DeletionView> deletion(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return parse(id).flatMap(deletions::count).map(DeletionView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    @DeleteMapping(path = MATERIAL)
+    @Operation(operationId = "deleteMaterial", summary = "Deletes one of the account's materials with every version"
+            + " (contract 1.24.0; 202, no body): from now on it is gone from every list and count, and its passages from"
+            + " every scope; its pages, passages, files, index points and rows are removed in the background. A"
+            + " reference an answer stored reads as a removed source. A material already being deleted is answered the"
+            + " same, and nothing changes. Cannot be undone. request.not_found (404) for another owner's material, an"
+            + " unknown or malformed id, or one whose every place is being deleted;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion is recorded"))
+    ResponseEntity<Void> delete(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        if (!parse(id).map(deletions::delete).orElse(false)) {
+            throw new ApiException(ApiProblem.forStatus(404));
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = VERSION)
+    @Operation(operationId = "removeMaterialVersion", summary = "Removes a superseded version of one of the account's"
+            + " materials (contract 1.24.0; 202, no body): from now on it is gone from the material's superseded"
+            + " versions, and its pages, passages, files, index points and row are removed in the background; the"
+            + " material and its other versions stay. A reference an answer stored to it reads as a removed source and"
+            + " its page is not found. A version whose removal is recorded already is answered the same."
+            + " material.version_not_removable (409) for a version in any other state (ready, in progress or"
+            + " discarded); request.not_found (404) for another owner's material or version, a version of another"
+            + " material, an unknown or malformed id, or a material whose every place is being deleted or whose deletion"
+            + " is recorded already; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The removal is recorded"))
+    ResponseEntity<Void> removeVersion(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(description = "The version's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("versionId") String versionId) {
+        Optional<UUID> material = parse(id);
+        Optional<UUID> version = parse(versionId);
+        if (material.isEmpty() || version.isEmpty() || !deletions.removeVersion(material.get(), version.get())) {
+            throw new ApiException(ApiProblem.forStatus(404));
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 
     private ResponseEntity<MaterialView> act(String id, String action) {

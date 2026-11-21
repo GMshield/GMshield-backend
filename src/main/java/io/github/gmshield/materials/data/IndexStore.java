@@ -49,4 +49,17 @@ public interface IndexStore {
 
     /** Whether the current owner's version has an {@code index.removal} input already (Story 3.1 part B). */
     boolean hasRemoval(UUID versionId);
+
+    /**
+     * The current owner's {@code index.removal} inputs of these jobs, by job (Story 3.4 part B: the removal retry sweep
+     * reads those of the failed jobs).
+     */
+    List<IndexRemovalRow> removals(Collection<UUID> jobIds);
+
+    /**
+     * Moves the current owner's {@code index.removal} input of job {@code jobId} to job {@code newJobId} (Story 3.4
+     * part B, the removal retry sweep): the row is replaced by one keyed by the new job, with the same version. Empty
+     * when the current owner has no such row; otherwise the new row.
+     */
+    Optional<IndexRemovalRow> moveRemoval(UUID jobId, UUID newJobId);
 }

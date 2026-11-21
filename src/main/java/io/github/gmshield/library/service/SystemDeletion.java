@@ -53,6 +53,14 @@ import org.springframework.transaction.support.TransactionTemplate;
  * it; each handler is given {@code Going(null, [campaign])}; the same sweep and one-shot passes run it, the row's kind
  * picking what is collected and what {@code library} removes last (the campaign row). A system deleted while one of its
  * campaigns is deleting takes that campaign too; the campaign's own deletion then finds it gone and is marked done.
+ *
+ * <p>Story 3.4 part B: deleting one of the owner's materials ({@link #deleteMaterial}) and removing one superseded
+ * version of one ({@link #removeVersion}) are the same process again, of kinds {@code material} and {@code version}.
+ * {@code library} knows neither: the {@code materials} module checks the target first, and each handler is given
+ * {@code Going.ofMaterial} or {@code Going.ofVersion} with the id alone. There is no system or campaign to mark or
+ * delete: the record is written (once per target: a second delete changes nothing) in one transaction with every
+ * handler's prepare, and a pass is done once the handlers' removal ends. The same sweep, one-shot passes, claim wait
+ * and preparing again run it.
  */
 @Service
 public class SystemDeletion {
@@ -168,6 +176,67 @@ public class SystemDeletion {
         return started.isPresent();
     }
 
+    /**
+     * Records the deletion of the owner's material {@code materialId} (Story 3.4 part B), as the class says; the
+     * {@code materials} module has found it the owner's and deletable. Answers whether it was recorded now: false when
+     * its deletion was recorded already (nothing changes then).
+     */
+    public boolean deleteMaterial(UUID materialId) {
+        return recordDeletion(DeletionRow.MATERIAL, materialId, SystemDeletionHandler.Going.ofMaterial(materialId));
+    }
+
+    /**
+     * Records the removal of the owner's version {@code versionId} of a material (Story 3.4 part B), as the class says;
+     * the {@code materials} module has found it the owner's and superseded. Answers whether it was recorded now: false
+     * when its removal was recorded already (nothing changes then).
+     */
+    public boolean removeVersion(UUID versionId) {
+        return recordDeletion(DeletionRow.VERSION, versionId, SystemDeletionHandler.Going.ofVersion(versionId));
+    }
+
+    /**
+     * Whether the deletion of the owner's material {@code materialId} is recorded, pending or done (Story 3.4 part B:
+     * from then on its count and its versions are not found).
+     */
+    public boolean materialDeletionRecorded(UUID materialId) {
+        UUID owner = OwnerContext.require();
+        return deletions.findTarget(owner, DeletionRow.MATERIAL, materialId).isPresent();
+    }
+
+    /**
+     * Whether the removal of the owner's version {@code versionId} is recorded, pending or done (Story 3.4 part B: a
+     * second removal of it is answered as the first).
+     */
+    public boolean versionRemovalRecorded(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return deletions.findTarget(owner, DeletionRow.VERSION, versionId).isPresent();
+    }
+
+    /**
+     * One transaction: the deletion row of {@code kind} unless the owner has one for this target already, then every
+     * handler's prepare, and {@code not_before} moved to the latest claim lapse; after the commit, the one-shot pass.
+     */
+    private boolean recordDeletion(String kind, UUID targetId, SystemDeletionHandler.Going going) {
+        UUID owner = OwnerContext.require();
+        Instant now = now();
+        Optional<DeletionRow> started = writing(() -> {
+            DeletionRow recorded = new DeletionRow(Ids.newId(), owner, kind, targetId, now, now, null);
+            if (!deletions.insertIfAbsent(recorded)) {
+                return Optional.<DeletionRow>empty();
+            }
+            Instant notBefore = prepare(going, now);
+            if (notBefore.isAfter(now)) {
+                deletions.postpone(owner, recorded.id(), notBefore);
+            }
+            DeletionRow row = new DeletionRow(recorded.id(), owner, kind, targetId, notBefore, now, null);
+            going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("deletionId", row.id())
+                    .addKeyValue("notBefore", row.notBefore()).log("library." + kind + "_deleting");
+            return Optional.of(row);
+        });
+        started.ifPresent(row -> later(row.ownerId(), row.id(), row.notBefore()));
+        return started.isPresent();
+    }
+
     /** One sweep: a pass of every deletion that is due, as its owner. Answers how many it finished. Never throws. */
     public int sweep() {
         int finished = 0;
@@ -239,6 +308,13 @@ public class SystemDeletion {
         for (SystemDeletionHandler handler : handlers()) {
             handler.remove(prepared.going());
         }
+        if (prepared.going().ofMaterials()) {
+            // A material or a version: nothing of library's own goes; the handlers' removal ended, so the record does.
+            writing(() -> deletions.done(owner, row.id(), now()));
+            prepared.going().about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("deletionId", row.id())
+                    .log("library." + row.kind() + "_deleted");
+            return true;
+        }
         if (DeletionRow.CAMPAIGN.equals(row.kind())) {
             endCampaign(owner, row);
             return true;
@@ -256,16 +332,30 @@ public class SystemDeletion {
         return true;
     }
 
-    /** Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. */
+    /**
+     * Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. A
+     * material or a version (Story 3.4 part B) is not library's to find: the handlers find what is left of it, and
+     * nothing when it is gone.
+     */
     private boolean targetDeleting(DeletionRow row) {
-        return DeletionRow.CAMPAIGN.equals(row.kind()) ? store.campaignDeleting(row.targetId())
-                : store.deleting(row.targetId());
+        return switch (row.kind()) {
+            case DeletionRow.CAMPAIGN -> store.campaignDeleting(row.targetId());
+            case DeletionRow.MATERIAL, DeletionRow.VERSION -> true;
+            default -> store.deleting(row.targetId());
+        };
     }
 
-    /** What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone. */
+    /**
+     * What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone, or
+     * (kinds {@code material} and {@code version}) that one id.
+     */
     private SystemDeletionHandler.Going goingOf(DeletionRow row) {
-        return DeletionRow.CAMPAIGN.equals(row.kind()) ? goingOfCampaign(row.targetId())
-                : new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
+        return switch (row.kind()) {
+            case DeletionRow.CAMPAIGN -> goingOfCampaign(row.targetId());
+            case DeletionRow.MATERIAL -> SystemDeletionHandler.Going.ofMaterial(row.targetId());
+            case DeletionRow.VERSION -> SystemDeletionHandler.Going.ofVersion(row.targetId());
+            default -> new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
+        };
     }
 
     /**

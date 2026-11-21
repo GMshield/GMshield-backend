@@ -177,16 +177,22 @@ public class Materials {
      * Story 1.21, {@code imageSet} only while an image set is uploading (then {@code upload} is null). From Story 3.3,
      * its {@code version} (a change of where it belongs names it), {@code size} (the current version's bytes, null until
      * known) and where it {@code belongs}. From Story 3.4, {@code serving}: its {@code ready} version while that is
-     * not its current one (a new version is being processed), else null.
+     * not its current one (a new version is being processed), else null. From Story 3.4 part B, {@code superseded}:
+     * its superseded versions, newest first (one whose removal is recorded is discarded already, so never among them).
      */
     public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
                            String failure, List<String> actions, ImageSet imageSet, long version, Long size,
-                           Belonging belonging, Serving serving) {
+                           Belonging belonging, Serving serving, List<Superseded> superseded) {
 
-        /** A material with no other version serving. */
+        public Material {
+            superseded = superseded == null ? List.of() : List.copyOf(superseded);
+        }
+
+        /** A material with no other version serving, and none superseded. */
         public Material(UUID id, String name, String state, String kind, Upload upload, Pages pages, String failure,
                         List<String> actions, ImageSet imageSet, long version, Long size, Belonging belonging) {
-            this(id, name, state, kind, upload, pages, failure, actions, imageSet, version, size, belonging, null);
+            this(id, name, state, kind, upload, pages, failure, actions, imageSet, version, size, belonging, null,
+                    List.of());
         }
 
         @Override
@@ -200,6 +206,13 @@ public class Materials {
      * total (null when not known) and its size in bytes (null when not known).
      */
     public record Serving(Integer pages, Long size) {
+    }
+
+    /**
+     * A superseded version of a material (Story 3.4 part B), which the GM may remove: its id, when it was created, its
+     * page total (null when not known) and its size in bytes (null when not known).
+     */
+    public record Superseded(UUID id, Instant createdAt, Integer pages, Long size) {
     }
 
     /** A system a material belongs to, or a campaign's system (Story 3.3): its id and its name, decrypted. */
@@ -599,6 +612,12 @@ public class Materials {
                 .map(row -> row.material().id()).toList();
         Map<UUID, VersionRow> serving = materials.readyOf(replacing).stream()
                 .collect(Collectors.toMap(VersionRow::materialId, Function.identity(), (first, second) -> second));
+        // Story 3.4 part B: the superseded versions of every listed material, newest first, in one read.
+        Map<UUID, List<Superseded>> superseded = materials.supersededOf(rows.stream()
+                        .map(row -> row.material().id()).toList()).stream()
+                .collect(Collectors.groupingBy(VersionRow::materialId, java.util.LinkedHashMap::new,
+                        Collectors.mapping(version -> new Superseded(version.id(), version.createdAt(),
+                                version.pageTotal(), version.sizeBytes()), Collectors.toList())));
         return rows.stream().map(row -> {
             UploadRow upload = Uploads.UPLOADING.equals(row.version().state()) ? open.get(row.version().id()) : null;
             Integer total = row.version().pageTotal();
@@ -616,7 +635,8 @@ public class Materials {
                                     row.version()) == IngestionSteps.RetryCheck.ALLOWED),
                     imageSet(row.version(), sets.get(row.version().id())), row.material().version(),
                     row.version().sizeBytes(), belongings.getOrDefault(row.material().id(), Belonging.NOWHERE),
-                    serving(serving.get(row.material().id())));
+                    serving(serving.get(row.material().id())),
+                    superseded.getOrDefault(row.material().id(), List.of()));
         }).toList();
     }
 

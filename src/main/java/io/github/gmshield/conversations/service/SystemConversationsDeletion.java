@@ -35,6 +35,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * </ul>
  *
  * <p>Story 3.2 part B: a campaign's deletion ({@code Going(null, [campaign])}) is the same, for that campaign alone.
+ *
+ * <p>Story 3.4 part B: a material's deletion or a version's removal ({@link Going#ofMaterials}) takes nothing here:
+ * a turn's references are stored by value, and one whose version is gone reads as a removed source.
  */
 @Service
 class SystemConversationsDeletion implements SystemDeletionHandler {
@@ -61,11 +64,17 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public long count(Going going) {
+        if (going.ofMaterials()) {
+            return 0;
+        }
         return store.conversationsOfCampaigns(going.campaignIds()).size();
     }
 
     @Override
     public Optional<Instant> prepare(Going going) {
+        if (going.ofMaterials()) {
+            return Optional.empty();
+        }
         List<UUID> jobIds = store.conversationsOfCampaigns(going.campaignIds()).stream()
                 .flatMap(conversation -> store.turnsOf(conversation.id()).stream()).map(TurnRow::jobId).toList();
         Optional<Instant> lapse = jobs.claimLapse(jobIds);
@@ -79,6 +88,9 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public void remove(Going going) {
+        if (going.ofMaterials()) {
+            return;
+        }
         UUID owner = OwnerContext.require();
         List<ConversationRow> conversations = reading(() -> store.conversationsOfCampaigns(going.campaignIds()));
         int turns = 0;

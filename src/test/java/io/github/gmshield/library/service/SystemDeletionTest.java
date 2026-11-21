@@ -27,6 +27,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * A delete hands its one-shot pass to the schedule at the deletion's not_before, and that pass finishes it (Story 3.1
  * part B); likewise a campaign's (Story 3.2 part B), and a campaign whose system was deleted meanwhile ends as done.
+ * Story 3.4 part B: a material's deletion and a version's removal are recorded once, prepared in the same transaction
+ * (waiting for the latest claim lapse), and done once the handlers' removal ends, with nothing of library's touched.
  */
 class SystemDeletionTest {
 
@@ -38,7 +40,14 @@ class SystemDeletionTest {
     private final SystemDeletionSweepSchedule schedule = mock(SystemDeletionSweepSchedule.class);
 
     private SystemDeletion deletion() {
+        return deletion(null);
+    }
+
+    private SystemDeletion deletion(SystemDeletionHandler handler) {
         StaticListableBeanFactory beans = new StaticListableBeanFactory();
+        if (handler != null) {
+            beans.addBean("handler", handler);
+        }
         beans.addBean("transactions", transactions);
         beans.addBean("schedule", schedule);
         beans.addBean("clock", Clock.fixed(NOW, ZoneOffset.UTC));
@@ -140,5 +149,98 @@ class SystemDeletionTest {
         assertThat(store.campaigns).doesNotContainKey(campaign);
         assertThat(deletions.rows.get(row.id()).doneAt()).isEqualTo(NOW);
         verify(schedule).once(any(), any());
+    }
+
+    /** A handler that records what it is given, and answers {@code lapse} from its prepare. */
+    private static final class Recording implements SystemDeletionHandler {
+        final java.util.List<Going> prepared = new java.util.ArrayList<>();
+        final java.util.List<Going> removed = new java.util.ArrayList<>();
+        Instant lapse;
+        boolean failing;
+
+        @Override
+        public String part() {
+            return SystemDeletion.MATERIALS;
+        }
+
+        @Override
+        public long count(Going going) {
+            return 0;
+        }
+
+        @Override
+        public java.util.Optional<Instant> prepare(Going going) {
+            prepared.add(going);
+            return java.util.Optional.ofNullable(lapse);
+        }
+
+        @Override
+        public void remove(Going going) {
+            removed.add(going);
+            if (failing) {
+                throw new IllegalStateException("material.version_not_discarded");
+            }
+        }
+    }
+
+    @Test
+    void aMaterialsDeletionIsRecordedOncePreparedAtOnceAndDoneOnceTheHandlersRemovalEnds() {
+        Recording handler = new Recording();
+        SystemDeletion deletion = deletion(handler);
+        UUID owner = Ids.newId();
+        UUID system = Ids.newId();
+        insert(owner, system);
+        UUID material = Ids.newId();
+
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteMaterial(material))).isTrue();
+        assertThat(handler.prepared).containsExactly(SystemDeletionHandler.Going.ofMaterial(material));
+        DeletionRow row = deletions.rows.values().stream().findFirst().orElseThrow();
+        assertThat(row.kind()).isEqualTo(DeletionRow.MATERIAL);
+        assertThat(row.targetId()).isEqualTo(material);
+        assertThat(row.ownerId()).isEqualTo(owner);
+        assertThat(row.notBefore()).isEqualTo(NOW);
+        // Again: nothing is recorded or prepared a second time.
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteMaterial(material))).isFalse();
+        assertThat(handler.prepared).hasSize(1);
+        assertThat(deletions.rows).hasSize(1);
+        ArgumentCaptor<Runnable> pass = ArgumentCaptor.forClass(Runnable.class);
+        verify(schedule).once(pass.capture(), eq(NOW));
+
+        // A removal that fails leaves the deletion for the next pass.
+        handler.failing = true;
+        pass.getValue().run();
+        assertThat(deletions.rows.get(row.id()).doneAt()).isNull();
+        handler.failing = false;
+
+        assertThat(deletion.run(owner, row.id())).isTrue();
+        assertThat(handler.prepared).hasSize(3).allMatch(SystemDeletionHandler.Going.ofMaterial(material)::equals);
+        assertThat(handler.removed).hasSize(2).allMatch(SystemDeletionHandler.Going.ofMaterial(material)::equals);
+        assertThat(deletions.rows.get(row.id()).doneAt()).isEqualTo(NOW);
+        assertThat(store.systems).containsKey(system);
+        assertThat(deletion.run(owner, row.id())).isFalse();
+    }
+
+    @Test
+    void aVersionsRemovalWaitsForTheLatestClaimLapseItsPrepareAnswers() {
+        Recording handler = new Recording();
+        handler.lapse = NOW.plusSeconds(90);
+        SystemDeletion deletion = deletion(handler);
+        UUID owner = Ids.newId();
+        UUID version = Ids.newId();
+
+        assertThat(OwnerContext.callAs(owner, () -> deletion.versionRemovalRecorded(version))).isFalse();
+        assertThat(OwnerContext.callAs(owner, () -> deletion.removeVersion(version))).isTrue();
+
+        DeletionRow row = deletions.rows.values().stream().findFirst().orElseThrow();
+        assertThat(row.kind()).isEqualTo(DeletionRow.VERSION);
+        assertThat(row.notBefore()).isEqualTo(NOW.plusSeconds(90));
+        assertThat(handler.prepared).containsExactly(SystemDeletionHandler.Going.ofVersion(version));
+        assertThat(OwnerContext.callAs(owner, () -> deletion.versionRemovalRecorded(version))).isTrue();
+        assertThat(OwnerContext.callAs(Ids.newId(), () -> deletion.versionRemovalRecorded(version))).isFalse();
+        verify(schedule).once(any(), eq(NOW.plusSeconds(90)));
+        // Not due yet: the pass does nothing.
+        assertThat(deletion.run(owner, row.id())).isFalse();
+        assertThat(handler.removed).isEmpty();
+        assertThat(deletion.sweep()).isZero();
     }
 }

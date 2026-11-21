@@ -16,8 +16,21 @@ public interface DeletionStore {
     /** Records a deletion; joins the caller's transaction, which must exist. */
     void insert(DeletionRow row);
 
+    /**
+     * Records a deletion unless the owner has one of the same kind and target already, done or not (Story 3.4 part B:
+     * a delete recorded idempotently); joins the caller's transaction, which must exist. Answers whether it was
+     * recorded now.
+     */
+    boolean insertIfAbsent(DeletionRow row);
+
     /** The owner's deletion with this id, done or not; empty for an unknown id or another owner's. */
     Optional<DeletionRow> find(UUID ownerId, UUID id);
+
+    /**
+     * The owner's deletion of this kind and target, done or not (Story 3.4 part B); empty when there is none or it is
+     * another owner's.
+     */
+    Optional<DeletionRow> findTarget(UUID ownerId, String kind, UUID targetId);
 
     /** Moves the owner's pending deletion's {@code notBefore} later; false when it is unknown, another's or done. */
     boolean postpone(UUID ownerId, UUID id, Instant notBefore);

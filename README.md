@@ -425,6 +425,53 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     the whole material, the serving version included. Nothing guards against it in code: before rolling back, check
     that no material has more than one version (`select material_id from material_version group by material_id
     having count(*) > 1`), or accept that loss.
+  - **Delete a material, remove a superseded version (Story 3.4 part B, public contract 1.24.0, migration V26,
+    AD-22).** The recorded, resumable deletion of a system (above), extended to `deletion` rows of kinds `material`
+    and `version`: the same `SystemDeletion` process, sweep, one-shot passes, claim wait and preparing again.
+    `library` knows neither: `materials.service.MaterialDeletions` checks the target, then `SystemDeletion
+    .deleteMaterial` or `.removeVersion` writes the row (once per owner, kind and target: `insert ... on conflict do
+    nothing`, so a second delete changes nothing) in one transaction with every handler's `prepare`, given
+    `Going.ofMaterial(id)` or `Going.ofVersion(id)`. There is no system or campaign to mark or delete: a pass is done
+    once the handlers' removal ends. `conversations` takes nothing (references are stored by value). No undo.
+    - `GET /api/v1/materials/{id}/deletion` answers `{versions, pages}`: the material's versions that are not
+      `discarded`, and the sum of their page totals.
+    - `DELETE /api/v1/materials/{id}` answers 202 with no body, and again for a material already being deleted.
+      `SystemMaterialsDeletion.prepare` discards every version of it (steps and index changes cancelled, the latest
+      claim lapse kept as `not_before`), so it leaves every list, count and scope at once and references to it read
+      `removed`. The removal runs `removeVersion` for each version (one `index.removal` per version, never two,
+      `VersionRemoval`, files, rows), then deletes the material with its attachments. A version that is no longer
+      `discarded` (an upload completed during the wait) fails the pass, and the next one prepares again.
+    - `DELETE /api/v1/materials/{id}/versions/{versionId}` answers 202 for a `superseded` version of that material,
+      and again once its removal is recorded; any other state is `material.version_not_removable` (409): a ready or
+      in-progress version is discarded instead. The same prepare and removal, for that version alone; the material
+      and its other versions stay. Its row goes, so a reference to it reads `removed` (`ScopeReads.removed`) and its
+      page is not found.
+    - All three answer `request.not_found` (404) for another owner's material or version, an unknown or malformed id,
+      a version of another material, or a material whose every place is being deleted.
+    - `Material.superseded` (`[{id, createdAt, pages, size}]`, newest first, one read for a whole page): the
+      material's `superseded` versions. One whose removal is recorded is `discarded` already, so it is left out.
+    - Failed removals: `IndexRemovalRetrySweep` (at the start and every `GMSHIELD_INDEX_RETRY_EVERY`, 10 min; off
+      with `gmshield.materials.index-retry-sweep.enabled=false`, the index retry sweep's own switch, so that setting
+      stops the retries of failed index changes too) visits each owner with a failed `index.removal` job
+      and gives each failed job that still has its `index_removal` row a new job with the same input (owner, source);
+      the row moves to it (`IndexStore.moveRemoval`), so the failed job, kept as history, is never retried twice.
+      Logs: `index.removal_retried`.
+    - Logs: `library.material_deleting`/`library.version_deleting`, then `library.material_deleted`/
+      `library.version_deleted`; `material.delete`, `material.version_remove` (ids and times only).
+    - `V26__material_deletion.sql` lets `deletion.kind` be `material` or `version`. Additive. Rolling back while one
+      is pending: that release's sweep finds no system with the row's target and marks it done; the versions the
+      delete discarded stay discarded (their content is removed by that release's version removal sweep, their rows
+      and points are not). For kind `material` the material row can also be left with no version (a pass that
+      stopped after its last version went, before the material did). After rolling forward, list the targets whose
+      row was marked done although something of them is left:
+      `select kind, target_id from deletion where done_at is not null and ((kind = 'material' and target_id in
+      (select id from material)) or (kind = 'version' and target_id in (select id from material_version)))`;
+      then reopen each (`update deletion set done_at = null where kind = '<kind>' and target_id = '<id>'`): the next
+      pass removes what is left, the versions, their points and, for `material`, the material row.
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.24.0). The worker does
+      not change. The first start after the deploy runs the index removal retry sweep at once, for every owner: it
+      starts again every failed `index.removal` job left since Stories 1.20 (a discard) and 3.1 part B (a system's or
+      a campaign's deletion), one new job each on the ingestion lane.
 - **The guided upload's details and the materials list (`materials`, Story 1.14).** `Upload-Metadata` at creation
   may also carry `kind` (`rulebook`, `supplement`, `homebrew`, `campaign_notes`, `other`), `language` (`pt-BR`,
   `en`, or `detect`, stored as null for a later read stage), and `campaign` or `system` (the id of one of the

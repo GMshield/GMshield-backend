@@ -24,6 +24,8 @@ public class InMemoryIndexStore implements IndexStore {
     public final Map<UUID, IndexRemovalRow> removals = new ConcurrentHashMap<>();
     /** The jobs whose index change a move refuses, as a failing database would (the retry sweep's isolation). */
     public final Set<UUID> refusedMoves = ConcurrentHashMap.newKeySet();
+    /** The jobs whose index removal a move refuses, as a failing database would (the removal retry sweep's isolation). */
+    public final Set<UUID> refusedRemovalMoves = ConcurrentHashMap.newKeySet();
     private final InMemoryMaterialStore materials;
 
     public InMemoryIndexStore(InMemoryMaterialStore materials) {
@@ -123,6 +125,34 @@ public class InMemoryIndexStore implements IndexStore {
     public Optional<IndexRemovalRow> findRemoval(UUID jobId) {
         UUID owner = OwnerContext.require();
         return Optional.ofNullable(removals.get(jobId)).filter(row -> row.ownerId().equals(owner));
+    }
+
+    @Override
+    public List<IndexRemovalRow> removals(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return removals.values().stream().filter(row -> row.ownerId().equals(owner) && jobIds.contains(row.jobId()))
+                .sorted(Comparator.comparing(IndexRemovalRow::jobId)).toList();
+    }
+
+    @Override
+    public synchronized Optional<IndexRemovalRow> moveRemoval(UUID jobId, UUID newJobId) {
+        Optional<IndexRemovalRow> found = findRemoval(jobId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        IndexRemovalRow before = found.get();
+        ownerFor(before.ownerId());
+        if (removals.containsKey(newJobId) || refusedRemovalMoves.contains(jobId)) {
+            throw new IllegalStateException("key refused");
+        }
+        IndexRemovalRow moved = new IndexRemovalRow(newJobId, before.ownerId(), before.versionId());
+        removals.remove(jobId);
+        removals.put(newJobId, moved);
+        RollbackUndo.onRollback(() -> {
+            removals.remove(newJobId);
+            removals.put(jobId, before);
+        });
+        return Optional.of(moved);
     }
 
     /** The current owner, who must be the row's; a write outside a transaction is refused, as JPA refuses it. */

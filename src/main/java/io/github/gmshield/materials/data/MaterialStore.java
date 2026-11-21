@@ -86,6 +86,13 @@ public interface MaterialStore {
      */
     List<VersionRow> readyOf(Collection<UUID> materialIds);
 
+    /**
+     * The current owner's {@code superseded} versions of these materials, newest first (the latest created, then the
+     * greatest id), in one read (Story 3.4 part B: the earlier versions the GM may remove); another owner's material
+     * has none.
+     */
+    List<VersionRow> supersededOf(Collection<UUID> materialIds);
+
     /** The current owner's material with this id; empty for an unknown id or another owner's. */
     Optional<MaterialRow> findMaterial(UUID id);
 

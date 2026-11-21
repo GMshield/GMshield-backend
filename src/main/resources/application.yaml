@@ -83,7 +83,8 @@ gmshield:
   # Materials (materials module, Story 1.13), a Spring duration: how often unfinished uploads past their 6 hours are
   # discarded, and removals that stopped half way are finished. From Story 1.20, how often the removals of discarded
   # versions that stopped half way (a restart, a failure) are finished. From indexing at worker start (2026-11-19), how
-  # often the index changes whose job failed get a new job (each run at most 3 times).
+  # often the index changes whose job failed get a new job (each run at most 3 times); from Story 3.4 part B, also how
+  # often (and once right after the start) the index removals whose job failed get a new job.
   materials:
     upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
     version-removal-sweep-every: ${GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY:10m}
