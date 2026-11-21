@@ -12,6 +12,11 @@ import java.util.UUID;
  * <p>From Story 3.1 part B a system is {@code ready} or {@code deleting}: every read here sees ready systems, and the
  * campaigns of ready systems, only; a deleting system and its campaigns are reached through the deletion's own
  * methods ({@link #markDeleting}, {@link #deleting}, {@link #campaignIdsOfDeleting}, {@link #deleteDeleting}) alone.
+ *
+ * <p>From Story 3.2 part B a campaign is {@code ready} or {@code deleting} too: every read here sees ready campaigns of
+ * ready systems only; a deleting campaign is reached through its deletion's methods ({@link #markCampaignDeleting},
+ * {@link #campaignDeleting}, {@link #deleteDeletingCampaign}), and through a system's deletion, which takes every
+ * campaign of the system, deleting ones included.
  */
 public interface LibraryStore {
 
@@ -45,7 +50,10 @@ public interface LibraryStore {
      */
     List<CampaignRow> campaigns(UUID systemId, boolean archived, UUID before, int limit);
 
-    /** The ids of all the current owner's campaigns of the system {@code systemId}, archived ones included, newest first. */
+    /**
+     * The ids of all the current owner's ready campaigns of the ready system {@code systemId}, archived ones included,
+     * newest first.
+     */
     List<UUID> campaignIdsOf(UUID systemId);
 
     /**
@@ -119,4 +127,23 @@ public interface LibraryStore {
      * when there is no such system. Joins the caller's transaction, which must exist.
      */
     boolean deleteDeleting(UUID id);
+
+    // --- campaign deletion (Story 3.2 part B)
+
+    /**
+     * The current owner's ready campaign {@code id} of a ready system, locked first, becomes {@code deleting} at
+     * {@code at}, its name fingerprint replaced by its id (so the name is free in its system at once); false for an
+     * unknown id, another owner's, a campaign already deleting or one of a deleting system. Joins the caller's
+     * transaction, which must exist.
+     */
+    boolean markCampaignDeleting(UUID id, Instant at);
+
+    /** Whether the current owner's campaign {@code id} is deleting (false once its row is gone). */
+    boolean campaignDeleting(UUID id);
+
+    /**
+     * Deletes the current owner's deleting campaign {@code id}, which nothing may name any more; false when there is no
+     * such campaign (a system's deletion may have taken it). Joins the caller's transaction, which must exist.
+     */
+    boolean deleteDeletingCampaign(UUID id);
 }

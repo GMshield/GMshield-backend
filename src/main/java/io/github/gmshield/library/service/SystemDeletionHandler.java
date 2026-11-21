@@ -9,7 +9,7 @@ import java.util.UUID;
  * What a module does when one of the owner's systems is deleted (Story 3.1 part B, AD-22). {@link SystemDeletion}
  * finds every handler registered as a bean and calls it as the owner of the work, so {@code library} depends on no
  * module that implements it ({@code materials}, {@code conversations}). Each call names what goes, collected again at
- * each call: the system and its campaigns.
+ * each call: the system and its campaigns, or (Story 3.2 part B, a campaign's deletion) no system and the one campaign.
  *
  * <ul>
  *   <li>{@link #count}: how many of its own items go, for the confirmation dialog; inside a read-only transaction.</li>
@@ -22,7 +22,10 @@ import java.util.UUID;
  */
 public interface SystemDeletionHandler {
 
-    /** What goes: the owner's system and the ids of all its campaigns. */
+    /**
+     * What goes: the owner's system and the ids of all its campaigns; for a campaign's deletion (Story 3.2 part B)
+     * {@code systemId} is null and {@code campaignIds} names that campaign alone, so nothing of its system goes.
+     */
     record Going(UUID systemId, List<UUID> campaignIds) {
 
         public Going {
@@ -33,7 +36,7 @@ public interface SystemDeletionHandler {
     /** The name of the count this handler gives: {@code conversations} or {@code materials}. */
     String part();
 
-    /** How many of this module's items go with the system. */
+    /** How many of this module's items go with the system, or with the campaign. */
     long count(Going going);
 
     /** Cancels and hides what goes, in the caller's transaction; the latest claim lapse of what it cancelled, if any. */

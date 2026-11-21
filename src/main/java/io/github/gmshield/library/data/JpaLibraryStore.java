@@ -23,7 +23,9 @@ import org.springframework.stereotype.Repository;
  * <p>Story 3.1: a write that the key on {@code (owner_id, name_fingerprint)} refuses, or an update of a row whose
  * version moved, is a {@link LibraryConflict}, never the database's message; from Story 3.2 the campaign's key on
  * {@code (owner_id, system_id, name_fingerprint)} as well. Part B: every read takes ready systems, and
- * the campaigns of ready systems, only; the deletion's methods alone reach a deleting one.
+ * the campaigns of ready systems, only; the deletion's methods alone reach a deleting one. Story 3.2 part B: likewise
+ * every read takes ready campaigns only; a deleting campaign is reached by its deletion's methods, and by a system's
+ * deletion, which takes all the system's campaigns.
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
@@ -34,6 +36,8 @@ class JpaLibraryStore implements LibraryStore {
     private static final String READY = SystemEntity.READY;
     private static final String OF_READY_SYSTEM = " exists (select r.id from LibrarySystem r where r.id = c.systemId"
             + " and r.state = 'ready')";
+    /** Story 3.2 part B: only a ready campaign of a ready system is read; the deletion's methods alone reach the others. */
+    private static final String READY_CAMPAIGN = " c.state = 'ready' and" + OF_READY_SYSTEM;
     private static final String SYSTEMS = "select s from LibrarySystem s where s.state = 'ready' order by s.id desc";
     private static final String SYSTEMS_BEFORE = "select s from LibrarySystem s where s.state = 'ready' and s.id < :before"
             + " order by s.id desc";
@@ -42,25 +46,25 @@ class JpaLibraryStore implements LibraryStore {
     /** Story 3.2: a list page's cursor when there is none, above every id. */
     private static final UUID TOP = new UUID(-1L, -1L);
     private static final String CAMPAIGNS = "select c from LibraryCampaign c where c.archivedAt is null"
-            + " and c.id < :before and" + OF_READY_SYSTEM + " order by c.id desc";
+            + " and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
     private static final String ARCHIVED_CAMPAIGNS = "select c from LibraryCampaign c where c.archivedAt is not null"
-            + " and c.id < :before and" + OF_READY_SYSTEM + " order by c.id desc";
+            + " and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
     private static final String CAMPAIGNS_OF = "select c from LibraryCampaign c where c.systemId = :system"
-            + " and c.archivedAt is null and c.id < :before and" + OF_READY_SYSTEM + " order by c.id desc";
+            + " and c.archivedAt is null and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
     private static final String ARCHIVED_CAMPAIGNS_OF = "select c from LibraryCampaign c where c.systemId = :system"
-            + " and c.archivedAt is not null and c.id < :before and" + OF_READY_SYSTEM + " order by c.id desc";
+            + " and c.archivedAt is not null and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
     private static final String CAMPAIGN_IDS_OF = "select c.id from LibraryCampaign c where c.systemId = :system and"
-            + OF_READY_SYSTEM + " order by c.id desc";
-    private static final String CAMPAIGN_BY_ID = "select c from LibraryCampaign c where c.id = :id and" + OF_READY_SYSTEM;
+            + READY_CAMPAIGN + " order by c.id desc";
+    private static final String CAMPAIGN_BY_ID = "select c from LibraryCampaign c where c.id = :id and" + READY_CAMPAIGN;
     /** Story 3.2: the ready, not archived campaign chosen last, else the oldest. */
     private static final String CURRENT_CAMPAIGN = "select c from LibraryCampaign c where c.archivedAt is null and"
-            + OF_READY_SYSTEM + " order by c.chosenAt desc nulls last, c.createdAt, c.id";
+            + READY_CAMPAIGN + " order by c.chosenAt desc nulls last, c.createdAt, c.id";
     private static final String CAMPAIGN_NAME_TAKEN = "select c.id from LibraryCampaign c where c.systemId = :system"
             + " and c.nameFingerprint = :fingerprint and c.id <> :except";
     private static final String WITHOUT_FINGERPRINT = "select c from LibraryCampaign c where c.nameFingerprint is null"
-            + " and" + OF_READY_SYSTEM + " order by c.id";
+            + " and" + READY_CAMPAIGN + " order by c.id";
     private static final String WITHOUT_FINGERPRINT_OF = "select c from LibraryCampaign c where c.systemId = :system"
-            + " and c.nameFingerprint is null and" + OF_READY_SYSTEM + " order by c.id";
+            + " and c.nameFingerprint is null and" + READY_CAMPAIGN + " order by c.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -251,6 +255,40 @@ class JpaLibraryStore implements LibraryStore {
             em.flush();
         });
         return system.isPresent();
+    }
+
+    @Override
+    public boolean markCampaignDeleting(UUID id, Instant at) {
+        Optional<CampaignEntity> found = em().createQuery(CAMPAIGN_BY_ID, CampaignEntity.class).setParameter("id", id)
+                .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst();
+        found.ifPresent(entity -> {
+            entity.markDeleting(at);
+            em().flush();
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean campaignDeleting(UUID id) {
+        return deletingCampaign(id).isPresent();
+    }
+
+    @Override
+    public boolean deleteDeletingCampaign(UUID id) {
+        Optional<CampaignEntity> campaign = deletingCampaign(id);
+        campaign.ifPresent(entity -> {
+            EntityManager em = em();
+            em.remove(entity);
+            em.flush();
+        });
+        return campaign.isPresent();
+    }
+
+    private Optional<CampaignEntity> deletingCampaign(UUID id) {
+        return em().createQuery("select c from LibraryCampaign c where c.id = :id and c.state = :state",
+                        CampaignEntity.class)
+                .setParameter("id", id).setParameter("state", CampaignEntity.DELETING)
+                .getResultList().stream().findFirst();
     }
 
     private Optional<SystemEntity> deletingSystem(UUID id) {

@@ -46,6 +46,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  * transaction deletes the campaigns and the system and marks the deletion done. Every step is safe to repeat; a pass
  * that fails leaves the deletion for the next one. Two passes of one deletion never run at once in this backend.
  * Logs carry ids, counts and times only.
+ *
+ * <p>Story 3.2 part B: deleting one of the owner's campaigns is the same process with no system part, a
+ * {@code deletion} row of kind {@code campaign}. What goes: the campaign, its conversation and every material attached
+ * to it; nothing of its system or of the other campaigns. {@link #previewCampaign} and {@link #deleteCampaign} start
+ * it; each handler is given {@code Going(null, [campaign])}; the same sweep and one-shot passes run it, the row's kind
+ * picking what is collected and what {@code library} removes last (the campaign row). A system deleted while one of its
+ * campaigns is deleting takes that campaign too; the campaign's own deletion then finds it gone and is marked done.
  */
 @Service
 public class SystemDeletion {
@@ -79,6 +86,10 @@ public class SystemDeletion {
     public record Counts(long campaigns, long conversations, long materials) {
     }
 
+    /** What goes with a campaign, as the confirmation dialog names it (Story 3.2 part B). */
+    public record CampaignCounts(long conversations, long materials) {
+    }
+
     /** What goes with the owner's system {@code systemId}; empty for an unknown system, another owner's or a deleting one. */
     public Optional<Counts> preview(UUID systemId) {
         return reading(() -> store.findSystem(systemId).map(system -> {
@@ -91,6 +102,45 @@ public class SystemDeletion {
             return new Counts(going.campaignIds().size(), parts.getOrDefault(CONVERSATIONS, 0L),
                     parts.getOrDefault(MATERIALS, 0L));
         }));
+    }
+
+    /**
+     * What goes with the owner's campaign {@code campaignId} (Story 3.2 part B); empty for an unknown campaign, another
+     * owner's, a deleting one or one of a deleting system.
+     */
+    public Optional<CampaignCounts> previewCampaign(UUID campaignId) {
+        return reading(() -> store.findCampaign(campaignId).map(campaign -> {
+            SystemDeletionHandler.Going going = new SystemDeletionHandler.Going(null, List.of(campaign.id()));
+            Map<String, Long> parts = new HashMap<>();
+            for (SystemDeletionHandler handler : handlers()) {
+                parts.merge(handler.part(), handler.count(going), Long::sum);
+            }
+            return new CampaignCounts(parts.getOrDefault(CONVERSATIONS, 0L), parts.getOrDefault(MATERIALS, 0L));
+        }));
+    }
+
+    /**
+     * Starts the deletion of the owner's campaign {@code campaignId} (Story 3.2 part B), as the class says: archived,
+     * current or last, it goes; the current campaign then falls back by itself. False (nothing changes) for an unknown
+     * campaign, another owner's, one already deleting or one of a deleting system.
+     */
+    public boolean deleteCampaign(UUID campaignId) {
+        UUID owner = OwnerContext.require();
+        Instant now = now();
+        Optional<DeletionRow> started = writing(() -> {
+            if (!store.markCampaignDeleting(campaignId, now)) {
+                return Optional.<DeletionRow>empty();
+            }
+            DeletionRow row = new DeletionRow(Ids.newId(), owner, DeletionRow.CAMPAIGN, campaignId,
+                    prepare(goingOfCampaign(campaignId), now), now, null);
+            deletions.insert(row);
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                    .addKeyValue("deletionId", row.id()).addKeyValue("notBefore", row.notBefore())
+                    .log("library.campaign_deleting");
+            return Optional.of(row);
+        });
+        started.ifPresent(row -> later(row.ownerId(), row.id(), row.notBefore()));
+        return started.isPresent();
     }
 
     /**
@@ -163,13 +213,13 @@ public class SystemDeletion {
         DeletionRow row = pending.get();
         Prepared prepared = writing(() -> {
             Instant now = now();
-            if (!store.deleting(row.targetId())) {
-                // Nothing of the system is left (it goes with the record's end, in one transaction): end the record.
+            if (!targetDeleting(row)) {
+                // Nothing of the target is left (it goes with the record's end, in one transaction, or, for a
+                // campaign, with its system's deletion): end the record.
                 deletions.done(owner, row.id(), now);
                 return new Prepared(null, null, true);
             }
-            SystemDeletionHandler.Going going = new SystemDeletionHandler.Going(row.targetId(),
-                    store.campaignIdsOfDeleting(row.targetId()));
+            SystemDeletionHandler.Going going = goingOf(row);
             Instant notBefore = prepare(going, now);
             if (notBefore.isAfter(now)) {
                 deletions.postpone(owner, row.id(), notBefore);
@@ -189,6 +239,10 @@ public class SystemDeletion {
         for (SystemDeletionHandler handler : handlers()) {
             handler.remove(prepared.going());
         }
+        if (DeletionRow.CAMPAIGN.equals(row.kind())) {
+            endCampaign(owner, row);
+            return true;
+        }
         writing(() -> {
             if (!store.deleteDeleting(row.targetId())) {
                 throw new IllegalStateException("library.deleting_system_missing");
@@ -200,6 +254,38 @@ public class SystemDeletion {
                 .addKeyValue("deletionId", row.id()).addKeyValue("campaigns", prepared.going().campaignIds().size())
                 .log("library.system_deleted");
         return true;
+    }
+
+    /** Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. */
+    private boolean targetDeleting(DeletionRow row) {
+        return DeletionRow.CAMPAIGN.equals(row.kind()) ? store.campaignDeleting(row.targetId())
+                : store.deleting(row.targetId());
+    }
+
+    /** What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone. */
+    private SystemDeletionHandler.Going goingOf(DeletionRow row) {
+        return DeletionRow.CAMPAIGN.equals(row.kind()) ? goingOfCampaign(row.targetId())
+                : new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
+    }
+
+    /**
+     * The end of a campaign's deletion, once its handlers removed their parts: the campaign row goes and the record is
+     * done, in one transaction. A system's deletion that took the campaign meanwhile removed the row already; the record
+     * ends all the same.
+     */
+    private void endCampaign(UUID owner, DeletionRow row) {
+        writing(() -> {
+            store.deleteDeletingCampaign(row.targetId());
+            deletions.done(owner, row.id(), now());
+            return null;
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", row.targetId())
+                .addKeyValue("deletionId", row.id()).log("library.campaign_deleted");
+    }
+
+    /** What goes with a campaign: the campaign alone, with no system part. */
+    private static SystemDeletionHandler.Going goingOfCampaign(UUID campaignId) {
+        return new SystemDeletionHandler.Going(null, List.of(campaignId));
     }
 
     /** Each handler prepares, in the caller's transaction: the latest claim lapse of what they cancelled, or now. */

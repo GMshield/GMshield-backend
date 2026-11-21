@@ -188,6 +188,21 @@ class LibraryIntegrationTest {
         public boolean deleteDeleting(UUID id) {
             return real.deleteDeleting(id);
         }
+
+        @Override
+        public boolean markCampaignDeleting(UUID id, Instant at) {
+            return real.markCampaignDeleting(id, at);
+        }
+
+        @Override
+        public boolean campaignDeleting(UUID id) {
+            return real.campaignDeleting(id);
+        }
+
+        @Override
+        public boolean deleteDeletingCampaign(UUID id) {
+            return real.deleteDeletingCampaign(id);
+        }
     }
 
     @Value("${local.server.port}")
