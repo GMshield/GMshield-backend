@@ -89,6 +89,12 @@ class JpaIndexStore implements IndexStore {
     }
 
     @Override
+    public boolean hasRemoval(UUID versionId) {
+        return !em().createQuery("select r.jobId from IndexRemoval r where r.versionId = :version", UUID.class)
+                .setParameter("version", versionId).setMaxResults(1).getResultList().isEmpty();
+    }
+
+    @Override
     public void insertRemoval(IndexRemovalRow row) {
         EntityManager em = em();
         em.persist(new IndexRemovalEntity(row));

@@ -728,4 +728,63 @@ public class InMemoryMaterialStore implements MaterialStore {
         }
         return owner;
     }
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    @Override
+    public List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds) {
+        UUID owner = OwnerContext.require();
+        return materials.values().stream().filter(row -> row.ownerId().equals(owner) && row.campaignId() != null
+                && campaignIds.contains(row.campaignId())).sorted(Comparator.comparing(MaterialRow::id)).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsOnlyOfSystem(UUID systemId) {
+        return attachedTo(systemId).filter(row -> !attachedElsewhere(row.id(), systemId)).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId) {
+        return attachedTo(systemId).filter(row -> attachedElsewhere(row.id(), systemId)).toList();
+    }
+
+    private java.util.stream.Stream<MaterialRow> attachedTo(UUID systemId) {
+        UUID owner = OwnerContext.require();
+        return materials.values().stream().filter(row -> row.ownerId().equals(owner) && systems.values().stream()
+                        .anyMatch(link -> link.ownerId().equals(owner) && link.materialId().equals(row.id())
+                                && link.systemId().equals(systemId)))
+                .sorted(Comparator.comparing(MaterialRow::id));
+    }
+
+    private boolean attachedElsewhere(UUID materialId, UUID systemId) {
+        UUID owner = OwnerContext.require();
+        return systems.values().stream().anyMatch(link -> link.ownerId().equals(owner)
+                && link.materialId().equals(materialId) && !link.systemId().equals(systemId));
+    }
+
+    @Override
+    public synchronized boolean detachSystem(UUID materialId, UUID systemId) {
+        UUID owner = OwnerContext.require();
+        List<MaterialSystemRow> found = systems.values().stream().filter(link -> link.ownerId().equals(owner)
+                && link.materialId().equals(materialId) && link.systemId().equals(systemId)).toList();
+        for (MaterialSystemRow link : found) {
+            ownerFor(link.ownerId());
+            systems.remove(link.id());
+            RollbackUndo.onRollback(() -> systems.put(link.id(), link));
+        }
+        return !found.isEmpty();
+    }
+
+    @Override
+    public synchronized int deleteSteps(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        List<StepRow> found = steps.values().stream().filter(step -> step.ownerId().equals(owner)
+                && step.versionId().equals(versionId)).toList();
+        for (StepRow step : found) {
+            ownerFor(step.ownerId());
+            steps.remove(step.id());
+            RollbackUndo.onRollback(() -> steps.put(step.id(), step));
+        }
+        return found.size();
+    }
 }

@@ -136,4 +136,11 @@ public class InMemoryIndexStore implements IndexStore {
         }
         return owner;
     }
+
+    @Override
+    public boolean hasRemoval(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        return removals.values().stream().anyMatch(row -> row.ownerId().equals(owner)
+                && row.versionId().equals(versionId));
+    }
 }

@@ -25,7 +25,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * {@link OwnerContext}: when that transaction rolls back there is no job and no message. After the commit the job
  * is offered on its lane's stream (an interactive job at once; an ingestion job when the lane is free). If Redis
  * fails then, the job is still recorded and the sweep offers it. A job can be cancelled in its owner's transaction
- * (Story 1.16), and its row locked there (Story 2.6).
+ * (Story 1.16), and its row locked there (Story 2.6). Before a deletion cancels jobs, it reads when their claims lapse
+ * ({@link #claimLapse}, Story 3.1 part B).
  */
 @Service
 public class Jobs {
@@ -179,6 +180,32 @@ public class Jobs {
         }
         UUID owner = OwnerContext.require();
         return storage.joined().findForUpdate(jobId).filter(row -> row.ownerId().equals(owner)).map(JobRow::state);
+    }
+
+    /**
+     * Locks the bound owner's jobs among {@code jobIds} that have not ended (Story 3.1 part B), in the caller's
+     * transaction, and answers the latest time a live claim of one of them lapses; empty when none is running. The
+     * caller cancels them next ({@link #cancel}), which ends a claim at once, but a worker that still runs it may act
+     * until then (at most the claim lapse after its last renewal); the locks keep any claim from coming in between.
+     * Another owner's job, an unknown one or an ended one is left out.
+     */
+    public Optional<Instant> claimLapse(Collection<UUID> jobIds) {
+        Objects.requireNonNull(jobIds, "jobIds");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("jobs.transaction_required");
+        }
+        UUID owner = OwnerContext.require();
+        Instant latest = null;
+        // In one order, so two callers locking overlapping jobs never wait on each other.
+        for (UUID jobId : jobIds.stream().distinct().sorted().toList()) {
+            Optional<JobRow> found = storage.joined().findForUpdate(jobId)
+                    .filter(row -> row.ownerId().equals(owner) && JobState.RUNNING.equals(row.state()));
+            Instant lapses = found.map(JobRow::claimLapsesAt).orElse(null);
+            if (lapses != null && (latest == null || lapses.isAfter(latest))) {
+                latest = lapses;
+            }
+        }
+        return Optional.ofNullable(latest);
     }
 
     /**

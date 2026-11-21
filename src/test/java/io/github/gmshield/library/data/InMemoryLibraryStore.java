@@ -2,11 +2,14 @@ package io.github.gmshield.library.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.nio.ByteBuffer;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,6 +26,8 @@ public class InMemoryLibraryStore implements LibraryStore {
 
     public final Map<UUID, SystemRow> systems = new ConcurrentHashMap<>();
     public final Map<UUID, CampaignRow> campaigns = new ConcurrentHashMap<>();
+    /** The systems being deleted (Story 3.1 part B): like {@code state = 'deleting'}, every read but the deletion's skips them. */
+    public final Set<UUID> deleting = ConcurrentHashMap.newKeySet();
     /** Set it to make the next campaign insert fail, as a database failure would. */
     public final AtomicBoolean failNextCampaign = new AtomicBoolean();
 
@@ -69,7 +74,8 @@ public class InMemoryLibraryStore implements LibraryStore {
     public List<SystemRow> systems(UUID before, int limit) {
         UUID owner = OwnerContext.require();
         return systems.values().stream()
-                .filter(row -> row.ownerId().equals(owner) && (before == null || row.id().compareTo(before) < 0))
+                .filter(row -> row.ownerId().equals(owner) && !deleting.contains(row.id())
+                        && (before == null || row.id().compareTo(before) < 0))
                 .sorted(Comparator.comparing(SystemRow::id).reversed()).limit(Math.max(limit, 0)).toList();
     }
 
@@ -78,7 +84,7 @@ public class InMemoryLibraryStore implements LibraryStore {
         UUID owner = OwnerContext.require();
         return campaigns.values().stream()
                 .filter(row -> row.ownerId().equals(owner) && row.systemId().equals(systemId)
-                        && (before == null || row.id().compareTo(before) < 0))
+                        && !deleting.contains(systemId) && (before == null || row.id().compareTo(before) < 0))
                 .sorted(Comparator.comparing(CampaignRow::id).reversed()).limit(Math.max(limit, 0)).toList();
     }
 
@@ -109,20 +115,77 @@ public class InMemoryLibraryStore implements LibraryStore {
     @Override
     public Optional<SystemRow> findSystem(UUID id) {
         UUID owner = OwnerContext.require();
-        return Optional.ofNullable(systems.get(id)).filter(row -> row.ownerId().equals(owner));
+        return Optional.ofNullable(systems.get(id)).filter(row -> row.ownerId().equals(owner) && !deleting.contains(id));
     }
 
     @Override
     public Optional<CampaignRow> findCampaign(UUID id) {
         UUID owner = OwnerContext.require();
-        return Optional.ofNullable(campaigns.get(id)).filter(row -> row.ownerId().equals(owner));
+        return Optional.ofNullable(campaigns.get(id))
+                .filter(row -> row.ownerId().equals(owner) && !deleting.contains(row.systemId()));
     }
 
     @Override
     public Optional<CampaignRow> firstCampaign() {
         UUID owner = OwnerContext.require();
-        return campaigns.values().stream().filter(row -> row.ownerId().equals(owner))
+        return campaigns.values().stream().filter(row -> row.ownerId().equals(owner) && !deleting.contains(row.systemId()))
                 .min(Comparator.comparing(CampaignRow::createdAt).thenComparing(CampaignRow::id));
+    }
+
+    @Override
+    public synchronized boolean markDeleting(UUID id, Instant at) {
+        Optional<SystemRow> found = findSystem(id);
+        found.ifPresent(before -> {
+            ownerFor(before.ownerId());
+            ByteBuffer id16 = ByteBuffer.allocate(16).putLong(id.getMostSignificantBits())
+                    .putLong(id.getLeastSignificantBits());
+            systems.put(id, new SystemRow(id, before.ownerId(), before.name(), id16.array(), before.edition(),
+                    before.description(), before.version() + 1, before.createdAt()));
+            deleting.add(id);
+            RollbackUndo.onRollback(() -> {
+                deleting.remove(id);
+                systems.put(id, before);
+            });
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean deleting(UUID id) {
+        UUID owner = OwnerContext.require();
+        SystemRow row = systems.get(id);
+        return row != null && row.ownerId().equals(owner) && deleting.contains(id);
+    }
+
+    @Override
+    public List<UUID> campaignIdsOfDeleting(UUID systemId) {
+        if (!deleting(systemId)) {
+            return List.of();
+        }
+        return campaigns.values().stream().filter(row -> row.systemId().equals(systemId))
+                .sorted(Comparator.comparing(CampaignRow::id).reversed()).map(CampaignRow::id).toList();
+    }
+
+    @Override
+    public synchronized boolean deleteDeleting(UUID id) {
+        if (!deleting(id)) {
+            return false;
+        }
+        SystemRow system = systems.get(id);
+        ownerFor(system.ownerId());
+        for (CampaignRow campaign : List.copyOf(campaigns.values())) {
+            if (campaign.systemId().equals(id)) {
+                campaigns.remove(campaign.id());
+                RollbackUndo.onRollback(() -> campaigns.put(campaign.id(), campaign));
+            }
+        }
+        systems.remove(id);
+        deleting.remove(id);
+        RollbackUndo.onRollback(() -> {
+            systems.put(id, system);
+            deleting.add(id);
+        });
+        return true;
     }
 
     /** The current owner, who must be the row's; a write outside a transaction is refused, as JPA refuses it. */

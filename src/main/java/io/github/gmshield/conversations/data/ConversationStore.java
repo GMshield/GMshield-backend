@@ -1,6 +1,7 @@
 package io.github.gmshield.conversations.data;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -41,4 +42,21 @@ public interface ConversationStore {
 
     /** The turn's batches with an event after {@code sequence}, by first sequence. */
     List<EventBatchRow> batchesAfter(UUID turnId, long sequence);
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    /** The current owner's conversations of these campaigns, oldest first. */
+    List<ConversationRow> conversationsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** The current owner's turns of a conversation, oldest first. */
+    List<TurnRow> turnsOf(UUID conversationId);
+
+    /**
+     * Deletes the current owner's turn with its event batches (its references must be gone); false when there is no
+     * such turn.
+     */
+    boolean deleteTurn(UUID turnId);
+
+    /** Deletes the current owner's conversation, which must have no turn left; false when there is none. */
+    boolean deleteConversation(UUID id);
 }

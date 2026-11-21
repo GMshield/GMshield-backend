@@ -195,7 +195,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
     malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
   - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
-    (deleting one is part B). A system is `{id, name, edition, description, version}`; `edition` and `description`
+    (deleting one is part B, below). A system is `{id, name, edition, description, version}`; `edition` and `description`
     are null when none was given.
     - Fields, counted in code points after trimming: name 1 to 120 (`request.system_name_invalid`, 400, params `min`
       and `max`), edition at most 60 (`request.system_edition_invalid`, params `max`), description at most 2,000
@@ -230,6 +230,45 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       edition; only a new account's starter system is created there.)
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.17.0). The worker does
       not change.
+  - **Delete a system (Story 3.1 part B, public contract 1.18.0, migration V22, AD-22).** A recorded process that
+    resumes after a restart (`library.service.SystemDeletion`). What goes: the system, its campaigns, their
+    conversations, and every material attached to one of its campaigns or to this system and no other. A material also
+    attached to another system stays and only loses this attachment. Deleting the system that holds the GM's only
+    campaign is allowed: there is then no current campaign (`GET /api/v1/campaigns/current` is 404). No undo.
+    - `GET /api/v1/systems/{id}/deletion` answers `{campaigns, conversations, materials}`, what the confirmation
+      dialog names; each module counts its own part (materials: those that go whose newest version is not discarded).
+    - `DELETE /api/v1/systems/{id}` answers 202 with no body. In one transaction: `system.state` becomes `deleting`
+      (and `name_fingerprint` becomes the system's id, so the name and edition are free at once); each module's
+      `SystemDeletionHandler.prepare` cancels the jobs of what goes (ingestion steps and index changes of its
+      materials' versions, the `question.answer` jobs of its campaigns' turns), after locking them and reading when
+      their claims lapse (`Jobs.claimLapse`), and every version of a material that goes becomes `discarded`, so it
+      leaves every list and scope at once; a `deletion` row records owner, kind `system`, target and `not_before`
+      (the latest claim lapse, or now).
+    - From that commit the system and its campaigns are `request.not_found` everywhere: the system list, GET, PATCH,
+      DELETE and `/deletion`, `?system=`, `GET /api/v1/campaigns/{id}`, the current campaign and every question and
+      conversation read that goes through it. Another owner's system is the same 404 on both routes.
+    - Removal runs at `not_before` (an index change already running may write points until its claim lapses, at most
+      `GMSHIELD_JOB_CLAIM_LAPSE` after its last renewal): a one-shot pass scheduled after the commit, and
+      `SystemDeletion.sweep` at the start and every `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` (10 min) for whatever is
+      due, each pass as the owner (`OwnerContext.callAs`). A pass collects what goes again and prepares it again (an
+      upload that completed during the wait, a question asked as the system went); when that cancels a running job,
+      `not_before` moves and the pass stops. Then `materials` starts one `index.removal` per version unless it has one
+      (the version locked, so never two), runs the discard's `VersionRemoval`, removes the pieces of its files and
+      uploads, then every row of the version (page views, passages, outline, page ranges, `version_file`, `upload`,
+      `ingestion_step`, `index_change`) and the version, then the material with its `material_system` rows; and
+      detaches the materials that stay. `conversations` deletes each conversation's turns with their references and
+      event batches, then the conversation (`model_call_usage` stays: it names jobs only). Last, one transaction
+      deletes the campaigns and the system and sets `deletion.done_at`. Every step is safe to repeat; a pass that
+      fails (logged `library.deletion_deferred` with its error type) leaves the row for the next one.
+    - `deletion` is not a library table (AD-7): ids and times only, read and written with `JdbcClient` (joined to the
+      owner's transaction), without `@TenantId`; the sweep's list alone reads across owners. The handler interface
+      lives in `library.service`, so `library` still depends on `shared` and `vault` only.
+    - `V22__system_deletion.sql` adds `system.state text not null default 'ready'` (check `ready|deleting`) and the
+      `deletion` table. Additive: the previous release neither reads nor writes them. Rolling back while a deletion
+      is pending shows the system again, with whatever its removal has not removed yet, under its id as fingerprint
+      (its name can then be taken twice).
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.18.0). The worker does
+      not change: `index.removal` per version already exists.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
     start without a database and use in-memory stores (`@Primary`).
@@ -818,6 +857,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
 | `GMSHIELD_INDEX_RETRY_EVERY` | how often the index changes whose job failed get a new job, each run at most 3 times (default `10m`) |
+| `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` | how often the deletions of systems that are due are run again, the first right after the start (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |

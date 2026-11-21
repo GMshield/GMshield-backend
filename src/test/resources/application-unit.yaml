@@ -37,3 +37,7 @@ gmshield:
       enabled: false
     index-retry-sweep:
       enabled: false
+  # Nor does the system deletion sweep, nor its one-shot passes (Story 3.1 part B): the tests run them.
+  library:
+    deletion-sweep:
+      enabled: false

@@ -44,8 +44,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  * earlier one is {@code request.stale_version} (409) and changes nothing. A system's campaigns are listed newest
  * first. Logs carry ids, counts and a system's version only.
  *
- * <p>Still to come in Epic 3: deleting a system (Story 3.1 part B), creating, renaming and switching campaigns (Story
- * 3.2). Until then the current campaign is the owner's oldest.
+ * <p>Story 3.1 part B: a system being deleted ({@link SystemDeletion}) and its campaigns are "not found" to every read
+ * and write here, from the commit of the GM's delete: the system list, {@link #system}, {@link #changeSystem},
+ * {@link #campaignsOf}, {@link #campaignIdsOf}, {@link #campaign} and {@link #currentCampaign}. When the deleted system
+ * held the owner's only campaign, there is no current campaign.
+ *
+ * <p>Still to come in Epic 3: creating, renaming and switching campaigns (Story 3.2). Until then the current campaign
+ * is the owner's oldest of a ready system.
  */
 @Service
 public class Library {
@@ -146,7 +151,7 @@ public class Library {
                 .log("library.starter_created");
     }
 
-    /** The owner's current campaign with its system: in this release, the owner's oldest campaign. */
+    /** The owner's current campaign with its system: in this release, the owner's oldest campaign of a ready system. */
     public Optional<Campaign> currentCampaign() {
         return reading(() -> store.firstCampaign().map(this::open));
     }

@@ -169,6 +169,12 @@ public class InMemoryUploadStorage implements UploadStorage {
         // --- image sets (Story 1.21)
 
         @Override
+        public List<UploadRow> allOfVersion(UUID owner, UUID versionId) {
+            return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId))
+                    .sorted(IN_ORDER).toList();
+        }
+
+        @Override
         public List<UploadRow> ofVersion(UUID owner, UUID versionId) {
             return rows.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId)
                     && !row.state().equals(UploadRow.REMOVING)).sorted(IN_ORDER).toList();

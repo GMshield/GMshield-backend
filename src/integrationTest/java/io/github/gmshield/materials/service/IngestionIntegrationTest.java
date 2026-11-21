@@ -67,6 +67,7 @@ import tools.jackson.databind.json.JsonMapper;
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
     "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.library.deletion-sweep.enabled=false",
     "gmshield.materials.index-retry-sweep.enabled=false",
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
 @ActiveProfiles("test-mode")

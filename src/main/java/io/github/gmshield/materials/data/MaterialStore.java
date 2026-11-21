@@ -259,4 +259,21 @@ public interface MaterialStore {
      * false when there is none.
      */
     boolean deleteMaterial(UUID id);
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    /** The current owner's materials whose campaign is one of {@code campaignIds}, by id. */
+    List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** The current owner's materials attached to the system {@code systemId} and to no other system, by id. */
+    List<MaterialRow> materialsOnlyOfSystem(UUID systemId);
+
+    /** The current owner's materials attached to the system {@code systemId} and to another system as well, by id. */
+    List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId);
+
+    /** The current owner's material is no longer attached to the system {@code systemId}; false when it was not. */
+    boolean detachSystem(UUID materialId, UUID systemId);
+
+    /** Deletes every step of the current owner's version, ended or not; answers how many went. */
+    int deleteSteps(UUID versionId);
 }

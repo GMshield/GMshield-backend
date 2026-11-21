@@ -2,8 +2,10 @@ package io.github.gmshield.library.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.LockModeType;
 import jakarta.persistence.OptimisticLockException;
 import jakarta.persistence.TypedQuery;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,19 +21,30 @@ import org.springframework.stereotype.Repository;
  * use, so the unit tests, which start without a database, can still create the application.
  *
  * <p>Story 3.1: a write that the key on {@code (owner_id, name_fingerprint)} refuses, or an update of a row whose
- * version moved, is a {@link LibraryConflict}, never the database's message.
+ * version moved, is a {@link LibraryConflict}, never the database's message. Part B: every read takes ready systems, and
+ * the campaigns of ready systems, only; the deletion's methods alone reach a deleting one.
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
 
     /** The unique key on a system's name fingerprint within its owner (V4). */
     static final String NAME_KEY = "system_owner_name_fingerprint_key";
-    private static final String SYSTEMS = "select s from LibrarySystem s order by s.id desc";
-    private static final String SYSTEMS_BEFORE = "select s from LibrarySystem s where s.id < :before order by s.id desc";
-    private static final String CAMPAIGNS_OF = "select c from LibraryCampaign c where c.systemId = :system"
-            + " order by c.id desc";
+    /** Story 3.1 part B: only a ready system, and only the campaigns of one, are read. */
+    private static final String READY = SystemEntity.READY;
+    private static final String OF_READY_SYSTEM = " exists (select r.id from LibrarySystem r where r.id = c.systemId"
+            + " and r.state = 'ready')";
+    private static final String SYSTEMS = "select s from LibrarySystem s where s.state = 'ready' order by s.id desc";
+    private static final String SYSTEMS_BEFORE = "select s from LibrarySystem s where s.state = 'ready' and s.id < :before"
+            + " order by s.id desc";
+    private static final String CAMPAIGNS_OF = "select c from LibraryCampaign c where c.systemId = :system and"
+            + OF_READY_SYSTEM + " order by c.id desc";
     private static final String CAMPAIGNS_OF_BEFORE = "select c from LibraryCampaign c where c.systemId = :system"
-            + " and c.id < :before order by c.id desc";
+            + " and c.id < :before and" + OF_READY_SYSTEM + " order by c.id desc";
+    private static final String CAMPAIGN_IDS_OF = "select c.id from LibraryCampaign c where c.systemId = :system and"
+            + OF_READY_SYSTEM + " order by c.id desc";
+    private static final String CAMPAIGN_BY_ID = "select c from LibraryCampaign c where c.id = :id and" + OF_READY_SYSTEM;
+    private static final String FIRST_CAMPAIGN = "select c from LibraryCampaign c where" + OF_READY_SYSTEM
+            + " order by c.createdAt, c.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -98,8 +111,7 @@ class JpaLibraryStore implements LibraryStore {
 
     @Override
     public List<UUID> campaignIdsOf(UUID systemId) {
-        return em().createQuery("select c.id from LibraryCampaign c where c.systemId = :system order by c.id desc",
-                UUID.class).setParameter("system", systemId).getResultList();
+        return em().createQuery(CAMPAIGN_IDS_OF, UUID.class).setParameter("system", systemId).getResultList();
     }
 
     @Override
@@ -116,21 +128,68 @@ class JpaLibraryStore implements LibraryStore {
 
     @Override
     public Optional<CampaignRow> findCampaign(UUID id) {
-        return em().createQuery("select c from LibraryCampaign c where c.id = :id", CampaignEntity.class)
+        return em().createQuery(CAMPAIGN_BY_ID, CampaignEntity.class)
                 .setParameter("id", id)
                 .getResultList().stream().findFirst().map(CampaignEntity::row);
     }
 
     @Override
     public Optional<CampaignRow> firstCampaign() {
-        return em().createQuery("select c from LibraryCampaign c order by c.createdAt, c.id", CampaignEntity.class)
+        return em().createQuery(FIRST_CAMPAIGN, CampaignEntity.class)
                 .setMaxResults(1)
                 .getResultList().stream().findFirst().map(CampaignEntity::row);
     }
 
+    @Override
+    public boolean markDeleting(UUID id, Instant at) {
+        Optional<SystemEntity> found = em().createQuery("select s from LibrarySystem s where s.id = :id"
+                        + " and s.state = :state", SystemEntity.class)
+                .setParameter("id", id).setParameter("state", READY).setLockMode(LockModeType.PESSIMISTIC_WRITE)
+                .getResultList().stream().findFirst();
+        found.ifPresent(entity -> {
+            entity.markDeleting(at);
+            em().flush();
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean deleting(UUID id) {
+        return deletingSystem(id).isPresent();
+    }
+
+    @Override
+    public List<UUID> campaignIdsOfDeleting(UUID systemId) {
+        if (deletingSystem(systemId).isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select c.id from LibraryCampaign c where c.systemId = :system order by c.id desc",
+                UUID.class).setParameter("system", systemId).getResultList();
+    }
+
+    @Override
+    public boolean deleteDeleting(UUID id) {
+        Optional<SystemEntity> system = deletingSystem(id);
+        system.ifPresent(entity -> {
+            EntityManager em = em();
+            em.createQuery("select c from LibraryCampaign c where c.systemId = :system", CampaignEntity.class)
+                    .setParameter("system", id).getResultList().forEach(em::remove);
+            em.flush();
+            em.remove(entity);
+            em.flush();
+        });
+        return system.isPresent();
+    }
+
+    private Optional<SystemEntity> deletingSystem(UUID id) {
+        return em().createQuery("select s from LibrarySystem s where s.id = :id and s.state = :state", SystemEntity.class)
+                .setParameter("id", id).setParameter("state", SystemEntity.DELETING)
+                .getResultList().stream().findFirst();
+    }
+
     private Optional<SystemEntity> system(UUID id) {
-        return em().createQuery("select s from LibrarySystem s where s.id = :id", SystemEntity.class)
-                .setParameter("id", id)
+        return em().createQuery("select s from LibrarySystem s where s.id = :id and s.state = :state", SystemEntity.class)
+                .setParameter("id", id).setParameter("state", READY)
                 .getResultList().stream().findFirst();
     }
 

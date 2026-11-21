@@ -88,6 +88,10 @@ gmshield:
     upload-sweep-every: ${GMSHIELD_UPLOAD_SWEEP_EVERY:10m}
     version-removal-sweep-every: ${GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY:10m}
     index-retry-every: ${GMSHIELD_INDEX_RETRY_EVERY:10m}
+  # Library (library module, Story 3.1 part B), a Spring duration: how often the deletions of systems that are due are
+  # run again (a restart, a failure, or a one-shot pass that did not run); the first time right after the start.
+  library:
+    deletion-sweep-every: ${GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY:10m}
   # Ingestion (materials module, Story 1.15): a version may have at most steps-per-page x its pages + 1 steps; a report
   # whose next steps would pass that fails the version with ingestion.too_many_steps. IngestionSettings refuses a
   # start unless 1 <= steps-per-page <= 100.
