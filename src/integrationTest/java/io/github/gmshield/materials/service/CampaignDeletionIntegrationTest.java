@@ -38,8 +38,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * event batches and references, its materials with their uploads, steps, files and passages), one
  * {@code index.removal} per version and never a second, its system, the system's materials and the sibling campaign
  * untouched, the name free at once and the current campaign fallen back, a pass resumed after another stopped between
- * two handlers, the removal waiting for a running claim and taking an upload that completed during the wait, and a
- * system deleted while one of its campaigns is deleting (both end done).
+ * two handlers, the removal waiting for a running claim and taking an upload that completed during the wait, an
+ * archived campaign leaving the archived list at once and the last campaign leaving no current one, and a system
+ * deleted while one of its campaigns is deleting (both end done).
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL.
@@ -256,6 +257,38 @@ class CampaignDeletionIntegrationTest {
         assertThat(files.fileExists(b.id(), lateUpload)).isFalse();
         assertThat(jdbc.sql("select done_at from deletion where id = ?").param(deletionId).query().singleRow()
                 .get("done_at")).isNotNull();
+    }
+
+    @Test
+    void anArchivedCampaignLeavesTheArchivedListAtOnceAndTheLastCampaignLeavesNoCurrentOneOnPostgres() throws Exception {
+        Owner d = owner();
+        UUID archived = campaign(d.id(), d.system(), "Mesa antiga");
+        assertThat(as(d.id(), () -> library.changeCampaign(archived, 0, null, true)).orElseThrow().archived()).isTrue();
+        assertThat(as(d.id(), () -> library.campaigns(null, true, null, 50)).orElseThrow().items())
+                .extracting(Library.Campaign::id).containsExactly(archived);
+        assertThat(as(d.id(), () -> library.campaigns(d.system(), true, null, 50)).orElseThrow().items())
+                .extracting(Library.Campaign::id).containsExactly(archived);
+
+        assertThat(as(d.id(), () -> deletion.deleteCampaign(archived))).isTrue();
+
+        assertThat(as(d.id(), () -> library.campaigns(null, true, null, 50)).orElseThrow().items()).isEmpty();
+        assertThat(as(d.id(), () -> library.campaigns(d.system(), true, null, 50)).orElseThrow().items()).isEmpty();
+        assertThat(as(d.id(), () -> library.campaign(archived))).isEmpty();
+        assertThat(as(d.id(), () -> library.currentCampaign()).orElseThrow().id()).isEqualTo(d.campaign());
+
+        // The current campaign, and the owner's last.
+        assertThat(as(d.id(), () -> deletion.deleteCampaign(d.campaign()))).isTrue();
+
+        assertThat(as(d.id(), () -> library.currentCampaign())).isEmpty();
+        assertThat(as(d.id(), () -> library.campaigns(null, false, null, 50)).orElseThrow().items()).isEmpty();
+        assertThat(as(d.id(), () -> library.system(d.system()))).isPresent();
+        for (UUID target : List.of(archived, d.campaign())) {
+            UUID id = jdbc.sql("select id from deletion where target_id = ?").param(target).query(UUID.class).single();
+            assertThat(deletion.run(d.id(), id)).isTrue();
+            assertThat(count("campaign", "id = ?", target)).isZero();
+        }
+        assertThat(count("system", "id = ?", d.system())).isOne();
+        assertThat(as(d.id(), () -> library.currentCampaign())).isEmpty();
     }
 
     @Test

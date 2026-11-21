@@ -27,7 +27,6 @@ import java.util.UUID;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.spi.LoggingEventBuilder;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -137,7 +136,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
                 }
             }
         }
-        about(log.atInfo(), going).addKeyValue("discarded", discarded).addKeyValue("cancelled", cancelled)
+        going.about(log.atInfo()).addKeyValue("discarded", discarded).addKeyValue("cancelled", cancelled)
                 .log("material.system_deletion_prepared");
         return Optional.ofNullable(latest);
     }
@@ -166,7 +165,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
                 detached += Boolean.TRUE.equals(writing(() -> materials.detachSystem(shared.id(), systemId))) ? 1 : 0;
             }
         }
-        about(log.atInfo().addKeyValue("ownerId", owner), going).addKeyValue("materials", removed)
+        going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("materials", removed)
                 .addKeyValue("detached", detached).addKeyValue("left", left).log("material.system_deletion_removed");
         if (left > 0) {
             throw new IllegalStateException("material.version_not_discarded");
@@ -245,11 +244,6 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         return List.copyOf(found.values());
     }
 
-    /** A log line's subject: the system when one goes, and how many campaigns. */
-    private static LoggingEventBuilder about(LoggingEventBuilder event, Going going) {
-        LoggingEventBuilder subject = going.systemId() == null ? event : event.addKeyValue("systemId", going.systemId());
-        return subject.addKeyValue("campaigns", going.campaignIds().size());
-    }
 
     private Instant now() {
         return clock.getIfAvailable(Clock::systemUTC).instant().truncatedTo(ChronoUnit.MICROS);

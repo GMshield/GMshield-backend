@@ -15,7 +15,6 @@ import java.util.UUID;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.spi.LoggingEventBuilder;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -74,7 +73,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
         for (UUID jobId : jobs.unended(jobIds)) {
             cancelled += jobs.cancel(jobId) ? 1 : 0;
         }
-        about(log.atInfo(), going).addKeyValue("cancelled", cancelled).log("conversation.system_deletion_prepared");
+        going.about(log.atInfo()).addKeyValue("cancelled", cancelled).log("conversation.system_deletion_prepared");
         return lapse;
     }
 
@@ -94,15 +93,10 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
                 return found.size();
             });
         }
-        about(log.atInfo().addKeyValue("ownerId", owner), going).addKeyValue("conversations", conversations.size())
+        going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("conversations", conversations.size())
                 .addKeyValue("turns", turns).log("conversation.system_deletion_removed");
     }
 
-    /** A log line's subject: the system when one goes, and how many campaigns. */
-    private static LoggingEventBuilder about(LoggingEventBuilder event, Going going) {
-        LoggingEventBuilder subject = going.systemId() == null ? event : event.addKeyValue("systemId", going.systemId());
-        return subject.addKeyValue("campaigns", going.campaignIds().size());
-    }
 
     private <T> T reading(Supplier<T> read) {
         TransactionTemplate template = new TransactionTemplate(transactions.getObject());

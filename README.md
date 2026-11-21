@@ -355,7 +355,13 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       removed yet, under its id as fingerprint; that release's sweep finds no system with the row's target and marks
       the row done, so after rolling forward again the campaign stays hidden (`deleting`, no pending row) with its
       remaining data. To finish it, reopen its row: `update deletion set done_at = null where kind = 'campaign' and
-      target_id = '<id>'`; to keep it instead: `update campaign set state = 'ready' where id = '<id>'`.
+      target_id = '<id>'`. To keep it instead, in one transaction: `delete from deletion where kind = 'campaign' and
+      target_id = '<id>'` (else a later delete of it is refused by `deletion_owner_target_key`), `update campaign set
+      state = 'ready', name_fingerprint = null where id = '<id>'` (its fingerprint is still its own id, which protects
+      no name), and `insert into campaign_fingerprint_backfill (owner_id) select owner_id from campaign where id =
+      '<id>' on conflict do nothing`; the next start fills its fingerprint. If another campaign of its system took its
+      name meanwhile, rename that one in the app first: otherwise the fill leaves this campaign without a fingerprint
+      (`library.campaign_fingerprint_duplicate`) and two campaigns share the name.
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.20.0). The worker does
       not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's

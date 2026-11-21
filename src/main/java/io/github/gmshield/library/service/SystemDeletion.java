@@ -271,16 +271,16 @@ public class SystemDeletion {
     /**
      * The end of a campaign's deletion, once its handlers removed their parts: the campaign row goes and the record is
      * done, in one transaction. A system's deletion that took the campaign meanwhile removed the row already; the record
-     * ends all the same.
+     * ends all the same, logged {@code removed=false}.
      */
     private void endCampaign(UUID owner, DeletionRow row) {
-        writing(() -> {
-            store.deleteDeletingCampaign(row.targetId());
+        boolean removed = Boolean.TRUE.equals(writing(() -> {
+            boolean deleted = store.deleteDeletingCampaign(row.targetId());
             deletions.done(owner, row.id(), now());
-            return null;
-        });
+            return deleted;
+        }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", row.targetId())
-                .addKeyValue("deletionId", row.id()).log("library.campaign_deleted");
+                .addKeyValue("deletionId", row.id()).addKeyValue("removed", removed).log("library.campaign_deleted");
     }
 
     /** What goes with a campaign: the campaign alone, with no system part. */

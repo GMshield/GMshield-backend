@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import org.slf4j.spi.LoggingEventBuilder;
 
 /**
  * What a module does when one of the owner's systems is deleted (Story 3.1 part B, AD-22). {@link SystemDeletion}
@@ -30,6 +31,20 @@ public interface SystemDeletionHandler {
 
         public Going {
             campaignIds = List.copyOf(campaignIds);
+        }
+
+        /**
+         * A handler's log line about what goes, so it matches the deletion's own lines: {@code systemId} when a system
+         * goes, else {@code campaignId} for a single campaign; then how many campaigns. Ids and counts only.
+         */
+        public LoggingEventBuilder about(LoggingEventBuilder event) {
+            LoggingEventBuilder subject = event;
+            if (systemId != null) {
+                subject = subject.addKeyValue("systemId", systemId);
+            } else if (campaignIds.size() == 1) {
+                subject = subject.addKeyValue("campaignId", campaignIds.get(0));
+            }
+            return subject.addKeyValue("campaigns", campaignIds.size());
         }
     }
 
