@@ -405,24 +405,62 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
 - **The guided upload's details and the materials list (`materials`, Story 1.14).** `Upload-Metadata` at creation
   may also carry `kind` (`rulebook`, `supplement`, `homebrew`, `campaign_notes`, `other`), `language` (`pt-BR`,
   `en`, or `detect`, stored as null for a later read stage), and `campaign` or `system` (the id of one of the
-  owner's, checked through `library.service.Library`). All are optional (an older frontend sends none). A bad
-  value, an unknown or another owner's id, or both `campaign` and `system` answer `upload.metadata_invalid` (400),
-  which never says which, and nothing is stored. Other keys are still ignored.
+  owner's, checked through `library.service.Library`); from Story 3.3 `systems` (below) names several systems. All
+  are optional (an older frontend sends none). A bad value, an unknown or another owner's id, or both `campaign` and
+  `system` answer `upload.metadata_invalid` (400), which never says which, and nothing is stored. Other keys are
+  still ignored.
   - `V7__material_details.sql`: `material.kind` and `material.language` (nullable, each with a CHECK of every
     value) and `material.campaign_id` (nullable, FK `(owner_id, campaign_id)` to `campaign`); the library table
     `material_system (id, owner_id, material_id, system_id)`, unique per `(owner_id, material_id, system_id)`, with
     owner-scoped FKs to `material` (on delete cascade, so a previous release that removes a refused upload's
-    material is not stopped) and `system`. One row per material in this release; several systems come with
-    Epic 3. Everything is written in creation's transaction; a refused format removes the row with the material.
+    material is not stopped) and `system`. One row per system the material belongs to (several from Story 3.3).
+    Everything is written in creation's transaction; a refused format removes the row with the material.
   - `GET /api/v1/materials?state=…&limit=&cursor=`: the owner's materials whose newest version (latest
     `created_at`, then greatest id) is in one of the given states, newest material first (descending id),
     `{items, nextCursor}`. `state` is repeatable and required, `limit` 1 to 50 (default 20), `cursor` the previous
-    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`).
+    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`). From Story 3.3
+    `state` is optional: without it, every material.
   - `GET /api/v1/materials/{id}`: one material. Another owner's id, an unknown id and a malformed id all answer
     `request.not_found` (404).
   - Each item is `{id, name, state, kind?, upload?}`; `upload` (`{id, offset, length, expiresAt}`, from the open
     `upload` row by its `(owner_id, version_id)` index) is there only while the newest version is `uploading`.
     Every answer is `no-store`. Nothing logs a name, a kind or where a material belongs.
+- **Where a material belongs (`materials`, Story 3.3, public contract 1.21.0, migration V25).** A material belongs
+  to exactly one of these: one campaign (`material.campaign_id`), or one to 100 systems (`material_system` rows). The
+  database cannot check that rule across two tables, so its one writer does: `Uploads.place` (the upload's check) and
+  `MaterialBelongings` (the change), both refusing a campaign with systems, more than 100 systems, or a target that is
+  not one of the owner's ready campaigns (archived ones included) and systems. A material uploaded with no place
+  (`none`) can be given one; no request takes a material back to no place.
+  - Uploads: tus metadata key `systems` (one to 100 ids, comma-separated inside the Base64 value) and
+    `ImageSetRequest.systems` (an array of one to 100; an empty one is refused). At most 100 ids as sent; a repeated
+    id is stored once. The single `system` key still names one; `system` with `systems`, or `campaign` with either, is
+    `upload.metadata_invalid`.
+  - `PATCH /api/v1/materials/{id}` `{version, belonging: {campaign} | {systems: [..]}}` answers 200 with the material,
+    its version raised by one. `material.version` (V25, `bigint not null default 0`, Hibernate `@Version`) is named by
+    the change; a stale one is `request.stale_version` (409). Both fields, neither, an empty list or one of more than
+    100 ids as sent (a repeated id is stored once), or an unknown, malformed, another owner's or deleting target is
+    `material.belonging_invalid` (400), which never says which; no version or a malformed body is `request.invalid`
+    (400); another owner's material, an unknown or malformed id, and a material whose every place is being deleted are
+    `request.not_found` (404). The material is locked (`select ... for update`) before its version is compared, so
+    two changes take turns and the second is stale. Systems change by difference: rows that stay are kept, the others
+    are deleted, new ones inserted (never a delete and insert of one key). The row's `updated_at` always moves, so the
+    version rises even when only its systems changed.
+  - A change writes only `material.campaign_id`, `material_system` rows and `material.version`: never a version, a
+    job, a passage or a Qdrant point. Every scope read resolves again (`AnswerJobs` resolves on each passages fetch),
+    so the change applies from the next question, and a question running while its material moves out gets
+    `scope.passage_refused` at its next fetch (`ConversationFlowTest`). References stored with a turn still open.
+  - The material view gains `version`, `size` (the newest version's bytes, absent until known) and `belonging:
+    {campaign: {id, name, system: {id, name}} | null, systems: [{id, name}]}`: only ready places, names decrypted.
+    The places of a page come from one read of its `material_system` rows and one `Library.places` call (one read
+    of the campaigns and one of the systems), never one read per row. A list leaves out a material that belongs
+    somewhere but whose every place is being deleted (a page may then hold fewer than the limit); `GET` by id still
+    answers it with an empty belonging.
+  - `V25__material_belonging.sql` adds `material.version`. Additive: the previous release neither reads nor writes
+    it (its inserts take the default). After a rollback, materials keep the place they were given last; a material
+    with several systems shows (and is resolved) in each of them, as the previous release's queries read every
+    `material_system` row.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.21.0). The worker does
+    not change.
 - **Cleaning an upload and splitting it into pages (`materials` and `jobs`, Story 1.15, AD-17).** Completing a PDF
   upload creates, in the same transaction, the version's first ingestion step: a job of kind `ingestion` (ingestion
   lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Text got its stage with Story 1.16
@@ -686,7 +724,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     campaign's system (one already in the campaign tier is left out); a tier switched off has none. A source is a
     version id, the `source` of the Qdrant payload. `pending` is the ids of the in-scope passages whose ordinal falls
     in the run of an `index.change` job that has not ended, kept by tier (`pending(tier)`). A campaign not found
-    (unknown, or another owner's) is 404 `request.not_found`.
+    (unknown, or another owner's) is 404 `request.not_found`. Where a material belongs is read afresh on every
+    resolve (Story 3.3): a material moved to another campaign or system leaves this scope at the next resolve, and a
+    material of several systems is in the system tier of each one's campaigns.
   - `Scopes.passages(scope, ids)` checks every id first: any id that is not a passage of an allowed source still
     `ready` (unknown, another owner's, a version no longer `ready`, out of every tier) refuses the whole request with
     403 `scope.passage_refused`, which names no id, before anything is decrypted. Otherwise it answers

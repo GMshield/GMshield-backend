@@ -165,6 +165,16 @@ class LibraryIntegrationTest {
         }
 
         @Override
+        public List<SystemRow> findSystems(java.util.Collection<UUID> ids) {
+            return real.findSystems(ids);
+        }
+
+        @Override
+        public List<CampaignRow> findCampaigns(java.util.Collection<UUID> ids) {
+            return real.findCampaigns(ids);
+        }
+
+        @Override
         public Optional<CampaignRow> currentCampaign() {
             return real.currentCampaign();
         }

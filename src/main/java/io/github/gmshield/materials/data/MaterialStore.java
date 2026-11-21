@@ -24,6 +24,23 @@ public interface MaterialStore {
     List<MaterialSystemRow> systemsOf(UUID materialId);
 
     /**
+     * The current owner's game systems of all these materials, in one read (Story 3.3: the places of a page of
+     * materials), by material and oldest first; another owner's material has none.
+     */
+    List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds);
+
+    /**
+     * Where the current owner's material {@code id} belongs changes (Story 3.3), with the material locked first: to the
+     * campaign {@code campaignId} and no system when it is not null, else to the systems of {@code systems} (rows of
+     * this material and owner, at least one) and no campaign. An attachment to a system not among them goes, one already
+     * there stays as it is, and the others are added; the material's version rises by one. Answers the material as
+     * stored; empty for an unknown id or another owner's. Throws {@link StaleMaterialVersion} when the material is not at
+     * {@code version}, and nothing is written. Never touches a version, a passage or the index.
+     */
+    Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId, List<MaterialSystemRow> systems,
+                                          Instant now);
+
+    /**
      * The current owner's materials whose newest version (the latest created, then the greatest id) is in one of
      * {@code states}, each with that version: newest material first (descending id, a UUID v7), only those whose id is
      * below {@code before} when it is given, at most {@code limit}.

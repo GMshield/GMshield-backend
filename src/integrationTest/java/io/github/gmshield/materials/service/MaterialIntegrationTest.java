@@ -31,7 +31,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * Story 1.14 against a real PostgreSQL (test mode: postgres:5432): V7's columns and their checks, a material's
  * campaign and its game system within the owner, the newest-version query behind the tray and its cursor, and the
- * cross-owner test of {@code material_system}.
+ * cross-owner test of {@code material_system}. Story 3.3: a move and a several-systems attach round-trip, the names
+ * read for a page, a stale version, and two changes of one material at once.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads {@code material},
  * {@code material_version} or {@code material_system} with native SQL.
@@ -54,6 +55,8 @@ class MaterialIntegrationTest {
     @Autowired
     private Library library;
     @Autowired
+    private MaterialBelongings belongings;
+    @Autowired
     private PlatformTransactionManager transactions;
     @Autowired
     private JdbcClient jdbc;
@@ -67,7 +70,7 @@ class MaterialIntegrationTest {
         Owner a = owner();
 
         UUID withCampaign = material(a.id(), as(a.id(), () -> uploads.create(10, "Livro.pdf",
-                new Uploads.Details("rulebook", "detect", a.campaign().toString(), null))));
+                new Uploads.Details("rulebook", "detect", a.campaign().toString(), (String) null))));
         UUID withSystem = material(a.id(), as(a.id(), () -> uploads.create(10, "Bestiário.pdf",
                 new Uploads.Details("supplement", "pt-BR", null, a.system().toString()))));
         UUID bare = material(a.id(), as(a.id(), () -> uploads.create(10, "old.pdf")));
@@ -95,7 +98,7 @@ class MaterialIntegrationTest {
         Owner b = owner();
         long before = jdbc.sql("select count(*) from material where owner_id = ?").param(b.id()).query(Long.class).single();
 
-        for (Uploads.Details details : List.of(new Uploads.Details(null, null, a.campaign().toString(), null),
+        for (Uploads.Details details : List.of(new Uploads.Details(null, null, a.campaign().toString(), (String) null),
                 new Uploads.Details(null, null, null, a.system().toString()),
                 new Uploads.Details(null, null, b.campaign().toString(), b.system().toString()))) {
             assertThatThrownBy(() -> as(b.id(), () -> uploads.create(10, "x.pdf", details)))
@@ -181,7 +184,7 @@ class MaterialIntegrationTest {
         for (int i = 0; i < 5; i++) {
             Thread.sleep(2); // ids made in the same millisecond sort randomly (Ids)
             created.add(material(a.id(), as(a.id(), () -> uploads.create(10, "m.pdf",
-                    new Uploads.Details("other", null, null, null)))));
+                    new Uploads.Details("other", null, null, (String) null)))));
         }
         material(b.id(), as(b.id(), () -> uploads.create(10, "b.pdf")));
         // The oldest material's version is ready, and a newer version of it is processing; the second is ready.
@@ -212,6 +215,95 @@ class MaterialIntegrationTest {
         assertThat(second.items().getLast().upload()).isNull();
         assertThat(second.nextCursor()).isNull();
         assertThat(as(a.id(), () -> materials.find(created.get(0))).orElseThrow().state()).isEqualTo("processing");
+    }
+
+    // --- Story 3.3: where a material belongs
+
+    @Test
+    void aMoveAndASeveralSystemsAttachRoundTripAndTheVersionRisesWithEach() throws Exception {
+        Owner a = owner();
+        UUID second = as(a.id(), () -> library.createSystem(new Library.SystemFields("Pathfinder", null, null))).id();
+        UUID material = material(a.id(), as(a.id(), () -> uploads.create(10, "notas.md",
+                new Uploads.Details(null, null, a.campaign().toString(), (String) null))));
+        long points = jdbc.sql("select count(*) from job where owner_id = ?").param(a.id()).query(Long.class).single();
+
+        Materials.Material moved = as(a.id(), () -> belongings.change(material, 0, null,
+                List.of(a.system().toString(), second.toString()))).orElseThrow();
+
+        assertThat(moved.version()).isEqualTo(1);
+        assertThat(moved.belonging().campaign()).isNull();
+        assertThat(moved.belonging().systems()).extracting(Materials.Place::name)
+                .containsExactlyInAnyOrder("Untitled system", "Pathfinder");
+        Map<String, Object> row = jdbc.sql("select campaign_id, version from material where id = ?").param(material)
+                .query().singleRow();
+        assertThat(row.get("campaign_id")).isNull();
+        assertThat(row.get("version")).isEqualTo(1L);
+        assertThat(jdbc.sql("select system_id from material_system where material_id = ?").param(material)
+                .query(UUID.class).list()).containsExactlyInAnyOrder(a.system(), second);
+        UUID keptRow = jdbc.sql("select id from material_system where material_id = ? and system_id = ?")
+                .param(material).param(second).query(UUID.class).single();
+
+        // One system goes, one stays as it was; then back to the campaign, which takes every system away.
+        as(a.id(), () -> belongings.change(material, 1, null, List.of(second.toString())));
+        assertThat(jdbc.sql("select id from material_system where material_id = ?").param(material)
+                .query(UUID.class).list()).containsExactly(keptRow);
+        Materials.Material back = as(a.id(), () -> belongings.change(material, 2, a.campaign().toString(), null))
+                .orElseThrow();
+        assertThat(back.version()).isEqualTo(3);
+        assertThat(back.belonging().campaign().id()).isEqualTo(a.campaign());
+        assertThat(back.belonging().campaign().system().id()).isEqualTo(a.system());
+        assertThat(jdbc.sql("select count(*) from material_system where material_id = ?").param(material)
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select campaign_id from material where id = ?").param(material).query(UUID.class)
+                .single()).isEqualTo(a.campaign());
+        // Nothing but the material's place was written: no job (no index change, no removal).
+        assertThat(jdbc.sql("select count(*) from job where owner_id = ?").param(a.id()).query(Long.class).single())
+                .isEqualTo(points);
+        // A page of the list names every place.
+        assertThat(as(a.id(), () -> materials.list(null, null, 10)).items()).singleElement()
+                .satisfies(item -> assertThat(item.belonging().campaign().name()).isEqualTo("First campaign"));
+    }
+
+    @Test
+    void aStaleVersionIsRefusedAndTwoChangesNamingOneVersionAtOnceLetOnlyOneThrough() throws Exception {
+        Owner a = owner();
+        UUID material = material(a.id(), as(a.id(), () -> uploads.create(10, "notas.md",
+                new Uploads.Details(null, null, a.campaign().toString(), (String) null))));
+        as(a.id(), () -> belongings.change(material, 0, null, List.of(a.system().toString())));
+
+        assertThatThrownBy(() -> as(a.id(), () -> belongings.change(material, 0, a.campaign().toString(), null)))
+                .isInstanceOf(ApiException.class)
+                .satisfies(thrown -> assertThat(((ApiException) thrown).problem().code())
+                        .isEqualTo("request.stale_version"));
+        assertThat(jdbc.sql("select version from material where id = ?").param(material).query(Long.class).single())
+                .isEqualTo(1L);
+
+        // Two changes on version 1 at once: the material's lock lets one write, and the other is stale.
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            List<java.util.concurrent.Future<String>> outcomes = new ArrayList<>();
+            for (String target : List.of(a.campaign().toString(), "systems")) {
+                outcomes.add(pool.submit(() -> {
+                    try {
+                        as(a.id(), () -> target.equals("systems")
+                                ? belongings.change(material, 1, null, List.of(a.system().toString()))
+                                : belongings.change(material, 1, target, null));
+                        return "changed";
+                    } catch (ApiException refused) {
+                        return refused.problem().code();
+                    }
+                }));
+            }
+            List<String> results = new ArrayList<>();
+            for (java.util.concurrent.Future<String> outcome : outcomes) {
+                results.add(outcome.get());
+            }
+            assertThat(results).containsExactlyInAnyOrder("changed", "request.stale_version");
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThat(jdbc.sql("select version from material where id = ?").param(material).query(Long.class).single())
+                .isEqualTo(2L);
     }
 
     // --- helpers ---

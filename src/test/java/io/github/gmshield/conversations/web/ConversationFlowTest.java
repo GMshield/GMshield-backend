@@ -599,6 +599,37 @@ class ConversationFlowTest {
         }
     }
 
+    // --- Story 3.3: a material moved while a question runs
+
+    @Test
+    void aMaterialMovedOutMidQuestionIsRefusedAtTheNextFetchWithNoJobAndAStoredReferenceToItStillOpens()
+            throws Exception {
+        Gm gm = signUp();
+        Paged source = pdf(gm, gm.campaign(), 14, 13);
+        // An earlier answer cites it: its reference is stored with that turn.
+        UUID earlier = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 3)));
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+        String ids = "{\"ids\":[\"" + source.passages().getFirst() + "\"]}";
+        assertThat(sendAsWorker("POST", claim.path("passages"), ids, claim.grant()).statusCode()).isEqualTo(200);
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/systems", "{\"name\":\"Pathfinder\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        int jobsBefore = jobs.rows.size();
+
+        // The GM moves it to another system: out of this campaign's scope.
+        HttpResponse<String> moved = send(gm, "PATCH", "/api/v1/materials/" + source.materialId(),
+                "{\"version\":0,\"belonging\":{\"systems\":[\"" + json(created).path("id").asString() + "\"]}}");
+        assertThat(moved.statusCode()).as(moved.body()).isEqualTo(200);
+        assertThat(json(moved).path("version").asLong()).isEqualTo(1);
+
+        // The same question's next fetch resolves its scope again, and refuses it.
+        assertProblem(sendAsWorker("POST", claim.path("passages"), ids, claim.grant()), 403, "scope.passage_refused");
+        // No job came of the move: no index change and no removal, so nothing is written to the index.
+        assertThat(jobs.rows).hasSize(jobsBefore);
+        // The reference stored before the move still opens its page.
+        assertThat(referencePage(gm, earlier, "1", "13").statusCode()).isEqualTo(200);
+    }
+
     @Test
     void anAccountWithNoCampaignHasNoCurrentConversation() throws Exception {
         Gm gm = signUp();

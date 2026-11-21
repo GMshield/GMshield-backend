@@ -22,6 +22,7 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -90,9 +91,9 @@ class UploadController {
     @Operation(operationId = "createUpload", summary = "tus 1.0.0 creation: a material, its version in uploading and an"
             + " upload that expires after 6 hours. upload.too_large (413) outside 1 byte to 2 GiB;"
             + " upload.metadata_invalid (400) without a valid filename, for a kind, language, campaign or system that is"
-            + " not valid, for a campaign or system that is not the account's, or for both at once (it never says"
-            + " which); request.invalid (400) for a missing or"
-            + " malformed Upload-Length; upload.tus_version (412) without"
+            + " not valid, for a campaign or system that is not the account's, for more than 100 systems, or for a"
+            + " campaign with systems, or system with systems (it never says which); request.invalid (400) for a"
+            + " missing or malformed Upload-Length; upload.tus_version (412) without"
             + " Tus-Resumable: 1.0.0;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
@@ -105,8 +106,10 @@ class UploadController {
                 @Parameter(name = "Upload-Metadata", in = ParameterIn.HEADER, required = true,
                         description = "tus metadata: comma-separated keys, each with its value in Base64. filename"
                                 + " is required. Optional: kind (rulebook, supplement, homebrew, campaign_notes, other),"
-                                + " language (pt-BR, en, detect), and campaign or system (the id of one of the"
-                                + " account's, never both)", schema = @Schema(type = "string", example = "filename cnVsZXMucGRm"))},
+                                + " language (pt-BR, en, detect), and campaign (the id of one of the account's"
+                                + " campaigns) or systems (one to 100 ids of the account's systems, comma-separated;"
+                                + " contract 1.21.0), never both. The single key system still names one system",
+                        schema = @Schema(type = "string", example = "filename cnVsZXMucGRm"))},
             responses = @ApiResponse(responseCode = "201", description = "Created",
                     headers = {
                         @Header(name = "Location", required = true, description = "The upload's path, relative",
@@ -279,14 +282,15 @@ class UploadController {
         }
     }
 
-    /** The keys of what the GM said about a file (Story 1.14). */
-    private static final Set<String> DETAIL_KEYS = Set.of("kind", "language", "campaign", "system");
+    /** The keys of what the GM said about a file (Story 1.14; {@code systems} from Story 3.3). */
+    private static final Set<String> DETAIL_KEYS = Set.of("kind", "language", "campaign", "system", "systems");
 
     /**
      * tus's {@code Upload-Metadata}: comma-separated pairs of a key and its value in Base64 (a key may stand alone).
      * Keys are unique. {@code filename} is required; {@code kind}, {@code language}, {@code campaign} and
      * {@code system} (Story 1.14) are optional, and a known key standing alone has an empty value, which the service
-     * refuses. Other keys are ignored.
+     * refuses. From Story 3.3 {@code systems} holds one or more system ids, comma-separated (an empty one is refused);
+     * {@code system} still names one, and the two together are refused. Other keys are ignored.
      */
     static Metadata metadata(String metadata) {
         if (metadata == null || metadata.isBlank()) {
@@ -312,8 +316,17 @@ class UploadController {
         if (filename == null) {
             throw UploadProblems.metadataInvalid();
         }
+        String system = details.get("system");
+        String systems = details.get("systems");
+        if (system != null && systems != null) {
+            throw UploadProblems.metadataInvalid();
+        }
+        List<String> named = systems != null ? List.of(systems.split(",", -1)) : null;
+        if (system != null) {
+            named = List.of(system);
+        }
         return new Metadata(filename, new Uploads.Details(details.get("kind"), details.get("language"),
-                details.get("campaign"), details.get("system")));
+                details.get("campaign"), named));
     }
 
     private static String utf8(String base64) {

@@ -539,6 +539,86 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.passages(scope, List.of(lib.bPassages().getFirst())))).hasSize(1);
     }
 
+    // --- Story 3.3: where a material belongs changes
+
+    @Test
+    void aCampaignsMaterialIsAbsentFromASiblingCampaignOfTheSameSystem() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+
+        assertThat(theirs.allowedSources()).doesNotContain(lib.a());
+        assertRefused(lib.gm().owner(), theirs, List.of(lib.aPassages().getFirst()));
+    }
+
+    @Test
+    void aMaterialMovedFromItsCampaignToTheSystemLeavesTheCampaignTierAndJoinsTheSystemTierOfEveryCampaignOfIt() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        fixture.move(lib.gm().owner(), lib.a(), null, lib.gm().system());
+
+        ResolvedScope mine = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+        assertThat(mine.sources(Tier.CAMPAIGN)).isEmpty();
+        assertThat(mine.sources(Tier.SYSTEM)).containsExactlyInAnyOrder(lib.a(), lib.b());
+        assertThat(theirs.sources(Tier.SYSTEM)).containsExactlyInAnyOrder(lib.a(), lib.b());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(theirs, List.of(lib.aPassages().getFirst()))))
+                .singleElement().satisfies(passage -> assertThat(passage.tier()).isEqualTo(Tier.SYSTEM));
+    }
+
+    @Test
+    void aMaterialMovedToAnotherCampaignIsInThatCampaignsTierOnly() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        fixture.move(lib.gm().owner(), lib.a(), sibling);
+
+        ResolvedScope mine = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+        assertThat(mine.allowedSources()).containsExactly(lib.b());
+        assertRefused(lib.gm().owner(), mine, List.of(lib.aPassages().getFirst()));
+        assertThat(theirs.sources(Tier.CAMPAIGN)).containsExactlyInAnyOrder(lib.a(), lib.c());
+    }
+
+    @Test
+    void aMaterialOfSeveralSystemsIsInTheSystemTierOfEachOnesCampaignsAndOfNoOtherSystem() {
+        Library2 lib = twoTiers();
+        UUID second = fixture.system(lib.gm().owner(), "Pathfinder");
+        UUID secondCampaign = fixture.campaignOf(lib.gm().owner(), second, "Mesa de sábado");
+        UUID third = fixture.system(lib.gm().owner(), "Tormenta");
+        UUID thirdCampaign = fixture.campaignOf(lib.gm().owner(), third, "Mesa de domingo");
+
+        fixture.move(lib.gm().owner(), lib.a(), null, lib.gm().system(), second);
+
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING))
+                .sources(Tier.SYSTEM)).contains(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(secondCampaign, ScopeSettings.STARTING))
+                .sources(Tier.SYSTEM)).containsExactly(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(thirdCampaign, ScopeSettings.STARTING))
+                .allowedSources()).isEmpty();
+    }
+
+    @Test
+    void aMaterialMovedOutAfterAQuestionResolvedIsRefusedAtTheNextFetchWhichResolvesAgain() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+        // The question's first fetch, as AnswerJobs makes it: the scope resolved for that fetch.
+        ResolvedScope first = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(first, List.of(lib.aPassages().getFirst()))))
+                .hasSize(1);
+
+        fixture.move(lib.gm().owner(), lib.a(), sibling);
+
+        // The next fetch of the same question resolves again and no longer has A.
+        ResolvedScope next = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+        assertRefused(lib.gm().owner(), next, List.of(lib.bPassages().getFirst(), lib.aPassages().getFirst()));
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(next, List.of(lib.bPassages().getFirst())))).hasSize(1);
+    }
+
     @Test
     void anotherOwnersScopeANullIdOrNoOwnerIsRefused() {
         Library2 lib = twoTiers();

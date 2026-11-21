@@ -5,6 +5,7 @@ import io.github.gmshield.materials.data.NewestVersion;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.PageViewRow;
 import io.github.gmshield.materials.data.PassageRow;
@@ -54,8 +55,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * needs review or is ready ({@link #report}), each page's outcome, an unreadable page with no view answered as one with
  * nothing on it, and only passages of a {@code ready} version.
  * From Story 3.1, the list of a system's materials ({@link #listOfSystem}): those attached to it and those of its
- * campaigns. Everything acts for the owner of the work ({@link OwnerContext}): another owner's material reads like an
- * unknown one. Nothing here logs a name.
+ * campaigns. From Story 3.3, each material's version, size and where it belongs ({@link Belonging}: only ready places,
+ * names decrypted, read for a whole page at once), every material when no state is given, and a list leaves out a
+ * material that belongs somewhere but whose every place is being deleted. Everything acts for the owner of the work
+ * ({@link OwnerContext}): another owner's material reads like an unknown one. Nothing here logs a name.
  */
 @Service
 public class Materials {
@@ -84,7 +87,7 @@ public class Materials {
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final JobsInProgress inProgress;
-    private final CampaignsOfSystem campaignsOfSystem;
+    private final Library library;
     private final FileStore files;
     private final IngestionSettings settings;
 
@@ -94,25 +97,19 @@ public class Materials {
         Set<UUID> of(Collection<UUID> jobIds);
     }
 
-    /**
-     * The ids of the campaigns of the bound owner's system, empty for a system that is not the owner's
-     * ({@link Library#campaignIdsOf}, Story 3.1).
-     */
-    @FunctionalInterface
-    interface CampaignsOfSystem {
-        Optional<List<UUID>> of(UUID systemId);
-    }
-
     @Autowired
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs, Library library,
               IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, files, jobs::inProgress, library::campaignIdsOf, settings, transactions);
+        this(materials, uploads, vault, files, jobs::inProgress, library, settings, transactions);
     }
 
+    /**
+     * {@code library}: the campaigns of a system ({@link Library#campaignIdsOf}, Story 3.1) and the places a material
+     * belongs to ({@link Library#places}, Story 3.3).
+     */
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
-              CampaignsOfSystem campaignsOfSystem, IngestionSettings settings,
-              ObjectProvider<PlatformTransactionManager> transactions) {
-        this.campaignsOfSystem = campaignsOfSystem;
+              Library library, IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+        this.library = library;
         this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
@@ -172,14 +169,41 @@ public class Materials {
      * A material: {@code kind} may be null, {@code upload} is there only while the state is {@code uploading},
      * {@code pages} once the page total is known, and {@code failure} (a code) only when the state is {@code failed};
      * {@code actions}, the GM's actions its newest version allows now (Story 1.20), in {@link #ACTIONS} order; from
-     * Story 1.21, {@code imageSet} only while an image set is uploading (then {@code upload} is null).
+     * Story 1.21, {@code imageSet} only while an image set is uploading (then {@code upload} is null). From Story 3.3,
+     * its {@code version} (a change of where it belongs names it), {@code size} (the newest version's bytes, null until
+     * known) and where it {@code belongs}.
      */
     public record Material(UUID id, String name, String state, String kind, Upload upload, Pages pages,
-                           String failure, List<String> actions, ImageSet imageSet) {
+                           String failure, List<String> actions, ImageSet imageSet, long version, Long size,
+                           Belonging belonging) {
         @Override
         public String toString() {
-            return "Material[id=" + id + ", state=" + state + "]";
+            return "Material[id=" + id + ", state=" + state + ", version=" + version + "]";
         }
+    }
+
+    /** A system a material belongs to, or a campaign's system (Story 3.3): its id and its name, decrypted. */
+    public record Place(UUID id, String name) {
+        @Override
+        public String toString() {
+            return "Place[id=" + id + "]";
+        }
+    }
+
+    /** A campaign a material belongs to (Story 3.3): its id, its name and its system. */
+    public record CampaignPlace(UUID id, String name, Place system) {
+        @Override
+        public String toString() {
+            return "CampaignPlace[id=" + id + ", system=" + system + "]";
+        }
+    }
+
+    /**
+     * Where a material belongs (Story 3.3): its campaign (null when none), or its systems (empty when none), the ready
+     * ones only. A material uploaded with neither has both empty.
+     */
+    public record Belonging(CampaignPlace campaign, List<Place> systems) {
+        public static final Belonging NOWHERE = new Belonging(null, List.of());
     }
 
     /**
@@ -317,12 +341,13 @@ public class Materials {
     }
 
     /**
-     * The owner's materials whose newest version is in one of {@code states}, newest first, after the material
-     * {@code cursor} when it is given, at most {@code limit} (1 to {@value #MAX_LIMIT}).
+     * The owner's materials whose newest version is in one of {@code states} (from Story 3.3, in any state when it is
+     * null), newest first, after the material {@code cursor} when it is given, at most {@code limit} (1 to
+     * {@value #MAX_LIMIT}). A material whose every place is being deleted is left out (a page may then be shorter).
      */
     public Page list(Collection<String> states, UUID cursor, int limit) {
         checkList(states, limit);
-        return reading(() -> page(materials.newestIn(Set.copyOf(states), cursor, limit + 1), limit));
+        return reading(() -> page(materials.newestIn(statesOrAll(states), cursor, limit + 1), limit));
     }
 
     /**
@@ -331,25 +356,29 @@ public class Materials {
      */
     public Optional<Page> listOfSystem(Collection<String> states, UUID systemId, UUID cursor, int limit) {
         checkList(states, limit);
-        return reading(() -> campaignsOfSystem.of(systemId).map(campaigns -> page(
-                materials.newestAttached(Set.copyOf(states), systemId, campaigns, cursor, limit + 1), limit)));
+        return reading(() -> library.campaignIdsOf(systemId).map(campaigns -> page(
+                materials.newestAttached(statesOrAll(states), systemId, campaigns, cursor, limit + 1), limit)));
     }
 
     private static void checkList(Collection<String> states, int limit) {
-        if (states.isEmpty() || !STATES.containsAll(states) || limit < 1 || limit > MAX_LIMIT) {
+        if ((states != null && (states.isEmpty() || !STATES.containsAll(states))) || limit < 1 || limit > MAX_LIMIT) {
             throw new IllegalArgumentException("materials.list_invalid");
         }
+    }
+
+    private static Set<String> statesOrAll(Collection<String> states) {
+        return states == null ? STATES : Set.copyOf(states);
     }
 
     private Page page(List<NewestVersion> found, int limit) {
         List<NewestVersion> page = found.size() > limit ? found.subList(0, limit) : found;
         UUID next = found.size() > limit ? page.getLast().material().id() : null;
-        return new Page(views(page), next);
+        return new Page(views(page, true), next);
     }
 
     /** The owner's material with this id; empty for an unknown id or another owner's. */
     public Optional<Material> find(UUID id) {
-        return reading(() -> materials.newest(id).map(found -> views(List.of(found)).getFirst()));
+        return reading(() -> materials.newest(id).map(found -> views(List.of(found), false).getFirst()));
     }
 
     /**
@@ -491,8 +520,15 @@ public class Materials {
                 passages, outcome);
     }
 
-    private List<Material> views(List<NewestVersion> rows) {
+    /**
+     * The materials as the interface shows them, with every read done once for all of them. {@code listed}: a material
+     * that belongs somewhere but whose every place is being deleted is left out.
+     */
+    private List<Material> views(List<NewestVersion> found, boolean listed) {
         UUID owner = OwnerContext.require();
+        Map<UUID, Belonging> belongings = belongings(found.stream().map(NewestVersion::material).toList());
+        List<NewestVersion> rows = listed
+                ? found.stream().filter(row -> belongings.containsKey(row.material().id())).toList() : found;
         List<UUID> uploading = rows.stream().map(NewestVersion::version)
                 .filter(version -> Uploads.UPLOADING.equals(version.state())).map(version -> version.id()).toList();
         // A plain upload's one open row; a set's members are grouped apart, by version (Story 1.21).
@@ -529,8 +565,40 @@ public class Materials {
                     actions(row.version().state(), pages == null ? 0 : pages.unreadable(),
                             IngestionSteps.retryCheck(materials, uploads, settings,
                                     row.version()) == IngestionSteps.RetryCheck.ALLOWED),
-                    imageSet(row.version(), sets.get(row.version().id())));
+                    imageSet(row.version(), sets.get(row.version().id())), row.material().version(),
+                    row.version().sizeBytes(), belongings.getOrDefault(row.material().id(), Belonging.NOWHERE));
         }).toList();
+    }
+
+    /**
+     * Where each of these materials belongs (Story 3.3), from one read of their systems and one read of the library:
+     * the ready places only. A material that belongs somewhere but none of whose places is ready (every one is being
+     * deleted) is left out of the map.
+     */
+    Map<UUID, Belonging> belongings(List<MaterialRow> rows) {
+        if (rows.isEmpty()) {
+            return Map.of();
+        }
+        Map<UUID, List<UUID>> systemsOf = materials.systemsOf(rows.stream().map(MaterialRow::id).toList()).stream()
+                .collect(Collectors.groupingBy(MaterialSystemRow::materialId, java.util.LinkedHashMap::new,
+                        Collectors.mapping(MaterialSystemRow::systemId, Collectors.toList())));
+        Set<UUID> campaignIds = rows.stream().map(MaterialRow::campaignId).filter(java.util.Objects::nonNull)
+                .collect(Collectors.toSet());
+        Set<UUID> systemIds = systemsOf.values().stream().flatMap(List::stream).collect(Collectors.toSet());
+        Library.Places places = library.places(campaignIds, systemIds);
+        Map<UUID, Belonging> found = new java.util.HashMap<>();
+        for (MaterialRow row : rows) {
+            List<UUID> attached = systemsOf.getOrDefault(row.id(), List.of());
+            Library.Campaign campaign = row.campaignId() == null ? null : places.campaigns().get(row.campaignId());
+            List<Place> systems = attached.stream().map(places.systems()::get).filter(java.util.Objects::nonNull)
+                    .map(system -> new Place(system.id(), system.name())).toList();
+            boolean somewhere = row.campaignId() != null || !attached.isEmpty();
+            if (!somewhere || campaign != null || !systems.isEmpty()) {
+                found.put(row.id(), new Belonging(campaign == null ? null : new CampaignPlace(campaign.id(),
+                        campaign.name(), new Place(campaign.system().id(), campaign.system().name())), systems));
+            }
+        }
+        return found;
     }
 
     /** A version's image set while it uploads (Story 1.21); null for any other version. */

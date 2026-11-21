@@ -216,6 +216,16 @@ public class InMemoryLibraryStore implements LibraryStore {
     }
 
     @Override
+    public List<SystemRow> findSystems(java.util.Collection<UUID> ids) {
+        return ids.stream().distinct().map(this::findSystem).flatMap(Optional::stream).toList();
+    }
+
+    @Override
+    public List<CampaignRow> findCampaigns(java.util.Collection<UUID> ids) {
+        return ids.stream().distinct().map(this::findCampaign).flatMap(Optional::stream).toList();
+    }
+
+    @Override
     public Optional<CampaignRow> currentCampaign() {
         UUID owner = OwnerContext.require();
         return campaigns.values().stream().filter(row -> row.ownerId().equals(owner) && ready(row) && !row.archived())

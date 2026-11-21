@@ -3,13 +3,17 @@ package io.github.gmshield.materials.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.OptimisticLockException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import org.hibernate.StaleStateException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
 import org.springframework.stereotype.Repository;
@@ -56,6 +60,65 @@ class JpaMaterialStore implements MaterialStore {
     @Override
     public List<MaterialSystemRow> systemsOf(UUID materialId) {
         return systemEntitiesOf(materialId).stream().map(MaterialSystemEntity::row).toList();
+    }
+
+    @Override
+    public List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select s from MaterialSystem s where s.materialId in :ids"
+                        + " order by s.materialId, s.createdAt, s.id", MaterialSystemEntity.class)
+                .setParameter("ids", materialIds).getResultList().stream().map(MaterialSystemEntity::row).toList();
+    }
+
+    /**
+     * Story 3.3: the material, found by JPQL (so within the owner), is refreshed under a row lock, so two changes of one
+     * material take turns and the second reads the first's version, even when its session read the material before.
+     * Attachments that stay are left as they are (no delete then insert of one key), so the key on
+     * (owner, material, system) never sees a row twice whatever order Hibernate writes in.
+     */
+    @Override
+    public Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId, List<MaterialSystemRow> systems,
+                                                 Instant now) {
+        Optional<MaterialEntity> found = material(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        MaterialEntity entity = found.get();
+        EntityManager em = em();
+        try {
+            em.refresh(entity, LockModeType.PESSIMISTIC_WRITE);
+        } catch (OptimisticLockException | StaleStateException moved) {
+            throw new StaleMaterialVersion();
+        }
+        if (entity.version() != version) {
+            throw new StaleMaterialVersion();
+        }
+        List<MaterialSystemRow> wanted = campaignId == null ? systems : List.of();
+        Set<UUID> kept = new HashSet<>();
+        Set<UUID> wantedIds = new HashSet<>();
+        wanted.forEach(row -> wantedIds.add(row.systemId()));
+        for (MaterialSystemEntity link : systemEntitiesOf(id)) {
+            UUID system = link.row().systemId();
+            if (wantedIds.contains(system)) {
+                kept.add(system);
+            } else {
+                em.remove(link);
+            }
+        }
+        for (MaterialSystemRow row : wanted) {
+            if (kept.add(row.systemId())) {
+                em.persist(new MaterialSystemEntity(row));
+            }
+        }
+        entity.belong(campaignId, now);
+        try {
+            em.flush();
+        } catch (OptimisticLockException | StaleStateException moved) {
+            throw new StaleMaterialVersion();
+        }
+        return Optional.of(entity.row());
     }
 
     /**

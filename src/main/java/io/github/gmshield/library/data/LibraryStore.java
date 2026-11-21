@@ -1,6 +1,7 @@
 package io.github.gmshield.library.data;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -97,6 +98,18 @@ public interface LibraryStore {
 
     /** The current owner's campaign with this id, archived or not; empty for an unknown id or another owner's. */
     Optional<CampaignRow> findCampaign(UUID id);
+
+    /**
+     * The current owner's ready systems with these ids, in one read (Story 3.3: the places of a page of materials), in no
+     * set order; an unknown id, another owner's or a deleting system is left out.
+     */
+    List<SystemRow> findSystems(Collection<UUID> ids);
+
+    /**
+     * The current owner's ready campaigns of ready systems with these ids, archived or not, in one read (Story 3.3), in
+     * no set order; an unknown id, another owner's or a deleting campaign is left out.
+     */
+    List<CampaignRow> findCampaigns(Collection<UUID> ids);
 
     /**
      * The current owner's current campaign (Story 3.2): of the ready, not archived campaigns, the one chosen last, else

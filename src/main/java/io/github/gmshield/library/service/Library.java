@@ -16,11 +16,14 @@ import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
@@ -133,6 +136,11 @@ public class Library {
     public record CampaignPage(List<Campaign> items, UUID nextCursor) {
     }
 
+    /** Campaigns (each with its system) and systems by id (Story 3.3), as {@link #places} finds them. */
+    public record Places(Map<UUID, Campaign> campaigns, Map<UUID, GameSystem> systems) {
+        public static final Places NONE = new Places(Map.of(), Map.of());
+    }
+
     /**
      * A first sign-in's starter library: one system and one campaign of it, named in the account's language,
      * for the owner of the work. Runs only inside the caller's transaction, so that the account and its starter
@@ -208,6 +216,36 @@ public class Library {
             Map<UUID, GameSystem> systems = new HashMap<>();
             return Optional.of(new CampaignPage(page.stream().map(row -> open(row, systems.computeIfAbsent(row.systemId(),
                     this::systemOf))).toList(), next));
+        });
+    }
+
+    /**
+     * The owner's campaigns {@code campaignIds} and systems {@code systemIds} (Story 3.3: where a page of materials
+     * belongs, or the targets of a change), from one read of the campaigns and one of the systems, theirs included:
+     * the ready ones only, a campaign archived or not with its system, each by id. An unknown id, another owner's, a
+     * deleting one, or a campaign of a deleting system is left out.
+     */
+    public Places places(Collection<UUID> campaignIds, Collection<UUID> systemIds) {
+        if (campaignIds.isEmpty() && systemIds.isEmpty()) {
+            OwnerContext.require();
+            return Places.NONE;
+        }
+        return reading(() -> {
+            List<CampaignRow> campaignRows = campaignIds.isEmpty() ? List.of()
+                    : store.findCampaigns(Set.copyOf(campaignIds));
+            Set<UUID> wanted = new HashSet<>(systemIds);
+            campaignRows.forEach(row -> wanted.add(row.systemId()));
+            Map<UUID, GameSystem> systems = new HashMap<>();
+            store.findSystems(wanted).forEach(row -> systems.put(row.id(), open(row)));
+            Map<UUID, Campaign> campaigns = new HashMap<>();
+            for (CampaignRow row : campaignRows) {
+                GameSystem system = systems.get(row.systemId());
+                if (system != null) {
+                    campaigns.put(row.id(), open(row, system));
+                }
+            }
+            systems.keySet().retainAll(Set.copyOf(systemIds));
+            return new Places(Map.copyOf(campaigns), Map.copyOf(systems));
         });
     }
 
