@@ -28,6 +28,7 @@ import org.springframework.stereotype.Repository;
 class JpaMaterialStore implements MaterialStore {
 
     private static final String READY = "ready";
+    private static final String SUPERSEDED = "superseded";
     private static final String DISCARDED = "discarded";
 
     private final ObjectProvider<EntityManagerFactory> factory;
@@ -267,6 +268,17 @@ class JpaMaterialStore implements MaterialStore {
         Optional<MaterialEntity> found = material(id);
         found.ifPresent(entity -> em().refresh(entity, LockModeType.PESSIMISTIC_WRITE));
         return found.map(MaterialEntity::row);
+    }
+
+    @Override
+    public List<VersionRow> supersededOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select v from MaterialVersion v where v.materialId in :ids and v.state = :state"
+                        + " order by v.createdAt desc, v.id desc", MaterialVersionEntity.class)
+                .setParameter("ids", materialIds).setParameter("state", SUPERSEDED).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
     }
 
     @Override

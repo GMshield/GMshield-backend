@@ -206,6 +206,14 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> supersededOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(version -> version.ownerId().equals(owner)
+                        && materialIds.contains(version.materialId()) && "superseded".equals(version.state()))
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id).reversed()).toList();
+    }
+
+    @Override
     public List<VersionRow> readyOf(Collection<UUID> materialIds) {
         UUID owner = OwnerContext.require();
         return versions.values().stream().filter(version -> version.ownerId().equals(owner)

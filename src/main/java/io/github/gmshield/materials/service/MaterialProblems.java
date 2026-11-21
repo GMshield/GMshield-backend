@@ -6,7 +6,8 @@ import io.github.gmshield.shared.service.ApiProblem;
 /**
  * The answers of the review actions (Story 1.20): accept, reprocess, retry and discard on a material's current version;
  * from Story 3.3, those of a change of where a material belongs; from Story 3.4, those of a new version (a replacement
- * upload or a reprocess of an accepted version). Params carry nothing.
+ * upload or a reprocess of an accepted version); from Story 3.4 part B, the removal of a version that is not
+ * superseded. Params carry nothing.
  */
 public final class MaterialProblems {
 
@@ -30,6 +31,10 @@ public final class MaterialProblems {
     /** Story 3.4: a new version is refused when the material has no ready version (every version discarded). */
     static final ApiProblem NOT_READY = ApiProblem.of(409, CATEGORY, "not_ready", "Material not ready");
 
+    /** Story 3.4 part B: only a superseded version is removed; a ready, in-progress or discarded one is not. */
+    static final ApiProblem VERSION_NOT_REMOVABLE = ApiProblem.of(409, CATEGORY, "version_not_removable",
+            "Material version not removable");
+
     private MaterialProblems() {
     }
 
@@ -51,6 +56,11 @@ public final class MaterialProblems {
     /** The material has no ready version to replace or read again (Story 3.4). */
     static ApiException notReady() {
         return new ApiException(NOT_READY);
+    }
+
+    /** The version is not superseded, and its removal is not recorded (Story 3.4 part B). */
+    static ApiException versionNotRemovable() {
+        return new ApiException(VERSION_NOT_REMOVABLE);
     }
 
     /** The steps the action would add take the version past its step cap; nothing changed. */

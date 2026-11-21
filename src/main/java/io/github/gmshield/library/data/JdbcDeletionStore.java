@@ -44,9 +44,29 @@ class JdbcDeletionStore implements DeletionStore {
     }
 
     @Override
+    public boolean insertIfAbsent(DeletionRow row) {
+        return jdbc.getObject().sql("insert into deletion (id, owner_id, kind, target_id, not_before, created_at,"
+                        + " done_at) values (:id, :owner, :kind, :target, :notBefore, :createdAt, :doneAt)"
+                        + " on conflict (owner_id, kind, target_id) do nothing")
+                .param("id", row.id()).param("owner", row.ownerId()).param("kind", row.kind())
+                .param("target", row.targetId())
+                .param("notBefore", time(row.notBefore()), Types.TIMESTAMP_WITH_TIMEZONE)
+                .param("createdAt", time(row.createdAt()), Types.TIMESTAMP_WITH_TIMEZONE)
+                .param("doneAt", time(row.doneAt()), Types.TIMESTAMP_WITH_TIMEZONE)
+                .update() == 1;
+    }
+
+    @Override
     public Optional<DeletionRow> find(UUID ownerId, UUID id) {
         return jdbc.getObject().sql(COLUMNS + "where id = :id and owner_id = :owner").param("id", id)
                 .param("owner", ownerId).query(JdbcDeletionStore::row).optional();
+    }
+
+    @Override
+    public Optional<DeletionRow> findTarget(UUID ownerId, String kind, UUID targetId) {
+        return jdbc.getObject().sql(COLUMNS + "where owner_id = :owner and kind = :kind and target_id = :target")
+                .param("owner", ownerId).param("kind", kind).param("target", targetId).query(JdbcDeletionStore::row)
+                .optional();
     }
 
     @Override

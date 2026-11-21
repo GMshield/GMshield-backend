@@ -61,11 +61,19 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 3.2 part B: for a campaign's deletion ({@code Going(null, [campaign])}) what goes is the campaign's
  * materials alone; no material attached to a system goes, and no attachment is touched.
+ *
+ * <p>Story 3.4 part B: for a material's deletion ({@code Going.ofMaterial}) what goes is that material, every version
+ * of it (each discarded by the prepare, so its passages leave every scope at once, then removed with its own
+ * {@code index.removal}) and, once it has no version, the material with its attachments; for a version's removal
+ * ({@code Going.ofVersion}) that one version alone, the same way, and the material stays. An unknown id, another
+ * owner's, or one already gone is nothing to do. Neither counts anything here: the dialog's counts are
+ * {@link MaterialDeletions#count}.
  */
 @Service
 class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(SystemMaterialsDeletion.class);
+    private static final String VERSION_NOT_DISCARDED = "material.version_not_discarded";
 
     private final MaterialStore materials;
     private final IndexStore index;
@@ -103,6 +111,9 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public long count(Going going) {
+        if (going.ofMaterials()) {
+            return 0;
+        }
         return going(going).stream()
                 .filter(material -> materials.current(material.id())
                         .filter(current -> !Uploads.DISCARDED.equals(current.version().state())).isPresent())
@@ -115,26 +126,24 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         Instant latest = null;
         int discarded = 0;
         int cancelled = 0;
-        for (MaterialRow material : going(going)) {
-            for (VersionRow listed : materials.versionsOf(material.id())) {
-                Optional<VersionRow> locked = materials.lockVersion(listed.id());
-                if (locked.isEmpty()) {
-                    continue;
-                }
-                VersionRow version = locked.get();
-                List<UUID> jobIds = new ArrayList<>();
-                materials.unendedSteps(version.id()).stream().map(StepRow::jobId).filter(Objects::nonNull)
-                        .forEach(jobIds::add);
-                index.changes(version.id()).stream().map(IndexChangeRow::jobId).forEach(jobIds::add);
-                Optional<Instant> lapse = jobs.claimLapse(jobIds);
-                if (lapse.isPresent() && (latest == null || lapse.get().isAfter(latest))) {
-                    latest = lapse.get();
-                }
-                cancelled += ingestion.cancelSteps(version.id()) + indexChanges.cancel(version.id());
-                if (!Uploads.DISCARDED.equals(version.state())) {
-                    materials.discardVersion(version.id(), now);
-                    discarded++;
-                }
+        for (UUID versionId : versionsGoing(going)) {
+            Optional<VersionRow> locked = materials.lockVersion(versionId);
+            if (locked.isEmpty()) {
+                continue;
+            }
+            VersionRow version = locked.get();
+            List<UUID> jobIds = new ArrayList<>();
+            materials.unendedSteps(version.id()).stream().map(StepRow::jobId).filter(Objects::nonNull)
+                    .forEach(jobIds::add);
+            index.changes(version.id()).stream().map(IndexChangeRow::jobId).forEach(jobIds::add);
+            Optional<Instant> lapse = jobs.claimLapse(jobIds);
+            if (lapse.isPresent() && (latest == null || lapse.get().isAfter(latest))) {
+                latest = lapse.get();
+            }
+            cancelled += ingestion.cancelSteps(version.id()) + indexChanges.cancel(version.id());
+            if (!Uploads.DISCARDED.equals(version.state())) {
+                materials.discardVersion(version.id(), now);
+                discarded++;
             }
         }
         going.about(log.atInfo()).addKeyValue("discarded", discarded).addKeyValue("cancelled", cancelled)
@@ -145,6 +154,16 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
+        if (going.versionId() != null) {
+            // One version: the material stays.
+            int left = removeVersion(owner, going.versionId()) ? 0 : 1;
+            going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("left", left)
+                    .log("material.system_deletion_removed");
+            if (left > 0) {
+                throw new IllegalStateException(VERSION_NOT_DISCARDED);
+            }
+            return;
+        }
         List<MaterialRow> gone = reading(() -> going(going));
         int left = 0;
         int removed = 0;
@@ -158,7 +177,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         List<UUID> goneIds = gone.stream().map(MaterialRow::id).toList();
         int detached = 0;
         UUID systemId = going.systemId();
-        // A campaign's deletion has no system part: no attachment changes.
+        // A campaign's deletion, or a material's, has no system part: no attachment changes.
         List<MaterialRow> sharedOnes = systemId == null ? List.of()
                 : reading(() -> materials.materialsAlsoOfOtherSystems(systemId));
         for (MaterialRow shared : sharedOnes) {
@@ -169,11 +188,29 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("materials", removed)
                 .addKeyValue("detached", detached).addKeyValue("left", left).log("material.system_deletion_removed");
         if (left > 0) {
-            throw new IllegalStateException("material.version_not_discarded");
+            throw new IllegalStateException(VERSION_NOT_DISCARDED);
         }
     }
 
-    /** Removes one discarded version, as the class says; false when it is no longer there or discarded (it is left). */
+    /**
+     * The versions whose jobs a prepare cancels and which it discards: every version of each material that goes, or
+     * (a version's removal) that version alone, when it is the owner's.
+     */
+    private List<UUID> versionsGoing(Going going) {
+        if (going.versionId() != null) {
+            return materials.findVersion(going.versionId()).map(version -> List.of(version.id())).orElse(List.of());
+        }
+        List<UUID> found = new ArrayList<>();
+        for (MaterialRow material : going(going)) {
+            materials.versionsOf(material.id()).forEach(version -> found.add(version.id()));
+        }
+        return found;
+    }
+
+    /**
+     * Removes one discarded version, as the class says; true also when it is gone already. False when it is no longer
+     * discarded (it is left).
+     */
     private boolean removeVersion(UUID owner, UUID versionId) {
         // The removal of its points, once for the version: the version's lock orders two passes.
         boolean discarded = Boolean.TRUE.equals(writing(() -> {
@@ -198,7 +235,11 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         before.forEach(file -> files.deleteFile(owner, file));
         Optional<List<UUID>> rest = writing(() -> {
             Optional<VersionRow> locked = materials.lockVersion(versionId);
-            if (locked.isEmpty() || !Uploads.DISCARDED.equals(locked.get().state())) {
+            if (locked.isEmpty()) {
+                // Gone already (an earlier pass, or another deletion that took it): nothing is left of it.
+                return Optional.of(List.<UUID>of());
+            }
+            if (!Uploads.DISCARDED.equals(locked.get().state())) {
                 return Optional.<List<UUID>>empty();
             }
             List<UUID> named = new ArrayList<>();
@@ -233,9 +274,16 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     /**
      * The materials that go: those of the system's campaigns, then those attached to it alone; each once. For a
-     * campaign's deletion (no system), the campaign's alone.
+     * campaign's deletion (no system), the campaign's alone; for a material's deletion, that material when it is the
+     * owner's; for a version's removal, none.
      */
     private List<MaterialRow> going(Going going) {
+        if (going.materialId() != null) {
+            return materials.findMaterial(going.materialId()).map(List::of).orElse(List.of());
+        }
+        if (going.versionId() != null) {
+            return List.of();
+        }
         Map<UUID, MaterialRow> found = new LinkedHashMap<>();
         materials.materialsOfCampaigns(going.campaignIds()).forEach(material -> found.put(material.id(), material));
         if (going.systemId() != null) {
