@@ -198,7 +198,7 @@ class MaterialsTest {
     // --- the list and the read ---
 
     @Test
-    void theListHasTheMaterialsWhoseNewestVersionIsInTheStatesNewestFirstWithTheUploadOnlyWhileUploading() {
+    void theListHasTheMaterialsWhoseCurrentVersionIsInTheStatesNewestFirstWithTheUploadOnlyWhileUploading() {
         UUID uploading = create(owner, "uploading.pdf", new Uploads.Details("rulebook", null, null, (String) null));
         UUID waiting = create(owner, "waiting.pdf", Uploads.Details.NONE);
         UUID processing = create(owner, "processing.pdf", Uploads.Details.NONE);
@@ -231,6 +231,58 @@ class MaterialsTest {
 
         assertThat(as(owner, () -> reads.list(List.of("ready"), null, 20)).items()).extracting(Materials.Material::id)
                 .containsExactly(ready);
+    }
+
+    @Test
+    void theCurrentVersionIsTheNewestNotDiscardedOneAndTheReadyOneServesBesideIt() {
+        UUID material = create(owner, "livro.pdf", Uploads.Details.NONE);
+        UUID first = versionOf(material).id();
+        write(() -> materials.recordIngestion(first, "5", 7, clock.instant()));
+        setState(material, "ready");
+        assertThat(as(owner, () -> reads.find(material)).orElseThrow().serving()).isNull();
+        assertThat(as(owner, () -> reads.find(material)).orElseThrow().actions()).containsExactly("reprocess");
+
+        // Story 3.4: a newer version on its way is the current one, and the ready one serves beside it.
+        clock.advance(Duration.ofMinutes(1));
+        UUID second = Ids.newId();
+        write(() -> {
+            materials.insertVersion(new VersionRow(second, owner, material, "needs_review", "pdf", 20L, clock.instant(),
+                    clock.instant()));
+            return true;
+        });
+        Materials.Material reviewing = as(owner, () -> reads.find(material)).orElseThrow();
+        assertThat(reviewing.state()).isEqualTo("needs_review");
+        assertThat(reviewing.size()).isEqualTo(20L);
+        assertThat(reviewing.serving()).isEqualTo(new Materials.Serving(7, 10L));
+        assertThat(as(owner, () -> reads.list(List.of("needs_review"), null, 20)).items())
+                .extracting(Materials.Material::id).containsExactly(material);
+        assertThat(as(owner, () -> reads.list(List.of("ready"), null, 20)).items()).isEmpty();
+
+        // A discarded newest version is not the current one: the material is ready again, on the old version.
+        write(() -> materials.discardVersion(second, clock.instant()));
+        Materials.Material back = as(owner, () -> reads.find(material)).orElseThrow();
+        assertThat(back.state()).isEqualTo("ready");
+        assertThat(back.size()).isEqualTo(10L);
+        assertThat(back.serving()).isNull();
+        assertThat(as(owner, () -> reads.list(List.of("ready"), null, 20)).items()).extracting(Materials.Material::id)
+                .containsExactly(material);
+        assertThat(as(owner, () -> reads.list(List.of("discarded"), null, 20)).items()).isEmpty();
+
+        // Every version discarded: the newest one.
+        write(() -> materials.discardVersion(first, clock.instant()));
+        assertThat(as(owner, () -> materials.current(material)).orElseThrow().version().id()).isEqualTo(second);
+        assertThat(as(owner, () -> reads.find(material)).orElseThrow().state()).isEqualTo("discarded");
+
+        // Created at the same instant: the greater id is the newer.
+        UUID twin = create(owner, "gemeos.pdf", Uploads.Details.NONE);
+        VersionRow one = versionOf(twin);
+        UUID greater = new UUID(one.id().getMostSignificantBits(), one.id().getLeastSignificantBits() + 1);
+        write(() -> {
+            materials.insertVersion(new VersionRow(greater, owner, twin, "waiting", null, null, one.createdAt(),
+                    one.createdAt()));
+            return true;
+        });
+        assertThat(as(owner, () -> materials.current(twin)).orElseThrow().version().id()).isEqualTo(greater);
     }
 
     @Test

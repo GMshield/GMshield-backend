@@ -49,7 +49,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * owner, and {@link Scopes} over them: both tiers, only {@code ready} versions, the passages of an index change that
  * has not ended (real jobs), passages read by id with their tier, a refusal for any id out of the scope, and another
  * owner's campaign. The same rows without a database are in {@code ScopesTest}. Story 3.3: a material moved from its
- * campaign to its system, then to a sibling campaign, is resolved from where it belongs now.
+ * campaign to its system, then to a sibling campaign, is resolved from where it belongs now. Story 3.4: a replacement
+ * leaves the old version serving until the GM accepts it, then only the new one.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -82,6 +83,8 @@ class ScopeIntegrationTest {
     private ScopeReads reads;
     @Autowired
     private MaterialBelongings belongings;
+    @Autowired
+    private MaterialActions actions;
 
     private Instant clock = Instant.now().truncatedTo(ChronoUnit.MICROS);
 
@@ -168,6 +171,51 @@ class ScopeIntegrationTest {
                 .containsExactly(a);
         assertThat(jdbc.sql("select count(*) from job where owner_id = ?").param(owner).query(Long.class).single())
                 .isEqualTo(jobsBefore);
+    }
+
+    @Test
+    void theOldVersionServesUntilItsReplacementIsAcceptedThenOnlyTheNewOneOnPostgres() {
+        UUID owner = Ids.newId();
+        Library.Campaign campaign = as(owner, () -> {
+            library.createStarter(Language.EN);
+            return library.currentCampaign().orElseThrow();
+        });
+        UUID old = material(owner, campaign.id(), null, "ready").getFirst();
+        UUID materialId = as(owner, () -> store.findVersion(old).orElseThrow().materialId());
+        UUID oldPassage = passages(owner, old, "Velho", 1).getFirst();
+        UUID replacement = as(owner, () -> {
+            UUID id = Ids.newId();
+            Instant at = next();
+            store.insertVersion(new VersionRow(id, owner, materialId, "needs_review", "pdf", 1000L, at, at, 1, "5",
+                    null));
+            return id;
+        });
+        UUID newPassage = passages(owner, replacement, "Novo", 1).getFirst();
+
+        ResolvedScope during = as(owner, () -> scopes.resolve(campaign.id(), ScopeSettings.STARTING));
+        assertThat(during.sources(Tier.CAMPAIGN)).containsExactly(old);
+        assertThat(as(owner, () -> scopes.passages(during, List.of(oldPassage)))).extracting(ScopedPassage::id)
+                .containsExactly(oldPassage);
+        assertThatThrownBy(() -> as(owner, () -> scopes.passages(during, List.of(newPassage))))
+                .isInstanceOf(ApiException.class);
+
+        as(owner, () -> actions.act(materialId, Materials.ACCEPT));
+        List<UUID> runs = as(owner, () -> index.changes(replacement).stream().map(IndexChangeRow::jobId).toList());
+        try {
+            // The accept's index run, ended, leaves nothing pending.
+            runs.forEach(run -> as(owner, () -> jobs.cancel(run)));
+            ResolvedScope after = as(owner, () -> scopes.resolve(campaign.id(), ScopeSettings.STARTING));
+            assertThat(after.sources(Tier.CAMPAIGN)).containsExactly(replacement);
+            assertThat(as(owner, () -> scopes.passages(after, List.of(newPassage)))).extracting(ScopedPassage::id)
+                    .containsExactly(newPassage);
+            assertThatThrownBy(() -> as(owner, () -> scopes.passages(after, List.of(oldPassage))))
+                    .isInstanceOfSatisfying(ApiException.class,
+                            e -> assertThat(e.problem().code()).isEqualTo("scope.passage_refused"));
+            assertThat(jdbc.sql("select state from material_version where id = ?").param(old).query(String.class)
+                    .single()).isEqualTo("superseded");
+        } finally {
+            runs.forEach(run -> as(owner, () -> jobs.cancel(run)));
+        }
     }
 
     /** The store queries and the scope over the library the test made (C of another campaign of the same system). */

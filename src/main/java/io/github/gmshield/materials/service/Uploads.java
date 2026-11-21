@@ -58,6 +58,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * member starts the set's chain only once no member is open or failed ({@link #startIfReady}), with the version
  * locked so that two members completing at once start it once.
  *
+ * <p>From Story 3.4, a replacement ({@link Details#material}): the upload adds a new version in {@code uploading} to
+ * one of the owner's materials, which keeps its name, kind, language and place, after the check of
+ * {@link NewVersions#lockReady} with the material locked. The new version goes through ingestion and review like a
+ * first one; the {@code ready} version keeps serving until the GM accepts the new one. A refused format, a whole-file
+ * mismatch or an expiry ends only the new version: the material stays {@code ready} on the old one.
+ *
  * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name, a
  * hash, a kind or where a material belongs; the file is never held whole in memory.
  */
@@ -117,11 +123,22 @@ public class Uploads {
      * What the GM said about a file (Story 1.14), as the tus metadata gave it: each may be null (an older frontend sends
      * none). {@code kind} is one of {@link #KINDS}; {@code language} one of {@link #LANGUAGES} or {@value #DETECT};
      * {@code campaign} the id of one of the owner's campaigns, or {@code systems} (Story 3.3: one to
-     * {@value #MAX_SYSTEMS}) ids of the owner's systems, never both. {@code toString} shows nothing.
+     * {@value #MAX_SYSTEMS}) ids of the owner's systems, never both. From Story 3.4, {@code material}: the id of one of
+     * the owner's materials this file replaces, never with any of the others. {@code toString} shows nothing.
      */
-    public record Details(String kind, String language, String campaign, List<String> systems) {
+    public record Details(String kind, String language, String campaign, List<String> systems, String material) {
 
         public static final Details NONE = new Details(null, null, null, (List<String>) null);
+
+        /** What the GM said about a new material (Story 3.3). */
+        public Details(String kind, String language, String campaign, List<String> systems) {
+            this(kind, language, campaign, systems, null);
+        }
+
+        /** A replacement of the material {@code material} (Story 3.4), with nothing else said. */
+        public static Details replacing(String material) {
+            return new Details(null, null, null, null, material);
+        }
 
         /** One system, or none when {@code system} is null (Story 1.14's single {@code system} key). */
         public Details(String kind, String language, String campaign, String system) {
@@ -180,7 +197,11 @@ public class Uploads {
             throw UploadProblems.tooLarge(MAX_LENGTH);
         }
         String material = validName(name);
-        Checked checked = checked(details == null ? Details.NONE : details);
+        Details given = details == null ? Details.NONE : details;
+        if (given.material() != null) {
+            return replace(owner, length, replaced(given));
+        }
+        Checked checked = checked(given);
         Instant now = now();
         UUID materialId = Ids.newId();
         UUID versionId = Ids.newId();
@@ -195,6 +216,48 @@ public class Uploads {
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", uploadId).addKeyValue("materialId", materialId)
                 .addKeyValue("versionId", versionId).addKeyValue("length", length).log("upload.created");
         return new Created(uploadId, expiresAt);
+    }
+
+    /**
+     * A replacement (Story 3.4): a new version of the owner's material {@code materialId} and its upload, in one
+     * transaction with the material locked ({@link NewVersions#lockReady}).
+     */
+    private Created replace(UUID owner, long length, UUID materialId) {
+        Instant now = now();
+        UUID versionId = Ids.newId();
+        UUID uploadId = Ids.newId();
+        Instant expiresAt = now.plus(LIFETIME);
+        inTransaction(() -> {
+            insertReplacement(owner, materialId, versionId, now);
+            uploads.joined().insert(new UploadRow(uploadId, owner, versionId, length, 0, 0, null, expiresAt, null, null,
+                    UploadRow.OPEN, now, now));
+            return null;
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", uploadId).addKeyValue("materialId", materialId)
+                .addKeyValue("versionId", versionId).addKeyValue("length", length).log("upload.replacement_created");
+        return new Created(uploadId, expiresAt);
+    }
+
+    /**
+     * The material a replacement names (Story 3.4), with nothing else said: a kind, language, campaign or system with
+     * it is {@code upload.metadata_invalid}, and so is an empty id; a malformed one reads like an unknown one
+     * ({@code request.not_found}).
+     */
+    static UUID replaced(Details details) {
+        if (details.kind() != null || details.language() != null || details.campaign() != null
+                || details.systems() != null || details.material().isBlank()) {
+            throw UploadProblems.metadataInvalid();
+        }
+        return id(details.material(), UploadProblems::notFound);
+    }
+
+    /**
+     * A new version in {@code uploading} of the owner's material, in the caller's transaction, after the check of
+     * {@link NewVersions#lockReady} with the material locked (Story 3.4).
+     */
+    void insertReplacement(UUID owner, UUID materialId, UUID versionId, Instant now) {
+        NewVersions.lockReady(materials, library, materialId);
+        materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
     }
 
     /**
@@ -451,13 +514,18 @@ public class Uploads {
         }
     }
 
-    /** A refused format: the upload, its version and its material go in one transaction, then any piece. */
+    /**
+     * A refused format: the upload, its version and its material go in one transaction, then any piece. From Story 3.4
+     * a replacement's material keeps its other versions and stays.
+     */
     private void refuse(UploadRow row, UUID owner) {
         inTransaction(() -> {
             VersionRow version = materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
             uploads.joined().delete(row.id());
             materials.deleteVersion(version.id());
-            materials.deleteMaterial(version.materialId());
+            if (materials.versionsOf(version.materialId()).isEmpty()) {
+                materials.deleteMaterial(version.materialId());
+            }
             return null;
         });
         files.deleteFile(owner, row.id());

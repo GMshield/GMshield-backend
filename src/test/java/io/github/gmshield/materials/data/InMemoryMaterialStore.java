@@ -133,21 +133,21 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
-    public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
+    public List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit) {
         UUID owner = OwnerContext.require();
         return materials.values().stream()
                 .filter(row -> row.ownerId().equals(owner) && (before == null || row.id().compareTo(before) < 0))
                 .sorted(Comparator.comparing(MaterialRow::id).reversed())
-                .map(row -> newestOf(row).orElse(null))
+                .map(row -> currentOf(row).orElse(null))
                 .filter(found -> found != null && states.contains(found.version().state()))
                 .limit(Math.max(limit, 0)).toList();
     }
 
     @Override
-    public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+    public List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
                                               UUID before, int limit) {
         UUID owner = OwnerContext.require();
-        return newestIn(states, before, Integer.MAX_VALUE).stream()
+        return currentIn(states, before, Integer.MAX_VALUE).stream()
                 .filter(found -> (found.material().campaignId() != null && campaignIds.contains(found.material().campaignId()))
                         || systems.values().stream().anyMatch(row -> row.ownerId().equals(owner)
                                 && row.materialId().equals(found.material().id()) && row.systemId().equals(systemId)))
@@ -155,37 +155,62 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
-    public List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit) {
-        return newestIn(states, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0))
+    public List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit) {
+        return currentIn(states, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0))
                 .toList();
     }
 
     @Override
-    public long newestCount(Collection<String> states) {
-        return newestIn(states, null, Integer.MAX_VALUE).size();
+    public long currentCount(Collection<String> states) {
+        return currentIn(states, null, Integer.MAX_VALUE).size();
     }
 
     @Override
-    public List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+    public List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
                                                   int offset, int limit) {
-        return newestAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0))
+        return currentAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0))
                 .limit(Math.max(limit, 0)).toList();
     }
 
     @Override
-    public long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
-        return newestAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).size();
+    public long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+        return currentAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).size();
     }
 
     @Override
-    public Optional<NewestVersion> newest(UUID materialId) {
-        return findMaterial(materialId).flatMap(this::newestOf);
+    public Optional<CurrentVersion> current(UUID materialId) {
+        return findMaterial(materialId).flatMap(this::currentOf);
     }
 
-    private Optional<NewestVersion> newestOf(MaterialRow material) {
-        return versions.values().stream().filter(version -> version.materialId().equals(material.id()))
-                .max(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id))
-                .map(version -> new NewestVersion(material, version));
+    /**
+     * The material's current version (Story 3.4): its newest version (the latest created, then the greatest id) that
+     * is not discarded, else its newest one.
+     */
+    private Optional<CurrentVersion> currentOf(MaterialRow material) {
+        Comparator<VersionRow> newest = Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id);
+        List<VersionRow> mine = versions.values().stream().filter(version -> version.materialId().equals(material.id()))
+                .toList();
+        return mine.stream().filter(version -> !"discarded".equals(version.state())).max(newest)
+                .or(() -> mine.stream().max(newest))
+                .map(version -> new CurrentVersion(material, version));
+    }
+
+    /** How many times {@link #lockMaterial} locked a material (Story 3.4). */
+    public final AtomicInteger materialLocks = new AtomicInteger();
+
+    @Override
+    public Optional<MaterialRow> lockMaterial(UUID id) {
+        Optional<MaterialRow> found = findMaterial(id);
+        found.ifPresent(row -> materialLocks.incrementAndGet());
+        return found;
+    }
+
+    @Override
+    public List<VersionRow> readyOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(version -> version.ownerId().equals(owner)
+                        && materialIds.contains(version.materialId()) && "ready".equals(version.state()))
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id)).toList();
     }
 
     @Override

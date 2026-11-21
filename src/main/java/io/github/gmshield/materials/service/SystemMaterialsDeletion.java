@@ -38,7 +38,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * material attached to another system as well stays, and only loses its attachment to this one.
  *
  * <ul>
- *   <li>{@link #count}: the materials that go and still show, those whose newest version is not {@code discarded}.</li>
+ *   <li>{@link #count}: the materials that go and still show, those whose current version is not {@code discarded}
+ *       (from Story 3.4: those with a version that is not).</li>
  *   <li>{@link #prepare}: each version of a material that goes is locked; the jobs of its unended steps and index
  *       changes are locked ({@link Jobs#claimLapse}) and cancelled ({@link IngestionSteps#cancelSteps},
  *       {@link IndexChanges#cancel}); a version not yet {@code discarded} becomes so, with its removal pending, so the
@@ -103,8 +104,8 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     @Override
     public long count(Going going) {
         return going(going).stream()
-                .filter(material -> materials.newest(material.id())
-                        .filter(newest -> !Uploads.DISCARDED.equals(newest.version().state())).isPresent())
+                .filter(material -> materials.current(material.id())
+                        .filter(current -> !Uploads.DISCARDED.equals(current.version().state())).isPresent())
                 .count();
     }
 

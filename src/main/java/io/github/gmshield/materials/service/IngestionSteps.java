@@ -96,6 +96,8 @@ import tools.jackson.databind.node.ObjectNode;
  *       reads the unreadable pages of a {@code needs_review} version again, by copies of the steps that read them;
  *       {@link #retry} starts a {@code failed} version again, from its original as a restart does or from its raw
  *       upload as {@link #start} does; {@link #cancelSteps} ends a discarded version's steps.</li>
+ *   <li>From Story 3.4, {@link #reprocessAccepted}: a {@code ready} version is never read again in place; a new
+ *       version of its material starts from a copy of its cleaned original, as a restart does.</li>
  * </ul>
  *
  * Every step row gets {@code ended_at} when its job is completed, finally fails or is cancelled here. Every call runs
@@ -595,6 +597,70 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("newJobId", started.jobId())
                 .addKeyValue("stage", stage).addKeyValue("ranges", started.ranges())
                 .addKeyValue("pageViews", started.pageViews()).log("ingestion.retried");
+    }
+
+    /**
+     * Reads an accepted version again (Story 3.4), in the caller's transaction, which has checked and locked its
+     * material ({@link NewVersions#lockReady}): a new version of the same material, {@code waiting}, with the accepted
+     * version's format, size and page total, whose first step reads a copy of the accepted version's cleaned original
+     * as a restart does ({@link #START_STAGES}: the clean stage reads a stored original again). The copy has a file id
+     * of its own, since a file id belongs to one version file of its owner, and goes after the transaction when it does
+     * not commit (a failed copy throws, so the transaction rolls back and its pieces go then). The accepted version, its files, passages and points are not touched: it keeps serving until the new
+     * version is accepted. Refused with {@code material.action_unavailable} when the accepted version has no original
+     * or its format has no chain. Answers the new version.
+     */
+    public VersionRow reprocessAccepted(VersionRow accepted) {
+        String stage = START_STAGES.get(accepted.format());
+        Optional<VersionFileRow> original = original(accepted.id());
+        if (!Materials.READY.equals(accepted.state()) || stage == null || original.isEmpty()) {
+            throw MaterialProblems.actionUnavailable();
+        }
+        UUID owner = OwnerContext.require();
+        Instant now = now();
+        UUID versionId = Ids.newId();
+        UUID fileId = Ids.newId();
+        VersionRow version = new VersionRow(versionId, owner, accepted.materialId(), Uploads.WAITING, accepted.format(),
+                accepted.sizeBytes(), now, now, accepted.pageTotal(), null, null);
+        materials.insertVersion(version);
+        VersionFileRow source = original.get();
+        copyFile(owner, source, fileId);
+        materials.insertVersionFile(new VersionFileRow(Ids.newId(), owner, versionId, fileId, VersionFileRow.ORIGINAL,
+                source.firstPage(), source.lastPage(), source.sizeBytes(), source.pieceCount(), now));
+        JobRef first = jobs.create(KIND, created -> materials.insertStep(new StepRow(Ids.newId(), owner, versionId,
+                created.id(), stage, null, null, fileId, now)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", versionId)
+                .addKeyValue("acceptedVersionId", accepted.id()).addKeyValue("jobId", first.id())
+                .addKeyValue("stage", stage).addKeyValue("pieces", source.pieceCount())
+                .log("ingestion.accepted_reprocessed");
+        return version;
+    }
+
+    /**
+     * The pieces of {@code source} written again under {@code fileId}, one decrypted piece in memory at a time. Its one
+     * removal path is the synchronization registered first: the copy goes when the transaction does not commit, which
+     * is also the case when the copy itself fails (the failure propagates and rolls it back).
+     */
+    private void copyFile(UUID owner, VersionFileRow source, UUID fileId) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                if (status != STATUS_COMMITTED) {
+                    removeCopy(owner, fileId);
+                }
+            }
+        });
+        for (int index = 0; index < source.pieceCount(); index++) {
+            files.writePiece(owner, fileId, index, files.readPiece(owner, source.fileId(), index));
+        }
+    }
+
+    private void removeCopy(UUID owner, UUID fileId) {
+        try {
+            files.deleteFile(owner, fileId);
+        } catch (RuntimeException failure) {
+            log.atWarn().addKeyValue("ownerId", owner).addKeyValue("fileId", fileId)
+                    .addKeyValue("errorType", failure.getClass().getName()).log("ingestion.copy_not_removed");
+        }
     }
 
     /** A new step that reads again a run of unreadable pages, as {@code step} read them. */

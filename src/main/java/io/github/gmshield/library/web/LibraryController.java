@@ -207,7 +207,7 @@ class LibraryController {
     record CampaignDeletionView(
             @Schema(description = "How many conversations of the campaign go with it", format = "int64", minimum = "0",
                     example = "1") long conversations,
-            @Schema(description = "How many materials attached to the campaign go with it (those whose newest version"
+            @Schema(description = "How many materials attached to the campaign go with it (those with a version that"
                     + " is not discarded)", format = "int64", minimum = "0", example = "2") long materials) {
 
         static CampaignDeletionView of(SystemDeletion.CampaignCounts counts) {

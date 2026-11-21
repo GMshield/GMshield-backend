@@ -41,37 +41,50 @@ public interface MaterialStore {
                                           Instant now);
 
     /**
-     * The current owner's materials whose newest version (the latest created, then the greatest id) is in one of
-     * {@code states}, each with that version: newest material first (descending id, a UUID v7), only those whose id is
-     * below {@code before} when it is given, at most {@code limit}.
+     * The current owner's materials whose current version is in one of {@code states}, each with that version: newest
+     * material first (descending id, a UUID v7), only those whose id is below {@code before} when it is given, at most
+     * {@code limit}. From Story 3.4 a material's current version is its newest version (the latest created, then the
+     * greatest id) that is not {@code discarded}, or its newest one when every version is discarded.
      */
-    List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit);
+    List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit);
 
     /**
-     * As {@link #newestIn}, only the materials attached to the system {@code systemId} ({@code material_system}) or
+     * As {@link #currentIn}, only the materials attached to the system {@code systemId} ({@code material_system}) or
      * whose campaign is one of {@code campaignIds} (Story 3.1: a system's materials).
      */
-    List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds, UUID before,
-                                       int limit);
+    List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                         UUID before, int limit);
 
     /**
-     * As {@link #newestIn}, by position instead of by cursor (a numbered page): the materials after the {@code offset}
+     * As {@link #currentIn}, by position instead of by cursor (a numbered page): the materials after the {@code offset}
      * newest ones, at most {@code limit}.
      */
-    List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit);
+    List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit);
 
-    /** How many materials {@link #newestIn} lists in all for these states. */
-    long newestCount(Collection<String> states);
+    /** How many materials {@link #currentIn} lists in all for these states. */
+    long currentCount(Collection<String> states);
 
-    /** As {@link #newestAttached}, by position instead of by cursor. */
-    List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
-                                           int offset, int limit);
+    /** As {@link #currentAttached}, by position instead of by cursor. */
+    List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                             int offset, int limit);
 
-    /** How many materials {@link #newestAttached} lists in all for these states, this system and these campaigns. */
-    long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds);
+    /** How many materials {@link #currentAttached} lists in all for these states, this system and these campaigns. */
+    long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds);
 
-    /** The current owner's material with this id and its newest version; empty for an unknown id or another owner's. */
-    Optional<NewestVersion> newest(UUID materialId);
+    /** The current owner's material with this id and its current version; empty for an unknown id or another owner's. */
+    Optional<CurrentVersion> current(UUID materialId);
+
+    /**
+     * The current owner's material with this id, read again under a row lock held until the end of the transaction
+     * (Story 3.4: two new versions of one material take turns); empty for an unknown id or another owner's.
+     */
+    Optional<MaterialRow> lockMaterial(UUID id);
+
+    /**
+     * The current owner's {@code ready} versions of these materials, oldest first (Story 3.4: the version that keeps
+     * serving while a new one is processed); another owner's material has none.
+     */
+    List<VersionRow> readyOf(Collection<UUID> materialIds);
 
     /** The current owner's material with this id; empty for an unknown id or another owner's. */
     Optional<MaterialRow> findMaterial(UUID id);
