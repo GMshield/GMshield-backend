@@ -183,11 +183,10 @@ public class Jobs {
     }
 
     /**
-     * Locks the bound owner's jobs among {@code jobIds} that have not ended (Story 3.1 part B), in the caller's
-     * transaction, and answers the latest time a live claim of one of them lapses; empty when none is running. The
+     * Locks every job of {@code jobIds} (Story 3.1 part B), in the caller's transaction, and answers the latest time a
+     * live claim of one of them lapses, counting only the bound owner's {@code running} jobs; empty when none is. The
      * caller cancels them next ({@link #cancel}), which ends a claim at once, but a worker that still runs it may act
      * until then (at most the claim lapse after its last renewal); the locks keep any claim from coming in between.
-     * Another owner's job, an unknown one or an ended one is left out.
      */
     public Optional<Instant> claimLapse(Collection<UUID> jobIds) {
         Objects.requireNonNull(jobIds, "jobIds");

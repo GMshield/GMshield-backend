@@ -266,7 +266,11 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     - `V22__system_deletion.sql` adds `system.state text not null default 'ready'` (check `ready|deleting`) and the
       `deletion` table. Additive: the previous release neither reads nor writes them. Rolling back while a deletion
       is pending shows the system again, with whatever its removal has not removed yet, under its id as fingerprint
-      (its name can then be taken twice).
+      (its name can then be taken twice). Rolling forward again finishes every deletion left pending (system `deleting`,
+      `deletion.done_at` null) at the first sweep, with whatever the GM added to that system meanwhile. To keep such a
+      system, cancel its deletion before rolling back: `update deletion set done_at = now() where target_id = '<id>'`
+      and `update system set state = 'ready' where id = '<id>'` (its `name_fingerprint` stays the system's id, so the
+      same name and edition can be created again).
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.18.0). The worker does
       not change: `index.removal` per version already exists.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's

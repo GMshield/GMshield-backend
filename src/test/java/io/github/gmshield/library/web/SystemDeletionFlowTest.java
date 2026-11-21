@@ -187,6 +187,8 @@ class SystemDeletionFlowTest {
         Made ofSystemAlone = material(gm, null, List.of(system), "needs_review", 1);
         Made shared = material(gm, null, List.of(system, other), "ready", 1);
         Made starter = material(gm, gm.campaign(), List.of(), "ready", 1);
+        // Attached to the system alone, but its one version was discarded: it goes, and the dialog does not count it.
+        Made hidden = material(gm, null, List.of(system), "discarded", 0);
         // A version the GM discarded before: it has its index removal already, and gets no second one.
         UUID discardedBefore = version(gm, ofCampaign.materialId(), "discarded");
         as(gm.id(), () -> {
@@ -238,7 +240,8 @@ class SystemDeletionFlowTest {
         assertThat(conversations.conversations.values()).noneMatch(conversation ->
                 List.of(first, second).contains(conversation.campaignId()));
         assertThat(conversations.turns).doesNotContainKeys(firstTurn, secondTurn).hasSize(1);
-        assertThat(materials.materials).doesNotContainKeys(ofCampaign.materialId(), ofSystemAlone.materialId())
+        assertThat(materials.materials).doesNotContainKeys(ofCampaign.materialId(), ofSystemAlone.materialId(),
+                        hidden.materialId())
                 .containsKeys(shared.materialId(), starter.materialId());
         assertThat(materials.versions).doesNotContainKeys(ofCampaign.versionId(), ofSystemAlone.versionId(),
                 discardedBefore);

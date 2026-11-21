@@ -238,6 +238,20 @@ class SystemDeletionIntegrationTest {
                 .single();
         assertThat(jdbc.sql("select state from material_version where id = ?").param(lateVersion).query(String.class)
                 .single()).isEqualTo("waiting");
+        // Its first step is claimed before the removal runs: the pass cancels it and waits again, for that claim.
+        UUID lateJob = jdbc.sql("select job_id from ingestion_step where version_id = ? and ended_at is null")
+                .param(lateVersion).query(UUID.class).single();
+        io.github.gmshield.jobs.service.JobClaims.Claim lateClaim = claims.claim(lateJob);
+        jdbc.sql("update deletion set not_before = ? where id = ?")
+                .params(java.time.OffsetDateTime.now().minusSeconds(1), deletionId).update();
+        assertThat(deletion.run(b.id(), deletionId)).isFalse();
+        assertThat(jdbc.sql("select not_before from deletion where id = ?").param(deletionId)
+                .query(java.time.OffsetDateTime.class).single().toInstant())
+                .isEqualTo(lateClaim.lapsesAt().truncatedTo(ChronoUnit.MICROS));
+        assertThat(jobState(lateJob)).isEqualTo("cancelled");
+        assertThat(count("index_removal", "version_id = ?", lateVersion)).isZero();
+        assertThat(count("material", "id = (select material_id from material_version where id = ?)", lateVersion))
+                .isOne();
         jdbc.sql("update deletion set not_before = ? where id = ?")
                 .params(java.time.OffsetDateTime.now().minusSeconds(1), deletionId).update();
 

@@ -167,7 +167,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         }
     }
 
-    /** Removes one discarded version, as the class says; false when it is no longer discarded (it is left). */
+    /** Removes one discarded version, as the class says; false when it is no longer there or discarded (it is left). */
     private boolean removeVersion(UUID owner, UUID versionId) {
         // The removal of its points, once for the version: the version's lock orders two passes.
         boolean discarded = Boolean.TRUE.equals(writing(() -> {
@@ -213,7 +213,8 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         });
         // Again after the rows went: a piece an unfinished part wrote meanwhile goes too.
         rest.ifPresent(named -> named.forEach(file -> files.deleteFile(owner, file)));
-        return true;
+        // A version no longer discarded is left, for the next pass.
+        return rest.isPresent();
     }
 
     /** The files of a version and the pieces of its uploads, by their ids. */
