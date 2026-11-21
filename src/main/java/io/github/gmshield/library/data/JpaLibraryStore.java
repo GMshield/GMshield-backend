@@ -54,6 +54,16 @@ class JpaLibraryStore implements LibraryStore {
             + " and c.archivedAt is null and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
     private static final String ARCHIVED_CAMPAIGNS_OF = "select c from LibraryCampaign c where c.systemId = :system"
             + " and c.archivedAt is not null and c.id < :before and" + READY_CAMPAIGN + " order by c.id desc";
+    /** The totals of the lists above: the same rows, counted. Constant texts, one per list. */
+    private static final String SYSTEM_COUNT = "select count(s) from LibrarySystem s where s.state = 'ready'";
+    private static final String CAMPAIGN_COUNT = "select count(c) from LibraryCampaign c where c.archivedAt is null and"
+            + READY_CAMPAIGN;
+    private static final String ARCHIVED_CAMPAIGN_COUNT = "select count(c) from LibraryCampaign c"
+            + " where c.archivedAt is not null and" + READY_CAMPAIGN;
+    private static final String CAMPAIGN_COUNT_OF = "select count(c) from LibraryCampaign c where c.systemId = :system"
+            + " and c.archivedAt is null and" + READY_CAMPAIGN;
+    private static final String ARCHIVED_CAMPAIGN_COUNT_OF = "select count(c) from LibraryCampaign c"
+            + " where c.systemId = :system and c.archivedAt is not null and" + READY_CAMPAIGN;
     private static final String CAMPAIGN_IDS_OF = "select c.id from LibraryCampaign c where c.systemId = :system and"
             + READY_CAMPAIGN + " order by c.id desc";
     private static final String CAMPAIGN_BY_ID = "select c from LibraryCampaign c where c.id = :id and" + READY_CAMPAIGN;
@@ -137,6 +147,54 @@ class JpaLibraryStore implements LibraryStore {
             query.setParameter("system", systemId);
         }
         return query.getResultList().stream().map(CampaignEntity::row).toList();
+    }
+
+    @Override
+    public List<SystemRow> systemsFrom(int offset, int limit) {
+        if (limit < 1 || offset < 0) {
+            return List.of();
+        }
+        return em().createQuery(SYSTEMS, SystemEntity.class).setFirstResult(offset).setMaxResults(limit)
+                .getResultList().stream().map(SystemEntity::row).toList();
+    }
+
+    @Override
+    public long systemCount() {
+        return em().createQuery(SYSTEM_COUNT, Long.class).getSingleResult();
+    }
+
+    @Override
+    public List<CampaignRow> campaignsFrom(UUID systemId, boolean archived, int offset, int limit) {
+        if (limit < 1 || offset < 0) {
+            return List.of();
+        }
+        String text;
+        if (systemId == null) {
+            text = archived ? ARCHIVED_CAMPAIGNS : CAMPAIGNS;
+        } else {
+            text = archived ? ARCHIVED_CAMPAIGNS_OF : CAMPAIGNS_OF;
+        }
+        TypedQuery<CampaignEntity> query = em().createQuery(text, CampaignEntity.class).setParameter("before", TOP)
+                .setFirstResult(offset).setMaxResults(limit);
+        if (systemId != null) {
+            query.setParameter("system", systemId);
+        }
+        return query.getResultList().stream().map(CampaignEntity::row).toList();
+    }
+
+    @Override
+    public long campaignCount(UUID systemId, boolean archived) {
+        String text;
+        if (systemId == null) {
+            text = archived ? ARCHIVED_CAMPAIGN_COUNT : CAMPAIGN_COUNT;
+        } else {
+            text = archived ? ARCHIVED_CAMPAIGN_COUNT_OF : CAMPAIGN_COUNT_OF;
+        }
+        TypedQuery<Long> query = em().createQuery(text, Long.class);
+        if (systemId != null) {
+            query.setParameter("system", systemId);
+        }
+        return query.getSingleResult();
     }
 
     @Override

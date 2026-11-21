@@ -82,6 +82,8 @@ public class Library {
     /** A list page's size: {@value #DEFAULT_LIMIT} unless asked, at most {@value #MAX_LIMIT}. */
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
+    /** The furthest position a list page may start at (a page's {@code offset}): far past any library. */
+    public static final int MAX_OFFSET = 100_000;
     /** The starter library's names, decided by Dalton on 2026-11-16. */
     static final Map<Language, String[]> STARTER_NAMES = Map.of(
             Language.PT_BR, new String[] {"Sistema sem nome", "Primeira campanha"},
@@ -128,12 +130,15 @@ public class Library {
         }
     }
 
-    /** One page of systems, and the cursor of the next one (null on the last). */
-    public record SystemPage(List<GameSystem> items, UUID nextCursor) {
+    /** One page of systems, the cursor of the next one (null on the last), and how many systems the list has in all. */
+    public record SystemPage(List<GameSystem> items, UUID nextCursor, long total) {
     }
 
-    /** One page of campaigns, and the cursor of the next one (null on the last). */
-    public record CampaignPage(List<Campaign> items, UUID nextCursor) {
+    /**
+     * One page of campaigns, the cursor of the next one (null on the last), and how many campaigns the list has in all
+     * (for the same system and the same {@code archived}).
+     */
+    public record CampaignPage(List<Campaign> items, UUID nextCursor, long total) {
     }
 
     /** Campaigns (each with its system) and systems by id (Story 3.3), as {@link #places} finds them. */
@@ -190,12 +195,22 @@ public class Library {
      * {@value #MAX_LIMIT}). Newest first because encrypted names cannot be sorted by the database.
      */
     public SystemPage systems(UUID cursor, int limit) {
+        return systems(cursor, 0, limit);
+    }
+
+    /**
+     * As {@link #systems(UUID, int)}, from a position instead of a cursor when {@code offset} is above zero: the
+     * systems after the {@code offset} newest ones (0 to {@value #MAX_OFFSET}), so a client can show numbered pages. A
+     * cursor and an offset together are refused. The page also says how many systems the list has in all.
+     */
+    public SystemPage systems(UUID cursor, int offset, int limit) {
         checkLimit(limit);
+        checkOffset(cursor, offset);
         return reading(() -> {
-            List<SystemRow> found = store.systems(cursor, limit + 1);
+            List<SystemRow> found = offset > 0 ? store.systemsFrom(offset, limit + 1) : store.systems(cursor, limit + 1);
             List<SystemRow> page = found.size() > limit ? found.subList(0, limit) : found;
             UUID next = found.size() > limit ? page.getLast().id() : null;
-            return new SystemPage(page.stream().map(this::open).toList(), next);
+            return new SystemPage(page.stream().map(this::open).toList(), next, store.systemCount());
         });
     }
 
@@ -205,17 +220,28 @@ public class Library {
      * most {@code limit} (1 to {@value #MAX_LIMIT}); empty for an unknown system or another owner's.
      */
     public Optional<CampaignPage> campaigns(UUID systemId, boolean archived, UUID cursor, int limit) {
+        return campaigns(systemId, archived, cursor, 0, limit);
+    }
+
+    /**
+     * As {@link #campaigns(UUID, boolean, UUID, int)}, from a position instead of a cursor when {@code offset} is above
+     * zero (0 to {@value #MAX_OFFSET}); a cursor and an offset together are refused. The page also says how many
+     * campaigns the list has in all.
+     */
+    public Optional<CampaignPage> campaigns(UUID systemId, boolean archived, UUID cursor, int offset, int limit) {
         checkLimit(limit);
+        checkOffset(cursor, offset);
         return reading(() -> {
             if (systemId != null && store.findSystem(systemId).isEmpty()) {
                 return Optional.<CampaignPage>empty();
             }
-            List<CampaignRow> found = store.campaigns(systemId, archived, cursor, limit + 1);
+            List<CampaignRow> found = offset > 0 ? store.campaignsFrom(systemId, archived, offset, limit + 1)
+                    : store.campaigns(systemId, archived, cursor, limit + 1);
             List<CampaignRow> page = found.size() > limit ? found.subList(0, limit) : found;
             UUID next = found.size() > limit ? page.getLast().id() : null;
             Map<UUID, GameSystem> systems = new HashMap<>();
             return Optional.of(new CampaignPage(page.stream().map(row -> open(row, systems.computeIfAbsent(row.systemId(),
-                    this::systemOf))).toList(), next));
+                    this::systemOf))).toList(), next, store.campaignCount(systemId, archived)));
         });
     }
 
@@ -486,6 +512,13 @@ public class Library {
     private static void checkLimit(int limit) {
         if (limit < 1 || limit > MAX_LIMIT) {
             throw new IllegalArgumentException("library.limit_invalid");
+        }
+    }
+
+    /** A list starts at a cursor or at a position, never both, and no position is below zero or past the cap. */
+    private static void checkOffset(UUID cursor, int offset) {
+        if (offset < 0 || offset > MAX_OFFSET || (offset > 0 && cursor != null)) {
+            throw new IllegalArgumentException("library.offset_invalid");
         }
     }
 

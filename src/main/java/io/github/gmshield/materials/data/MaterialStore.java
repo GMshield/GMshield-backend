@@ -54,6 +54,22 @@ public interface MaterialStore {
     List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds, UUID before,
                                        int limit);
 
+    /**
+     * As {@link #newestIn}, by position instead of by cursor (a numbered page): the materials after the {@code offset}
+     * newest ones, at most {@code limit}.
+     */
+    List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit);
+
+    /** How many materials {@link #newestIn} lists in all for these states. */
+    long newestCount(Collection<String> states);
+
+    /** As {@link #newestAttached}, by position instead of by cursor. */
+    List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                           int offset, int limit);
+
+    /** How many materials {@link #newestAttached} lists in all for these states, this system and these campaigns. */
+    long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds);
+
     /** The current owner's material with this id and its newest version; empty for an unknown id or another owner's. */
     Optional<NewestVersion> newest(UUID materialId);
 

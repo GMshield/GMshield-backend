@@ -214,6 +214,20 @@ class MaterialIntegrationTest {
         assertThat(second.items()).extracting(Materials.Material::id).containsExactly(created.get(2), created.get(0));
         assertThat(second.items().getLast().upload()).isNull();
         assertThat(second.nextCursor()).isNull();
+        // A numbered page (the same rows by position) and the list's total, from the database's own count.
+        assertThat(first.total()).isEqualTo(4);
+        assertThat(second.total()).isEqualTo(4);
+        Materials.Page byPosition = as(a.id(), () -> materials.list(List.of("uploading", "processing"), null, 2, 2));
+        assertThat(byPosition.items()).extracting(Materials.Material::id).containsExactly(created.get(2), created.get(0));
+        assertThat(byPosition.nextCursor()).isNull();
+        assertThat(as(a.id(), () -> store.newestFrom(Set.of("uploading", "processing"), 1, 2)))
+                .extracting(found -> found.material().id()).containsExactly(created.get(3), created.get(2));
+        assertThat(as(a.id(), () -> store.newestCount(Set.of("uploading", "processing")))).isEqualTo(4);
+        assertThat(as(a.id(), () -> store.newestCount(Set.of("ready")))).isEqualTo(1);
+        assertThat(as(a.id(), () -> store.newestCount(Set.of("failed")))).isZero();
+        // A material counts once whatever its versions, and never for another owner.
+        assertThat(as(a.id(), () -> store.newestCount(Materials.STATES))).isEqualTo(5);
+        assertThat(as(b.id(), () -> store.newestCount(Materials.STATES))).isEqualTo(1);
         assertThat(as(a.id(), () -> materials.find(created.get(0))).orElseThrow().state()).isEqualTo("processing");
     }
 

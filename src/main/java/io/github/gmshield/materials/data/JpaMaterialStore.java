@@ -125,10 +125,13 @@ class JpaMaterialStore implements MaterialStore {
      * The newest version of a material is the one no other version of it follows (later, or as late with a greater id).
      * Two constant query texts rather than a null parameter, whose type PostgreSQL could not tell.
      */
-    private static final String NEWEST = "select m, v from Material m join MaterialVersion v on v.materialId = m.id"
+    private static final String NEWEST_FROM = " from Material m join MaterialVersion v on v.materialId = m.id"
             + " where v.state in :states"
             + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
             + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))";
+    /** The materials with their newest version in the states asked: what the lists read, and what their totals count. */
+    private static final String NEWEST = "select m, v" + NEWEST_FROM;
+    private static final String NEWEST_COUNT = "select count(m)" + NEWEST_FROM;
     private static final String NEWEST_IN = NEWEST + " order by m.id desc";
     private static final String NEWEST_IN_BEFORE = NEWEST + " and m.id < :before order by m.id desc";
 
@@ -160,6 +163,9 @@ class JpaMaterialStore implements MaterialStore {
     private static final String ATTACHED_BEFORE = ATTACHED + BEFORE_NEWEST_FIRST;
     private static final String ATTACHED_OR_CAMPAIGN_FIRST = ATTACHED_OR_CAMPAIGN + NEWEST_FIRST;
     private static final String ATTACHED_OR_CAMPAIGN_BEFORE = ATTACHED_OR_CAMPAIGN + BEFORE_NEWEST_FIRST;
+    private static final String ATTACHED_COUNT = NEWEST_COUNT + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN_COUNT = NEWEST_COUNT + ATTACHED_TO_SYSTEM
+            + " or m.campaignId in :campaigns)";
 
     @Override
     public List<NewestVersion> newestAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
@@ -185,6 +191,57 @@ class JpaMaterialStore implements MaterialStore {
         return query.getResultList().stream()
                 .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
+    }
+
+    @Override
+    public List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit) {
+        if (states.isEmpty() || limit < 1 || offset < 0) {
+            return List.of();
+        }
+        return em().createQuery(NEWEST_IN, Object[].class).setParameter("states", states).setFirstResult(offset)
+                .setMaxResults(limit).getResultList().stream()
+                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    @Override
+    public long newestCount(Collection<String> states) {
+        if (states.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery(NEWEST_COUNT, Long.class).setParameter("states", states).getSingleResult();
+    }
+
+    @Override
+    public List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                                  int offset, int limit) {
+        if (states.isEmpty() || limit < 1 || offset < 0) {
+            return List.of();
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        var query = em().createQuery(byCampaign ? ATTACHED_OR_CAMPAIGN_FIRST : ATTACHED_FIRST, Object[].class)
+                .setParameter("states", states).setParameter("system", systemId).setFirstResult(offset)
+                .setMaxResults(limit);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        return query.getResultList().stream()
+                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    @Override
+    public long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+        if (states.isEmpty()) {
+            return 0;
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        var query = em().createQuery(byCampaign ? ATTACHED_OR_CAMPAIGN_COUNT : ATTACHED_COUNT, Long.class)
+                .setParameter("states", states).setParameter("system", systemId);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        return query.getSingleResult();
     }
 
     @Override

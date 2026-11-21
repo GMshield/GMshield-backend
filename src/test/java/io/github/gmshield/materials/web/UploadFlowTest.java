@@ -389,6 +389,27 @@ class UploadFlowTest {
             page.path("items").forEach(item -> names.add(item.path("name").asString()));
         }
         assertThat(names).containsExactlyInAnyOrder("a.pdf", "b.pdf", "c.pdf");
+        // A numbered page: every page names the total for its states, and a page can start at a position.
+        assertThat(first.path("total").asLong()).isEqualTo(3);
+        assertThat(second.path("total").asLong()).isEqualTo(3);
+        JsonNode last = json(get(gm, "/api/v1/materials?state=uploading&limit=2&offset=2"));
+        assertThat(last.path("items").size()).isEqualTo(1);
+        assertThat(last.path("items").get(0).path("id").asString()).isEqualTo(second.path("items").get(0).path("id").asString());
+        assertThat(last.has("nextCursor")).isFalse();
+        assertThat(last.path("total").asLong()).isEqualTo(3);
+        JsonNode middle = json(get(gm, "/api/v1/materials?state=uploading&limit=1&offset=1"));
+        assertThat(middle.path("items").get(0).path("id").asString()).isEqualTo(first.path("items").get(1).path("id").asString());
+        assertThat(middle.path("nextCursor").asString()).isEqualTo(cursor);
+        // Another state has its own total, and a position past the end is an empty page.
+        assertThat(json(get(gm, "/api/v1/materials?state=ready")).path("total").asLong()).isZero();
+        JsonNode past = json(get(gm, "/api/v1/materials?offset=7"));
+        assertThat(past.path("items").size()).isZero();
+        assertThat(past.path("total").asLong()).isEqualTo(3);
+        for (String query : List.of("offset=-1", "offset=x", "offset=01", "offset=100001", "offset=1&cursor=" + cursor)) {
+            HttpResponse<String> refused = get(gm, "/api/v1/materials?state=uploading&" + query);
+            assertThat(refused.statusCode()).as(query).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        }
     }
 
     @Test

@@ -125,6 +125,26 @@ class LibraryIntegrationTest {
         }
 
         @Override
+        public List<SystemRow> systemsFrom(int offset, int limit) {
+            return real.systemsFrom(offset, limit);
+        }
+
+        @Override
+        public long systemCount() {
+            return real.systemCount();
+        }
+
+        @Override
+        public List<CampaignRow> campaignsFrom(UUID systemId, boolean archived, int offset, int limit) {
+            return real.campaignsFrom(systemId, archived, offset, limit);
+        }
+
+        @Override
+        public long campaignCount(UUID systemId, boolean archived) {
+            return real.campaignCount(systemId, archived);
+        }
+
+        @Override
         public List<UUID> campaignIdsOf(UUID systemId) {
             return real.campaignIdsOf(systemId);
         }
@@ -572,6 +592,30 @@ class LibraryIntegrationTest {
         assertThat(lastCampaign.path("items")).extracting(item -> item.path("id").asString())
                 .containsExactly(gm.campaignId().toString());
         assertThat(lastCampaign.has("nextCursor")).isFalse();
+
+        // The same lists by position (a numbered page), with the database's own count as their total.
+        assertThat(first.path("total").asLong()).isEqualTo(3);
+        JsonNode third = ok(get("/api/v1/systems?limit=1&offset=2", gm.session()));
+        assertThat(third.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.systemId().toString());
+        assertThat(third.has("nextCursor")).isFalse();
+        assertThat(third.path("total").asLong()).isEqualTo(3);
+        JsonNode middle = ok(get("/api/v1/systems?limit=1&offset=1", gm.session()));
+        assertThat(middle.path("items")).extracting(item -> item.path("id").asString()).containsExactly(older);
+        assertThat(middle.path("nextCursor").asString()).isEqualTo(older);
+        assertThat(campaigns.path("total").asLong()).isEqualTo(2);
+        JsonNode secondCampaign = ok(get("/api/v1/campaigns?limit=1&offset=1&system=" + gm.systemId(), gm.session()));
+        assertThat(secondCampaign.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(gm.campaignId().toString());
+        // Archived ones are another list with its own total: none here, in this system or in all.
+        assertThat(ok(get("/api/v1/campaigns?archived=true", gm.session())).path("total").asLong()).isZero();
+        assertThat(ok(get("/api/v1/campaigns?archived=true&system=" + gm.systemId(), gm.session())).path("total").asLong())
+                .isZero();
+        assertThat(ok(get("/api/v1/campaigns", gm.session())).path("total").asLong()).isEqualTo(2);
+        // Another account's rows are never counted.
+        Gm other = signUp("en");
+        assertThat(ok(get("/api/v1/systems", other.session())).path("total").asLong()).isEqualTo(1);
+        assertThat(ok(get("/api/v1/campaigns", other.session())).path("total").asLong()).isEqualTo(1);
     }
 
     @Test
@@ -594,8 +638,20 @@ class LibraryIntegrationTest {
         assertThat(last.path("items")).extracting(item -> item.path("id").asString()).containsExactly(ofSystem.toString());
         assertThat(last.has("nextCursor")).isFalse();
         // A system with neither, and one with a material of its own but no campaign.
-        assertThat(ok(get("/api/v1/materials?state=ready&system=" + otherSystem, gm.session())).path("items"))
-                .extracting(item -> item.path("name").asString()).containsExactly("other.pdf");
+        JsonNode ofOther = ok(get("/api/v1/materials?state=ready&system=" + otherSystem, gm.session()));
+        assertThat(ofOther.path("items")).extracting(item -> item.path("name").asString()).containsExactly("other.pdf");
+        // The totals are of each list as the database counts it (with the system's campaigns, and for a system with
+        // none), and the second material of the system is also reached by its position.
+        assertThat(first.path("total").asLong()).isEqualTo(2);
+        assertThat(ofOther.path("total").asLong()).isEqualTo(1);
+        JsonNode byPosition = ok(get(list + "&limit=1&offset=1", gm.session()));
+        assertThat(byPosition.path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(ofSystem.toString());
+        assertThat(byPosition.has("nextCursor")).isFalse();
+        assertThat(ok(get("/api/v1/materials?state=ready", gm.session())).path("total").asLong()).isEqualTo(4);
+        assertThat(ok(get("/api/v1/materials?state=ready&limit=2&offset=2", gm.session())).path("items")).hasSize(2);
+        assertThat(ok(get("/api/v1/materials?state=failed&system=" + gm.systemId(), gm.session())).path("total").asLong())
+                .isZero();
     }
 
     // --- Story 3.2: campaigns ---

@@ -68,6 +68,8 @@ class MaterialController {
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
+    /** A page's position: 0, or up to six digits with no leading zero. */
+    private static final Pattern OFFSET = Pattern.compile("0|[1-9][0-9]{0,5}");
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
 
     private final Materials materials;
@@ -265,19 +267,24 @@ class MaterialController {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "MaterialPage", requiredProperties = "items")
+    @Schema(name = "MaterialPage", requiredProperties = {"items", "total"})
     record PageView(
             @ArraySchema(schema = @Schema(implementation = MaterialView.class)) List<MaterialView> items,
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
-                    example = "0190a0b0-0000-7000-8000-000000000003") String nextCursor) {
+                    example = "0190a0b0-0000-7000-8000-000000000003") String nextCursor,
+            @Schema(description = "How many materials the list has in all for the same states and system, whatever the"
+                    + " page; it counts a material whose every place is being deleted until that deletion is done",
+                    format = "int64", example = "61") long total) {
     }
 
     @GetMapping(path = MATERIALS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listMaterials", summary = "The account's materials whose newest version is in one of the"
             + " given states (every material without a state), newest first, with the upload's progress on those still"
             + " uploading; with system, only those attached to that system or to one of its campaigns. A material whose"
-            + " every place is being deleted is left out, so a page may hold fewer than the limit. request.invalid (400)"
-            + " for an unknown state, a limit outside 1 to 50 or a malformed cursor; request.not_found (404) for a system"
+            + " every place is being deleted is left out, so a page may hold fewer than the limit. A page starts after a"
+            + " cursor or at an offset (a numbered page), and names the total of the list. request.invalid (400)"
+            + " for an unknown state, a limit outside 1 to 50, a malformed cursor, an offset outside 0 to 100000 or a"
+            + " cursor together with an offset above 0; request.not_found (404) for a system"
             + " that is not the account's (unknown, another account's or malformed);" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
@@ -296,11 +303,16 @@ class MaterialController {
                                 format = "uuid")),
                 @Parameter(name = "system", in = ParameterIn.QUERY, description = "Only the materials of this system"
                         + " (Story 3.1): attached to it or to one of its campaigns", schema = @Schema(type = "string",
-                                format = "uuid"))})
+                                format = "uuid")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the newest to skip, 0 to"
+                        + " 100000, for a numbered page; not together with cursor",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
     ResponseEntity<PageView> list(@Parameter(hidden = true) @RequestParam(value = "state", required = false) List<String> states,
                                   @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
                                   @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
-                                  @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system) {
+                                  @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system,
+                                  @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
         if (states != null && (states.isEmpty() || !Materials.STATES.containsAll(states))) {
             throw invalid();
         }
@@ -309,12 +321,18 @@ class MaterialController {
         }
         int size = limit == null ? Materials.DEFAULT_LIMIT : Integer.parseInt(limit);
         UUID after = cursor == null ? null : parse(cursor).orElseThrow(MaterialController::invalid);
-        Materials.Page page = system == null ? materials.list(states, after, size)
-                : parse(system).flatMap(id -> materials.listOfSystem(states, id, after, size))
+        // A page starts after a cursor or at a position, never both.
+        if (offset != null && (!OFFSET.matcher(offset).matches() || Integer.parseInt(offset) > Materials.MAX_OFFSET
+                || (after != null && Integer.parseInt(offset) > 0))) {
+            throw invalid();
+        }
+        int from = offset == null ? 0 : Integer.parseInt(offset);
+        Materials.Page page = system == null ? materials.list(states, after, from, size)
+                : parse(system).flatMap(id -> materials.listOfSystem(states, id, after, from, size))
                         .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(new PageView(page.items().stream().map(MaterialView::of).toList(),
-                        page.nextCursor() == null ? null : page.nextCursor().toString()));
+                        page.nextCursor() == null ? null : page.nextCursor().toString(), page.total()));
     }
 
     @GetMapping(path = MATERIAL, produces = MediaType.APPLICATION_JSON_VALUE)

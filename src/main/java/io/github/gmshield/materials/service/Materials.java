@@ -81,6 +81,8 @@ public class Materials {
     public static final String OUTLINE_EMPTY = "report.outline_empty";
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
+    /** The furthest position a list page may start at (a page's {@code offset}): far past any library. */
+    public static final int MAX_OFFSET = 100_000;
 
     private final MaterialStore materials;
     private final UploadStorage uploads;
@@ -336,8 +338,12 @@ public class Materials {
         }
     }
 
-    /** One page of materials, and the cursor of the next one (null when this is the last). */
-    public record Page(List<Material> items, UUID nextCursor) {
+    /**
+     * One page of materials, the cursor of the next one (null when this is the last), and how many materials the list
+     * has in all for the same states (and system). The total counts a material whose every place is being deleted,
+     * which a page leaves out, until that deletion is done.
+     */
+    public record Page(List<Material> items, UUID nextCursor, long total) {
     }
 
     /**
@@ -346,8 +352,19 @@ public class Materials {
      * {@value #MAX_LIMIT}). A material whose every place is being deleted is left out (a page may then be shorter).
      */
     public Page list(Collection<String> states, UUID cursor, int limit) {
-        checkList(states, limit);
-        return reading(() -> page(materials.newestIn(statesOrAll(states), cursor, limit + 1), limit));
+        return list(states, cursor, 0, limit);
+    }
+
+    /**
+     * As {@link #list(Collection, UUID, int)}, from a position instead of a cursor when {@code offset} is above zero:
+     * the materials after the {@code offset} newest ones (0 to {@value #MAX_OFFSET}), so a client can show numbered
+     * pages. A cursor and an offset together are refused.
+     */
+    public Page list(Collection<String> states, UUID cursor, int offset, int limit) {
+        checkList(states, cursor, offset, limit);
+        Set<String> in = statesOrAll(states);
+        return reading(() -> page(offset > 0 ? materials.newestFrom(in, offset, limit + 1)
+                : materials.newestIn(in, cursor, limit + 1), limit, materials.newestCount(in)));
     }
 
     /**
@@ -355,13 +372,22 @@ public class Materials {
      * those of its campaigns. Empty for an unknown system or another owner's.
      */
     public Optional<Page> listOfSystem(Collection<String> states, UUID systemId, UUID cursor, int limit) {
-        checkList(states, limit);
-        return reading(() -> library.campaignIdsOf(systemId).map(campaigns -> page(
-                materials.newestAttached(statesOrAll(states), systemId, campaigns, cursor, limit + 1), limit)));
+        return listOfSystem(states, systemId, cursor, 0, limit);
     }
 
-    private static void checkList(Collection<String> states, int limit) {
-        if ((states != null && (states.isEmpty() || !STATES.containsAll(states))) || limit < 1 || limit > MAX_LIMIT) {
+    /** As {@link #listOfSystem(Collection, UUID, UUID, int)}, from a position when {@code offset} is above zero. */
+    public Optional<Page> listOfSystem(Collection<String> states, UUID systemId, UUID cursor, int offset, int limit) {
+        checkList(states, cursor, offset, limit);
+        Set<String> in = statesOrAll(states);
+        return reading(() -> library.campaignIdsOf(systemId).map(campaigns -> page(
+                offset > 0 ? materials.newestAttachedFrom(in, systemId, campaigns, offset, limit + 1)
+                        : materials.newestAttached(in, systemId, campaigns, cursor, limit + 1),
+                limit, materials.newestAttachedCount(in, systemId, campaigns))));
+    }
+
+    private static void checkList(Collection<String> states, UUID cursor, int offset, int limit) {
+        if ((states != null && (states.isEmpty() || !STATES.containsAll(states))) || limit < 1 || limit > MAX_LIMIT
+                || offset < 0 || offset > MAX_OFFSET || (offset > 0 && cursor != null)) {
             throw new IllegalArgumentException("materials.list_invalid");
         }
     }
@@ -370,10 +396,10 @@ public class Materials {
         return states == null ? STATES : Set.copyOf(states);
     }
 
-    private Page page(List<NewestVersion> found, int limit) {
+    private Page page(List<NewestVersion> found, int limit, long total) {
         List<NewestVersion> page = found.size() > limit ? found.subList(0, limit) : found;
         UUID next = found.size() > limit ? page.getLast().material().id() : null;
-        return new Page(views(page, true), next);
+        return new Page(views(page, true), next, total);
     }
 
     /** The owner's material with this id; empty for an unknown id or another owner's. */

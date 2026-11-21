@@ -155,6 +155,29 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<NewestVersion> newestFrom(Collection<String> states, int offset, int limit) {
+        return newestIn(states, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0))
+                .toList();
+    }
+
+    @Override
+    public long newestCount(Collection<String> states) {
+        return newestIn(states, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public List<NewestVersion> newestAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                                  int offset, int limit) {
+        return newestAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0))
+                .limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public long newestAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+        return newestAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
     public Optional<NewestVersion> newest(UUID materialId) {
         return findMaterial(materialId).flatMap(this::newestOf);
     }

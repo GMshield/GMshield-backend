@@ -461,6 +461,17 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     `material_system` row.
   - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.21.0). The worker does
     not change.
+- **Numbered pages (`library`, `materials`, public contract 1.22.0).** The three lists (`GET /api/v1/materials`,
+  `/api/v1/systems`, `/api/v1/campaigns`) name `total`, how many items the list has in all for the same filters
+  (`state` and `system`; `system` and `archived`), and take `offset` (0 to 100000, default 0): how many of the newest to
+  skip, so a client shows page 3 with one call instead of reading two pages by cursor first.
+  - A page starts after a `cursor` or at an `offset`, never both: an `offset` above 0 with a `cursor`, or one outside
+    its range, is `request.invalid` (400). An offset past the end is an empty page that still names the total.
+  - The total is a `count` of the same query the list reads, in constant JPQL texts (`JpaLibraryStore.SYSTEM_COUNT` and
+    the four campaign counts; `JpaMaterialStore.NEWEST_COUNT` and the two attached counts). The materials total counts
+    a material whose every place is being deleted, which a page leaves out, until that deletion is done.
+  - No migration, and the worker does not change. Deploy order: the backend first, then a frontend whose minimum public
+    contract is 1.22.0. A frontend on 1.21.0 keeps working: it ignores `total` and never sends `offset`.
 - **Cleaning an upload and splitting it into pages (`materials` and `jobs`, Story 1.15, AD-17).** Completing a PDF
   upload creates, in the same transaction, the version's first ingestion step: a job of kind `ingestion` (ingestion
   lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Text got its stage with Story 1.16
