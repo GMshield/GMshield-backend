@@ -72,6 +72,11 @@ class LibraryController {
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
+    /** A page's position: 0, or up to six digits with no leading zero. */
+    private static final Pattern OFFSET_TEXT = Pattern.compile("0|[1-9][0-9]{0,5}");
+    private static final String OFFSET = "How many of the newest to skip, 0 to 100000, for a numbered page; not"
+            + " together with cursor";
+    private static final String TOTAL = "How many items the list has in all, whatever the page";
     private static final String SESSION = "X-Session-Token";
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
     private static final String CURSOR_EXAMPLE = "0190a0b0-0000-7000-8000-000000000001";
@@ -167,19 +172,21 @@ class LibraryController {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "SystemPage", requiredProperties = "items")
+    @Schema(name = "SystemPage", requiredProperties = {"items", "total"})
     record SystemPageView(
             @ArraySchema(schema = @Schema(implementation = SystemView.class)) List<SystemView> items,
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
-                    example = CURSOR_EXAMPLE) String nextCursor) {
+                    example = CURSOR_EXAMPLE) String nextCursor,
+            @Schema(description = TOTAL, format = "int64", example = "3") long total) {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "CampaignPage", requiredProperties = "items")
+    @Schema(name = "CampaignPage", requiredProperties = {"items", "total"})
     record CampaignPageView(
             @ArraySchema(schema = @Schema(implementation = CampaignSummaryView.class)) List<CampaignSummaryView> items,
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
-                    example = "0190a0b0-0000-7000-8000-000000000002") String nextCursor) {
+                    example = "0190a0b0-0000-7000-8000-000000000002") String nextCursor,
+            @Schema(description = TOTAL, format = "int64", example = "4") long total) {
     }
 
     @Schema(name = "SystemDeletion", requiredProperties = {"campaigns", "conversations", "materials"})
@@ -302,9 +309,11 @@ class LibraryController {
     @GetMapping(path = CAMPAIGNS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listCampaigns", summary = "The account's campaigns, of one of its systems when system is"
             + " given, newest first, each with its system; the archived ones only with archived=true, else the others."
+            + " A page starts after a cursor or at an offset (a numbered page), and names the total of the list."
             + " request.not_found (404) for a system that is not the account's (unknown, another account's or"
-            + " malformed); request.invalid (400) for an archived other than true or false, a limit outside 1 to 50 or a"
-            + " malformed cursor;" + SESSION_SUMMARY,
+            + " malformed); request.invalid (400) for an archived other than true or false, a limit outside 1 to 50, a"
+            + " malformed cursor, an offset outside 0 to 100000 or a cursor together with an offset above 0;"
+            + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -317,20 +326,25 @@ class LibraryController {
                         schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
                                 defaultValue = "20")),
                 @Parameter(name = "cursor", in = ParameterIn.QUERY, description = "The nextCursor of the previous page",
-                        schema = @Schema(type = "string", format = "uuid"))})
+                        schema = @Schema(type = "string", format = "uuid")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = OFFSET,
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
     ResponseEntity<CampaignPageView> campaigns(
             @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system,
             @Parameter(hidden = true) @RequestParam(value = "archived", required = false) String archived,
             @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
-            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor) {
+            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
         boolean onlyArchived = flag(archived);
         int size = limit(limit);
         UUID after = cursor(cursor);
+        int from = offset(offset, after);
         UUID systemId = system == null ? null : parse(system).orElseThrow(LibraryController::notFound);
-        Library.CampaignPage page = library.campaigns(systemId, onlyArchived, after, size)
+        Library.CampaignPage page = library.campaigns(systemId, onlyArchived, after, from, size)
                 .orElseThrow(LibraryController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new CampaignPageView(
-                page.items().stream().map(CampaignSummaryView::of).toList(), text(page.nextCursor())));
+                page.items().stream().map(CampaignSummaryView::of).toList(), text(page.nextCursor()), page.total()));
     }
 
     @PostMapping(path = CAMPAIGNS, consumes = MediaType.APPLICATION_JSON_VALUE,
@@ -417,8 +431,10 @@ class LibraryController {
     }
 
     @GetMapping(path = SYSTEMS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "listSystems", summary = "The account's game systems, newest first. request.invalid (400)"
-            + " for a limit outside 1 to 50 or a malformed cursor;" + SESSION_SUMMARY,
+    @Operation(operationId = "listSystems", summary = "The account's game systems, newest first. A page starts after a"
+            + " cursor or at an offset (a numbered page), and names the total of the list. request.invalid (400)"
+            + " for a limit outside 1 to 50, a malformed cursor, an offset outside 0 to 100000 or a cursor together"
+            + " with an offset above 0;" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
@@ -426,14 +442,19 @@ class LibraryController {
                         schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
                                 defaultValue = "20")),
                 @Parameter(name = "cursor", in = ParameterIn.QUERY, description = "The nextCursor of the previous page",
-                        schema = @Schema(type = "string", format = "uuid"))})
+                        schema = @Schema(type = "string", format = "uuid")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = OFFSET,
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
     ResponseEntity<SystemPageView> systems(
             @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
-            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor) {
+            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
         int size = limit(limit);
-        Library.SystemPage page = library.systems(cursor(cursor), size);
+        UUID after = cursor(cursor);
+        Library.SystemPage page = library.systems(after, offset(offset, after), size);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new SystemPageView(
-                page.items().stream().map(SystemView::of).toList(), text(page.nextCursor())));
+                page.items().stream().map(SystemView::of).toList(), text(page.nextCursor()), page.total()));
     }
 
     @PostMapping(path = SYSTEMS, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -547,6 +568,21 @@ class LibraryController {
     /** The cursor of a page: none, or an id, else {@code request.invalid}. */
     private static UUID cursor(String cursor) {
         return cursor == null ? null : parse(cursor).orElseThrow(LibraryController::invalid);
+    }
+
+    /**
+     * The position a page starts at: 0 without one, else 0 to {@value Library#MAX_OFFSET}; {@code request.invalid} for
+     * anything else, and for a position above 0 together with a cursor (a page starts at one or the other).
+     */
+    private static int offset(String offset, UUID cursor) {
+        if (offset == null) {
+            return 0;
+        }
+        if (!OFFSET_TEXT.matcher(offset).matches() || Integer.parseInt(offset) > Library.MAX_OFFSET
+                || (cursor != null && Integer.parseInt(offset) > 0)) {
+            throw invalid();
+        }
+        return Integer.parseInt(offset);
     }
 
     private static String text(UUID id) {

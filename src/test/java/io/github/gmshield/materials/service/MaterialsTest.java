@@ -261,6 +261,27 @@ class MaterialsTest {
         assertThat(first.nextCursor()).isEqualTo(ofCampaign);
         assertThat(as(owner, () -> reads.listOfSystem(states, system, ofCampaign, 2)).orElseThrow().items())
                 .extracting(Materials.Material::id).containsExactly(ofSystem);
+        // A numbered page: the total is of this system's materials in these states, and a page starts at a position.
+        assertThat(page.total()).isEqualTo(3);
+        assertThat(first.total()).isEqualTo(3);
+        assertThat(as(owner, () -> reads.listOfSystem(List.of("ready"), system, null, 20)).orElseThrow().total()).isEqualTo(1);
+        Materials.Page last = as(owner, () -> reads.listOfSystem(states, system, null, 2, 2)).orElseThrow();
+        assertThat(last.items()).extracting(Materials.Material::id).containsExactly(ofSystem);
+        assertThat(last.nextCursor()).isNull();
+        assertThat(as(owner, () -> reads.listOfSystem(states, system, null, 1, 1)).orElseThrow().nextCursor())
+                .isEqualTo(ofCampaign);
+        // The whole list: the owner's five materials in these states, of every place; never another owner's.
+        Materials.Page all = as(owner, () -> reads.list(states, null, 3, 20));
+        assertThat(all.total()).isEqualTo(5);
+        assertThat(all.items()).hasSize(2);
+        assertThat(as(other, () -> reads.list(states, null, 20)).total()).isEqualTo(1);
+        // A cursor with a position, or a position out of range, is refused before anything is read.
+        for (int offset : new int[] {-1, Materials.MAX_OFFSET + 1}) {
+            assertThatThrownBy(() -> as(owner, () -> reads.list(states, null, offset, 20)))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThatThrownBy(() -> as(owner, () -> reads.list(states, ofCampaign, 1, 20)))
+                .isInstanceOf(IllegalArgumentException.class);
         // Another owner's system, or an unknown one, is not found: not an empty list.
         assertThat(as(owner, () -> reads.listOfSystem(states, theirSystem, null, 20))).isEmpty();
         assertThat(as(owner, () -> reads.listOfSystem(states, Ids.newId(), null, 20))).isEmpty();

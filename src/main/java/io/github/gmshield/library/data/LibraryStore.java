@@ -52,6 +52,24 @@ public interface LibraryStore {
     List<CampaignRow> campaigns(UUID systemId, boolean archived, UUID before, int limit);
 
     /**
+     * As {@link #systems}, by position instead of by cursor (a numbered page): the systems after the {@code offset}
+     * newest ones, at most {@code limit}.
+     */
+    List<SystemRow> systemsFrom(int offset, int limit);
+
+    /** How many systems {@link #systems} lists in all. */
+    long systemCount();
+
+    /**
+     * As {@link #campaigns}, by position instead of by cursor: the campaigns after the {@code offset} newest ones, at
+     * most {@code limit}.
+     */
+    List<CampaignRow> campaignsFrom(UUID systemId, boolean archived, int offset, int limit);
+
+    /** How many campaigns {@link #campaigns} lists in all, for the same system and the same {@code archived}. */
+    long campaignCount(UUID systemId, boolean archived);
+
+    /**
      * The ids of all the current owner's ready campaigns of the ready system {@code systemId}, archived ones included,
      * newest first.
      */

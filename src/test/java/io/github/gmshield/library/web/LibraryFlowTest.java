@@ -500,7 +500,27 @@ class LibraryFlowTest {
         assertThat(second.path("items")).extracting(item -> item.path("name").asString())
                 .containsExactly("A", "Untitled system");
         assertThat(second.has("nextCursor")).isFalse();
-        for (String query : List.of("?limit=0", "?limit=51", "?limit=abc", "?cursor=nope", "?limit=-1")) {
+        // A numbered page: every page names the total of the list, and a page can start at a position instead of a cursor.
+        assertThat(first.path("total").asLong()).isEqualTo(4);
+        assertThat(second.path("total").asLong()).isEqualTo(4);
+        JsonNode third = ok(get("/api/v1/systems?limit=2&offset=2", gm.session()));
+        assertThat(third.path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("A", "Untitled system");
+        assertThat(third.has("nextCursor")).isFalse();
+        assertThat(third.path("total").asLong()).isEqualTo(4);
+        JsonNode middle = ok(get("/api/v1/systems?limit=2&offset=1", gm.session()));
+        assertThat(middle.path("items")).extracting(item -> item.path("name").asString()).containsExactly("B", "A");
+        assertThat(middle.path("nextCursor").asString()).isEqualTo(created.get(2));
+        // A position past the end is an empty page that still names the total; position 0 is the first page.
+        JsonNode past = ok(get("/api/v1/systems?offset=9", gm.session()));
+        assertThat(past.path("items")).isEmpty();
+        assertThat(past.path("total").asLong()).isEqualTo(4);
+        assertThat(ok(get("/api/v1/systems?limit=2&offset=0", gm.session())).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("C", "B");
+        assertThat(ok(get("/api/v1/systems?limit=2&offset=0&cursor=" + created.get(1), gm.session())).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("A", "Untitled system");
+        for (String query : List.of("?limit=0", "?limit=51", "?limit=abc", "?cursor=nope", "?limit=-1", "?offset=-1",
+                "?offset=abc", "?offset=01", "?offset=100001", "?offset=1&cursor=" + created.get(1))) {
             HttpResponse<String> response = get("/api/v1/systems" + query, gm.session());
             assertThat(response.statusCode()).as(query).isEqualTo(400);
             assertThat(json(response).path("code").asString()).isEqualTo("request.invalid");
@@ -514,7 +534,10 @@ class LibraryFlowTest {
         assertThat(campaigns.path("items").get(0).path("system").path("id").asString()).isEqualTo(starter.toString());
         assertThat(campaigns.path("items").get(0).path("archived").asBoolean()).isFalse();
         assertThat(campaigns.has("nextCursor")).isFalse();
-        assertThat(ok(get("/api/v1/campaigns?system=" + created.getFirst(), gm.session())).path("items")).isEmpty();
+        assertThat(campaigns.path("total").asLong()).isEqualTo(1);
+        JsonNode none = ok(get("/api/v1/campaigns?system=" + created.getFirst(), gm.session()));
+        assertThat(none.path("items")).isEmpty();
+        assertThat(none.path("total").asLong()).isZero();
         UUID newer = Ids.newId();
         OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
                 library.insertCampaign(new CampaignRow(newer, gm.id(), starter,
@@ -525,7 +548,14 @@ class LibraryFlowTest {
         assertThat(paged.path("nextCursor").asString()).isEqualTo(newer.toString());
         assertThat(ok(get("/api/v1/campaigns?system=" + starter + "&cursor=" + newer, gm.session())).path("items")
                 .get(0).path("name").asString()).isEqualTo("First campaign");
-        for (String query : List.of("?archived=yes", "?limit=0&system=" + starter, "?cursor=x&system=" + starter)) {
+        // The total is of this system's campaigns, and the second one is also reached by its position.
+        assertThat(paged.path("total").asLong()).isEqualTo(2);
+        JsonNode byPosition = ok(get("/api/v1/campaigns?limit=1&offset=1&system=" + starter, gm.session()));
+        assertThat(byPosition.path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("First campaign");
+        assertThat(byPosition.has("nextCursor")).isFalse();
+        for (String query : List.of("?archived=yes", "?limit=0&system=" + starter, "?cursor=x&system=" + starter,
+                "?offset=x&system=" + starter, "?offset=100001", "?offset=1&cursor=" + newer + "&system=" + starter)) {
             HttpResponse<String> response = get("/api/v1/campaigns" + query, gm.session());
             assertThat(response.statusCode()).as(query).isEqualTo(400);
             assertThat(json(response).path("code").asString()).isEqualTo("request.invalid");
@@ -814,6 +844,13 @@ class LibraryFlowTest {
                 gm.session())).path("items")).extracting(item -> item.path("name").asString()).containsExactly("A");
         assertThat(ok(get("/api/v1/campaigns?archived=false", gm.session())).path("items"))
                 .extracting(item -> item.path("name").asString()).containsExactly("B", "First campaign");
+        // Each list's total is its own: four in use before the two were archived, then two of each.
+        assertThat(first.path("total").asLong()).isEqualTo(4);
+        assertThat(archived.path("total").asLong()).isEqualTo(2);
+        assertThat(ok(get("/api/v1/campaigns", gm.session())).path("total").asLong()).isEqualTo(2);
+        JsonNode second2 = ok(get("/api/v1/campaigns?archived=true&limit=1&offset=1", gm.session()));
+        assertThat(second2.path("items")).extracting(item -> item.path("name").asString()).containsExactly("A");
+        assertThat(second2.has("nextCursor")).isFalse();
     }
 
     @Test

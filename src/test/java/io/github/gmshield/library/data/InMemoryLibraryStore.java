@@ -96,6 +96,27 @@ public class InMemoryLibraryStore implements LibraryStore {
     }
 
     @Override
+    public List<SystemRow> systemsFrom(int offset, int limit) {
+        return systems(null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public long systemCount() {
+        return systems(null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public List<CampaignRow> campaignsFrom(UUID systemId, boolean archived, int offset, int limit) {
+        return campaigns(systemId, archived, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0))
+                .limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public long campaignCount(UUID systemId, boolean archived) {
+        return campaigns(systemId, archived, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
     public List<UUID> campaignIdsOf(UUID systemId) {
         UUID owner = OwnerContext.require();
         return campaigns.values().stream()
