@@ -53,6 +53,10 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 3.1 part B: what goes with a system ({@code GET .../deletion}), and its deletion ({@code DELETE}, 202 with
  * no body; {@link SystemDeletion}). A system being deleted is {@code request.not_found} on every route, as another
  * owner's is.
+ *
+ * <p>Story 3.2 part B: what goes with a campaign ({@code GET .../deletion}), and its deletion ({@code DELETE}, 202 with
+ * no body; {@link SystemDeletion#deleteCampaign}). A campaign being deleted is {@code request.not_found} on every
+ * route, as another owner's is.
  */
 @RestController
 @Tag(name = "library")
@@ -64,6 +68,7 @@ class LibraryController {
     static final String SYSTEMS = "/api/v1/systems";
     static final String SYSTEM = "/api/v1/systems/{id}";
     static final String SYSTEM_DELETION = "/api/v1/systems/{id}/deletion";
+    static final String CAMPAIGN_DELETION = "/api/v1/campaigns/{id}/deletion";
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
@@ -188,6 +193,18 @@ class LibraryController {
 
         static SystemDeletionView of(SystemDeletion.Counts counts) {
             return new SystemDeletionView(counts.campaigns(), counts.conversations(), counts.materials());
+        }
+    }
+
+    @Schema(name = "CampaignDeletion", requiredProperties = {"conversations", "materials"})
+    record CampaignDeletionView(
+            @Schema(description = "How many conversations of the campaign go with it", format = "int64", minimum = "0",
+                    example = "1") long conversations,
+            @Schema(description = "How many materials attached to the campaign go with it (those whose newest version"
+                    + " is not discarded)", format = "int64", minimum = "0", example = "2") long materials) {
+
+        static CampaignDeletionView of(SystemDeletion.CampaignCounts counts) {
+            return new CampaignDeletionView(counts.conversations(), counts.materials());
         }
     }
 
@@ -367,6 +384,36 @@ class LibraryController {
             @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id) {
         return found(parse(id).flatMap(library::campaign).map(CampaignView::of));
+    }
+
+    @GetMapping(path = CAMPAIGN_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getCampaignDeletion", summary = "What goes with one of the account's campaigns if it is"
+            + " deleted: how many conversations and materials (those attached to it). request.not_found (404) for any"
+            + " other id, a campaign being deleted included;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<CampaignDeletionView> campaignDeletion(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return found(parse(id).flatMap(deletion::previewCampaign).map(CampaignDeletionView::of));
+    }
+
+    @DeleteMapping(path = CAMPAIGN)
+    @Operation(operationId = "deleteCampaign", summary = "Deletes one of the account's campaigns, archived, current or"
+            + " last (202, no body): from now on it is not found, the current campaign falls back to another (or there"
+            + " is none), its name is free in its system, and its conversation and the materials attached to it are"
+            + " removed in the background; nothing of its system or of the other campaigns changes. Cannot be undone."
+            + " request.not_found (404) for any other id, a campaign already being deleted included;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion started"))
+    ResponseEntity<Void> deleteCampaign(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        if (!parse(id).map(deletion::deleteCampaign).orElse(false)) {
+            throw notFound();
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 
     @GetMapping(path = SYSTEMS, produces = MediaType.APPLICATION_JSON_VALUE)

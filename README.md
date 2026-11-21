@@ -284,7 +284,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       form (as a system's, under `campaign`/`name`), unique on `(owner_id, system_id, name_fingerprint)`
       (`campaign_owner_system_name_fingerprint_key`). A duplicate on POST or PATCH is `request.campaign_name_taken`
       (409); the service checks first and a write the key refuses anyway is the same 409. The same name in another
-      system is fine. An archived campaign keeps its name, so its name stays taken until it is renamed (part B: deleted). A first sign-in stores the starter campaign's fingerprint.
+      system is fine. An archived campaign keeps its name, so its name stays taken until it is renamed or deleted (part B). A first sign-in stores the starter campaign's fingerprint.
     - **Rows from before V23** have no fingerprint (SQL cannot compute a keyed one, and the key ignores nulls). V23
       lists their owners in `campaign_fingerprint_backfill` (owner ids only, not a library table); once the application
       is ready, `library.service.CampaignFingerprints` fills each listed owner's rows as that owner (decrypt, then
@@ -324,6 +324,45 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
       the oldest again, and a starter made meanwhile has no fingerprint (filled at the next roll forward only when its
       owner is listed; otherwise it is still compared by name on every create and rename).
     - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.19.0). The worker does
+      not change.
+  - **Delete a campaign (Story 3.2 part B, public contract 1.20.0, migration V24, AD-22).** The recorded, resumable
+    deletion of a system (above), extended to a `deletion` row of kind `campaign`: the same `SystemDeletion` process,
+    sweep and one-shot passes, the row's kind choosing what is collected and what `library` removes last. What goes:
+    the campaign, its conversation (turns, event batches, references) and every material attached to it
+    (`material.campaign_id`); nothing of its system or of the other campaigns. An archived campaign, the current one
+    and the GM's last one can all be deleted; the current campaign then falls back (part A's rule), or there is none
+    (the composer disabled). No undo.
+    - `GET /api/v1/campaigns/{id}/deletion` answers `{conversations, materials}` (materials whose newest version is
+      not discarded), what the confirmation dialog names.
+    - `DELETE /api/v1/campaigns/{id}` answers 202 with no body. In one transaction: `campaign.state` becomes
+      `deleting` (the row locked first; `name_fingerprint` becomes the campaign's id, so the name is free in its
+      system at once); each handler's `prepare` runs with `Going(null, [campaign])` (no system part: `materials` takes
+      the campaign's materials alone and detaches nothing; `conversations` cancels the campaign's answer jobs); a
+      `deletion` row records owner, kind `campaign`, target and `not_before` (the latest claim lapse, or now). Logs:
+      `library.campaign_deleting`, then `library.campaign_deleted` (ids and times only).
+    - From that commit the campaign is `request.not_found` to every read and write that goes through `library`: the
+      lists (and the switcher), GET, PATCH, DELETE and `/deletion`, `PUT .../current`, the current campaign, its
+      conversation, questions asked on it, uploads naming it. A system's preview no longer counts it. Reads by turn id
+      (a turn, its stop, events and references) still answer until the removal, as for a system (3.1 B, finding V4).
+    - Removal at `not_before`, per owner, as for a system: materials (one `index.removal` per version, never two,
+      `VersionRemoval`, files, rows), the conversation, then the campaign row and `deletion.done_at`. Each pass
+      collects again, so an upload that lands during the wait goes too.
+    - A system deleted while one of its campaigns is deleting takes that campaign too (a system's deletion takes all
+      its campaigns, deleting ones included); the campaign's own deletion then finds it gone and is marked done.
+    - `V24__campaign_deletion.sql` adds `campaign.state text not null default 'ready'` (check `ready|deleting`) and
+      lets `deletion.kind` be `campaign`. Additive: the previous release neither reads nor writes `campaign.state`.
+      Rolling back while a campaign deletion is pending shows the campaign again, with whatever its removal has not
+      removed yet, under its id as fingerprint; that release's sweep finds no system with the row's target and marks
+      the row done, so after rolling forward again the campaign stays hidden (`deleting`, no pending row) with its
+      remaining data. To finish it, reopen its row: `update deletion set done_at = null where kind = 'campaign' and
+      target_id = '<id>'`. To keep it instead, in one transaction: `delete from deletion where kind = 'campaign' and
+      target_id = '<id>'` (else a later delete of it is refused by `deletion_owner_target_key`), `update campaign set
+      state = 'ready', name_fingerprint = null where id = '<id>'` (its fingerprint is still its own id, which protects
+      no name), and `insert into campaign_fingerprint_backfill (owner_id) select owner_id from campaign where id =
+      '<id>' on conflict do nothing`; the next start fills its fingerprint. If another campaign of its system took its
+      name meanwhile, rename that one in the app first: otherwise the fill leaves this campaign without a fingerprint
+      (`library.campaign_fingerprint_duplicate`) and two campaigns share the name.
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.20.0). The worker does
       not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
@@ -913,7 +952,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
 | `GMSHIELD_INDEX_RETRY_EVERY` | how often the index changes whose job failed get a new job, each run at most 3 times (default `10m`) |
-| `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` | how often the deletions of systems that are due are run again, the first right after the start (default `10m`) |
+| `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` | how often the deletions of systems and campaigns that are due are run again, the first right after the start (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |

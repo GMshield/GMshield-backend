@@ -833,6 +833,9 @@ class LibraryFlowTest {
         refused.add(send("POST", "/api/v1/campaigns", b.session(), Map.of("name", "Stolen", "systemId", aSystem.toString())));
         refused.add(get("/api/v1/campaigns?system=" + aSystem, b.session()));
         refused.add(get("/api/v1/campaigns?archived=true&system=" + aSystem, b.session()));
+        // Story 3.2 part B: what goes with it, and its deletion.
+        refused.add(get("/api/v1/campaigns/" + aCampaign + "/deletion", b.session()));
+        refused.add(sendText("DELETE", "/api/v1/campaigns/" + aCampaign, b.session(), ""));
         for (HttpResponse<String> response : refused) {
             assertThat(withoutTraceId(notFound(response))).isEqualTo(withoutTraceId(expected));
             assertThat(response.body()).doesNotContain(aCampaign.toString()).doesNotContain(aSystem.toString())
@@ -841,6 +844,7 @@ class LibraryFlowTest {
         assertThat(library.campaigns).hasSize(campaigns);
         assertThat(library.campaigns.get(aCampaign).version()).isZero();
         assertThat(library.campaigns.get(aCampaign).chosenAt()).isNull();
+        assertThat(library.deletingCampaigns).doesNotContain(aCampaign);
         // B's list and current campaign are B's.
         assertThat(ok(get("/api/v1/campaigns", b.session())).path("items")).extracting(item -> item.path("name").asString())
                 .containsExactly("Primeira campanha");
@@ -852,6 +856,9 @@ class LibraryFlowTest {
         assertThat(send("PATCH", "/api/v1/campaigns/" + aCampaign, null, Map.of("version", 0)).statusCode()).isEqualTo(401);
         assertThat(send("PUT", "/api/v1/campaigns/current", null, Map.of("campaignId", aCampaign.toString())).statusCode())
                 .isEqualTo(401);
+        assertThat(get("/api/v1/campaigns/" + aCampaign + "/deletion", null).statusCode()).isEqualTo(401);
+        assertThat(sendText("DELETE", "/api/v1/campaigns/" + aCampaign, null, "").statusCode()).isEqualTo(401);
+        assertThat(get("/api/v1/campaigns/" + aCampaign, a.session()).statusCode()).isEqualTo(200);
     }
 
     /** A new campaign of the GM's system, through the API: its id. */

@@ -180,7 +180,7 @@ class ModuleBoundaryTest {
     /**
      * Story 3.1 part B: a system's deletion reaches {@code materials} and {@code conversations} only through the
      * {@code library.service.SystemDeletionHandler} each implements, so {@code library} still depends on no feature
-     * module, and both handlers are there.
+     * module, and both handlers are there. Story 3.2 part B: a campaign's deletion goes through the same handlers.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {

@@ -5,6 +5,7 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
+import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.UUID;
 import org.hibernate.annotations.OptimisticLock;
@@ -17,10 +18,16 @@ import org.hibernate.annotations.TenantId;
  * <p>Story 3.2 (V23): its {@code version} is Hibernate's: a rename, an archive or a restore raises it, and an update of
  * a row whose version moved meanwhile fails. Choosing it ({@code chosen_at}) and filling a missing name fingerprint
  * never raise it, so neither makes an open rename stale.
+ *
+ * <p>Story 3.2 part B (V24): it has a {@code state}: every read of the store but the deletion's own takes
+ * {@code ready} rows only.
  */
 @Entity(name = "LibraryCampaign")
 @Table(name = "campaign")
 class CampaignEntity {
+
+    static final String READY = "ready";
+    static final String DELETING = "deleting";
 
     @Id
     @Column(name = "id", nullable = false, updatable = false)
@@ -46,6 +53,10 @@ class CampaignEntity {
     @OptimisticLock(excluded = true)
     @Column(name = "chosen_at")
     private Instant chosenAt;
+
+    /** {@value #READY}, or {@value #DELETING} from the GM's delete until the row goes (Story 3.2 part B, V24). */
+    @Column(name = "state", nullable = false)
+    private String state = READY;
 
     @Version
     @Column(name = "version", nullable = false)
@@ -109,6 +120,18 @@ class CampaignEntity {
     /** Its name fingerprint, filled once (a row from before V23); the version stays. */
     void fingerprint(byte[] fingerprint) {
         this.nameFingerprint = fingerprint.clone();
+    }
+
+    /**
+     * The campaign is being deleted (Story 3.2 part B): it leaves every read, and its name fingerprint becomes its own
+     * id (16 bytes, never a keyed fingerprint's 32), so the name is free in its system at once.
+     */
+    void markDeleting(Instant at) {
+        this.state = DELETING;
+        ByteBuffer id16 = ByteBuffer.allocate(16);
+        id16.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+        this.nameFingerprint = id16.array();
+        this.updatedAt = at;
     }
 
     CampaignRow row() {

@@ -57,6 +57,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * </ul>
  *
  * Every step is safe to repeat. Nothing here logs a name.
+ *
+ * <p>Story 3.2 part B: for a campaign's deletion ({@code Going(null, [campaign])}) what goes is the campaign's
+ * materials alone; no material attached to a system goes, and no attachment is touched.
  */
 @Service
 class SystemMaterialsDeletion implements SystemDeletionHandler {
@@ -133,8 +136,8 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
                 }
             }
         }
-        log.atInfo().addKeyValue("systemId", going.systemId()).addKeyValue("discarded", discarded)
-                .addKeyValue("cancelled", cancelled).log("material.system_deletion_prepared");
+        going.about(log.atInfo()).addKeyValue("discarded", discarded).addKeyValue("cancelled", cancelled)
+                .log("material.system_deletion_prepared");
         return Optional.ofNullable(latest);
     }
 
@@ -153,15 +156,17 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         }
         List<UUID> goneIds = gone.stream().map(MaterialRow::id).toList();
         int detached = 0;
-        for (MaterialRow shared : reading(() -> materials.materialsAlsoOfOtherSystems(going.systemId()))) {
+        UUID systemId = going.systemId();
+        // A campaign's deletion has no system part: no attachment changes.
+        List<MaterialRow> sharedOnes = systemId == null ? List.of()
+                : reading(() -> materials.materialsAlsoOfOtherSystems(systemId));
+        for (MaterialRow shared : sharedOnes) {
             if (!goneIds.contains(shared.id())) {
-                detached += Boolean.TRUE.equals(writing(() -> materials.detachSystem(shared.id(), going.systemId())))
-                        ? 1 : 0;
+                detached += Boolean.TRUE.equals(writing(() -> materials.detachSystem(shared.id(), systemId))) ? 1 : 0;
             }
         }
-        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("systemId", going.systemId())
-                .addKeyValue("materials", removed).addKeyValue("detached", detached).addKeyValue("left", left)
-                .log("material.system_deletion_removed");
+        going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("materials", removed)
+                .addKeyValue("detached", detached).addKeyValue("left", left).log("material.system_deletion_removed");
         if (left > 0) {
             throw new IllegalStateException("material.version_not_discarded");
         }
@@ -225,13 +230,20 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
         return ids;
     }
 
-    /** The materials that go: those of the system's campaigns, then those attached to it alone; each once. */
+    /**
+     * The materials that go: those of the system's campaigns, then those attached to it alone; each once. For a
+     * campaign's deletion (no system), the campaign's alone.
+     */
     private List<MaterialRow> going(Going going) {
         Map<UUID, MaterialRow> found = new LinkedHashMap<>();
         materials.materialsOfCampaigns(going.campaignIds()).forEach(material -> found.put(material.id(), material));
-        materials.materialsOnlyOfSystem(going.systemId()).forEach(material -> found.putIfAbsent(material.id(), material));
+        if (going.systemId() != null) {
+            materials.materialsOnlyOfSystem(going.systemId())
+                    .forEach(material -> found.putIfAbsent(material.id(), material));
+        }
         return List.copyOf(found.values());
     }
+
 
     private Instant now() {
         return clock.getIfAvailable(Clock::systemUTC).instant().truncatedTo(ChronoUnit.MICROS);

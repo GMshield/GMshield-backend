@@ -33,6 +33,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@link #remove}: one transaction per conversation deletes the references, event batches and turn of each of
  *       its turns, then the conversation. Safe to repeat.</li>
  * </ul>
+ *
+ * <p>Story 3.2 part B: a campaign's deletion ({@code Going(null, [campaign])}) is the same, for that campaign alone.
  */
 @Service
 class SystemConversationsDeletion implements SystemDeletionHandler {
@@ -71,8 +73,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
         for (UUID jobId : jobs.unended(jobIds)) {
             cancelled += jobs.cancel(jobId) ? 1 : 0;
         }
-        log.atInfo().addKeyValue("systemId", going.systemId()).addKeyValue("cancelled", cancelled)
-                .log("conversation.system_deletion_prepared");
+        going.about(log.atInfo()).addKeyValue("cancelled", cancelled).log("conversation.system_deletion_prepared");
         return lapse;
     }
 
@@ -92,10 +93,10 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
                 return found.size();
             });
         }
-        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("systemId", going.systemId())
-                .addKeyValue("conversations", conversations.size()).addKeyValue("turns", turns)
-                .log("conversation.system_deletion_removed");
+        going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("conversations", conversations.size())
+                .addKeyValue("turns", turns).log("conversation.system_deletion_removed");
     }
+
 
     private <T> T reading(Supplier<T> read) {
         TransactionTemplate template = new TransactionTemplate(transactions.getObject());
