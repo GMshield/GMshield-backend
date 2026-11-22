@@ -64,6 +64,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * oldest first, and a rename whose row moved after it was read refused at the flush.
  * Story 3.11 (V32): a dismissed turn left out of the conversation's turns, its question counts and the next claim's
  * history, a second dismissal keeping the first time, and the undo putting it back.
+ * Story 3.12 (V33): the saved answers across two campaigns, newest saved first, paged with their total, each with its
+ * campaign's name, area, conversation name and excerpt; a running turn refused and another owner's never listed nor
+ * saved; a dismissed answer and an archived campaign's left out until they come back with the same time; an unsave; and
+ * a conversation being deleted leaving the list at once.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -578,6 +582,153 @@ class ConversationIntegrationTest {
         assertThat(historyOf(fifth)).containsExactly("Pergunta 1?", "Pergunta 2?", "Pergunta 3?");
     }
 
+    @Test
+    void theSavedAnswersAreListedAcrossCampaignsNewestFirstLeavingOutArchivedAndDismissedOnPostgres() {
+        UUID owner = Ids.newId();
+        Library.Campaign starter = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow();
+        });
+        UUID campaign = starter.id();
+        UUID other = as(owner, () -> library.createCampaign(starter.system().id(), "A Coroa Partida")).orElseThrow()
+                .id();
+        UUID here = citedPassage(owner, campaign);
+        UUID thereCited = citedPassage(owner, other);
+        Conversations.Asked first = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 1?", null,
+                Area.QUESTIONS));
+        answer(first.turnId(), "**Resposta** 1.", here);
+        UUID second = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 2?",
+                first.conversationId(), null)).turnId();
+        answer(second, "Resposta 2.", here);
+        // A silent answer (no reference: the sources said nothing) is not saved.
+        UUID silent = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta muda?",
+                first.conversationId(), null)).turnId();
+        answer(silent, "Nada.");
+        Conversations.Asked elsewhere = OwnerContext.callAs(owner, () -> conversations.ask(other, "Pergunta lá?", null,
+                Area.RULES));
+        answer(elsewhere.turnId(), "Resposta lá.", thereCited);
+        Conversations.Asked running = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Ainda?",
+                first.conversationId(), null));
+        // Another owner's saved answer is never listed.
+        UUID stranger = Ids.newId();
+        UUID theirCampaign = as(stranger, () -> {
+            library.createStarter(Language.EN);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID theirPassage = citedPassage(stranger, theirCampaign);
+        UUID theirs = OwnerContext.callAs(stranger, () -> conversations.ask(theirCampaign, "Theirs?")).turnId();
+        answer(theirs, "Their answer.", theirPassage);
+        OwnerContext.runAs(stranger, () -> conversations.bookmark(theirs));
+
+        for (UUID turn : List.of(first.turnId(), elsewhere.turnId(), second)) {
+            OwnerContext.runAs(owner, () -> conversations.bookmark(turn));
+            sleep();
+        }
+        assertThatThrownBy(() -> OwnerContext.runAs(owner, () -> conversations.bookmark(running.turnId())))
+                .isInstanceOfSatisfying(ApiException.class, refused ->
+                        assertThat(refused.problem().code()).isEqualTo("conversation.turn_not_done"));
+        assertThat(bookmarkedAt(running.turnId())).isNull();
+        assertThatThrownBy(() -> OwnerContext.runAs(owner, () -> conversations.bookmark(silent)))
+                .isInstanceOfSatisfying(ApiException.class, refused ->
+                        assertThat(refused.problem().code()).isEqualTo("conversation.turn_not_done"));
+        assertThat(bookmarkedAt(silent)).isNull();
+        assertThatThrownBy(() -> OwnerContext.runAs(owner, () -> conversations.bookmark(theirs)))
+                .isInstanceOfSatisfying(ApiException.class, refused ->
+                        assertThat(refused.problem().code()).isEqualTo("request.not_found"));
+
+        Conversations.SavedPage page = as(owner, () -> conversations.saved(0, 20));
+        assertThat(page.items()).extracting(Conversations.Saved::turnId)
+                .containsExactly(second, elsewhere.turnId(), first.turnId());
+        assertThat(page.total()).isEqualTo(3);
+        assertThat(page.nextOffset()).isNull();
+        Conversations.Saved there = page.items().get(1);
+        assertThat(there.campaignId()).isEqualTo(other);
+        assertThat(there.campaignName()).isEqualTo("A Coroa Partida");
+        assertThat(there.area()).isEqualTo(Area.RULES);
+        assertThat(there.conversationName()).isEqualTo("Pergunta lá?");
+        assertThat(there.savedAt()).isEqualTo(bookmarkedAt(elsewhere.turnId()));
+        assertThat(page.items().get(2).excerpt()).isEqualTo("Resposta 1.");
+        assertThat(page.items().get(2).conversationName()).isEqualTo("Pergunta 1?");
+        // Paged by offset, newest saved first.
+        Conversations.SavedPage firstPage = as(owner, () -> conversations.saved(0, 2));
+        assertThat(firstPage.items()).extracting(Conversations.Saved::turnId).containsExactly(second,
+                elsewhere.turnId());
+        assertThat(firstPage.nextOffset()).isEqualTo(2);
+        assertThat(firstPage.total()).isEqualTo(3);
+        assertThat(as(owner, () -> conversations.saved(2, 2)).items()).extracting(Conversations.Saved::turnId)
+                .containsExactly(first.turnId());
+        // The bookmark is in the turns read, and gives no standing: the next history is the same.
+        assertThat(as(owner, () -> conversations.turns(first.conversationId())).orElseThrow())
+                .extracting(Conversations.StoredTurn::bookmarked).containsExactly(true, true, false, false);
+
+        // A dismissed answer and an archived campaign's are left out of the list and the total.
+        Instant savedAt = bookmarkedAt(second);
+        OwnerContext.runAs(owner, () -> conversations.dismiss(second));
+        long version = as(owner, () -> library.campaign(other)).orElseThrow().version();
+        as(owner, () -> library.changeCampaign(other, version, null, true));
+        Conversations.SavedPage narrowed = as(owner, () -> conversations.saved(0, 20));
+        assertThat(narrowed.items()).extracting(Conversations.Saved::turnId).containsExactly(first.turnId());
+        assertThat(narrowed.total()).isOne();
+        // Both come back: the dismissal undone keeps the time it was saved.
+        OwnerContext.runAs(owner, () -> conversations.restore(second));
+        as(owner, () -> library.changeCampaign(other, version + 1, null, false));
+        assertThat(as(owner, () -> conversations.saved(0, 20)).items()).extracting(Conversations.Saved::turnId)
+                .containsExactly(second, elsewhere.turnId(), first.turnId());
+        assertThat(bookmarkedAt(second)).isEqualTo(savedAt);
+
+        // Unsaved: it leaves the list; a second unsave and one of a running turn change nothing.
+        OwnerContext.runAs(owner, () -> conversations.unbookmark(second));
+        OwnerContext.runAs(owner, () -> conversations.unbookmark(second));
+        OwnerContext.runAs(owner, () -> conversations.unbookmark(running.turnId()));
+        assertThat(bookmarkedAt(second)).isNull();
+        assertThat(as(owner, () -> conversations.saved(0, 20)).total()).isEqualTo(2);
+        // The conversation being deleted: its saved answer leaves the list at once.
+        assertThat(as(owner, () -> conversations.delete(first.conversationId()))).isTrue();
+        assertThat(as(owner, () -> conversations.saved(0, 20)).items()).extracting(Conversations.Saved::turnId)
+                .containsExactly(elsewhere.turnId());
+        assertThat(as(stranger, () -> conversations.saved(0, 20)).items()).extracting(Conversations.Saved::turnId)
+                .containsExactly(theirs);
+    }
+
+    private static void sleep() {
+        try {
+            Thread.sleep(2);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private Instant bookmarkedAt(UUID turnId) {
+        java.time.OffsetDateTime at = jdbc.sql("select bookmarked_at from turn where id = :id").param("id", turnId)
+                .query(java.time.OffsetDateTime.class).list().getFirst();
+        return at == null ? null : at.toInstant();
+    }
+
+    /** An accepted material of the owner's campaign with one passage, which an answer can cite (Story 3.12). */
+    private UUID citedPassage(UUID owner, UUID campaign) {
+        UUID passage = Ids.newId();
+        as(owner, () -> {
+            Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+            UUID material = Ids.newId();
+            UUID version = Ids.newId();
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "Livro"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, passage, 0, 4)));
+            return null;
+        });
+        return passage;
+    }
+
+    /** As {@link #answer(UUID, String)}, citing {@code passage} at the text's start: an answer with a reference. */
+    private void answer(UUID turnId, String text, UUID passage) {
+        UUID job = jdbc.sql("select job_id from turn where id = :id").param("id", turnId).query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(job, null, List.of("azure-openai"));
+        claims.events(job, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1,
+                List.of(JobEvent.delta(text), JobEvent.citation(passage, 0))), List.of());
+        claims.report(job, claim.claimId(), claim.grant(), "done", null, null);
+    }
+
     /** Claims the turn's job, posts {@code text} as its answer and reports it done. */
     private void answer(UUID turnId, String text) {
         UUID job = jdbc.sql("select job_id from turn where id = :id").param("id", turnId).query(UUID.class).single();
@@ -656,7 +807,7 @@ class ConversationIntegrationTest {
                 UUID turnId = Ids.newId();
                 store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
                         Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
-                        java.util.Set.of(), start.plusSeconds(number), null, null));
+                        java.util.Set.of(), start.plusSeconds(number), null, null, null));
                 ids.add(turnId);
             }
             return ids;

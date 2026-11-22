@@ -13,6 +13,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -22,6 +24,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * when its transaction rolls back. A conversation's state (Story 3.10 part B) is kept beside its row: {@link #deleting}
  * holds the ids of the deleting ones, and every read but the deletion's own skips them. A dismissed turn (Story 3.11)
  * is left out of {@link #newestTurns}, {@link #turnCount} and {@link #turnCounts}, as the JPA store leaves it out.
+ * The saved list (Story 3.12) takes bookmarked, shown turns of conversations that are not deleting.
  */
 public class InMemoryConversationStore implements ConversationStore {
 
@@ -30,6 +33,11 @@ public class InMemoryConversationStore implements ConversationStore {
     public final Map<UUID, EventBatchRow> batches = new ConcurrentHashMap<>();
     /** The conversations whose state is {@code deleting} (Story 3.10 part B). */
     public final Set<UUID> deleting = ConcurrentHashMap.newKeySet();
+    /**
+     * Story 3.12, for a race test: run once right after the next {@link #savedTurns} read, as another connection's
+     * commit landing between that read and the reads that follow it in the same request.
+     */
+    public final AtomicReference<Runnable> afterSavedTurns = new AtomicReference<>();
 
     @Override
     public synchronized void insertConversation(ConversationRow row) {
@@ -199,6 +207,65 @@ public class InMemoryConversationStore implements ConversationStore {
         turns.put(turnId, before.dismissed(null));
         RollbackUndo.onRollback(() -> turns.put(turnId, before));
         return true;
+    }
+
+    @Override
+    public synchronized boolean markBookmarked(UUID turnId, Instant at) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || found.get().bookmarkedAt() != null) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.bookmarked(at));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
+    }
+
+    @Override
+    public synchronized boolean clearBookmarked(UUID turnId) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || found.get().bookmarkedAt() == null) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.bookmarked(null));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
+    }
+
+    /** As the JPA store's saved list: newest saved first, then by id, newest first. */
+    private static final Comparator<TurnRow> SAVED = Comparator.comparing(TurnRow::bookmarkedAt)
+            .thenComparing(TurnRow::id).reversed();
+
+    @Override
+    public Set<UUID> savedCampaigns() {
+        return saved().map(row -> conversations.get(row.conversationId()).campaignId()).collect(Collectors.toSet());
+    }
+
+    @Override
+    public List<TurnRow> savedTurns(Collection<UUID> campaignIds, int offset, int limit) {
+        List<TurnRow> page = saved(campaignIds).sorted(SAVED).skip(offset).limit(limit).toList();
+        Runnable meanwhile = afterSavedTurns.getAndSet(null);
+        if (meanwhile != null) {
+            meanwhile.run();
+        }
+        return page;
+    }
+
+    @Override
+    public long savedCount(Collection<UUID> campaignIds) {
+        return saved(campaignIds).count();
+    }
+
+    private Stream<TurnRow> saved() {
+        return owned(turns).filter(row -> row.bookmarkedAt() != null && row.dismissedAt() == null
+                && findConversation(row.conversationId()).isPresent());
+    }
+
+    private Stream<TurnRow> saved(Collection<UUID> campaignIds) {
+        return saved().filter(row -> campaignIds.contains(conversations.get(row.conversationId()).campaignId()));
     }
 
     @Override

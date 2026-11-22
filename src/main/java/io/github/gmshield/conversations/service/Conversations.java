@@ -29,6 +29,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -111,6 +112,17 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@link #eventsAfter}, {@link #references}, {@link #referencePage}) still answer; and deleting the conversation
  *       removes it too. The history is built for each claim of a question's job, so a claim already made keeps the
  *       history it was given.</li>
+ *   <li>Story 3.12, bookmarking an answer. {@link #bookmark} saves the answer of a turn of the owner whose last stored
+ *       event is {@code done} and that was neither stopped nor silent (else {@code conversation.turn_not_done}, nothing
+ *       changes);
+ *       {@link #unbookmark} removes the bookmark whatever the turn's state. Both are safe to repeat (a second save
+ *       keeps the first time), {@code request.not_found} for a turn that is not the owner's or is of a deleting
+ *       conversation, and neither changes the conversation's version or last question time. {@link #saved} pages the
+ *       owner's saved answers across all their campaigns, the newest saved first, each with its campaign's name, its
+ *       conversation's area and {@link #nameOf name}, and an excerpt ({@link #excerpt}); it leaves out dismissed turns
+ *       (their bookmark is kept, so an undo lists them again), turns of deleting conversations, and campaigns that are
+ *       archived or being deleted. A bookmark gives an answer no standing as a source: {@link #history}, the scope
+ *       and retrieval never read it. {@link #turns} says whether each turn is saved.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -131,6 +143,8 @@ public class Conversations {
     public static final int DEFAULT_NAME = 60;
     /** The most turns a conversation's turns read returns: its newest (Story 3.10). */
     public static final int MAX_TURNS = 200;
+    /** A saved answer's excerpt, at most this many code points (Story 3.12). */
+    public static final int EXCERPT = 280;
     /** How many earlier turns reach the model with a question (Story 3.10). */
     public static final int HISTORY_TURNS = 6;
     /** An earlier answer as the model reads it, at most this many code points (Story 3.10). */
@@ -233,7 +247,8 @@ public class Conversations {
      * A stored turn (Story 3.10): its question and language, when it was asked, and its stored events in order, each
      * with its data as the stream sends it ({@code done}'s built now from its references).
      */
-    public record StoredTurn(UUID id, String question, String language, Instant createdAt, List<StoredEvent> events) {
+    public record StoredTurn(UUID id, String question, String language, Instant createdAt, List<StoredEvent> events,
+                             boolean bookmarked) {
         public StoredTurn {
             events = List.copyOf(events);
         }
@@ -249,6 +264,25 @@ public class Conversations {
         @Override
         public String toString() {
             return "StoredEvent[sequence=" + sequence + ", type=" + type + "]";
+        }
+    }
+
+    /**
+     * A saved answer (Story 3.12): its turn, conversation and campaign, the campaign's name, the conversation's area
+     * and name, when it was saved, and its excerpt.
+     */
+    public record Saved(UUID turnId, UUID conversationId, UUID campaignId, String campaignName, Area area,
+                        String conversationName, Instant savedAt, String excerpt) {
+        @Override
+        public String toString() {
+            return "Saved[turnId=" + turnId + "]";
+        }
+    }
+
+    /** One page of the saved answers (Story 3.12), the offset of the next page (null on the last), and the total. */
+    public record SavedPage(List<Saved> items, Integer nextOffset, long total) {
+        public SavedPage {
+            items = List.copyOf(items);
         }
     }
 
@@ -310,7 +344,7 @@ public class Conversations {
             JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
-                    settings.modelKnowledge(), settings.materialsOff(), now, null, null)));
+                    settings.modelKnowledge(), settings.materialsOff(), now, null, null, null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
                     .addKeyValue("turnId", turnId)
@@ -463,8 +497,7 @@ public class Conversations {
                 if (!done || failed) {
                     continue;
                 }
-                String answer = events.stream().filter(event -> TurnEvent.DELTA.equals(event.type()))
-                        .map(TurnEvent::text).filter(text -> text != null).collect(Collectors.joining());
+                String answer = answerText(events);
                 earlier.add(new Earlier(vault.decryptText(question(row.id(), row.ownerId()), row.question()),
                         cut(answer, HISTORY_ANSWER)));
             }
@@ -512,7 +545,7 @@ public class Conversations {
             stored.add(new StoredEvent(event.sequence(), event.type(), data));
         }
         return new StoredTurn(row.id(), vault.decryptText(question(row.id(), row.ownerId()), row.question()),
-                row.language(), row.createdAt(), stored);
+                row.language(), row.createdAt(), stored, row.bookmarkedAt() != null);
     }
 
     private static boolean modelTier(TurnEvent event) {
@@ -586,6 +619,114 @@ public class Conversations {
         });
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
                 .log("conversation.turn_restored");
+    }
+
+    /** Saves the answer of the owner's done turn (Story 3.12), as the class says. */
+    public void bookmark(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
+                    .orElseThrow(ConversationProblems::notFound);
+            if (turn.bookmarkedAt() != null) {
+                return false;
+            }
+            // A done turn never runs again, so no lock is needed: one seen done stays done.
+            if (!done(turn)) {
+                throw ConversationProblems.turnNotDone();
+            }
+            return store.markBookmarked(turn.id(), now());
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.turn_bookmarked");
+    }
+
+    /** Removes the bookmark of the owner's turn (Story 3.12), as the class says. */
+    public void unbookmark(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
+                    .orElseThrow(ConversationProblems::notFound);
+            // No check of the row read here: a bookmark committed since is cleared too (the update checks it is set).
+            return store.clearBookmarked(turn.id());
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.turn_unbookmarked");
+    }
+
+    /**
+     * The owner's saved answers (Story 3.12), as the class says, the newest saved first, skipping the first
+     * {@code offset} (0 to {@value #MAX_OFFSET}), at most {@code limit} (1 to {@value #MAX_LIMIT}).
+     */
+    public SavedPage saved(int offset, int limit) {
+        if (limit < 1 || limit > MAX_LIMIT || offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("conversations.page_invalid");
+        }
+        OwnerContext.require();
+        return reading(() -> {
+            // A campaign archived or being deleted is left out: the places hold the ready ones, archived or not.
+            Map<UUID, Library.Campaign> campaigns = new HashMap<>();
+            library.places(store.savedCampaigns(), List.of()).campaigns().forEach((id, campaign) -> {
+                if (!campaign.archived()) {
+                    campaigns.put(id, campaign);
+                }
+            });
+            if (campaigns.isEmpty()) {
+                return new SavedPage(List.of(), null, 0);
+            }
+            List<TurnRow> rows = store.savedTurns(campaigns.keySet(), offset, limit + 1);
+            List<TurnRow> page = rows.size() > limit ? rows.subList(0, limit) : rows;
+            Map<UUID, ConversationRow> conversationsById = new HashMap<>();
+            for (TurnRow row : page) {
+                // A conversation marked deleting since the page was read is left out, with its rows.
+                store.findConversation(row.conversationId())
+                        .ifPresent(found -> conversationsById.put(found.id(), found));
+            }
+            Map<UUID, TurnRow> first = store.firstTurns(conversationsById.keySet());
+            List<Saved> items = new ArrayList<>();
+            for (TurnRow row : page) {
+                ConversationRow conversation = conversationsById.get(row.conversationId());
+                if (conversation == null) {
+                    continue;
+                }
+                Library.Campaign campaign = campaigns.get(conversation.campaignId());
+                items.add(new Saved(row.id(), conversation.id(), campaign.id(), campaign.name(),
+                        Area.of(conversation.area()).orElseThrow(), nameOf(conversation, first.get(conversation.id())),
+                        row.bookmarkedAt(), excerpt(answerText(storedEvents(row.id(), 0)))));
+            }
+            return new SavedPage(items, rows.size() > limit ? offset + limit : null,
+                    store.savedCount(campaigns.keySet()));
+        });
+    }
+
+    /** An answer's text: its joined {@code delta} texts (they hold no citation marker). */
+    private static String answerText(List<TurnEvent> events) {
+        return events.stream().filter(event -> TurnEvent.DELTA.equals(event.type())).map(TurnEvent::text)
+                .filter(text -> text != null).collect(Collectors.joining());
+    }
+
+    /**
+     * A saved answer's excerpt (Story 3.12): its Markdown removed ({@link Markdown#plain}), its white space flattened,
+     * then cut at a word boundary to at most {@value #EXCERPT} code points ({@link Searches#firstWords(String, int)}).
+     */
+    static String excerpt(String answer) {
+        return Searches.firstWords(Markdown.plain(answer), EXCERPT);
+    }
+
+    /**
+     * Whether the turn is done and can be saved (Story 3.12): not stopped, its last stored event a {@code done} event
+     * that is not marked stopped, and not silent (it has a source reference, or a {@code model} tier part on a turn whose
+     * model knowledge was on: the same rule as the {@code done} event's {@code silent}, {@link TurnEvents#doneData}).
+     */
+    private boolean done(TurnRow turn) {
+        if (turn.stoppedAt() != null) {
+            return false;
+        }
+        List<TurnEvent> events = storedEvents(turn.id(), 0);
+        if (events.isEmpty() || !TurnEvent.DONE.equals(events.getLast().type()) || events.getLast().stopped()) {
+            return false;
+        }
+        return !references(turn.id()).isEmpty()
+                || turn.modelKnowledge() && events.stream().anyMatch(Conversations::modelTier);
     }
 
     /** Whether the turn has ended (Story 3.11): stopped, or its last stored event is {@code done} or {@code error}. */

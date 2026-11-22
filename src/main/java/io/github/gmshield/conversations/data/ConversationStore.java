@@ -5,6 +5,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -102,6 +103,35 @@ public interface ConversationStore {
      * the row; false when it was shown already, or for an unknown turn or another owner's.
      */
     boolean clearDismissed(UUID turnId);
+
+    /**
+     * Sets the owner's turn's {@code bookmarked_at} to {@code at} when it is null (Story 3.12), by one bulk update
+     * after the owner's row was read: true when this call changed the row; false when it was saved already, or for an
+     * unknown turn or another owner's. Changes nothing else.
+     */
+    boolean markBookmarked(UUID turnId, Instant at);
+
+    /**
+     * Clears the owner's turn's {@code bookmarked_at} (Story 3.12), as {@link #markBookmarked}: true when this call
+     * changed the row; false when it was not saved, or for an unknown turn or another owner's.
+     */
+    boolean clearBookmarked(UUID turnId);
+
+    /**
+     * The campaigns of the current owner's listed saved turns (Story 3.12): bookmarked, not dismissed, of a
+     * {@code ready} conversation.
+     */
+    Set<UUID> savedCampaigns();
+
+    /**
+     * The current owner's listed saved turns of conversations of these campaigns (Story 3.12; listed as
+     * {@link #savedCampaigns} says), the newest saved first (then by id, newest first), skipping the first
+     * {@code offset}, at most {@code limit}.
+     */
+    List<TurnRow> savedTurns(Collection<UUID> campaignIds, int offset, int limit);
+
+    /** How many listed saved turns the current owner has in conversations of these campaigns (Story 3.12). */
+    long savedCount(Collection<UUID> campaignIds);
 
     /** The current owner's turn answered by this job. */
     Optional<TurnRow> turnOfJob(UUID jobId);

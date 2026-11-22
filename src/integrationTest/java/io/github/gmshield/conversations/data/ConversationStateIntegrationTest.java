@@ -32,6 +32,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 3.11 on PostgreSQL: only the store's bulk updates write {@code turn.dismissed_at}. A stop whose turn was
  * loaded before a dismissal committed on another connection flushes its {@code stopped_at} only: the turn keeps both.
+ *
+ * <p>Story 3.12 on PostgreSQL: the same for {@code turn.bookmarked_at}, written by the store's bulk updates only.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -44,6 +46,7 @@ class ConversationStateIntegrationTest {
 
     private static final String STOPPED_AT = "select stopped_at from turn where id = ?";
     private static final String DISMISSED_AT = "select dismissed_at from turn where id = ?";
+    private static final String BOOKMARKED_AT = "select bookmarked_at from turn where id = ?";
 
     @Autowired
     private Library library;
@@ -132,7 +135,45 @@ class ConversationStateIntegrationTest {
         assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
     }
 
-    /** The turn's time read by {@code query} (one of the two below), or null. */
+    @Test
+    void aStopLoadedBeforeABookmarkCommittedKeepsTheBookmarkAndTheStop() {
+        UUID owner = Ids.newId();
+        UUID campaign = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        }));
+        UUID turn = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Quanto dano?", null,
+                Area.QUESTIONS)).turnId();
+        Instant bookmarkedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        Instant stoppedAt = bookmarkedAt.plusSeconds(1);
+        TransactionTemplate other = new TransactionTemplate(transactions);
+        other.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            EntityManager em = EntityManagerFactoryUtils.getTransactionalEntityManager(entities);
+            TurnEntity loaded = em.createQuery("select t from Turn t where t.id = :id", TurnEntity.class)
+                    .setParameter("id", turn).getSingleResult();
+            assertThat(loaded.row(java.util.Set.of()).bookmarkedAt()).isNull();
+            // Another connection commits a bookmark (the store's bulk update, whatever the turn's state).
+            other.executeWithoutResult(moved -> assertThat(store.markBookmarked(turn, bookmarkedAt)).isTrue());
+            // The stop flushes the entity it holds, whose bookmarked_at is still null in memory.
+            assertThat(store.markStopped(turn, stoppedAt)).isTrue();
+            return null;
+        }));
+
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isEqualTo(bookmarkedAt);
+        // A second mark keeps the first time; the clear leaves the stop as it is.
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                assertThat(store.markBookmarked(turn, stoppedAt)).isFalse()));
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isEqualTo(bookmarkedAt);
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                store.clearBookmarked(turn)));
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isNull();
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+    }
+
+    /** The turn's time read by {@code query} (one of those above), or null. */
     private Instant turnTime(UUID turn, String query) {
         OffsetDateTime time = jdbc.sql(query).param(turn).query(OffsetDateTime.class).list().getFirst();
         return time == null ? null : time.toInstant();

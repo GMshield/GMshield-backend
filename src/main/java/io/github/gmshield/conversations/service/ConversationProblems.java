@@ -19,6 +19,10 @@ public final class ConversationProblems {
     static final ApiProblem TURN_RUNNING =
             ApiProblem.of(409, "conversation", "turn_running", "Turn running");
 
+    /** A bookmark of a turn whose answer is not done (Story 3.12): running, stopped, failed or silent. */
+    static final ApiProblem TURN_NOT_DONE =
+            ApiProblem.of(409, "conversation", "turn_not_done", "Turn not done");
+
     private ConversationProblems() {
     }
 
@@ -40,6 +44,11 @@ public final class ConversationProblems {
     /** A dismissal of a turn that has not ended (Story 3.11). */
     public static ApiException turnRunning() {
         return new ApiException(TURN_RUNNING);
+    }
+
+    /** A bookmark of a turn whose answer is not done (Story 3.12). */
+    public static ApiException turnNotDone() {
+        return new ApiException(TURN_NOT_DONE);
     }
 
     /** A rename on a version the conversation has left (Story 3.10). */
