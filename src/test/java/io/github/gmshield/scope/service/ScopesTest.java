@@ -789,8 +789,10 @@ class ScopesTest {
 
         JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Qual é o alcance da Espada Vorpal?"));
 
-        assertThat(fieldNames(input)).containsExactly("question", "owner", "tiers", "tokenKey");
+        assertThat(fieldNames(input)).containsExactly("question", "owner", "modelKnowledge", "tiers", "tokenKey");
         assertThat(input.path("question").asString()).isEqualTo("Qual é o alcance da Espada Vorpal?");
+        assertThat(input.path("modelKnowledge").isBoolean()).isTrue();
+        assertThat(input.path("modelKnowledge").asBoolean()).isFalse();
         assertThat(input.path("owner").asString()).isEqualTo(lib.gm().owner().toString());
         JsonNode tiers = input.path("tiers");
         assertThat(tiers.size()).isEqualTo(3);
@@ -808,6 +810,23 @@ class ScopesTest {
         assertThat(input.toString()).doesNotContain(lib.c().toString());
         assertThat(java.util.Base64.getDecoder().decode(input.path("tokenKey").asString()))
                 .isEqualTo(vault.ownerTokenKey(lib.gm().owner()));
+    }
+
+    @Test
+    void theQuestionInputCarriesTheScopesModelKnowledgeSwitchAndNothingElseChanges() {
+        Library2 lib = twoTiers();
+        ResolvedScope off = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope on = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                new ScopeSettings(true, true, false, true)));
+
+        JsonNode withoutIt = as(lib.gm().owner(), () -> scopes.questionInput(off, "Vorpal?"));
+        JsonNode withIt = as(lib.gm().owner(), () -> scopes.questionInput(on, "Vorpal?"));
+
+        assertThat(withoutIt.path("modelKnowledge").asBoolean()).isFalse();
+        assertThat(withIt.path("modelKnowledge").isBoolean()).isTrue();
+        assertThat(withIt.path("modelKnowledge").asBoolean()).isTrue();
+        // The switch changes no source and no passage handed over.
+        assertThat(withIt.path("tiers")).isEqualTo(withoutIt.path("tiers"));
     }
 
     @Test

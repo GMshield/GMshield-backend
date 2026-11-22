@@ -838,9 +838,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     production kind `question.answer` implements it through `Scopes`; a test-only handler (`ScopedPassagesFlowTest`)
     proves the path too.
   - **The question input (Story 2.3).** `Scopes.questionInput(scope, question)` is the one builder of the input of a
-    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
-    sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
-    source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
+    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, modelKnowledge, tiers:
+    [{tier, sources, pending}], tokenKey}` (`modelKnowledge` from Story 3.8, below). Both tiers are always listed, in
+    order (campaign, then system), a tier without a source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
     (5,000 from indexing at worker start, 100 before; the worker reads them 100 at a time within a time budget) in
     order, so a re-index of a whole library never fills the claim reply (the total is logged as a count, `pending`,
     beside `pendingListed` and `pendingLeftOut`); `owner` is the scope's owner, for the worker's Qdrant
@@ -876,7 +876,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     material) per material off. `AnswerJobs` rebuilds the `ScopeSettings` from the turn on every passage fetch and
     reference read, so a change made while a turn is answered applies from the next question and never turns into
     `scope.passage_refused` mid-answer. `GET /api/v1/conversations/current` uses the stored settings.
-    `modelKnowledge = true` is stored and frozen but changes no answer until Story 3.8.
+    `modelKnowledge = true` is stored and frozen; from Story 3.8 it lets the model add its own knowledge (below).
   - `GET /api/v1/campaigns/{id}/scope` answers `{version, campaignTier, systemTier, otherTier, modelKnowledge,
     materials: [{id, name, tier, on}]}`: the materials of every tier whatever the tier's switch, each with a `ready`
     version, in tier order, then newest first (`Scopes.members`).
@@ -922,6 +922,30 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - Deploy order: backend → frontend → worker. The backend first (V28 is additive; a 1.13 worker never sends a
     `tier` event), then the frontend (its minimum becomes 1.26.0), then the worker (its minimum becomes 1.14.0).
     Rolling the backend back below 1.26.0: the column is ignored, and the worker and the frontend must go back first.
+- **Model knowledge only when the GM turns it on (`conversations`, `scope`, Story 3.8, public contract 1.27.0,
+  internal contract 1.15.0, no migration).** The campaign's `modelKnowledge` switch (stored since V27, frozen on each
+  turn since V17) now reaches the worker and decides whether an answer may hold a part from the model's own knowledge.
+  - **The question input.** `Scopes.questionInput` adds `modelKnowledge` (boolean, always present): the switch of the
+    scope's settings, which for an answer job are the turn's frozen settings, so a change applies from the next
+    question. It changes no source, no pending passage and nothing the passages route hands over. The worker gives the
+    model a fixed extra rule only when it is true, and reads an absent field as false.
+  - **The model tier word.** `JobStreamEvent.tier` (internal 1.15.0) and `TurnTierEvent.tier` (public 1.27.0) allow
+    `model`: the model's own knowledge starts at that offset. It is a turn-event tier word only (`JobEvent.MODEL`,
+    `TurnEvent.MODEL`): `Tier`, `JobPassage.tier`, `turn_reference.tier` and `TurnSourceReference.tier` keep their
+    three words, so a reference never carries it. The batch check accepts it with the same fields as any tier marker.
+    `AnswerJobs.events` stores a `model` marker only when the turn's frozen `modelKnowledge` is on; otherwise it is
+    dropped (`conversation.tiers_dropped`) and never relayed. A kept one is stored, relayed and replayed like any tier
+    marker.
+  - **The done event.** `TurnDoneEvent` gains the required `modelKnowledge` (the turn's frozen switch, read from the
+    turn row, so a turn asked before 3.8 answers its stored value), and `silent` becomes "not stopped, no reference
+    and no `model` tier event". `Conversations.ending(turnId)` reads the references, the switch and whether a `model`
+    marker was stored (it reads the turn's events only when the switch is on) in one transaction, when `done` is sent.
+    The frontend uses `modelKnowledge` to offer the scope under a silent answer only when the switch was off.
+  - Deploy order: backend → worker → frontend. The backend first (a 1.14 worker ignores the new input field and never
+    sends a `model` marker), then the worker (its minimum becomes 1.15.0; the old frontend cannot turn the switch on,
+    so nothing it can set is ignored), then the frontend (its minimum becomes 1.27.0), last so the switch only turns
+    on once the worker honours it. Rolling the backend back below 1.27.0: the frontend and the worker must go back
+    first.
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

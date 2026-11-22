@@ -155,9 +155,11 @@ class ConversationController {
     @Schema(name = "TurnTierEvent", requiredProperties = {"tier", "offset"},
             description = "The data of a tier event (Story 3.7): the sources disagree, and the version of this tier of"
                     + " the scope starts at a place of the answer's text. The campaign's version comes first; each"
-                    + " other tier's follows as an alternative. Only a tier with a source in the turn's scope")
+                    + " other tier's follows as an alternative. Only a tier with a source in the turn's scope. From"
+                    + " contract 1.27.0 the tier model (Story 3.8) starts a part from the model's own knowledge, which"
+                    + " has no reference; only on a turn whose model knowledge was on")
     record TierEvent(
-            @Schema(allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(allowableValues = {"campaign", "system", "other", "model"}) String tier,
             @Schema(description = "Where the tier's version starts, in code points of the answer's text",
                     format = "int32", minimum = "0") int offset) {
     }
@@ -184,14 +186,16 @@ class ConversationController {
                     allowableValues = {"campaign", "system", "other"}) String tier) {
     }
 
-    @Schema(name = "TurnDoneEvent", requiredProperties = {"stopped", "silent", "references"},
+    @Schema(name = "TurnDoneEvent", requiredProperties = {"stopped", "silent", "modelKnowledge", "references"},
             description = "The data of a done event: the answer is complete, or the GM stopped it, with its source"
                     + " references. Built when the event is sent, so a replay shows removed as of then")
     record DoneEvent(
             @Schema(description = "True when the GM stopped the answer: the text sent so far is all there is, and the"
                     + " references are those of the citations sent so far") boolean stopped,
-            @Schema(description = "True exactly when the answer was not stopped and references is empty: the sources"
-                    + " say nothing about the question") boolean silent,
+            @Schema(description = "True exactly when the answer was not stopped, references is empty and the turn"
+                    + " has no model tier event: the sources say nothing about the question") boolean silent,
+            @Schema(description = "Whether the model could answer from its own knowledge on this turn: the switch as"
+                    + " frozen when the question was asked (Story 3.8)") boolean modelKnowledge,
             @ArraySchema(arraySchema = @Schema(description = "The source references, by number (1..n, each once)"),
                     schema = @Schema(implementation = SourceReference.class)) List<SourceReference> references) {
     }

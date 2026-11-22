@@ -52,9 +52,11 @@ import tools.jackson.databind.JsonNode;
  *       sequence order, are read again within the turn's scope ({@link Scopes#references}), which drops an unknown,
  *       foreign or out-of-scope id; the places left become references ({@link TurnReferences#group}), stored by value
  *       with the material's name and the section path encrypted, and with the tier of its source in that scope (Story
- *       3.7: frozen at answer time, as the scope labelled it). No reference makes the answer {@code silent}.</li>
+ *       3.7: frozen at answer time, as the scope labelled it). No reference and no {@code model} tier marker make the
+ *       answer {@code silent}.</li>
  *   <li>A {@code tier} marker (Story 3.7) is stored with the batch's events only when its tier has a source in the
- *       turn's frozen scope; one with no source is dropped, never relayed.</li>
+ *       turn's frozen scope; one with no source is dropped, never relayed. A {@code model} marker (Story 3.8) is
+ *       stored only when the turn's frozen model-knowledge switch is on.</li>
  *   <li>The GM's stop (Story 2.6, {@link Conversations#stop}) ends the turn at once: unless it has a final event, its
  *       citations so far become references as above, {@code done} marked {@code stopped} is appended and
  *       {@code turn.stopped_at} is set. From then on a batch stores no event (its usage is still recorded), the answer
@@ -273,15 +275,28 @@ public class AnswerJobs implements JobHandler {
 
     /**
      * The events without the tier markers whose tier has no source in the turn's frozen scope (Story 3.7): the tier
-     * shown is always the backend's, so a marker the worker could not have been handed is never stored or relayed.
+     * shown is always the backend's, so a marker the worker could not have been handed is never stored or relayed. A
+     * {@code model} marker (Story 3.8) is kept only when the turn's frozen model-knowledge switch is on.
      */
     private List<TurnEvent> withTiersInScope(TurnRow turn, List<TurnEvent> events) {
         if (events.stream().noneMatch(event -> TurnEvent.TIER.equals(event.type()))) {
             return events;
         }
-        ResolvedScope scope = scopeOf(turn, false);
-        return events.stream().filter(event -> !TurnEvent.TIER.equals(event.type()) || Tier.of(event.tier())
-                .map(tier -> !scope.sources(tier).isEmpty()).orElse(false)).toList();
+        boolean scoped = events.stream().anyMatch(event -> TurnEvent.TIER.equals(event.type())
+                && !TurnEvent.MODEL.equals(event.tier()));
+        ResolvedScope scope = scoped ? scopeOf(turn, false) : null;
+        return events.stream().filter(event -> keeps(turn, scope, event)).toList();
+    }
+
+    /** Whether {@link #withTiersInScope} keeps the event; {@code scope} is null only when no event needs it. */
+    private static boolean keeps(TurnRow turn, ResolvedScope scope, TurnEvent event) {
+        if (!TurnEvent.TIER.equals(event.type())) {
+            return true;
+        }
+        if (TurnEvent.MODEL.equals(event.tier())) {
+            return turn.modelKnowledge();
+        }
+        return scope != null && Tier.of(event.tier()).map(tier -> !scope.sources(tier).isEmpty()).orElse(false);
     }
 
     private static TurnEvent turnEvent(JobEvent event) {

@@ -132,6 +132,17 @@ public class Conversations {
     public record Asked(UUID turnId, UUID conversationId, String language) {
     }
 
+    /**
+     * What a turn's {@code done} event says beside {@code stopped} (Story 3.8): its source references, its frozen
+     * model-knowledge switch, and whether a {@code model} tier event was stored with it.
+     */
+    public record Ending(List<TurnReference> references, boolean modelKnowledge, boolean modelTier) {
+
+        public Ending {
+            references = List.copyOf(references);
+        }
+    }
+
     /** A turn of the owner: its id and its language. */
     public record Turn(UUID id, UUID conversationId, String language) {
     }
@@ -243,6 +254,21 @@ public class Conversations {
                     TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
                             row.sectionPath())),
                     row.page(), row.passageIds(), removed.contains(row.versionId()), row.tier())).toList();
+        });
+    }
+
+    /**
+     * The owner's turn's {@link Ending}: its references ({@link #references}), the model-knowledge switch frozen with
+     * it (false for an unknown turn or another owner's), and whether one of its stored events is a {@code model} tier
+     * marker.
+     */
+    public Ending ending(UUID turnId) {
+        return reading(() -> {
+            boolean modelKnowledge = turnId != null && store.findTurn(turnId).map(TurnRow::modelKnowledge)
+                    .orElse(false);
+            boolean modelTier = modelKnowledge && eventsAfter(turnId, 0).stream()
+                    .anyMatch(event -> TurnEvent.TIER.equals(event.type()) && TurnEvent.MODEL.equals(event.tier()));
+            return new Ending(references(turnId), modelKnowledge, modelTier);
         });
     }
 

@@ -120,15 +120,14 @@ public class TurnStreams implements DisposableBean {
         }
 
         /**
-         * The event's data line; a {@code done} event's is built now from the turn's stored references, so a replay
-         * shows {@code removed} as of now (Story 2.5).
+         * The event's data line; a {@code done} event's is built now from the turn's stored references, frozen model
+         * knowledge switch and tier events, so a replay shows {@code removed} as of now (Story 2.5).
          */
         private String dataLine(TurnEvent event) {
             if (!TurnEvent.DONE.equals(event.type())) {
                 return TurnEvents.dataLine(event);
             }
-            return TurnEvents.doneLine(OwnerContext.callAs(owner, () -> conversations.references(turnId)),
-                    event.stopped());
+            return TurnEvents.doneLine(OwnerContext.callAs(owner, () -> conversations.ending(turnId)), event.stopped());
         }
 
         void close() {
