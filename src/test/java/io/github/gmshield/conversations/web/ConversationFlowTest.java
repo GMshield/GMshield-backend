@@ -1,6 +1,7 @@
 package io.github.gmshield.conversations.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -35,10 +36,12 @@ import io.github.gmshield.materials.data.IndexChangeRow;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.MaterialTestStores;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.TestMaterials;
+import io.github.gmshield.scope.data.InMemoryScopeStore;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.data.DataKeyStore;
@@ -178,6 +181,8 @@ class ConversationFlowTest {
     private InMemoryIndexStore index;
     @Autowired
     private InMemoryLibraryStore library;
+    @Autowired
+    private InMemoryScopeStore scopes;
     @Autowired
     private Jobs jobService;
     @Autowired
@@ -1180,6 +1185,335 @@ class ConversationFlowTest {
         return client.send(HttpRequest.newBuilder(uri("/api/v1/turns/" + turnId + "/stop"))
                 .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
                 .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    // --- Story 3.5: a closed scope holds across three tiers
+
+    @Test
+    void aCampaignNeverChangedReadsAsTheStartingScopeAtVersionZeroWithItsMaterialsOn() throws Exception {
+        Gm gm = signUp();
+        UUID system = systemOf(gm);
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Source ofSystem = systemSource(gm, system);
+        UUID sibling = campaign(gm, system, "Mesa irmã");
+        Source ofSibling = source(gm, sibling, List.of(1));
+
+        HttpResponse<String> read = get(gm, scopePath(gm.campaign()));
+
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode scope = json(read);
+        assertThat(scope.propertyNames()).containsExactlyInAnyOrder("version", "campaignTier", "systemTier",
+                "otherTier", "modelKnowledge", "materials");
+        assertThat(scope.path("version").asLong()).isZero();
+        assertThat(scope.path("campaignTier").asBoolean()).isTrue();
+        assertThat(scope.path("systemTier").asBoolean()).isTrue();
+        assertThat(scope.path("otherTier").asBoolean()).isFalse();
+        assertThat(scope.path("modelKnowledge").asBoolean()).isFalse();
+        // Every tier's materials, whatever the switch, in tier order, each on.
+        assertThat(scope.path("materials")).extracting(m -> m.path("id").asString(), m -> m.path("tier").asString(),
+                        m -> m.path("on").asBoolean(), m -> m.path("name").asString())
+                .containsExactly(tuple(own.materialId().toString(), "campaign", true, MATERIAL_NAME),
+                        tuple(ofSystem.materialId().toString(), "system", true, MATERIAL_NAME),
+                        tuple(ofSibling.materialId().toString(), "other", true, MATERIAL_NAME));
+        assertThat(scopes.rows).doesNotContainKey(gm.campaign());
+        // Another owner's campaign, an unknown one and a malformed id are not found.
+        Gm other = signUp();
+        assertNotFound(get(other, scopePath(gm.campaign())));
+        assertNotFound(get(gm, scopePath(Ids.newId())));
+        assertNotFound(get(gm, "/api/v1/campaigns/not-an-id/scope"));
+        assertNotFound(send(other, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, true, false, List.of())));
+        assertThat(scopes.rows).doesNotContainKey(gm.campaign());
+    }
+
+    @Test
+    void withTheDefaultsAnotherCampaignsHouseRuleIsNeverFoundFetchedOrCited() throws Exception {
+        Gm gm = signUp();
+        UUID system = systemOf(gm);
+        Source own = source(gm, gm.campaign(), List.of(1));
+        UUID sibling = campaign(gm, system, "Mesa da regra da casa");
+        Source houseRule = source(gm, sibling, List.of(1));
+
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+
+        assertThat(claim.input().path("tiers")).extracting(tier -> tier.path("tier").asString())
+                .containsExactly("campaign", "system", "other");
+        assertThat(claim.input().path("tiers").get(2).path("sources")).isEmpty();
+        assertThat(claim.input().toString()).doesNotContain(houseRule.versionId().toString())
+                .doesNotContain(houseRule.passages().getFirst().toString());
+        assertProblem(sendAsWorker("POST", claim.path("passages"), "{\"ids\":[\"" + houseRule.passages().getFirst()
+                + "\"]}", claim.grant()), 403, "scope.passage_refused");
+        postEvents(claim, 1, List.of(delta("Um."), citation(houseRule.passages().getFirst(), 1),
+                citation(own.passages().getFirst(), 2)), List.of());
+        report(claim, "{\"outcome\":\"done\"}");
+        assertThat(done(gm, turnId, null).path("references")).hasSize(1).first()
+                .satisfies(reference -> assertThat(strings(reference.path("passageIds")))
+                        .containsExactly(own.passages().getFirst().toString()));
+        assertThat(references.rows.values()).noneMatch(row -> row.versionId().equals(houseRule.versionId()));
+    }
+
+    @Test
+    void theOtherTierSwitchedOnServesTheNextQuestionLabelledOther() throws Exception {
+        Gm gm = signUp();
+        UUID system = systemOf(gm);
+        source(gm, gm.campaign(), List.of(1));
+        UUID farSystem = system(gm, "Outro sistema");
+        UUID farCampaign = campaign(gm, farSystem, "Campanha distante");
+        Source ofFarCampaign = source(gm, farCampaign, List.of(1));
+        Source ofFarSystem = systemSource(gm, farSystem);
+
+        HttpResponse<String> changed = send(gm, "PUT", scopePath(gm.campaign()),
+                scopeBody(0, true, true, true, true, List.of()));
+
+        assertThat(changed.statusCode()).as(changed.body()).isEqualTo(200);
+        assertThat(changed.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(changed).path("version").asLong()).isEqualTo(1);
+        assertThat(json(changed).path("otherTier").asBoolean()).isTrue();
+        assertThat(json(changed).path("modelKnowledge").asBoolean()).isTrue();
+        assertThat(json(get(gm, scopePath(gm.campaign()))).path("version").asLong()).isEqualTo(1);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        TurnRow row = conversations.turns.get(turnId);
+        assertThat(row.otherTier()).isTrue();
+        assertThat(row.modelKnowledge()).isTrue();
+        Claim claim = claim(row.jobId());
+        JsonNode other = claim.input().path("tiers").get(2);
+        assertThat(other.path("tier").asString()).isEqualTo("other");
+        assertThat(strings(other.path("sources"))).containsExactlyInAnyOrder(ofFarCampaign.versionId().toString(),
+                ofFarSystem.versionId().toString());
+        HttpResponse<String> read = sendAsWorker("POST", claim.path("passages"), "{\"ids\":[\""
+                + ofFarCampaign.passages().getFirst() + "\",\"" + ofFarSystem.passages().getFirst() + "\"]}",
+                claim.grant());
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(json(read).path("passages")).extracting(passage -> passage.path("tier").asString())
+                .containsExactly("other", "other");
+        // The current conversation counts the other tier's sources too.
+        assertThat(json(get(gm, CURRENT)).path("hasSources").asBoolean()).isTrue();
+        assertThat(system).isNotEqualTo(farSystem);
+    }
+
+    @Test
+    void aMaterialSwitchedOffLeavesItsTierAndItsPassagesAreRefused() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Source ofSystem = systemSource(gm, systemOf(gm));
+
+        JsonNode changed = json(send(gm, "PUT", scopePath(gm.campaign()),
+                scopeBody(0, true, true, false, false, List.of(ofSystem.materialId()))));
+
+        assertThat(changed.path("materials")).extracting(m -> m.path("id").asString(), m -> m.path("on").asBoolean())
+                .containsExactly(tuple(own.materialId().toString(), true),
+                        tuple(ofSystem.materialId().toString(), false));
+        Claim claim = claim(jobOf(turnId(ask(gm, gm.campaign(), QUESTION))));
+        assertThat(claim.input().path("tiers").get(1).path("sources")).isEmpty();
+        assertThat(conversations.turns.values()).filteredOn(turn -> turn.jobId().equals(claim.jobId()))
+                .singleElement().satisfies(turn -> assertThat(turn.materialsOff())
+                        .containsExactly(ofSystem.materialId()));
+        assertProblem(sendAsWorker("POST", claim.path("passages"), "{\"ids\":[\"" + ofSystem.passages().getFirst()
+                + "\"]}", claim.grant()), 403, "scope.passage_refused");
+        // With every tier off the current conversation has no source.
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, false, false, false, false, List.of()));
+        assertThat(json(get(gm, CURRENT)).path("hasSources").asBoolean()).isFalse();
+    }
+
+    @Test
+    void aChangeMidAnswerLeavesThatTurnsFrozenScopeAndTheNextTurnUsesTheNewOne() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        UUID sibling = campaign(gm, systemOf(gm), "Mesa irmã");
+        Source ofSibling = source(gm, sibling, List.of(1));
+        UUID first = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim firstClaim = claim(jobOf(first));
+
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, true, false,
+                List.of(own.materialId()))).statusCode()).isEqualTo(200);
+
+        // The turn being answered keeps its frozen scope: its own material still reads, the other tier does not.
+        HttpResponse<String> read = sendAsWorker("POST", firstClaim.path("passages"), "{\"ids\":[\""
+                + own.passages().getFirst() + "\"]}", firstClaim.grant());
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertProblem(sendAsWorker("POST", firstClaim.path("passages"), "{\"ids\":[\""
+                + ofSibling.passages().getFirst() + "\"]}", firstClaim.grant()), 403, "scope.passage_refused");
+        postEvents(firstClaim, 1, List.of(delta("Um."), citation(own.passages().getFirst(), 1)), List.of());
+        report(firstClaim, "{\"outcome\":\"done\"}");
+        assertThat(done(gm, first, null).path("references")).hasSize(1);
+        // The next turn uses the new one.
+        Claim next = claim(jobOf(turnId(ask(gm, gm.campaign(), QUESTION))));
+        assertThat(next.input().path("tiers").get(0).path("sources")).isEmpty();
+        assertThat(strings(next.input().path("tiers").get(2).path("sources")))
+                .containsExactly(ofSibling.versionId().toString());
+        assertProblem(sendAsWorker("POST", next.path("passages"), "{\"ids\":[\"" + own.passages().getFirst()
+                + "\"]}", next.grant()), 403, "scope.passage_refused");
+    }
+
+    @Test
+    void aStaleChangeAnUnknownMaterialAndAMalformedBodyChangeNothing() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Gm other = signUp();
+        Source theirs = source(other, other.campaign(), List.of(1));
+        Source unready = source(gm, gm.campaign(), List.of(1));
+        as(gm.id(), () -> materials.changeVersionState(unready.versionId(), "processing",
+                clock.instant().truncatedTo(ChronoUnit.MICROS)));
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, false, List.of()))
+                .statusCode()).isEqualTo(200);
+
+        assertProblem(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, false, false, false, false, List.of())),
+                409, "request.stale_version");
+        for (UUID id : List.of(theirs.materialId(), unready.materialId(), Ids.newId())) {
+            assertProblem(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, true, true, false, false,
+                    List.of(id))), 400, "scope.material_unknown");
+        }
+        List<String> invalid = new ArrayList<>(List.of("{}", "null", "{\"version\":1}",
+                "{\"version\":1,\"campaignTier\":true,\"systemTier\":true,\"otherTier\":false,"
+                        + "\"modelKnowledge\":false}",
+                "{\"campaignTier\":true,\"systemTier\":true,\"otherTier\":false,\"modelKnowledge\":false,"
+                        + "\"materialsOff\":[]}",
+                "{\"version\":1,\"systemTier\":true,\"otherTier\":false,\"modelKnowledge\":false,"
+                        + "\"materialsOff\":[]}",
+                "{\"version\":-1,\"campaignTier\":true,\"systemTier\":true,\"otherTier\":false,"
+                        + "\"modelKnowledge\":false,\"materialsOff\":[]}",
+                "{\"version\":1,\"campaignTier\":true,\"systemTier\":true,\"otherTier\":false,"
+                        + "\"modelKnowledge\":false,\"materialsOff\":[null]}",
+                "{\"version\":1,\"campaignTier\":true,\"systemTier\":true,\"otherTier\":false,"
+                        + "\"modelKnowledge\":false,\"materialsOff\":[\"nope\"]}"));
+        List<UUID> tooMany = new ArrayList<>();
+        for (int i = 0; i < 1001; i++) {
+            tooMany.add(own.materialId());
+        }
+        invalid.add(scopeBody(1, true, true, false, false, tooMany));
+        for (String body : invalid) {
+            assertProblem(send(gm, "PUT", scopePath(gm.campaign()), body), 400, "request.invalid");
+        }
+        JsonNode stored = json(get(gm, scopePath(gm.campaign())));
+        assertThat(stored.path("version").asLong()).isEqualTo(1);
+        assertThat(stored.path("campaignTier").asBoolean()).isTrue();
+        assertThat(stored.path("materials")).allSatisfy(material -> assertThat(material.path("on").asBoolean())
+                .isTrue());
+        // 1000 ids (repeats of one material) is within the limit.
+        List<UUID> thousand = new ArrayList<>(tooMany.subList(0, 1000));
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, true, true, false, false, thousand))
+                .statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void aPageOfTheCurrentScopeIsServedAndAnythingElseIsNotFound() throws Exception {
+        Gm gm = signUp();
+        Paged own = pdf(gm, gm.campaign(), 2, 1);
+        UUID sibling = campaign(gm, systemOf(gm), "Mesa irmã");
+        Paged ofSibling = pdf(gm, sibling, 2, 1);
+        Gm other = signUp();
+        Paged theirs = pdf(other, other.campaign(), 2, 1);
+
+        HttpResponse<String> read = get(gm, sourcePath(gm.campaign(), own.versionId(), "1"));
+
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode page = json(read);
+        assertThat(page.propertyNames()).containsExactlyInAnyOrder("page", "pageTotal", "picture", "lines", "text",
+                "passages", "outcome");
+        assertThat(page.path("page").asInt()).isEqualTo(1);
+        assertThat(page.path("pageTotal").asInt()).isEqualTo(2);
+        assertThat(page.path("passages").get(0).path("id").asString()).isEqualTo(own.passages().getFirst().toString());
+        HttpResponse<byte[]> picture = sourcePicture(gm, gm.campaign(), own.versionId(), "2");
+        assertThat(picture.statusCode()).isEqualTo(200);
+        assertThat(picture.body()).isEqualTo(own.pictures().get(2));
+        assertThat(picture.headers().firstValue("Content-Type").orElseThrow()).isEqualTo("image/webp");
+        assertThat(picture.headers().firstValue("X-Content-Type-Options").orElseThrow()).isEqualTo("nosniff");
+        // Out of scope (the other tier is off), another owner's version or campaign, unknown, malformed, past the end.
+        assertNotFound(get(gm, sourcePath(gm.campaign(), ofSibling.versionId(), "1")));
+        assertThat(sourcePicture(gm, gm.campaign(), ofSibling.versionId(), "2").statusCode()).isEqualTo(404);
+        assertNotFound(get(gm, sourcePath(gm.campaign(), theirs.versionId(), "1")));
+        assertNotFound(get(other, sourcePath(gm.campaign(), own.versionId(), "1")));
+        assertNotFound(get(other, sourcePath(other.campaign(), own.versionId(), "1")));
+        assertNotFound(get(gm, sourcePath(gm.campaign(), Ids.newId(), "1")));
+        assertNotFound(get(gm, sourcePath(gm.campaign(), own.versionId(), "3")));
+        assertNotFound(get(gm, sourcePath(gm.campaign(), own.versionId(), "0")));
+        assertNotFound(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/sources/nope/pages/1"));
+        // The scope decides: with the other tier on the sibling's page opens; with its material off, it does not.
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, true, false, List.of()));
+        assertThat(get(gm, sourcePath(gm.campaign(), ofSibling.versionId(), "1")).statusCode()).isEqualTo(200);
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, true, true, true, false,
+                List.of(ofSibling.materialId())));
+        assertNotFound(get(gm, sourcePath(gm.campaign(), ofSibling.versionId(), "1")));
+        assertThat(sibling).isNotEqualTo(gm.campaign());
+    }
+
+    @Test
+    void aStoredReferenceStillOpensAfterItsMaterialIsSwitchedOff() throws Exception {
+        Gm gm = signUp();
+        Paged source = pdf(gm, gm.campaign(), 2, 1);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(source.passages().getFirst(), 1)));
+
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, false,
+                List.of(source.materialId())));
+
+        assertThat(referencePage(gm, turnId, "1", "1").statusCode()).isEqualTo(200);
+        assertThat(referencePicture(gm, turnId, "1", "2").statusCode()).isEqualTo(200);
+        assertNotFound(get(gm, sourcePath(gm.campaign(), source.versionId(), "1")));
+        // Nothing new is drawn from it.
+        Claim next = claim(jobOf(turnId(ask(gm, gm.campaign(), QUESTION))));
+        assertThat(next.input().path("tiers").get(0).path("sources")).isEmpty();
+    }
+
+    private static String scopePath(UUID campaign) {
+        return "/api/v1/campaigns/" + campaign + "/scope";
+    }
+
+    private static String sourcePath(UUID campaign, UUID version, String page) {
+        return "/api/v1/campaigns/" + campaign + "/sources/" + version + "/pages/" + page;
+    }
+
+    private HttpResponse<byte[]> sourcePicture(Gm gm, UUID campaign, UUID version, String page) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri(sourcePath(campaign, version, page) + "/picture"))
+                .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
+                .header("Accept", "image/webp").GET().build(), HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private static String scopeBody(long version, boolean campaignTier, boolean systemTier, boolean otherTier,
+                                    boolean modelKnowledge, List<UUID> materialsOff) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("version", version);
+        body.put("campaignTier", campaignTier);
+        body.put("systemTier", systemTier);
+        body.put("otherTier", otherTier);
+        body.put("modelKnowledge", modelKnowledge);
+        body.put("materialsOff", materialsOff.stream().map(UUID::toString).toList());
+        return JSON.writeValueAsString(body);
+    }
+
+    /** The GM's current campaign's system. */
+    private UUID systemOf(Gm gm) throws Exception {
+        return UUID.fromString(json(get(gm, "/api/v1/campaigns/" + gm.campaign())).path("system").path("id")
+                .asString());
+    }
+
+    /** A new system of the GM. */
+    private UUID system(Gm gm, String name) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/systems", JSON.writeValueAsString(Map.of("name", name)));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return UUID.fromString(json(created).path("id").asString());
+    }
+
+    /** A new campaign of the GM's system; the GM's first campaign stays the current one. */
+    private UUID campaign(Gm gm, UUID system, String name) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns",
+                JSON.writeValueAsString(Map.of("name", name, "systemId", system.toString())));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(send(gm, "PUT", "/api/v1/campaigns/current", "{\"campaignId\":\"" + gm.campaign() + "\"}")
+                .statusCode()).isEqualTo(200);
+        return UUID.fromString(json(created).path("id").asString());
+    }
+
+    /** An accepted material attached to the system, with one passage. */
+    private Source systemSource(Gm gm, UUID system) {
+        Source made = source(gm, null, List.of(1));
+        as(gm.id(), () -> {
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), gm.id(), made.materialId(), system,
+                    clock.instant().truncatedTo(ChronoUnit.MICROS)));
+            return null;
+        });
+        return made;
     }
 
     // --- Story 2.7: open the cited page in the source view

@@ -298,6 +298,12 @@ public interface MaterialStore {
      */
     List<VersionRow> readyOfSystem(UUID systemId);
 
+    /**
+     * Every {@code ready} version of the current owner, oldest first (Story 3.5: the other tier is what is left of them
+     * once the campaign's and its system's are taken out).
+     */
+    List<VersionRow> readyOfOwner();
+
     /** The ids of the current owner's passages of a version from ordinal {@code first} to {@code last}, in order. */
     List<UUID> passageIds(UUID versionId, int first, int last);
 

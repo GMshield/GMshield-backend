@@ -4,8 +4,12 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
@@ -57,12 +61,16 @@ class JpaConversationStore implements ConversationStore {
         EntityManager em = em();
         em.persist(new TurnEntity(row));
         em.flush();
+        for (UUID materialId : row.materialsOff()) {
+            em.persist(new TurnMaterialOffEntity(row.id(), materialId, row.ownerId()));
+        }
+        em.flush();
     }
 
     @Override
     public Optional<TurnRow> findTurn(UUID id) {
         return em().createQuery("select t from Turn t where t.id = :id", TurnEntity.class).setParameter("id", id)
-                .getResultList().stream().findFirst().map(TurnEntity::row);
+                .getResultList().stream().findFirst().map(this::row);
     }
 
     @Override
@@ -80,7 +88,7 @@ class JpaConversationStore implements ConversationStore {
     @Override
     public Optional<TurnRow> turnOfJob(UUID jobId) {
         return em().createQuery("select t from Turn t where t.jobId = :job", TurnEntity.class)
-                .setParameter("job", jobId).getResultList().stream().findFirst().map(TurnEntity::row);
+                .setParameter("job", jobId).getResultList().stream().findFirst().map(this::row);
     }
 
     @Override
@@ -131,9 +139,11 @@ class JpaConversationStore implements ConversationStore {
 
     @Override
     public List<TurnRow> turnsOf(UUID conversationId) {
-        return em().createQuery("select t from Turn t where t.conversationId = :conversation order by t.createdAt, t.id",
-                        TurnEntity.class).setParameter("conversation", conversationId).getResultList().stream()
-                .map(TurnEntity::row).toList();
+        List<TurnEntity> turns = em().createQuery("select t from Turn t where t.conversationId = :conversation"
+                        + " order by t.createdAt, t.id", TurnEntity.class).setParameter("conversation", conversationId)
+                .getResultList();
+        Map<UUID, Set<UUID>> off = materialsOff(turns.stream().map(TurnEntity::id).toList());
+        return turns.stream().map(turn -> turn.row(off.getOrDefault(turn.id(), Set.of()))).toList();
     }
 
     @Override
@@ -143,6 +153,8 @@ class JpaConversationStore implements ConversationStore {
                 .setParameter("id", turnId).getResultList().stream().findFirst();
         found.ifPresent(turn -> {
             em.createQuery("select b from TurnEventBatch b where b.turnId = :turn", TurnEventBatchEntity.class)
+                    .setParameter("turn", turnId).getResultList().forEach(em::remove);
+            em.createQuery("select o from TurnMaterialOff o where o.key.turnId = :turn", TurnMaterialOffEntity.class)
                     .setParameter("turn", turnId).getResultList().forEach(em::remove);
             em.flush();
             em.remove(turn);
@@ -161,6 +173,23 @@ class JpaConversationStore implements ConversationStore {
             em.flush();
         });
         return found.isPresent();
+    }
+
+    /** The turn's row, with the materials switched off frozen with it. */
+    private TurnRow row(TurnEntity turn) {
+        return turn.row(materialsOff(List.of(turn.id())).getOrDefault(turn.id(), Set.of()));
+    }
+
+    /** The materials switched off frozen with each of these turns, by turn (a turn with none is absent). */
+    private Map<UUID, Set<UUID>> materialsOff(Collection<UUID> turnIds) {
+        if (turnIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<UUID, Set<UUID>> off = new HashMap<>();
+        em().createQuery("select o from TurnMaterialOff o where o.key.turnId in :turns", TurnMaterialOffEntity.class)
+                .setParameter("turns", turnIds).getResultList()
+                .forEach(row -> off.computeIfAbsent(row.turnId(), key -> new HashSet<>()).add(row.materialId()));
+        return off;
     }
 
     /** The shared, transaction-bound entity manager: each transaction (or each call outside one) has its own session. */

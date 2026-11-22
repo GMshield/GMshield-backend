@@ -5,12 +5,14 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.util.Set;
 import java.util.UUID;
 import org.hibernate.annotations.TenantId;
 
 /**
  * {@code turn}: written once, but for {@code stopped_at}, set once by the GM's stop (Story 2.6). Hibernate fills
- * {@code owner_id} and filters every query by it.
+ * {@code owner_id} and filters every query by it. From Story 3.5 it freezes the other tier's switch too; the materials
+ * switched off are {@link TurnMaterialOffEntity} rows.
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -42,6 +44,9 @@ class TurnEntity {
     @Column(name = "system_tier", nullable = false, updatable = false)
     private boolean systemTier;
 
+    @Column(name = "other_tier", nullable = false, updatable = false)
+    private boolean otherTier;
+
     @Column(name = "model_knowledge", nullable = false, updatable = false)
     private boolean modelKnowledge;
 
@@ -64,6 +69,7 @@ class TurnEntity {
         this.language = row.language();
         this.campaignTier = row.campaignTier();
         this.systemTier = row.systemTier();
+        this.otherTier = row.otherTier();
         this.modelKnowledge = row.modelKnowledge();
         this.createdAt = row.createdAt();
         this.stoppedAt = row.stoppedAt();
@@ -73,8 +79,13 @@ class TurnEntity {
         this.stoppedAt = at;
     }
 
-    TurnRow row() {
+    /** The row, with the materials switched off frozen with it (read from {@code turn_material_off}). */
+    TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                modelKnowledge, createdAt, stoppedAt);
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt);
+    }
+
+    UUID id() {
+        return id;
     }
 }

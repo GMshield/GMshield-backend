@@ -10,6 +10,7 @@ import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.scope.service.CampaignScopes;
 import io.github.gmshield.scope.service.Indexing;
 import io.github.gmshield.scope.service.IndexingFailure;
 import io.github.gmshield.scope.service.ScopeSettings;
@@ -42,7 +43,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * The GM's conversation (Story 2.4). Everything here acts for the owner of the work ({@link OwnerContext}).
  *
  * <ul>
- *   <li>{@link #current}: the current campaign, whether its starting scope has a source (an allowed source, or a
+ *   <li>{@link #current}: the current campaign, whether its scope (from Story 3.5 its stored settings,
+ *       {@link CampaignScopes#settings}) has a source (an allowed source, or a
  *       pending passage of one), and how many of that scope's passages are still waiting for search
  *       ({@link Scopes#indexing}; null when nothing in it is pending), and how many could not be prepared for search,
  *       with whether a retry remains ({@link Scopes#status}; null when none). No campaign is
@@ -53,7 +55,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@link #ask}: a question of 1 to {@value Scopes#MAX_QUESTION} code points, not blank (else
  *       {@code request.invalid}, nothing recorded), on a campaign of the owner (else {@code request.not_found}). In one
  *       transaction: the campaign's one conversation (made on the first question), the turn with the question
- *       encrypted, its language ({@link Languages}) and {@link ScopeSettings#STARTING} frozen on it, and its
+ *       encrypted, its language ({@link Languages}) and the campaign's stored scope settings frozen on it (Story 3.5,
+ *       {@link CampaignScopes#settings}: the switches and the materials off), and its
  *       {@code question.answer} job on the interactive lane.</li>
  *   <li>{@link #turn} and {@link #eventsAfter}: a turn of the owner, and its stored events after a sequence, decrypted,
  *       in order.</li>
@@ -69,6 +72,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       come first: the owner's turn exists, its conversation's campaign is the owner's, and the turn has a reference
  *       with that number. {@link Scopes#referencePage} then serves the page from the stored version and material, never
  *       from an id the client sent. Empty for anything not served.</li>
+ *   <li>{@link #sourcePage} and {@link #sourcePicture} (Story 3.5): a page of a version that is an allowed source of
+ *       the campaign's current stored scope, on the ground "the current scope" ({@link CampaignScopes#sourcePage});
+ *       empty for anything else, with no hint whether the version exists.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -88,19 +94,22 @@ public class Conversations {
     private final TurnReferenceStore referenceStore;
     private final Library library;
     private final Scopes scopes;
+    private final CampaignScopes campaignScopes;
     private final Jobs jobs;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<AnswerJobs> answers;
     private final Clock clock;
 
-    Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes, Jobs jobs,
-                  Vault vault, ObjectProvider<PlatformTransactionManager> transactions,
-                  ObjectProvider<AnswerJobs> answers, ObjectProvider<Clock> clock) {
+    Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes,
+                  CampaignScopes campaignScopes, Jobs jobs, Vault vault,
+                  ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<AnswerJobs> answers,
+                  ObjectProvider<Clock> clock) {
         this.store = store;
         this.referenceStore = referenceStore;
         this.library = library;
         this.scopes = scopes;
+        this.campaignScopes = campaignScopes;
         this.jobs = jobs;
         this.vault = vault;
         this.transactions = transactions;
@@ -132,7 +141,7 @@ public class Conversations {
         return reading(() -> {
             Library.Campaign campaign = library.currentCampaign().orElseThrow(ConversationProblems::notFound);
             // One look-up of the sources; a pending passage always belongs to an allowed source.
-            ScopeStatus status = scopes.status(campaign.id(), ScopeSettings.STARTING);
+            ScopeStatus status = scopes.status(campaign.id(), campaignScopes.settings(campaign.id()));
             return new Current(campaign.id(), status.hasSources(), status.indexing(), status.failed());
         });
     }
@@ -165,13 +174,16 @@ public class Conversations {
                 return created;
             });
             UUID turnId = Ids.newId();
-            ScopeSettings settings = ScopeSettings.STARTING;
+            ScopeSettings settings = campaignScopes.settings(campaignId);
             JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
-                    language, settings.campaignTier(), settings.systemTier(), settings.modelKnowledge(), now, null)));
+                    language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
+                    settings.modelKnowledge(), settings.materialsOff(), now, null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("turnId", turnId)
                     .addKeyValue("jobId", job.id()).addKeyValue("language", language == null ? "unsure" : language)
+                    .addKeyValue("otherTier", settings.otherTier())
+                    .addKeyValue("materialsOff", settings.materialsOff().size())
                     .addKeyValue("questionLength", question.codePointCount(0, question.length()))
                     .log("conversation.turn_recorded");
             return new Asked(turnId, conversation.id(), language);
@@ -250,6 +262,16 @@ public class Conversations {
         log.atInfo().addKeyValue("turnId", turnId).addKeyValue("number", number).addKeyValue("page", page)
                 .addKeyValue("served", served.isPresent()).log("conversation.reference_picture");
         return served;
+    }
+
+    /** Page {@code page} of a version in the owner's campaign's current scope, as the class says. */
+    public Optional<SourcePage> sourcePage(UUID campaignId, UUID versionId, int page) {
+        return campaignScopes.sourcePage(campaignId, versionId, page);
+    }
+
+    /** The picture of that page, as {@link #sourcePage} finds it; empty also for a page with no picture. */
+    public Optional<SourcePicture> sourcePicture(UUID campaignId, UUID versionId, int page) {
+        return campaignScopes.sourcePicture(campaignId, versionId, page);
     }
 
     /** What a stored reference names: its turn's campaign, and its material and version. */
