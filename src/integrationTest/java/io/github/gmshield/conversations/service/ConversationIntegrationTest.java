@@ -44,6 +44,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Story 2.6: the GM's stop on PostgreSQL: the job row locked, {@code turn.stopped_at} set, the references so far and
  * {@code done} marked stopped stored at once, the next batch stored no more but its usage recorded as an estimate
  * ({@code model_call_usage.estimated}), and the worker's {@code done} adding nothing.
+ * Story 3.7: the reference's tier in {@code turn_reference.tier} (V28), null on an older row, and a tier marker stored
+ * only when its tier has a source in the turn's scope.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -181,7 +183,8 @@ class ConversationIntegrationTest {
                 .query(UUID.class).single();
         JobClaims.Claim claim = claims.claim(jobId, null, List.of("azure-openai"));
         claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1, List.of(
-                JobEvent.delta("Fire Bolt causa 1d10."), JobEvent.citation(passages.get(2), 9),
+                JobEvent.tier("campaign", 0), JobEvent.delta("Fire Bolt causa 1d10."),
+                JobEvent.citation(passages.get(2), 9), JobEvent.tier("system", 20),
                 JobEvent.citation(passages.get(1), 20), JobEvent.citation(Ids.newId(), 20),
                 JobEvent.citation(passages.get(0), 20))), List.of());
         claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
@@ -194,13 +197,20 @@ class ConversationIntegrationTest {
                         org.assertj.core.groups.Tuple.tuple(2, 4, List.of(passages.get(1), passages.get(0)), false));
         assertThat(references.getFirst().materialName()).isEqualTo("SRD 5.2.1");
         assertThat(references.getFirst().sectionPath()).containsExactly("Magias", "Fire Bolt");
+        // Story 3.7: the tier is stored with the reference (V28), from the turn's frozen scope; the campaign marker is
+        // stored with the events, and the system one, whose tier has no source in this scope, is dropped.
+        assertThat(references).extracting(TurnReference::tier).containsExactly("campaign", "campaign");
+        assertThat(as(owner, () -> conversations.eventsAfter(asked.turnId(), 0))).filteredOn(event ->
+                TurnEvent.TIER.equals(event.type())).extracting(TurnEvent::tier, TurnEvent::offset)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple("campaign", 0));
         List<Map<String, Object>> rows = jdbc.sql("select owner_id, number, version_id, material_id, page,"
-                + " material_name, section_path from turn_reference where turn_id = :turn order by number")
+                + " material_name, section_path, tier from turn_reference where turn_id = :turn order by number")
                 .param("turn", asked.turnId()).query().listOfRows();
         assertThat(rows).hasSize(2);
         assertThat(rows.getFirst().get("owner_id")).isEqualTo(owner);
         assertThat(rows.getFirst().get("version_id")).isEqualTo(version);
         assertThat(rows.getFirst().get("material_id")).isEqualTo(material);
+        assertThat(rows).extracting(row -> row.get("tier")).containsExactly("campaign", "campaign");
         assertThat(rows).allSatisfy(row -> {
             assertThat(new String((byte[]) row.get("material_name"), StandardCharsets.ISO_8859_1)).doesNotContain("SRD");
             assertThat(new String((byte[]) row.get("section_path"), StandardCharsets.ISO_8859_1))
@@ -214,8 +224,17 @@ class ConversationIntegrationTest {
 
         as(owner, () -> materials.discardVersion(version, Instant.now()));
 
-        assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::removed)
-                .containsExactly(true, true);
+        assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::removed,
+                TurnReference::tier).containsExactly(org.assertj.core.groups.Tuple.tuple(true, "campaign"),
+                org.assertj.core.groups.Tuple.tuple(true, "campaign"));
+        // A row written before V28 has no tier, and still reads; the column takes only the three words.
+        jdbc.sql("update turn_reference set tier = null where turn_id = :turn and number = 2")
+                .param("turn", asked.turnId()).update();
+        assertThat(as(owner, () -> conversations.references(asked.turnId()))).extracting(TurnReference::tier)
+                .containsExactly("campaign", null);
+        assertThatThrownBy(() -> jdbc.sql("update turn_reference set tier = 'model' where turn_id = :turn")
+                .param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("turn_reference_tier_check");
     }
 
     @Test

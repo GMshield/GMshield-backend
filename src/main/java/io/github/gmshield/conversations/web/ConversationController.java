@@ -152,6 +152,16 @@ class ConversationController {
                     minimum = "0") int offset) {
     }
 
+    @Schema(name = "TurnTierEvent", requiredProperties = {"tier", "offset"},
+            description = "The data of a tier event (Story 3.7): the sources disagree, and the version of this tier of"
+                    + " the scope starts at a place of the answer's text. The campaign's version comes first; each"
+                    + " other tier's follows as an alternative. Only a tier with a source in the turn's scope")
+    record TierEvent(
+            @Schema(allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(description = "Where the tier's version starts, in code points of the answer's text",
+                    format = "int32", minimum = "0") int offset) {
+    }
+
     @Schema(name = "TurnSourceReference", requiredProperties = {"number", "materialName", "sectionPath", "page",
         "passageIds", "removed"}, description = "A source reference of a completed answer, stored by value with the"
             + " turn: one distinct place (material version, section path, page) the answer cited")
@@ -168,7 +178,10 @@ class ConversationController {
             List<UUID> passageIds,
             @Schema(description = "Whether its source has been removed since (its version gone, discarded or pending"
                     + " removal, or its material gone), as of when the event is sent. A version superseded by a newer"
-                    + " accepted one is not removed") boolean removed) {
+                    + " accepted one is not removed") boolean removed,
+            @Schema(description = "The tier its source had in the turn's scope when the answer was written (Story"
+                    + " 3.7), kept when the source leaves the scope; absent for a reference stored before then",
+                    allowableValues = {"campaign", "system", "other"}) String tier) {
     }
 
     @Schema(name = "TurnDoneEvent", requiredProperties = {"stopped", "silent", "references"},
@@ -271,7 +284,8 @@ class ConversationController {
     @Operation(operationId = "streamTurnEvents", summary = "The turn's answer as server-sent events: the stored events"
             + " after Last-Event-ID (0 when absent), then new ones as they are written. Events: delta (TurnDeltaEvent),"
             + " citation (TurnCitationEvent), done (TurnDoneEvent) and error (TurnErrorEvent), each with id: its"
-            + " sequence (1, 2, ... per turn). A comment line ': keep-alive' every 15 s; the stream closes after done or"
+            + " sequence (1, 2, ... per turn). From contract 1.26.0 also tier (TurnTierEvent), stored and replayed like"
+            + " citation. A comment line ': keep-alive' every 15 s; the stream closes after done or"
             + " error, and after 30 minutes without either: the client then reopens it with Last-Event-ID, the id of"
             + " the last event it received. Leaving never touches the answer. request.not_found (404) for a turn that"
             + " is not the account's",
@@ -280,7 +294,8 @@ class ConversationController {
             responses = @ApiResponse(responseCode = "200", description = "The event stream",
                     content = @Content(mediaType = MediaType.TEXT_EVENT_STREAM_VALUE, schema = @Schema(
                             description = "Each event's data is one of these, by its event name",
-                            oneOf = {DeltaEvent.class, CitationEvent.class, DoneEvent.class, ErrorEvent.class}))))
+                            oneOf = {DeltaEvent.class, CitationEvent.class, TierEvent.class, DoneEvent.class,
+                                ErrorEvent.class}))))
     ResponseEntity<SseEmitter> events(
             @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("turnId") String turnId,

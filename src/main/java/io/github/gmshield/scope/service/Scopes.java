@@ -74,7 +74,8 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #references} (Story 2.5): where cited passages stand within a resolved scope, in the order cited, each
  *       once. A citation is model output, so an id that is not a passage of an allowed source that is still
  *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; the line carries the
- *       dropped count only. No passage text is decrypted.</li>
+ *       dropped count only. Each place carries the tier of its source in that scope (Story 3.7), so a reference
+ *       keeps the tier it had when it was cited. No passage text is decrypted.</li>
  *   <li>{@link #removedVersions} (Story 2.5): which of these versions are removed for the owner (gone,
  *       {@code discarded}, pending removal, or of a material that is gone), so a stored reference shows as removed.</li>
  *   <li>{@link #referencePage} and {@link #referencePicture} (Story 2.7): one page of the version a source reference
@@ -322,7 +323,8 @@ public class Scopes {
         List<UUID> cited = ids.stream().filter(Objects::nonNull).distinct().toList();
         List<CitedPlace> places = reading(() -> reads.places(cited, scope.allowedSources())).stream()
                 .map(place -> new CitedPlace(place.passageId(), place.versionId(), place.materialId(),
-                        place.materialName(), place.sectionPath(), place.page())).toList();
+                        place.materialName(), place.sectionPath(), place.page(), scope.tierOf(place.versionId())
+                        .orElseThrow(() -> new IllegalStateException("scope.tier_missing")))).toList();
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", cited.size())
                 .addKeyValue("kept", places.size()).addKeyValue("dropped", cited.size() - places.size())
                 .log("scope.references_read");

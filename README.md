@@ -905,6 +905,23 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     worker right after the backend. Rolling the backend back below 1.25.0: the scope tables and `turn.other_tier` are
     ignored (every campaign resolves as `STARTING`, a frozen turn by its V17 switches alone), and the worker must go
     back first, since it refuses a 1.24 backend.
+- **The campaign's version leads (`conversations`, Story 3.7, public contract 1.26.0, internal contract 1.14.0,
+  migration V28).** The tier shown with an answer is always the backend's: the worker copies `JobPassage.tier` onto
+  each passage it hands the model and never works one out.
+  - **The tier marker.** `JobStreamEvent` gains type `tier` with a field `tier` (`campaign`, `system` or `other`) and
+    `offset`: the model opened a tier's version of the answer there (the campaign's first, then each other tier's as
+    an alternative, when the sources disagree). A `tier` event with any other field, no offset, a negative one, or
+    another word is `job.events_invalid` (400, nothing stored). `AnswerJobs.events` drops a marker whose tier has no
+    source in the turn's frozen scope (`conversation.tiers_dropped`, a count) and stores the rest encrypted with the
+    batch's events, like a citation (`{"type": "tier", "tier", "offset"}`). The stream relays it as the public event
+    `tier` (`TurnTierEvent` `{tier, offset}`) and replays it after `Last-Event-ID`.
+  - **The reference's tier.** `turn_reference.tier` (V28, nullable, checked to the three words) is written once with
+    the reference, from `ResolvedScope.tierOf(versionId)` on the turn's frozen scope (`CitedPlace.tier`): a source that
+    leaves the scope, or is removed, keeps the tier it had. `TurnSourceReference` gains an optional `tier`; a row
+    written before V28 has none, shows no tier and still opens. No backfill.
+  - Deploy order: backend → frontend → worker. The backend first (V28 is additive; a 1.13 worker never sends a
+    `tier` event), then the frontend (its minimum becomes 1.26.0), then the worker (its minimum becomes 1.14.0).
+    Rolling the backend back below 1.26.0: the column is ignored, and the worker and the frontend must go back first.
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

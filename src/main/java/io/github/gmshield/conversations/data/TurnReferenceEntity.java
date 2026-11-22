@@ -52,6 +52,10 @@ class TurnReferenceEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    /** Story 3.7 (V28): null on a row written before it. */
+    @Column(name = "tier", updatable = false, length = 16)
+    private String tier;
+
     protected TurnReferenceEntity() {
         // for Hibernate
     }
@@ -68,10 +72,11 @@ class TurnReferenceEntity {
         this.materialName = row.materialName();
         this.sectionPath = row.sectionPath();
         this.createdAt = row.createdAt();
+        this.tier = row.tier();
     }
 
     TurnReferenceRow row() {
         return new TurnReferenceRow(id, ownerId, turnId, number, versionId, materialId, page, List.of(passageIds),
-                materialName, sectionPath, createdAt);
+                materialName, sectionPath, createdAt, tier);
     }
 }
