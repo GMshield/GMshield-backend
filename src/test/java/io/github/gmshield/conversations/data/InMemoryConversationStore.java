@@ -12,8 +12,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
@@ -32,6 +33,11 @@ public class InMemoryConversationStore implements ConversationStore {
     public final Map<UUID, EventBatchRow> batches = new ConcurrentHashMap<>();
     /** The conversations whose state is {@code deleting} (Story 3.10 part B). */
     public final Set<UUID> deleting = ConcurrentHashMap.newKeySet();
+    /**
+     * Story 3.12, for a race test: run once right after the next {@link #savedTurns} read, as another connection's
+     * commit landing between that read and the reads that follow it in the same request.
+     */
+    public final AtomicReference<Runnable> afterSavedTurns = new AtomicReference<>();
 
     @Override
     public synchronized void insertConversation(ConversationRow row) {
@@ -240,7 +246,12 @@ public class InMemoryConversationStore implements ConversationStore {
 
     @Override
     public List<TurnRow> savedTurns(Collection<UUID> campaignIds, int offset, int limit) {
-        return saved(campaignIds).sorted(SAVED).skip(offset).limit(limit).toList();
+        List<TurnRow> page = saved(campaignIds).sorted(SAVED).skip(offset).limit(limit).toList();
+        Runnable meanwhile = afterSavedTurns.getAndSet(null);
+        if (meanwhile != null) {
+            meanwhile.run();
+        }
+        return page;
     }
 
     @Override

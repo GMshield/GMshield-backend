@@ -76,7 +76,8 @@ import tools.jackson.databind.json.JsonMapper;
  * owner's conversation on both routes. The removal against PostgreSQL is in
  * {@code ConversationDeletionIntegrationTest}. Story 3.11: a deleting conversation's turns are not found on both
  * dismissal routes, and a dismissed turn goes with its conversation. Story 3.12: the same on both bookmark routes; a
- * saved turn leaves the saved list when its conversation or campaign starts being deleted, and goes with its row.
+ * saved turn leaves the saved list when its conversation or campaign starts being deleted, and goes with its row; a
+ * conversation marked deleting while the list is read is left out of that page and its total.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -466,6 +467,37 @@ class ConversationDeletionFlowTest {
         JsonNode after = json(get(gm, "/api/v1/saved-answers"));
         assertThat(ids(after.path("items"), "turnId")).containsExactly(kept.toString());
         assertThat(after.path("total").asLong()).isEqualTo(1);
+    }
+
+    @Test
+    void aConversationMarkedDeletingWhileTheSavedListIsReadIsLeftOutOfThatPageAndItsTotal() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID going = answered(gm, null, "questions", source);
+        UUID conversation = conversations.turns.get(going).conversationId();
+        tick();
+        UUID kept = answered(gm, null, "rules", source);
+        for (UUID turn : List.of(going, kept)) {
+            tick();
+            assertThat(send(gm, "PUT", "/api/v1/turns/" + turn + "/bookmark").statusCode()).isEqualTo(204);
+        }
+        // Story 3.12: the conversation starts being deleted after the page's saved turns were read and before the
+        // conversations behind them are (another connection's commit, READ COMMITTED): a 200, never a 500.
+        conversations.afterSavedTurns.set(() -> conversations.deleting.add(conversation));
+        try {
+            HttpResponse<String> listed = get(gm, "/api/v1/saved-answers");
+
+            assertThat(listed.statusCode()).as(listed.body()).isEqualTo(200);
+            JsonNode page = json(listed);
+            assertThat(ids(page.path("items"), "turnId")).containsExactly(kept.toString());
+            // The total is counted after the mark, so it leaves the deleting conversation out as well.
+            assertThat(page.path("total").asLong()).isEqualTo(1);
+            assertThat(page.has("nextCursor")).isFalse();
+            assertThat(conversations.afterSavedTurns.get()).isNull();
+        } finally {
+            conversations.afterSavedTurns.set(null);
+            conversations.deleting.remove(conversation);
+        }
     }
 
     // --- helpers
