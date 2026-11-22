@@ -946,6 +946,62 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     so nothing it can set is ignored), then the frontend (its minimum becomes 1.27.0), last so the switch only turns
     on once the worker honours it. Rolling the backend back below 1.27.0: the frontend and the worker must go back
     first.
+- **Search the library (`conversations`, `scope`, Story 3.9, public contract 1.28.0, internal contract unchanged
+  1.15.0, migration V29).** A GM finds a passage by meaning or exact words without asking a question. Search is a job
+  on the interactive lane, like a question, and its text is never matched in SQL.
+  - `POST /api/v1/campaigns/{campaignId}/searches` with `{query, tier?, materialId?}` answers 202 `{id}`
+    (`createSearch`). The query is 1 to 500 code points, not blank; `tier` is `campaign`, `system` or `other`;
+    `materialId` a material's id; each filter may be absent or null. Anything else is 400 `request.invalid`, a campaign
+    that is not the account's 404 `request.not_found`, with nothing recorded. In one transaction (`Searches.create`):
+    the `search` row with the query encrypted (binding `search`/`query`), its filters and state `pending`, and its job
+    of kind `library.search`; then the owner's searches past the newest 20 are pruned (their unended jobs cancelled,
+    then their results and rows).
+  - `GET /api/v1/searches/{searchId}` answers `{id, campaignId, query, tier, materialId, state, code?, results}`
+    (`getSearch`, schema `Search`): `state` is `pending`, `done` or `failed`; `code` only when failed; `results` (empty
+    unless done) up to 20 `{passageId, versionId, materialName, sectionPath, page, firstWords, tier}` in rank order.
+    Each stored result is re-read on every `GET` within the campaign's **current** scope narrowed by the search's
+    filters (`Scopes.results`): one whose source left the scope since (a tier or material switched off, a version no
+    longer `ready`) is dropped, never refused, and the tier is the one the scope gives now. `firstWords` is the
+    passage's text with its runs of white space made one space, cut to its first 160 code points at a word boundary.
+    Another owner's search, an unknown or malformed id, a pruned one, and one whose campaign was deleted since are the
+    same 404. `/api/v1/searches/**` joins the library routes (`LibraryOwnerFilter`). The result's page opens on the
+    ground of the current scope (`getScopeSourcePage`, Story 3.5); there is no new ground.
+  - **The scope narrowed (`ScopeFilter`).** `Scopes.resolve(campaign, settings, filter)` and `resolveSources(…)` keep
+    only the allowed sources the filter keeps, before the pending passages are read: a tier filter empties the other
+    tiers' `sources` and `pending`, a material filter keeps only that material's version (and its pending passages).
+    A filter only narrows: a tier or material switched off, or a material in no tier, leaves nothing.
+  - **The job (`SearchJobs`, `library.search`, interactive, `callsModel()` false).** Its input is
+    `Scopes.searchInput`: the question input's shape (`{query, owner, modelKnowledge, tiers: [{tier, sources,
+    pending}], tokenKey}`) with `query` in place of `question`, within the search's campaign's current stored settings
+    narrowed by its filters. Its passages route (the worker reads the candidates' text to put the exact query first)
+    serves that same narrowed scope through `Scopes.passages`, so an id outside it is 403 `scope.passage_refused`.
+    `completed` takes `result.ids`: 0 to 20 distinct passage ids in rank order (anything else is 400
+    `job.result_invalid` and the search stays pending). Every id is checked against the narrowed scope first
+    (`Scopes.references`, which decrypts no text): when any is not a passage of an allowed source still `ready`, the
+    whole result is refused and the search ends `failed` with `scope.passage_refused` (the job itself is done).
+    Otherwise `search_result` stores each id with its rank, version and tier, and the search ends `done`. The job's end
+    in `failed` (a reported failure or a lapsed claim after the last attempt) ends the search `failed` with its code.
+  - The worker's side: `GMshield-worker` `lanes/search.py` (README there). Its result is ids only.
+  - `V29__search.sql`: `search` (owner `@TenantId`, campaign with a reference to it, job, encrypted query, tier,
+    material by value, state, code: a failed search has one and only it) and `search_result` (search, rank 1 to 20,
+    passage, version and tier by value; a (search, rank) and a (search, passage) once). Library tables: every key
+    with the owner, JPA and JPQL only. The campaign's and the system's deletion (`SystemConversationsDeletion`)
+    cancel the searches' jobs with the answers' and remove the searches with their results; a material's deletion takes
+    none (the next read drops its results).
+  - Lines (`search.created`, `search.done`, `search.failed`, `search.result_refused`, `search.read`,
+    `search.results_dropped`, `scope.search_input`, `scope.results_read`) carry ids, counts and codes, never the query
+    or a passage's text.
+  - Deploy order: backend → worker → frontend. The backend first (V29 is additive; nothing creates a search until the
+    frontend does), then the worker (it adds the `library.search` handler), then the frontend (its minimum becomes
+    1.28.0). **A backend rolled back below this release must first cancel every unended `library.search` job**, with
+    the backend stopped, as `gmshield_backend`; the two tables are then left unread:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind = 'library.search' and state in ('waiting', 'offered', 'running');
+    ```
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

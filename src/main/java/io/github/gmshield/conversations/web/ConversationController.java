@@ -3,9 +3,11 @@ package io.github.gmshield.conversations.web;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.conversations.service.ConversationProblems;
 import io.github.gmshield.conversations.service.Conversations;
+import io.github.gmshield.conversations.service.Searches;
 import io.github.gmshield.conversations.service.TurnStreams;
 import io.github.gmshield.scope.service.SourcePage;
 import io.github.gmshield.scope.service.SourcePicture;
+import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -42,6 +44,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * JSON with the same shape as {@code MaterialPageView}, and its picture, streamed as WebP with {@code nosniff}. From
  * Story 3.2, a campaign's conversation with its question count. From Story 3.5, a page of a version on the ground "the
  * current scope" (an allowed source of the campaign's current stored scope), and its picture, in the same shapes.
+ * From Story 3.9, a search of the library: created as a job (202) and read by id, with its results re-checked against
+ * the campaign's current scope each time.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -58,6 +62,8 @@ class ConversationController {
     static final String REFERENCE_PICTURE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture";
     static final String SOURCE_PAGE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}";
     static final String SOURCE_PICTURE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture";
+    static final String SEARCHES = "/api/v1/campaigns/{campaignId}/searches";
+    static final String SEARCH = "/api/v1/searches/{searchId}";
     static final String WEBP = "image/webp";
     /** A reference or page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is nowhere. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
@@ -66,10 +72,12 @@ class ConversationController {
     private static final Pattern SEQUENCE = Pattern.compile("\\d{1,18}");
 
     private final Conversations conversations;
+    private final Searches searches;
     private final TurnStreams streams;
 
-    ConversationController(Conversations conversations, TurnStreams streams) {
+    ConversationController(Conversations conversations, Searches searches, TurnStreams streams) {
         this.conversations = conversations;
+        this.searches = searches;
         this.streams = streams;
     }
 
@@ -203,6 +211,76 @@ class ConversationController {
     @Schema(name = "TurnErrorEvent", requiredProperties = "code",
             description = "The data of an error event: the answer ended without completing")
     record ErrorEvent(@Schema(description = "category.reason, for example model.unavailable") String code) {
+    }
+
+    @Schema(name = "NewSearch", requiredProperties = "query", description = "A search of the campaign's scope (contract"
+            + " 1.28.0). The filters only narrow the scope, never widen it")
+    record NewSearch(
+            @Schema(description = "What to find, by meaning or exact words: 1 to 500 code points, not blank",
+                    minLength = 1, maxLength = 500) String query,
+            @Schema(description = "Only this tier's sources; absent or null for every tier on",
+                    types = {"string", "null"}, allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(description = "Only this material's version; absent or null for every material on",
+                    types = {"string", "null"}, format = "uuid") String materialId) {
+
+        @Override
+        public String toString() {
+            return "NewSearch[tier=" + tier + "]";
+        }
+    }
+
+    @Schema(name = "SearchCreated", requiredProperties = "id")
+    record SearchCreated(@Schema(description = "The search's id", format = "uuid") UUID id) {
+    }
+
+    @Schema(name = "SearchResult", requiredProperties = {"passageId", "versionId", "materialName", "sectionPath", "page",
+        "firstWords", "tier"}, description = "A passage found, as it stands in the campaign's current scope")
+    record SearchResultView(
+            @Schema(format = "uuid") UUID passageId,
+            @Schema(description = "Its material version: the source page opens on the ground of the current scope",
+                    format = "uuid") UUID versionId,
+            @Schema(description = "The material's name") String materialName,
+            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty"),
+                    schema = @Schema(type = "string")) List<String> sectionPath,
+            @Schema(description = "The page", format = "int32", minimum = "1") int page,
+            @Schema(description = "The passage's first 160 code points (its white space made single spaces), cut at a"
+                    + " word boundary") String firstWords,
+            @Schema(description = "The tier of its source in the campaign's current scope",
+                    allowableValues = {"campaign", "system", "other"}) String tier) {
+    }
+
+    @Schema(name = "Search", requiredProperties = {"id", "campaignId", "query", "tier", "materialId", "state",
+        "results"}, description = "A search of the library (contract 1.28.0)")
+    record SearchView(
+            @Schema(format = "uuid") UUID id,
+            @Schema(format = "uuid") UUID campaignId,
+            @Schema(description = "The query as the GM wrote it") String query,
+            @Schema(description = "The tier filter, null for none", types = {"string", "null"},
+                    allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(description = "The material filter, null for none", types = {"string", "null"}, format = "uuid")
+            UUID materialId,
+            @Schema(description = "pending until its job ends: done with its results, or failed with a code",
+                    allowableValues = {"pending", "done", "failed"}) String state,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            @Schema(description = "Why it failed (category.reason, for example scope.passage_refused); only when"
+                    + " failed") String code,
+            @ArraySchema(arraySchema = @Schema(description = "Up to 20 results, best first; empty unless done. Each is"
+                    + " re-checked against the campaign's current scope when read: one that left it since is not"
+                    + " listed"), maxItems = 20, schema = @Schema(implementation = SearchResultView.class))
+            List<SearchResultView> results) {
+
+        static SearchView of(Searches.Found found) {
+            return new SearchView(found.id(), found.campaignId(), found.query(),
+                    found.tier() == null ? null : found.tier().word(), found.materialId(), found.state(), found.code(),
+                    found.results().stream().map(result -> new SearchResultView(result.passageId(), result.versionId(),
+                            result.materialName(), result.sectionPath(), result.page(), result.firstWords(),
+                            result.tier().word())).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "SearchView[id=" + id + ", state=" + state + ", results=" + results.size() + "]";
+        }
     }
 
     /** A text line of a picture page, as {@code PageLine}. */
@@ -441,6 +519,48 @@ class ConversationController {
                         .flatMap(wanted -> conversations.sourcePicture(campaign, version, wanted))))
                 .orElseThrow(ConversationProblems::notFound);
         writePicture(picture, response);
+    }
+
+    @PostMapping(path = SEARCHES, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    @Operation(operationId = "createSearch", summary = "Search the campaign's scope by meaning or exact words (202): the"
+            + " search and its job are recorded together, and the search is then read by id until it is done or failed."
+            + " Only the campaign's current scope is searched (its tiers and materials switched on, each material's"
+            + " ready version, and passages still being prepared for search), narrowed by the filters; a passage that"
+            + " holds the exact query comes first. Only the account's newest 20 searches are kept. request.invalid"
+            + " (400) for a blank query, one past 500 code points, an unknown tier or a malformed material id;"
+            + " request.not_found (404) for a campaign that is not the account's; nothing is recorded then",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<SearchCreated> createSearch(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @RequestBody NewSearch body) {
+        UUID campaign = parse(campaignId).orElseThrow(ConversationProblems::notFound);
+        if (body == null) {
+            throw ConversationProblems.invalid();
+        }
+        Tier tier = body.tier() == null ? null : Tier.of(body.tier()).orElseThrow(ConversationProblems::invalid);
+        UUID material = body.materialId() == null ? null
+                : parse(body.materialId()).orElseThrow(ConversationProblems::invalid);
+        UUID created = searches.create(campaign, body.query(), tier, material);
+        return ResponseEntity.status(HttpStatus.ACCEPTED).cacheControl(CacheControl.noStore())
+                .body(new SearchCreated(created));
+    }
+
+    @GetMapping(path = SEARCH, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getSearch", summary = "A search of the account: its query, filters and state, and once"
+            + " done its results, each re-checked against its campaign's current scope narrowed by the filters (one"
+            + " that left the scope since is not listed). request.not_found (404) for a search that is not the"
+            + " account's (another account's, unknown, malformed, pruned, or of a campaign deleted since)",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<SearchView> search(
+            @Parameter(description = "The search's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("searchId") String searchId) {
+        Searches.Found found = parse(searchId).flatMap(searches::find).orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(SearchView.of(found));
     }
 
     /** A malformed number is no different from an unknown one. */

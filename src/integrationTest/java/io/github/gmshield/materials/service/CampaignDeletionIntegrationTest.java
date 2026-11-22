@@ -67,6 +67,8 @@ class CampaignDeletionIntegrationTest {
     @Autowired
     private Conversations conversations;
     @Autowired
+    private io.github.gmshield.conversations.service.Searches searches;
+    @Autowired
     private MaterialStore store;
     @Autowired
     private io.github.gmshield.jobs.service.JobClaims claims;
@@ -105,6 +107,9 @@ class CampaignDeletionIntegrationTest {
         UUID again = as(a.id(), () -> conversations.ask(target, "E o alcance?")).turnId();
         eventsAndReference(a.id(), turn);
         UUID siblingTurn = as(a.id(), () -> conversations.ask(sibling, "Quem age primeiro?")).turnId();
+        // Story 3.9: a search of each campaign.
+        UUID search = as(a.id(), () -> searches.create(target, "Quanto dano", null, null));
+        UUID siblingSearch = as(a.id(), () -> searches.create(sibling, "Quem age", null, null));
         Completed ofCampaign = completed(a.id(), new Uploads.Details("rulebook", "pt-BR", target.toString(), (String) null));
         List<UUID> pieces = versionFileAndPassage(a.id(), ofCampaign.versionId());
         UUID open = uploads(a.id(), new Uploads.Details("supplement", "pt-BR", target.toString(), (String) null));
@@ -148,6 +153,9 @@ class CampaignDeletionIntegrationTest {
         assertThat(jobState(turnJob(turn))).isEqualTo("cancelled");
         assertThat(jobState(turnJob(siblingTurn))).isNotEqualTo("cancelled");
         assertThat(jobState(ofSibling.jobId())).isNotEqualTo("cancelled");
+        assertThat(jobState(searchJob(search))).isEqualTo("cancelled");
+        assertThat(jobState(searchJob(siblingSearch))).isNotEqualTo("cancelled");
+        assertThat(as(a.id(), () -> searches.find(search))).isEmpty();
         Map<String, Object> row = jdbc.sql("select id, owner_id, kind, not_before, done_at from deletion"
                 + " where target_id = ?").param(target).query().singleRow();
         assertThat(row).containsEntry("owner_id", a.id()).containsEntry("kind", "campaign")
@@ -173,6 +181,8 @@ class CampaignDeletionIntegrationTest {
         assertThat(count("conversation", "campaign_id = ?", target)).isZero();
         assertThat(count("turn_event_batch", "turn_id = ?", turn)).isZero();
         assertThat(count("turn_reference", "turn_id = ?", turn)).isZero();
+        assertThat(count("search", "campaign_id = ?", target)).isZero();
+        assertThat(count("search", "id = ?", siblingSearch)).isOne();
         assertThat(count("material", "id in (?, ?)", ofCampaign.materialId(), openMaterial)).isZero();
         for (UUID version : goingVersions) {
             for (String table : List.of("material_version", "upload", "ingestion_step", "version_file", "passage",
@@ -402,6 +412,10 @@ class CampaignDeletionIntegrationTest {
 
     private UUID turnJob(UUID turn) {
         return jdbc.sql("select job_id from turn where id = ?").param(turn).query(UUID.class).single();
+    }
+
+    private UUID searchJob(UUID search) {
+        return jdbc.sql("select job_id from search where id = ?").param(search).query(UUID.class).single();
     }
 
     private String jobState(UUID job) {

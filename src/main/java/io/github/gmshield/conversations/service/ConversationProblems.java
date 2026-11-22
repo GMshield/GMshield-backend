@@ -9,12 +9,12 @@ public final class ConversationProblems {
     private ConversationProblems() {
     }
 
-    /** A question that is blank or longer than the limit: nothing recorded. */
-    static ApiException invalid() {
+    /** A question or a search that is blank, longer than the limit or malformed: nothing recorded. */
+    public static ApiException invalid() {
         return new ApiException(ApiProblem.forStatus(400));
     }
 
-    /** A campaign or a turn that is not the owner's, unknown or malformed: the same answer. */
+    /** A campaign, a turn or a search that is not the owner's, unknown or malformed: the same answer. */
     public static ApiException notFound() {
         return new ApiException(ApiProblem.forStatus(404));
     }

@@ -18,6 +18,8 @@ import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.conversations.data.EventBatchRow;
 import io.github.gmshield.conversations.data.InMemoryConversationStore;
+import io.github.gmshield.conversations.data.InMemorySearchStore;
+import io.github.gmshield.conversations.data.SearchRow;
 import io.github.gmshield.conversations.data.InMemoryTurnReferenceStore;
 import io.github.gmshield.conversations.data.TurnReferenceRow;
 import io.github.gmshield.conversations.data.TurnRow;
@@ -110,6 +112,12 @@ import tools.jackson.databind.json.JsonMapper;
  * marker, relayed, stored encrypted and replayed, each reference with its tier; a marker of a tier with no source in
  * the frozen scope dropped; malformed markers refused; an other-tier reference; a tier kept after its source leaves the
  * scope or is removed; and a reference stored before V28 with no tier that still opens.
+ *
+ * <p>Story 3.9: every backend row of its I/O matrix for a search of the library: its job and input within the
+ * campaign's scope (a tier off, a tier or material filter that only narrows), its results stored in rank order and
+ * read with their places, a result dropped once it leaves the scope, a forged result refused whole, nothing found, a bad
+ * query, another owner's search or a deleted campaign's, a failed job, and only the newest 20 searches kept. Every
+ * assertion is on the passage ids handed over; no model is called.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -178,6 +186,8 @@ class ConversationFlowTest {
     private InMemoryConversationStore conversations;
     @Autowired
     private InMemoryTurnReferenceStore references;
+    @Autowired
+    private InMemorySearchStore searchStore;
     @Autowired
     private InMemoryUsageStore usage;
     @Autowired
@@ -1692,6 +1702,335 @@ class ConversationFlowTest {
         Claim next = claim(jobOf(turnId(ask(gm, gm.campaign(), QUESTION))));
         assertThat(next.input().path("tiers").get(0).path("sources")).isEmpty();
     }
+
+    // --- Story 3.9: search the library
+
+    private static final String QUERY = "Fire Bolt";
+
+    @Test
+    void aSearchIsRecordedWithItsJobAndItsResultsComeBackInRankOrderWithTheirPlaces() throws Exception {
+        Gm gm = signUp();
+        Paged own = pdf(gm, gm.campaign(), 2, 1);
+        Source ofSystem = systemSource(gm, systemOf(gm));
+
+        HttpResponse<String> created = createSearch(gm, gm.campaign(), QUERY, null, null);
+
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(202);
+        assertThat(created.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        UUID searchId = UUID.fromString(json(created).path("id").asString());
+        SearchRow row = searchStore.searches.get(searchId);
+        assertThat(row.state()).isEqualTo("pending");
+        assertThat(new String(row.query(), StandardCharsets.ISO_8859_1)).doesNotContain("Fire").doesNotContain("Bolt");
+        JobRow job = jobs.row(row.jobId());
+        assertThat(job.kind()).isEqualTo("library.search");
+        assertThat(job.lane()).isEqualTo("interactive");
+        assertThat(stream.offered("gmshield:work:interactive")).contains(job.id());
+        JsonNode pending = json(get(gm, searchPath(searchId)));
+        assertThat(pending.propertyNames()).containsExactlyInAnyOrder("id", "campaignId", "query", "tier",
+                "materialId", "state", "results");
+        assertThat(pending.path("state").asString()).isEqualTo("pending");
+        assertThat(pending.path("query").asString()).isEqualTo(QUERY);
+        assertThat(pending.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(pending.path("tier").isNull()).isTrue();
+        assertThat(pending.path("materialId").isNull()).isTrue();
+        assertThat(pending.path("results")).isEmpty();
+
+        // The claim carries the question input's shape with query in place of question, and no model.
+        Claim claim = claimSearch(job.id());
+        assertThat(fieldNames(claim.input())).containsExactly("query", "owner", "modelKnowledge", "tiers",
+                "tokenKey");
+        assertThat(claim.input().path("query").asString()).isEqualTo(QUERY);
+        assertThat(strings(claim.input().path("tiers").get(0).path("sources")))
+                .containsExactly(own.versionId().toString());
+        assertThat(strings(claim.input().path("tiers").get(1).path("sources")))
+                .containsExactly(ofSystem.versionId().toString());
+        // The worker reads the candidates' text within the same scope.
+        HttpResponse<String> read = sendAsWorker("POST", claim.path("passages"), "{\"ids\":[\""
+                + own.passages().getFirst() + "\",\"" + ofSystem.passages().getFirst() + "\"]}", claim.grant());
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(json(read).path("passages").get(0).path("text").asString()).isEqualTo(PASSAGE_TEXT);
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[\"" + ofSystem.passages().getFirst()
+                + "\",\"" + own.passages().getFirst() + "\"]}}").statusCode()).isEqualTo(204);
+
+        JsonNode done = json(get(gm, searchPath(searchId)));
+
+        assertThat(done.path("state").asString()).isEqualTo("done");
+        assertThat(done.has("code")).isFalse();
+        JsonNode results = done.path("results");
+        assertThat(results).hasSize(2);
+        assertThat(results.get(0).propertyNames()).containsExactlyInAnyOrder("passageId", "versionId",
+                "materialName", "sectionPath", "page", "firstWords", "tier");
+        assertThat(results.get(0).path("passageId").asString()).isEqualTo(ofSystem.passages().getFirst().toString());
+        assertThat(results.get(0).path("tier").asString()).isEqualTo("system");
+        assertThat(results.get(0).path("firstWords").asString()).isEqualTo(PASSAGE_TEXT + " 0");
+        assertThat(results.get(1).path("passageId").asString()).isEqualTo(own.passages().getFirst().toString());
+        assertThat(results.get(1).path("versionId").asString()).isEqualTo(own.versionId().toString());
+        assertThat(results.get(1).path("materialName").asString()).isEqualTo(MATERIAL_NAME);
+        assertThat(strings(results.get(1).path("sectionPath"))).isEqualTo(SECTION);
+        assertThat(results.get(1).path("page").asInt()).isEqualTo(1);
+        assertThat(results.get(1).path("tier").asString()).isEqualTo("campaign");
+        assertThat(results.get(1).path("firstWords").asString()).isEqualTo(PASSAGE_TEXT);
+        // The result's page opens on the ground of the current scope.
+        assertThat(get(gm, sourcePath(gm.campaign(), own.versionId(), "1")).statusCode()).isEqualTo(200);
+        assertThat(searchStore.results.values().stream().filter(result -> result.searchId().equals(searchId)))
+                .hasSize(2);
+        // No line carries the query or a passage's text.
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Fire Bolt").doesNotContain("1d10"));
+    }
+
+    @Test
+    void aTierSwitchedOffHandsOverNoPassageOfItAndAFilterOnlyNarrowsTheScope() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Source second = source(gm, gm.campaign(), List.of(2));
+        Source ofSystem = systemSource(gm, systemOf(gm));
+        Source ofSibling = source(gm, campaign(gm, systemOf(gm), "Mesa irmã"), List.of(1));
+
+        // The system tier off: its source and passages are never handed over.
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, false, true, false, List.of()));
+        Claim claim = claimSearch(searchJob(gm, null, null));
+        assertThat(handedSources(claim)).containsExactlyInAnyOrder(own.versionId(), second.versionId(),
+                ofSibling.versionId()).doesNotContain(ofSystem.versionId());
+        assertThat(claim.input().path("tiers").get(1).path("sources")).isEmpty();
+        assertThat(claim.input().path("tiers").get(1).path("pending")).isEmpty();
+        assertProblem(sendAsWorker("POST", claim.path("passages"), "{\"ids\":[\"" + ofSystem.passages().getFirst()
+                + "\"]}", claim.grant()), 403, "scope.passage_refused");
+
+        // A tier filter keeps only that tier; a material filter only that material's version.
+        Claim campaignOnly = claimSearch(searchJob(gm, "campaign", null));
+        assertThat(handedSources(campaignOnly)).containsExactlyInAnyOrder(own.versionId(), second.versionId());
+        assertThat(campaignOnly.input().path("tiers").get(2).path("sources")).isEmpty();
+        Claim oneMaterial = claimSearch(searchJob(gm, null, second.materialId()));
+        assertThat(handedSources(oneMaterial)).containsExactly(second.versionId());
+        // A filter never widens: the system tier stays off under its own filter, and a material in no tier is nothing.
+        assertThat(handedSources(claimSearch(searchJob(gm, "system", null)))).isEmpty();
+        assertThat(handedSources(claimSearch(searchJob(gm, null, ofSystem.materialId())))).isEmpty();
+        assertThat(handedSources(claimSearch(searchJob(gm, null, Ids.newId())))).isEmpty();
+        // The passages route follows the filter too.
+        assertProblem(sendAsWorker("POST", oneMaterial.path("passages"), "{\"ids\":[\"" + own.passages().getFirst()
+                + "\"]}", oneMaterial.grant()), 403, "scope.passage_refused");
+        // The stored search names its filters.
+        UUID filtered = UUID.fromString(json(createSearch(gm, gm.campaign(), QUERY, "campaign",
+                second.materialId())).path("id").asString());
+        JsonNode read = json(get(gm, searchPath(filtered)));
+        assertThat(read.path("tier").asString()).isEqualTo("campaign");
+        assertThat(read.path("materialId").asString()).isEqualTo(second.materialId().toString());
+    }
+
+    @Test
+    void aResultWhoseMaterialIsSwitchedOffIsDroppedOnTheNextRead() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Source ofSystem = systemSource(gm, systemOf(gm));
+        UUID searchId = searched(gm, List.of(own.passages().getFirst(), ofSystem.passages().getFirst()));
+        assertThat(json(get(gm, searchPath(searchId))).path("results")).hasSize(2);
+
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, false, List.of(own.materialId())));
+
+        JsonNode read = json(get(gm, searchPath(searchId)));
+        assertThat(read.path("state").asString()).isEqualTo("done");
+        assertThat(read.path("results")).extracting(result -> result.path("passageId").asString())
+                .containsExactly(ofSystem.passages().getFirst().toString());
+        // Switched on again, it is back: the stored ids never changed.
+        send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, true, true, false, false, List.of()));
+        assertThat(json(get(gm, searchPath(searchId))).path("results")).hasSize(2);
+    }
+
+    @Test
+    void aForgedResultIsRefusedWholeAndTheSearchFailsWhileAMalformedOneIsInvalid() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+        Gm them = signUp();
+        Source theirs = source(them, them.campaign(), List.of(1));
+        Source unattached = source(gm, null, List.of(1));
+
+        for (UUID forged : List.of(theirs.passages().getFirst(), unattached.passages().getFirst(), Ids.newId())) {
+            UUID jobId = searchJob(gm, null, null);
+            Claim claim = claimSearch(jobId);
+            assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[\"" + own.passages().getFirst()
+                    + "\",\"" + forged + "\"]}}").statusCode()).isEqualTo(204);
+            SearchRow row = searchStore.anySearchOfJob(jobId).orElseThrow();
+            JsonNode read = json(get(gm, searchPath(row.id())));
+            assertThat(read.path("state").asString()).isEqualTo("failed");
+            assertThat(read.path("code").asString()).isEqualTo("scope.passage_refused");
+            assertThat(read.path("results")).isEmpty();
+            assertThat(searchStore.results.values().stream().filter(result -> result.searchId().equals(row.id())))
+                    .isEmpty();
+        }
+        // A result that is not 0 to 20 distinct ids is job.result_invalid, and the search stays pending.
+        UUID jobId = searchJob(gm, null, null);
+        Claim claim = claimSearch(jobId);
+        List<String> tooMany = new ArrayList<>();
+        for (int i = 0; i < 21; i++) {
+            tooMany.add("\"" + Ids.newId() + "\"");
+        }
+        for (String result : List.of("{}", "{\"ids\":\"nope\"}", "{\"ids\":[\"nope\"]}", "{\"ids\":[null]}",
+                "{\"ids\":[\"" + own.passages().getFirst() + "\",\"" + own.passages().getFirst() + "\"]}",
+                "{\"ids\":[" + String.join(",", tooMany) + "]}")) {
+            assertProblem(report(claim, "{\"outcome\":\"done\",\"result\":" + result + "}"), 400,
+                    "job.result_invalid");
+        }
+        assertThat(searchStore.anySearchOfJob(jobId).orElseThrow().state()).isEqualTo("pending");
+        // An empty list is nothing found.
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[]}}").statusCode()).isEqualTo(204);
+        JsonNode nothing = json(get(gm, searchPath(searchStore.anySearchOfJob(jobId).orElseThrow().id())));
+        assertThat(nothing.path("state").asString()).isEqualTo("done");
+        assertThat(nothing.path("results")).isEmpty();
+    }
+
+    @Test
+    void anEmptyScopeIsSearchedAsNothingAndAFailedJobFailsTheSearchWithItsCode() throws Exception {
+        Gm gm = signUp();
+
+        Claim empty = claimSearch(searchJob(gm, null, null));
+        assertThat(handedSources(empty)).isEmpty();
+        assertThat(report(empty, "{\"outcome\":\"done\",\"result\":{\"ids\":[]}}").statusCode()).isEqualTo(204);
+        assertThat(json(get(gm, searchPath(searchStore.anySearchOfJob(empty.jobId()).orElseThrow().id())))
+                .path("state").asString()).isEqualTo("done");
+
+        UUID jobId = searchJob(gm, null, null);
+        Claim claim = claimSearch(jobId);
+        assertThat(report(claim, "{\"outcome\":\"failed\",\"code\":\"retrieval.store_unavailable\",\"retry\":false}")
+                .statusCode()).isEqualTo(204);
+        JsonNode failed = json(get(gm, searchPath(searchStore.anySearchOfJob(jobId).orElseThrow().id())));
+        assertThat(failed.path("state").asString()).isEqualTo("failed");
+        assertThat(failed.path("code").asString()).isEqualTo("retrieval.store_unavailable");
+        assertThat(failed.path("results")).isEmpty();
+    }
+
+    @Test
+    void aBlankTooLongOrMalformedSearchRecordsNothing() throws Exception {
+        Gm gm = signUp();
+        int searchesBefore = searchStore.searches.size();
+        int rows = jobs.rows.size();
+        String longest = "😀".repeat(500);
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/searches";
+
+        for (String query : new String[] {"", "   \n\t", longest + "a"}) {
+            assertProblem(createSearch(gm, gm.campaign(), query, null, null), 400, "request.invalid");
+        }
+        for (String body : List.of("{}", "{nope", "null", "{\"query\":\"x\",\"tier\":\"model\"}",
+                "{\"query\":\"x\",\"tier\":\"\"}", "{\"query\":\"x\",\"materialId\":\"nope\"}")) {
+            assertProblem(send(gm, "POST", path, body), 400, "request.invalid");
+        }
+        assertThat(searchStore.searches).hasSize(searchesBefore);
+        assertThat(jobs.rows).hasSize(rows);
+        assertThat(createSearch(gm, gm.campaign(), longest, null, null).statusCode()).isEqualTo(202);
+    }
+
+    @Test
+    void anotherOwnersSearchOrADeletedCampaignsIsNotFound() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        UUID theirs = UUID.fromString(json(createSearch(them, them.campaign(), QUERY, null, null)).path("id")
+                .asString());
+        int searchesBefore = searchStore.searches.size();
+
+        assertProblem(createSearch(gm, them.campaign(), QUERY, null, null), 404, "request.not_found");
+        assertProblem(createSearch(gm, Ids.newId(), QUERY, null, null), 404, "request.not_found");
+        assertProblem(send(gm, "POST", "/api/v1/campaigns/nope/searches", "{\"query\":\"x\"}"), 404,
+                "request.not_found");
+        assertThat(searchStore.searches).hasSize(searchesBefore);
+        for (String path : List.of(searchPath(theirs), searchPath(Ids.newId()), "/api/v1/searches/nope")) {
+            HttpResponse<String> refused = get(gm, path);
+            assertProblem(refused, 404, "request.not_found");
+            assertThat(refused.body()).doesNotContain(theirs.toString()).doesNotContain(QUERY);
+        }
+        assertThat(get(them, searchPath(theirs)).statusCode()).isEqualTo(200);
+        // A campaign deleted after its search ran: the search is not found.
+        library.campaigns.remove(them.campaign());
+        assertProblem(get(them, searchPath(theirs)), 404, "request.not_found");
+        // Without a session, nothing at all.
+        HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(uri(searchPath(theirs)))
+                .header("Authorization", "Bearer " + CREDENTIAL).GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(anonymous.statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void onlyTheNewest20SearchesOfAnOwnerAreKeptAndAPrunedOnesJobIsCancelled() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        UUID theirs = UUID.fromString(json(createSearch(them, them.campaign(), QUERY, null, null)).path("id")
+                .asString());
+        List<UUID> made = new ArrayList<>();
+        for (int i = 0; i < 21; i++) {
+            clock.advance(Duration.ofSeconds(1));
+            made.add(UUID.fromString(json(createSearch(gm, gm.campaign(), QUERY + " " + i, null, null)).path("id")
+                    .asString()));
+        }
+
+        UUID oldest = made.getFirst();
+        assertProblem(get(gm, searchPath(oldest)), 404, "request.not_found");
+        assertThat(searchStore.searches).doesNotContainKey(oldest);
+        for (UUID kept : made.subList(1, 21)) {
+            assertThat(get(gm, searchPath(kept)).statusCode()).isEqualTo(200);
+        }
+        // Its job was cancelled; another owner's search is untouched.
+        assertThat(jobs.rows.values().stream().filter(row -> "library.search".equals(row.kind())
+                && "cancelled".equals(row.state()) && row.ownerId().equals(gm.id()))).hasSize(1);
+        assertThat(get(them, searchPath(theirs)).statusCode()).isEqualTo(200);
+    }
+
+    private static String searchPath(UUID searchId) {
+        return "/api/v1/searches/" + searchId;
+    }
+
+    private HttpResponse<String> createSearch(Gm gm, UUID campaign, String query, String tier, UUID materialId)
+            throws Exception {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("query", query);
+        if (tier != null) {
+            body.put("tier", tier);
+        }
+        if (materialId != null) {
+            body.put("materialId", materialId.toString());
+        }
+        return send(gm, "POST", "/api/v1/campaigns/" + campaign + "/searches", JSON.writeValueAsString(body));
+    }
+
+    /** A search of the GM's campaign with these filters; answers its job. */
+    private UUID searchJob(Gm gm, String tier, UUID materialId) throws Exception {
+        HttpResponse<String> created = createSearch(gm, gm.campaign(), QUERY, tier, materialId);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(202);
+        return searchStore.searches.get(UUID.fromString(json(created).path("id").asString())).jobId();
+    }
+
+    /** A search whose worker found these ids, done; answers the search. */
+    private UUID searched(Gm gm, List<UUID> ids) throws Exception {
+        UUID jobId = searchJob(gm, null, null);
+        Claim claim = claimSearch(jobId);
+        String listed = String.join(",", ids.stream().map(id -> "\"" + id + "\"").toList());
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[" + listed + "]}}").statusCode())
+                .isEqualTo(204);
+        return searchStore.anySearchOfJob(jobId).orElseThrow().id();
+    }
+
+    /** A search job's claim: no model, whatever providers the worker states. */
+    private Claim claimSearch(UUID jobId) throws Exception {
+        HttpResponse<String> claimed = sendAsWorker("POST", "/internal/v1/jobs/" + jobId + "/claims",
+                "{\"providers\":[\"azure-openai\"]}", null);
+        assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        JsonNode reply = json(claimed);
+        assertThat(reply.path("kind").asString()).isEqualTo("library.search");
+        assertThat(reply.path("model").isMissingNode() || reply.path("model").isNull()).as(claimed.body()).isTrue();
+        return new Claim(jobId, reply.path("claimId").asString(), reply.path("grant").asString(), reply.path("input"));
+    }
+
+    /** Every source the claim's input hands over, of every tier. */
+    private static List<UUID> handedSources(Claim claim) {
+        List<UUID> found = new ArrayList<>();
+        claim.input().path("tiers").forEach(tier -> tier.path("sources")
+                .forEach(source -> found.add(UUID.fromString(source.asString()))));
+        return found;
+    }
+
+    private static List<String> fieldNames(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.propertyNames().forEach(names::add);
+        return names;
+    }
+
 
     private static String scopePath(UUID campaign) {
         return "/api/v1/campaigns/" + campaign + "/scope";
