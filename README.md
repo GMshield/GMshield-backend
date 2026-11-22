@@ -194,6 +194,22 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - `GET /api/v1/campaigns/current` (the owner's current campaign, with its system: Story 3.2, below), `GET
     /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
     malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
+  - **The cross-owner audit (Story 3.13 part C).** `CrossOwnerAuditFlowTest` (unit flow, in-memory stores, part of
+    `./gradlew check`) gives account A one item of every library kind (system, campaign and its scope settings, an
+    ingested and accepted material with a superseded version, pages and pictures, an image set and its open uploads,
+    conversations with a bookmarked, a dismissed and a waiting turn and a reference, a search). Account B then calls
+    every public route that names an item by id with A's ids: each answer is `request.not_found` (404) with the same
+    body as a random id (the trace id aside), also with B's own campaign or material beside A's version. Each body or
+    header field that names an item (`campaignId`, `systemId`, `conversationId`, a search's `materialId`,
+    `materialsOff`, a material's `belonging`, upload metadata and image-set `campaign`, `system`, `systems` and
+    `material`, the `?system=` filters) answers exactly what a random id gets. Afterwards no in-memory row, job or
+    offered message has changed, A reads every item back as it was, and B's lists hold none of A's ids.
+    `CrossOwnerRouteGuardTest` reads `/v3/api-docs/public`: an operation whose path has a `{…}` parameter that is
+    neither a row of the audit nor in its exemption list (with a reason) fails, naming its method and path, and so
+    does a path outside `LibraryOwnerFilter.LIBRARY_ROUTES` that is not in its short list of session and sign-in
+    paths; each covered operation is also refused with `session.required` without a session. A new route therefore
+    ships with its row in the audit. The audit runs on the in-memory twins of the stores; PostgreSQL's owner
+    filtering is covered by the integration tests of the library, uploads and materials.
   - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
     (deleting one is part B, below). A system is `{id, name, edition, description, version}`; `edition` and `description`
     are null when none was given.
