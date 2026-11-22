@@ -1126,6 +1126,41 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     the internal contract (1.16.0) do not change. After a rollback every dismissed turn shows again and is sent as
     history again; rolling forward hides them again.
 
+- **Bookmark an answer (`conversations`, Story 3.12, public contract 1.32.0, migration V33, FR-34, FR-36).** The GM
+  saves a useful answer and finds it again from a list across all their campaigns. No notes or folders.
+  - `V33__turn_bookmark.sql`: `turn.bookmarked_at timestamptz` (null: not saved) and the partial index
+    `turn_owner_bookmarked` on `(owner_id, bookmarked_at)` where it is not null. Additive: the previous release
+    neither reads nor writes it.
+  - `PUT /api/v1/turns/{id}/bookmark` (`bookmarkTurn`) answers 204 and sets `bookmarked_at` when it is null;
+    `DELETE /api/v1/turns/{id}/bookmark` (`unbookmarkTurn`) answers 204 and clears it, whatever the turn's state. Both
+    are safe to repeat (a second save keeps the first time), and neither moves the conversation's version or
+    `last_asked_at`. Only a done turn is saved (not stopped, its last stored event a `done` not marked stopped, and
+    not silent: it has a source reference, or a model-knowledge part on a turn whose model knowledge was on, as the
+    `done` event's `silent` says): a running, stopped, failed or silent one is 409 `conversation.turn_not_done` and
+    nothing changes. Another account's
+    turn, an unknown or malformed id and a turn of a deleting conversation are 404 `request.not_found` on both routes.
+  - `TurnEntity.bookmarkedAt` is mapped `updatable = false`, as `dismissedAt`: only the store's JPQL bulk updates
+    (`JpaConversationStore.markBookmarked`, `clearBookmarked`) write it (`ConversationStateIntegrationTest`). Deleting
+    a turn by any route (its conversation, campaign or system) deletes the row, so the bookmark goes with it.
+  - `GET /api/v1/conversations/{id}/turns`: each turn gains `bookmarked`.
+  - `GET /api/v1/saved-answers?limit&offset` (`listSavedAnswers`, under the library routes' session edge) answers
+    `{items, nextCursor, total}` as the conversations list does: ordered `bookmarked_at desc, id desc`, `limit` 1 to
+    50 (default 20), `offset` 0 to 100000, else 400 `request.invalid`. Each item: `turnId`, `conversationId`,
+    `campaignId`, `campaignName`, `area`, `conversationName` (the list's name rule), `savedAt` and `excerpt` (the
+    answer's joined `delta` texts with Markdown stripped by `conversations.service.Markdown`, white space flattened,
+    cut at a word boundary to at most 280 code points by `Searches.firstWords`). `Conversations.saved` reads the
+    campaigns of the owner's listed saved turns (`savedCampaigns`), keeps those `Library.places` holds and that are
+    not archived (so a campaign being deleted or archived drops out, and an archived one comes back on its restore),
+    then pages `savedTurns` and counts `savedCount` within them: both join each saved turn to its `ready`
+    conversation on owner and id and leave out a dismissed turn (its bookmark is kept, so the undo lists it again).
+  - No standing as a source: neither the scope, retrieval nor `Conversations.history` reads the column
+    (`ConversationFlowTest` asserts the history and the passages handed over are the same with and without it).
+  - Lines `conversation.turn_bookmarked` and `conversation.turn_unbookmarked` carry the owner, the turn and whether
+    it changed.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.32.0). The worker and
+    the internal contract (1.16.0) do not change. After a rollback the bookmarks are kept but not shown; rolling
+    forward shows them again.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

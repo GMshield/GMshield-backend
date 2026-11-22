@@ -17,6 +17,9 @@ import org.hibernate.annotations.TenantId;
  * <p>Story 3.11 (V32): {@code dismissed_at} is mapped not updatable: only the store's bulk updates
  * ({@code JpaConversationStore#markDismissed}, {@code #clearDismissed}) change it, so a stop's flush of this entity
  * (loaded before a dismissal committed) never writes it back to null.
+ *
+ * <p>Story 3.12 (V33): {@code bookmarked_at} is mapped the same way: only the store's bulk updates
+ * ({@code JpaConversationStore#markBookmarked}, {@code #clearBookmarked}) change it.
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -63,6 +66,9 @@ class TurnEntity {
     @Column(name = "dismissed_at", updatable = false)
     private Instant dismissedAt;
 
+    @Column(name = "bookmarked_at", updatable = false)
+    private Instant bookmarkedAt;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -81,6 +87,7 @@ class TurnEntity {
         this.createdAt = row.createdAt();
         this.stoppedAt = row.stoppedAt();
         this.dismissedAt = row.dismissedAt();
+        this.bookmarkedAt = row.bookmarkedAt();
     }
 
     void stop(Instant at) {
@@ -90,7 +97,7 @@ class TurnEntity {
     /** The row, with the materials switched off frozen with it (read from {@code turn_material_off}). */
     TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt);
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt);
     }
 
     UUID id() {

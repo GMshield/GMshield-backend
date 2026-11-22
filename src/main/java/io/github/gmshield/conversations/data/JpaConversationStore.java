@@ -32,6 +32,11 @@ import org.springframework.stereotype.Repository;
  * <p>Story 3.11: {@code turn.dismissed_at} is written by bulk updates only ({@link #markDismissed},
  * {@link #clearDismissed}), and {@link #newestTurns}, {@link #turnCount} and {@link #turnCounts} take shown turns
  * only; {@link #firstTurns} (the default name), {@link #findTurn} and {@link #turnsOf} (the deletion) take them all.
+ *
+ * <p>Story 3.12: {@code turn.bookmarked_at} is written by bulk updates only ({@link #markBookmarked},
+ * {@link #clearBookmarked}). The saved list ({@link #savedTurns}, {@link #savedCount}, {@link #savedCampaigns}) joins
+ * each saved, shown turn to its {@code ready} conversation on the owner and the conversation's id; deleting a turn (by
+ * any route) removes its bookmark with the row.
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
@@ -39,6 +44,15 @@ class JpaConversationStore implements ConversationStore {
     /** A campaign's conversations of one area, the most recently asked first (Story 3.10). */
     private static final String LIST = "select c from Conversation c where c.campaignId = :campaign and c.area = :area"
             + " and c.state = 'ready' order by c.lastAskedAt desc, c.id desc";
+
+    /** The current owner's listed saved turns (Story 3.12): bookmarked, shown, of a ready conversation. */
+    private static final String SAVED = " from Turn t join Conversation c on c.ownerId = t.ownerId"
+            + " and c.id = t.conversationId where t.bookmarkedAt is not null and t.dismissedAt is null"
+            + " and c.state = 'ready'";
+    private static final String SAVED_OF = SAVED + " and c.campaignId in :campaigns";
+    private static final String SAVED_CAMPAIGNS = "select distinct c.campaignId" + SAVED;
+    private static final String SAVED_TURNS = "select t" + SAVED_OF + " order by t.bookmarkedAt desc, t.id desc";
+    private static final String SAVED_COUNT = "select count(t)" + SAVED_OF;
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -237,6 +251,50 @@ class JpaConversationStore implements ConversationStore {
         }
         return em().createQuery("update Turn t set t.dismissedAt = null where t.id = :id and t.dismissedAt is not null")
                 .setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean markBookmarked(UUID turnId, Instant at) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        // As markDismissed: one bulk update after the owner's row was read; a bookmark already recorded keeps its time.
+        return em().createQuery("update Turn t set t.bookmarkedAt = :at where t.id = :id and t.bookmarkedAt is null")
+                .setParameter("at", at).setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean clearBookmarked(UUID turnId) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        return em().createQuery("update Turn t set t.bookmarkedAt = null where t.id = :id"
+                + " and t.bookmarkedAt is not null").setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public Set<UUID> savedCampaigns() {
+        return Set.copyOf(em().createQuery(SAVED_CAMPAIGNS, UUID.class).getResultList());
+    }
+
+    @Override
+    public List<TurnRow> savedTurns(Collection<UUID> campaignIds, int offset, int limit) {
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        List<TurnEntity> saved = em().createQuery(SAVED_TURNS, TurnEntity.class)
+                .setParameter("campaigns", campaignIds).setFirstResult(offset).setMaxResults(limit).getResultList();
+        Map<UUID, Set<UUID>> off = materialsOff(saved.stream().map(TurnEntity::id).toList());
+        return saved.stream().map(turn -> turn.row(off.getOrDefault(turn.id(), Set.of()))).toList();
+    }
+
+    @Override
+    public long savedCount(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery(SAVED_COUNT, Long.class).setParameter("campaigns", campaignIds)
+                .getSingleResult();
     }
 
     @Override

@@ -35,6 +35,7 @@ import org.springframework.transaction.support.TransactionTemplate;
  * their event batches, materials-off rows or references, and touches nothing else (the other conversation, its
  * campaign, the searches, the usage); it waits for a running answer's claim, it is finished by the sweep after a pass
  * stopped mid-way, and a campaign deleted meanwhile takes the conversation, after which both deletions end done.
+ * Story 3.12: a saved turn's bookmark goes with its row, and another conversation's stays.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL.
@@ -84,6 +85,8 @@ class ConversationDeletionIntegrationTest {
             stored(a.id(), turn);
         }
         stored(a.id(), kept.turnId());
+        // Story 3.12: a saved turn of each conversation (the column is the store's to write; set here to prove removal).
+        jdbc.sql("update turn set bookmarked_at = now() where id in (?, ?)").params(second, kept.turnId()).update();
         UUID search = as(a.id(), () -> searches.create(a.campaign(), "Quanto dano", null, null));
         assertThat(as(a.id(), () -> conversations.deletion(target))).contains(3L);
         assertThat(as(Ids.newId(), () -> conversations.deletion(target))).isEmpty();
@@ -140,6 +143,9 @@ class ConversationDeletionIntegrationTest {
             }
             assertThat(count("turn", "id = ?", turn)).isZero();
         }
+        // The saved turn went with its row; the other conversation's bookmark stays.
+        assertThat(count("turn", "bookmarked_at is not null and id = ?", second)).isZero();
+        assertThat(count("turn", "bookmarked_at is not null and id = ?", kept.turnId())).isOne();
         for (UUID job : jobs) {
             // The usage of each model call stays: it names a job, never a turn.
             assertThat(count("model_call_usage", "job_id = ?", job)).isOne();

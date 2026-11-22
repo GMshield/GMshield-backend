@@ -128,6 +128,13 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code ConversationDeletionFlowTest}): a dismissed turn left out of the turns, the counts and the next question's
  * history, its undo, both repeated, a stopped and a failed turn dismissed, a running or waiting one refused with
  * {@code conversation.turn_running}, the default name kept, and another owner's turn on both routes.
+ *
+ * <p>Story 3.12: every backend row of its I/O matrix but the deleting conversation (in
+ * {@code ConversationDeletionFlowTest}): a done turn saved and unsaved, both repeated with the first time kept,
+ * {@code bookmarked} on the turns, the saved list's shape and excerpt, a running, waiting, stopped or failed turn
+ * refused with {@code conversation.turn_not_done}, another owner's turn on both routes and never in the list, another
+ * campaign's answer listed with its name, an archived campaign's and a dismissed answer left out until they come back,
+ * the list paged, and no standing as a source (the history and the passage ids handed over are unchanged).
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -2874,6 +2881,294 @@ class ConversationFlowTest {
 
         assertThat(conversations.turns.get(shown).dismissedAt()).isNull();
         assertThat(conversations.turns.get(dismissed).dismissedAt()).isEqualTo(at);
+    }
+
+    // --- Story 3.12: bookmark answers and find them again
+
+    private static final String SAVED = "/api/v1/saved-answers";
+
+    @Test
+    void aSavedAnswerIsMarkedOnItsTurnsAndHeadsTheSavedListUntilItIsUnsaved() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID first = answeredIn(gm, null, "Como funciona o descanso longo?", "Oito horas.", passages.getFirst());
+        UUID conversation = conversations.turns.get(first).conversationId();
+        UUID second = turnId(askIn(gm, gm.campaign(), "E o curto?", conversation, null));
+        Claim claim = claim(jobOf(second));
+        postEvents(claim, 1, List.of(delta("## Descanso curto\n\n**Uma hora**, e *gaste* dados de vida. Veja [o"
+                + " livro](https://example.test/a).\n- primeiro\n- segundo\n```\nrolar 1d8\n```"),
+                citation(passages.getFirst(), 0)), List.of());
+        report(claim, "{\"outcome\":\"done\"}");
+        long version = conversations.conversations.get(conversation).version();
+        Instant lastAsked = conversations.conversations.get(conversation).lastAskedAt();
+        // Nothing saved yet: one empty page.
+        JsonNode none = json(get(gm, SAVED));
+        assertThat(none.path("items")).isEmpty();
+        assertThat(none.path("total").asLong()).isZero();
+        assertThat(none.has("nextCursor")).isFalse();
+        assertThat(turnsBookmarked(gm, conversation)).containsExactly(false, false);
+
+        HttpResponse<String> saved = bookmark(gm, "PUT", second.toString());
+
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(204);
+        assertThat(saved.body()).isEmpty();
+        assertThat(saved.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        Instant at = conversations.turns.get(second).bookmarkedAt();
+        assertThat(at).isEqualTo(clock.instant().truncatedTo(ChronoUnit.MICROS));
+        // Twice: 204, and the first time is kept.
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(bookmark(gm, "PUT", second.toString()).statusCode()).isEqualTo(204);
+        assertThat(conversations.turns.get(second).bookmarkedAt()).isEqualTo(at);
+        assertThat(turnsBookmarked(gm, conversation)).containsExactly(false, true);
+        assertThat(conversations.conversations.get(conversation).version()).isEqualTo(version);
+        assertThat(conversations.conversations.get(conversation).lastAskedAt()).isEqualTo(lastAsked);
+        // It heads the list, with its campaign, conversation and an excerpt without Markdown.
+        HttpResponse<String> listed = get(gm, SAVED);
+        assertThat(listed.statusCode()).as(listed.body()).isEqualTo(200);
+        assertThat(listed.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode page = json(listed);
+        assertThat(page.path("total").asLong()).isEqualTo(1);
+        assertThat(page.has("nextCursor")).isFalse();
+        JsonNode item = page.path("items").get(0);
+        assertThat(fieldNames(item)).containsExactlyInAnyOrder("turnId", "conversationId", "campaignId",
+                "campaignName", "area", "conversationName", "savedAt", "excerpt");
+        assertThat(item.path("turnId").asString()).isEqualTo(second.toString());
+        assertThat(item.path("conversationId").asString()).isEqualTo(conversation.toString());
+        assertThat(item.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(item.path("campaignName").asString()).isEqualTo(json(get(gm, "/api/v1/campaigns/"
+                + gm.campaign())).path("name").asString()).isNotBlank();
+        assertThat(item.path("area").asString()).isEqualTo("questions");
+        assertThat(item.path("conversationName").asString()).isEqualTo("Como funciona o descanso longo?");
+        assertThat(item.path("savedAt").asString()).isEqualTo(at.toString());
+        assertThat(item.path("excerpt").asString()).isEqualTo("Descanso curto Uma hora, e gaste dados de vida. Veja o"
+                + " livro. primeiro segundo rolar 1d8");
+        // The other turn saved later heads the list.
+        assertThat(bookmark(gm, "PUT", first.toString()).statusCode()).isEqualTo(204);
+        assertThat(savedIds(gm, SAVED)).containsExactly(first.toString(), second.toString());
+
+        HttpResponse<String> unsaved = bookmark(gm, "DELETE", second.toString());
+
+        assertThat(unsaved.statusCode()).as(unsaved.body()).isEqualTo(204);
+        assertThat(unsaved.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(conversations.turns.get(second).bookmarkedAt()).isNull();
+        // An unsaved turn: 204, no change.
+        assertThat(bookmark(gm, "DELETE", second.toString()).statusCode()).isEqualTo(204);
+        assertThat(savedIds(gm, SAVED)).containsExactly(first.toString());
+        assertThat(json(get(gm, SAVED)).path("total").asLong()).isEqualTo(1);
+        assertThat(turnsBookmarked(gm, conversation)).containsExactly(true, false);
+        assertThat(conversations.conversations.get(conversation).version()).isEqualTo(version);
+        assertThat(conversations.conversations.get(conversation).lastAskedAt()).isEqualTo(lastAsked);
+        // Lines carry ids and words, never a question or an answer.
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo(
+                "conversation.turn_bookmarked"));
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo(
+                "conversation.turn_unbookmarked"));
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("descanso").doesNotContain("Uma hora"));
+    }
+
+    @Test
+    void onlyADoneTurnIsSavedARunningStoppedFailedOrSilentOneIsRefusedAndAnyIsUnsaved() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID done = answered(gm, QUESTION, List.of(delta("Um."), citation(passages.getFirst(), 0)));
+        // Silent: done, but with no reference and no model part (the sources said nothing).
+        UUID silent = answered(gm, QUESTION, List.of(delta("Nada.")));
+        UUID stopped = turnId(ask(gm, gm.campaign(), QUESTION));
+        postEvents(claim(jobOf(stopped)), 1, List.of(delta("Dois")), List.of());
+        assertThat(stopTurn(gm, stopped).statusCode()).isEqualTo(204);
+        UUID stoppedBeforeClaim = turnId(ask(gm, gm.campaign(), QUESTION));
+        assertThat(stopTurn(gm, stoppedBeforeClaim).statusCode()).isEqualTo(204);
+        UUID failed = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim failing = claim(jobOf(failed));
+        postEvents(failing, 1, List.of(delta("Tr")), List.of());
+        report(failing, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}");
+        UUID running = turnId(ask(gm, gm.campaign(), QUESTION));
+        postEvents(claim(jobOf(running)), 1, List.of(delta("Quatro")), List.of());
+        UUID waiting = turnId(ask(gm, gm.campaign(), QUESTION));
+
+        for (UUID turn : List.of(silent, stopped, stoppedBeforeClaim, failed, running, waiting)) {
+            String state = jobs.row(jobOf(turn)).state();
+            assertProblem(bookmark(gm, "PUT", turn.toString()), 409, "conversation.turn_not_done");
+            assertThat(conversations.turns.get(turn).bookmarkedAt()).isNull();
+            assertThat(jobs.row(jobOf(turn)).state()).isEqualTo(state);
+            // A DELETE always succeeds on a turn the GM can see.
+            assertThat(bookmark(gm, "DELETE", turn.toString()).statusCode()).isEqualTo(204);
+        }
+        assertThat(conversations.turns.get(running).stoppedAt()).isNull();
+        assertThat(bookmark(gm, "PUT", done.toString()).statusCode()).isEqualTo(204);
+        assertThat(savedIds(gm, SAVED)).containsExactly(done.toString());
+        // With model knowledge on, an answer from the model's own knowledge alone (no reference) is not silent: saved.
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, true, List.of()))
+                .statusCode()).isEqualTo(200);
+        UUID modelOnly = answered(gm, QUESTION, List.of(tier("model", 0), delta("Em geral, 1d10.")));
+        assertThat(bookmark(gm, "PUT", modelOnly.toString()).statusCode()).isEqualTo(204);
+        assertThat(conversations.turns.get(modelOnly).bookmarkedAt()).isNotNull();
+    }
+
+    @Test
+    void anotherOwnersTurnAnUnknownOneOrAMalformedIdIsNotFoundOnBothBookmarkRoutesAndNeverListed() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        UUID passage = accepted(them, 1).getFirst();
+        UUID unsaved = answered(them, QUESTION, List.of(delta("Um."), citation(passage, 0)));
+        UUID saved = answered(them, "Outra?", List.of(delta("Dois."), citation(passage, 0)));
+        assertThat(bookmark(them, "PUT", saved.toString()).statusCode()).isEqualTo(204);
+        Instant at = conversations.turns.get(saved).bookmarkedAt();
+
+        for (String id : List.of(unsaved.toString(), saved.toString(), UUID.randomUUID().toString(), "nope")) {
+            for (String method : List.of("PUT", "DELETE")) {
+                HttpResponse<String> refused = bookmark(gm, method, id);
+                assertNotFound(refused);
+                assertThat(refused.body()).doesNotContain(unsaved.toString()).doesNotContain(saved.toString());
+            }
+        }
+
+        assertThat(conversations.turns.get(unsaved).bookmarkedAt()).isNull();
+        assertThat(conversations.turns.get(saved).bookmarkedAt()).isEqualTo(at);
+        JsonNode mine = json(get(gm, SAVED));
+        assertThat(mine.path("items")).isEmpty();
+        assertThat(mine.path("total").asLong()).isZero();
+        assertThat(savedIds(them, SAVED)).containsExactly(saved.toString());
+        // No session: refused before anything is read.
+        HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(uri(SAVED))
+                .header("Authorization", "Bearer " + CREDENTIAL).GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertProblem(anonymous, 401, "session.required");
+    }
+
+    @Test
+    void theSavedListSpansCampaignsLeavesOutArchivedCampaignsAndDismissedAnswersUntilTheyComeBack() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID other = campaign(gm, systemOf(gm), "A Coroa Partida");
+        UUID here = answeredIn(gm, null, "Pergunta aqui?", "Resposta aqui.", passages.getFirst());
+        UUID otherPassage = source(gm, other, List.of(1)).passages().getFirst();
+        UUID there = turnId(askIn(gm, other, "Pergunta lá?", null, "rules"));
+        Claim claim = claim(jobOf(there));
+        postEvents(claim, 1, List.of(delta("Resposta lá."), citation(otherPassage, 0)), List.of());
+        report(claim, "{\"outcome\":\"done\"}");
+        clock.advance(Duration.ofSeconds(1));
+        UUID dismissed = answeredIn(gm, null, "Pergunta dispensada?", "Resposta dispensada.", passages.getFirst());
+        for (UUID turn : List.of(here, there, dismissed)) {
+            assertThat(bookmark(gm, "PUT", turn.toString()).statusCode()).isEqualTo(204);
+            clock.advance(Duration.ofSeconds(1));
+        }
+        JsonNode page = json(get(gm, SAVED));
+        assertThat(page.path("total").asLong()).isEqualTo(3);
+        JsonNode thereItem = page.path("items").get(1);
+        assertThat(thereItem.path("turnId").asString()).isEqualTo(there.toString());
+        assertThat(thereItem.path("campaignId").asString()).isEqualTo(other.toString());
+        assertThat(thereItem.path("campaignName").asString()).isEqualTo("A Coroa Partida");
+        assertThat(thereItem.path("area").asString()).isEqualTo("rules");
+        assertThat(thereItem.path("conversationName").asString()).isEqualTo("Pergunta lá?");
+        Instant dismissedAt = conversations.turns.get(dismissed).bookmarkedAt();
+
+        // A dismissed answer is left out of the list and its total, and its bookmark is kept.
+        assertThat(dismissal(gm, "PUT", dismissed.toString()).statusCode()).isEqualTo(204);
+        assertThat(savedIds(gm, SAVED)).containsExactly(there.toString(), here.toString());
+        assertThat(json(get(gm, SAVED)).path("total").asLong()).isEqualTo(2);
+        assertThat(conversations.turns.get(dismissed).bookmarkedAt()).isEqualTo(dismissedAt);
+        // The campaign archived: its answers are left out; restored, they come back.
+        assertThat(send(gm, "PATCH", "/api/v1/campaigns/" + other, "{\"version\":0,\"archived\":true}").statusCode())
+                .isEqualTo(200);
+        assertThat(savedIds(gm, SAVED)).containsExactly(here.toString());
+        assertThat(json(get(gm, SAVED)).path("total").asLong()).isEqualTo(1);
+        assertThat(send(gm, "PATCH", "/api/v1/campaigns/" + other, "{\"version\":1,\"archived\":false}").statusCode())
+                .isEqualTo(200);
+        // The dismissal undone: listed again with the same time.
+        assertThat(dismissal(gm, "DELETE", dismissed.toString()).statusCode()).isEqualTo(204);
+        JsonNode back = json(get(gm, SAVED));
+        assertThat(back.path("total").asLong()).isEqualTo(3);
+        assertThat(back.path("items")).extracting(item -> item.path("turnId").asString())
+                .containsExactly(dismissed.toString(), there.toString(), here.toString());
+        assertThat(back.path("items").get(0).path("savedAt").asString()).isEqualTo(dismissedAt.toString());
+    }
+
+    @Test
+    void theSavedListIsPagedByOffsetNewestSavedFirstWithItsTotal() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        List<UUID> saved = new ArrayList<>();
+        UUID conversation = null;
+        for (int number = 1; number <= 5; number++) {
+            UUID turn = answeredIn(gm, conversation, "Pergunta " + number + "?", "Resposta " + number + ".",
+                    passages.getFirst());
+            conversation = conversations.turns.get(turn).conversationId();
+            assertThat(bookmark(gm, "PUT", turn.toString()).statusCode()).isEqualTo(204);
+            saved.add(0, turn);
+        }
+
+        JsonNode first = json(get(gm, SAVED + "?limit=2"));
+        assertThat(first.path("items")).extracting(item -> item.path("turnId").asString())
+                .containsExactly(saved.get(0).toString(), saved.get(1).toString());
+        assertThat(first.path("nextCursor").asString()).isEqualTo("2");
+        assertThat(first.path("total").asLong()).isEqualTo(5);
+        JsonNode last = json(get(gm, SAVED + "?limit=2&offset=4"));
+        assertThat(last.path("items")).extracting(item -> item.path("turnId").asString())
+                .containsExactly(saved.get(4).toString());
+        assertThat(last.has("nextCursor")).isFalse();
+        assertThat(last.path("total").asLong()).isEqualTo(5);
+        assertThat(json(get(gm, SAVED)).path("items")).hasSize(5);
+        assertThat(json(get(gm, SAVED + "?offset=9")).path("items")).isEmpty();
+        for (String query : List.of("?limit=0", "?limit=51", "?limit=x", "?offset=-1", "?offset=100001",
+                "?offset=01")) {
+            assertProblem(get(gm, SAVED + query), 400, "request.invalid");
+        }
+    }
+
+    @Test
+    void aBookmarkGivesNoStandingTheHistoryAndThePassagesHandedOverAreTheSame() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 2);
+        UUID first = answeredIn(gm, null, "Pergunta 1?", "Resposta 1.", passages.getFirst());
+        UUID conversation = conversations.turns.get(first).conversationId();
+        UUID without = turnId(askIn(gm, gm.campaign(), "Pergunta 2?", conversation, null));
+        Claim before = claim(jobOf(without));
+        HttpResponse<String> readBefore = sendAsWorker("POST", before.path("passages"), passageIds(passages),
+                before.grant());
+        assertThat(stopTurn(gm, without).statusCode()).isEqualTo(204);
+        clock.advance(Duration.ofSeconds(1));
+
+        assertThat(bookmark(gm, "PUT", first.toString()).statusCode()).isEqualTo(204);
+
+        UUID with = turnId(askIn(gm, gm.campaign(), "Pergunta 3?", conversation, null));
+        Claim after = claim(jobOf(with));
+        HttpResponse<String> readAfter = sendAsWorker("POST", after.path("passages"), passageIds(passages),
+                after.grant());
+        assertThat(after.input().path("history")).isEqualTo(before.input().path("history"));
+        assertThat(after.input().path("history")).extracting(item -> item.path("question").asString())
+                .containsExactly("Pergunta 1?");
+        assertThat(handedSources(after)).isEqualTo(handedSources(before)).isNotEmpty();
+        assertThat(after.input().path("tiers")).isEqualTo(before.input().path("tiers"));
+        assertThat(readAfter.statusCode()).as(readAfter.body()).isEqualTo(readBefore.statusCode()).isEqualTo(200);
+        assertThat(json(readAfter).path("passages")).hasSize(2).isEqualTo(json(readBefore).path("passages"));
+    }
+
+    private static String passageIds(List<UUID> passages) {
+        return JSON.writeValueAsString(Map.of("ids", passages.stream().map(UUID::toString).toList()));
+    }
+
+    private HttpResponse<String> bookmark(Gm gm, String method, String turnId) throws Exception {
+        return send(gm, method, "/api/v1/turns/" + turnId + "/bookmark", "");
+    }
+
+    private List<Boolean> turnsBookmarked(Gm gm, UUID conversation) throws Exception {
+        HttpResponse<String> read = get(gm, "/api/v1/conversations/" + conversation + "/turns");
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        List<Boolean> marks = new ArrayList<>();
+        json(read).path("items").forEach(item -> {
+            assertThat(item.path("bookmarked").isBoolean()).isTrue();
+            marks.add(item.path("bookmarked").asBoolean());
+        });
+        return marks;
+    }
+
+    private List<String> savedIds(Gm gm, String path) throws Exception {
+        HttpResponse<String> read = get(gm, path);
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        List<String> ids = new ArrayList<>();
+        json(read).path("items").forEach(item -> ids.add(item.path("turnId").asString()));
+        return ids;
     }
 
     private HttpResponse<String> dismissal(Gm gm, String method, String turnId) throws Exception {
