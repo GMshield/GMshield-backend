@@ -3,6 +3,9 @@ package io.github.gmshield.conversations.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.gmshield.conversations.data.ConversationConflict;
+import io.github.gmshield.conversations.data.ConversationStore;
+import io.github.gmshield.conversations.data.TurnRow;
 import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.jobs.service.JobEvent;
@@ -31,6 +34,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -52,6 +56,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * encrypted, its claim's input, its results stored in rank order and read back with their places, a result dropped
  * once its version is no longer ready, a forged result refused whole, the checks of the tables, another owner, and
  * only the newest 20 searches kept.
+ * Story 3.10 (V30): many conversations per campaign (the unique key gone, the list's index there), each in an area
+ * (checked), listed most recently asked first, renamed on its version with the name encrypted (a stale rename refused,
+ * asking never raises the version), another owner's never seen, and a done turn's question and answer in the next
+ * question's history. On Postgres too: the list most recently asked first (also when that differs from the order they
+ * were made), an offset, an area-less question continuing the most recently asked conversation, the newest 200 turns
+ * oldest first, and a rename whose row moved after it was read refused at the flush.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -70,6 +80,8 @@ class ConversationIntegrationTest {
     private MaterialStore materials;
     @Autowired
     private Conversations conversations;
+    @Autowired
+    private ConversationStore store;
     @Autowired
     private Searches searches;
     @Autowired
@@ -436,6 +448,176 @@ class ConversationIntegrationTest {
                 .single()).isZero();
         assertThat(jdbc.sql("select count(*) from search_result where search_id = :id").param("id", searchId)
                 .query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void conversationsByAreaAreListedRenamedAndCarryTheirHistoryOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        // V30: the unique key on (owner, campaign) is gone, and the list's index is there.
+        assertThat(jdbc.sql("select count(*) from pg_constraint where conname = 'conversation_owner_campaign_key'")
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select count(*) from pg_indexes where indexname = 'conversation_owner_campaign_area'")
+                .query(Long.class).single()).isOne();
+
+        Conversations.Asked first = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Que regras já existem sobre fabricar itens?", null, Area.RULES));
+        Conversations.Asked other = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION, null,
+                Area.QUESTIONS));
+        Conversations.Asked latest = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "E agora?"));
+        Conversations.Asked again = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Mais uma?",
+                first.conversationId(), null));
+
+        assertThat(latest.conversationId()).isEqualTo(other.conversationId());
+        assertThat(again.conversationId()).isEqualTo(first.conversationId());
+        Map<String, Object> row = jdbc.sql("select area, name, version, created_at, last_asked_at from conversation"
+                + " where id = :id").param("id", first.conversationId()).query().singleRow();
+        assertThat(row).containsEntry("area", "rules").containsEntry("name", null).containsEntry("version", 0L);
+        assertThat(((java.sql.Timestamp) row.get("last_asked_at")).toInstant())
+                .isAfter(((java.sql.Timestamp) row.get("created_at")).toInstant());
+        Conversations.Page rules = as(owner, () -> conversations.list(campaign, Area.RULES, 0, 20)).orElseThrow();
+        assertThat(rules.total()).isOne();
+        assertThat(rules.items()).extracting(Conversations.Summary::id, Conversations.Summary::name,
+                Conversations.Summary::questions).containsExactly(org.assertj.core.groups.Tuple.tuple(
+                        first.conversationId(), "Que regras já existem sobre fabricar itens?", 2L));
+        Conversations.Page questions = as(owner, () -> conversations.list(campaign, Area.QUESTIONS, 0, 20))
+                .orElseThrow();
+        assertThat(questions.items()).extracting(Conversations.Summary::id).containsExactly(other.conversationId());
+        assertThat(as(Ids.newId(), () -> conversations.list(campaign, Area.RULES, 0, 20))).isEmpty();
+
+        // A rename on its version, stored encrypted; a stale one changes nothing.
+        Conversations.Opened renamed = OwnerContext.callAs(owner, () -> conversations.rename(first.conversationId(), 0,
+                " Fabricar itens ")).orElseThrow();
+        assertThat(renamed.name()).isEqualTo("Fabricar itens");
+        assertThat(renamed.version()).isOne();
+        byte[] name = jdbc.sql("select name from conversation where id = :id").param("id", first.conversationId())
+                .query((result, number) -> result.getBytes(1)).single();
+        assertThat(new String(name, StandardCharsets.ISO_8859_1)).doesNotContain("Fabricar");
+        assertThatThrownBy(() -> OwnerContext.callAs(owner, () -> conversations.rename(first.conversationId(), 0,
+                "Outro"))).isInstanceOfSatisfying(ApiException.class, refused ->
+                        assertThat(refused.problem().code()).isEqualTo("request.stale_version"));
+        // Asking never raises the version.
+        OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Ainda?", first.conversationId(), null));
+        assertThat(jdbc.sql("select version from conversation where id = :id").param("id", first.conversationId())
+                .query(Long.class).single()).isOne();
+        assertThat(as(Ids.newId(), () -> conversations.conversation(first.conversationId()))).isEmpty();
+        assertThatThrownBy(() -> jdbc.sql("update conversation set area = 'search' where id = :id")
+                .param("id", first.conversationId()).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("conversation_area_check");
+
+        // The history: the done turn's question and answer, through the claim of the next question.
+        UUID firstJob = jdbc.sql("select job_id from turn where id = :id").param("id", first.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim opening = claims.claim(firstJob, null, List.of("azure-openai"));
+        assertThat(opening.input().path("history")).isEmpty();
+        claims.events(firstJob, opening.claimId(), opening.grant(), new JobEventBatch(opening.claimId(), 1,
+                List.of(JobEvent.delta("Duas regras: "), JobEvent.delta("forja e alquimia."))), List.of());
+        claims.report(firstJob, opening.claimId(), opening.grant(), "done", null, null);
+        UUID secondJob = jdbc.sql("select job_id from turn where id = :id").param("id", again.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim next = claims.claim(secondJob, null, List.of("azure-openai"));
+        assertThat(next.input().path("history")).hasSize(1);
+        assertThat(next.input().path("history").get(0).path("question").asString())
+                .isEqualTo("Que regras já existem sobre fabricar itens?");
+        assertThat(next.input().path("history").get(0).path("answer").asString())
+                .isEqualTo("Duas regras: forja e alquimia.");
+        List<Conversations.StoredTurn> turns = as(owner, () -> conversations.turns(first.conversationId()))
+                .orElseThrow();
+        assertThat(turns).extracting(Conversations.StoredTurn::id).startsWith(first.turnId(), again.turnId());
+        assertThat(turns.getFirst().events()).extracting(Conversations.StoredEvent::type)
+                .containsExactly("delta", "delta", "done");
+    }
+
+    @Test
+    void theListIsMostRecentlyAskedFirstOnPostgresAndAnAreaLessQuestionContinuesTheMostRecentlyAskedOne() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Conversations.Asked older = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Primeira?", null,
+                Area.QUESTIONS));
+        Conversations.Asked newer = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Segunda?", null,
+                Area.QUESTIONS));
+        // The one made first is asked again: it is now the most recently asked.
+        OwnerContext.callAs(owner, () -> conversations.ask(campaign, "De novo?", older.conversationId(), null));
+
+        assertThat(as(owner, () -> conversations.list(campaign, Area.QUESTIONS, 0, 20)).orElseThrow().items())
+                .extracting(Conversations.Summary::id).containsExactly(older.conversationId(), newer.conversationId());
+        Conversations.Page second = as(owner, () -> conversations.list(campaign, Area.QUESTIONS, 1, 20)).orElseThrow();
+        assertThat(second.items()).extracting(Conversations.Summary::id).containsExactly(newer.conversationId());
+        assertThat(second.total()).isEqualTo(2);
+        Conversations.Page first = as(owner, () -> conversations.list(campaign, Area.QUESTIONS, 0, 1)).orElseThrow();
+        assertThat(first.nextOffset()).isOne();
+        Conversations.Asked areaLess = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Sem área?"));
+        assertThat(areaLess.conversationId()).isEqualTo(older.conversationId());
+    }
+
+    @Test
+    void aConversationsTurnsAreItsNewest200OldestFirstOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID conversation = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 0", null,
+                Area.RULES)).conversationId();
+        UUID firstTurn = jdbc.sql("select id from turn where conversation_id = :id").param("id", conversation)
+                .query(UUID.class).single();
+        Instant start = Instant.now().truncatedTo(ChronoUnit.MICROS).plusSeconds(10);
+        List<UUID> added = as(owner, () -> {
+            List<UUID> ids = new java.util.ArrayList<>();
+            for (int number = 1; number <= 200; number++) {
+                UUID turnId = Ids.newId();
+                store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
+                        Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
+                        java.util.Set.of(), start.plusSeconds(number), null));
+                ids.add(turnId);
+            }
+            return ids;
+        });
+
+        List<Conversations.StoredTurn> turns = as(owner, () -> conversations.turns(conversation)).orElseThrow();
+
+        assertThat(turns).hasSize(200);
+        assertThat(turns).extracting(Conversations.StoredTurn::id).doesNotContain(firstTurn).containsExactlyElementsOf(added);
+        assertThat(turns.getFirst().question()).isEqualTo("Pergunta 1");
+        assertThat(turns.getLast().question()).isEqualTo("Pergunta 200");
+    }
+
+    @Test
+    void aRenameWhoseRowMovedAfterItWasReadIsAConflictAtTheFlushAndChangesNothing() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID conversation = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION, null,
+                Area.QUESTIONS)).conversationId();
+        TransactionTemplate other = new TransactionTemplate(transactions);
+        other.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        Throwable refused = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            // Read at version 0 in this transaction; then another transaction raises the version and commits.
+            assertThat(store.findConversation(conversation).orElseThrow().version()).isZero();
+            other.executeWithoutResult(moved -> jdbc.sql("update conversation set version = version + 1 where id = :id")
+                    .param("id", conversation).update());
+            status.setRollbackOnly();
+            try {
+                store.renameConversation(conversation, 0, new byte[] {1, 2, 3});
+                return null;
+            } catch (RuntimeException conflict) {
+                return conflict;
+            }
+        }));
+
+        assertThat(refused).isInstanceOf(ConversationConflict.class);
+        Map<String, Object> row = jdbc.sql("select name, version from conversation where id = :id")
+                .param("id", conversation).query().singleRow();
+        assertThat(row).containsEntry("name", null).containsEntry("version", 1L);
     }
 
     private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page) {

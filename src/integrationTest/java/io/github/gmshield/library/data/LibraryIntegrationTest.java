@@ -804,8 +804,8 @@ class LibraryIntegrationTest {
         // A's campaign has a conversation (no question, so no answer job is left behind): B still learns nothing of it.
         UUID conversationId = Ids.newId();
         OwnerContext.runAs(a.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
-                conversations.insertConversation(new ConversationRow(conversationId, a.id(), a.campaignId(),
-                        Instant.now().truncatedTo(ChronoUnit.MICROS)))));
+                conversations.insertConversation(ConversationRow.started(conversationId, a.id(), a.campaignId(),
+                        ConversationRow.QUESTIONS, Instant.now().truncatedTo(ChronoUnit.MICROS)))));
         JsonNode conversation = ok(get("/api/v1/campaigns/" + a.campaignId() + "/conversation", a.session()));
         assertThat(conversation.path("id").asString()).isEqualTo(conversationId.toString());
         assertThat(conversation.path("questions").asLong()).isZero();

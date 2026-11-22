@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.data;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -14,8 +15,45 @@ public interface ConversationStore {
 
     void insertConversation(ConversationRow row);
 
-    /** The current owner's conversation of a campaign. */
-    Optional<ConversationRow> conversationOfCampaign(UUID campaignId);
+    /**
+     * The current owner's conversation of a campaign in {@code area} whose newest question was asked last (Story 3.10);
+     * empty when it has none there.
+     */
+    Optional<ConversationRow> latestConversation(UUID campaignId, String area);
+
+    /**
+     * The current owner's conversations of a campaign in {@code area} (Story 3.10), the most recently asked first (then
+     * by id, newest first), skipping the first {@code offset}, at most {@code limit}.
+     */
+    List<ConversationRow> conversations(UUID campaignId, String area, int offset, int limit);
+
+    /** How many conversations the current owner's campaign has in {@code area} (Story 3.10). */
+    long conversationCount(UUID campaignId, String area);
+
+    /**
+     * The first turn of each of these conversations of the current owner (Story 3.10: the oldest, then by id), by
+     * conversation; a conversation with no turn, or another owner's, is absent.
+     */
+    Map<UUID, TurnRow> firstTurns(Collection<UUID> conversationIds);
+
+    /** How many turns each of these conversations of the current owner has (Story 3.10); one with none is absent. */
+    Map<UUID, Long> turnCounts(Collection<UUID> conversationIds);
+
+    /** The current owner's newest {@code limit} turns of a conversation (Story 3.10), oldest first. */
+    List<TurnRow> newestTurns(UUID conversationId, int limit);
+
+    /**
+     * A question was asked in the owner's conversation at {@code at} (Story 3.10): its {@code last_asked_at} moves
+     * there (never back); its version stays. False for an unknown conversation or another owner's.
+     */
+    boolean markAsked(UUID id, Instant at);
+
+    /**
+     * Renames the owner's conversation (Story 3.10) on {@code version} to the ciphertext {@code name}, raising its
+     * version by one; empty for an unknown conversation or another owner's. Throws {@link ConversationConflict} when the
+     * row is no longer at {@code version}; nothing changes then.
+     */
+    Optional<ConversationRow> renameConversation(UUID id, long version, byte[] name);
 
     Optional<ConversationRow> findConversation(UUID id);
 

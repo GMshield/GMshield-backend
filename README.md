@@ -845,7 +845,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     order, so a re-index of a whole library never fills the claim reply (the total is logged as a count, `pending`,
     beside `pendingListed` and `pendingLeftOut`); `owner` is the scope's owner, for the worker's Qdrant
     filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
-    use `vault :: service`). The question is 1 to 4,000 characters (code points), else
+    use `vault :: service`). From internal contract 1.16.0 (Story 3.10) the answer job adds `history` after this builder
+    (below). The question is 1 to 4,000 characters (code points), else
     `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier come
     with the claim (Story 2.10, `model`), never in this input. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
     (no claim schema change). Lines (`scope.question_input`) carry counts, never the question or the key. No
@@ -1002,6 +1003,54 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
      where kind = 'library.search' and state in ('waiting', 'offered', 'running');
     ```
 
+- **Conversations by area (`conversations`, Story 3.10 part A, public contract 1.29.0, internal contract 1.16.0,
+  migration V30).** A campaign has many conversations, each in one area of the sidebar: `questions` (Consultas) or
+  `rules` (Criação de Regras). A conversation is made by its first question, never by "Nova conversa", so none is
+  empty. Deleting a conversation is part B.
+  - `V30__conversation_areas.sql`: `conversation` gains `area` (checked to the two words; existing rows `questions`),
+    `name` (bytea, null until the GM renames it; vault binding `conversation`/`name`), `version` (Hibernate `@Version`,
+    raised by a rename only) and `last_asked_at` (an existing row takes its newest turn's time; asking moves it forward
+    by one JPQL bulk update that never moves it back and never raises the version, so an open rename stays valid). The unique key
+    `conversation_owner_campaign_key` is dropped, and `conversation_owner_campaign_area (owner_id, campaign_id, area,
+    last_asked_at)` serves the lists.
+  - `GET /api/v1/campaigns/{campaignId}/conversations?area=&limit=&offset=` (`listConversations`) answers `{items:
+    [{id, area, name, questions, createdAt, lastAskedAt, version}], nextCursor?, total}`: the area's conversations,
+    the most recently asked first (then by id), `limit` 1 to 50 (20 by default), `offset` 0 to 100,000; `nextCursor`
+    is the next page's offset as text, absent on the last. A missing or unknown area, a limit or an offset outside its
+    range is 400 `request.invalid`; a campaign that is not the account's is 404.
+  - `GET /api/v1/conversations/{id}` (`getConversation`) answers `{id, campaignId, area, name, version}`;
+    `GET /api/v1/conversations/{id}/turns` (`listConversationTurns`) answers `{items: [{id, question, language,
+    createdAt, events: [{sequence, type, data}]}]}`: the newest 200 turns, oldest first, each event's `data` as the
+    stream sends it (a `done`'s built when read, as on the stream). A turn still being answered has no final event
+    yet; its stream continues after its last sequence.
+  - `PATCH /api/v1/conversations/{id}` (`renameConversation`) with `{version, name}`: the name trimmed, 1 to 120
+    code points (else 400 `request.conversation_name_invalid`, params `min` and `max`; a missing or null `name` too),
+    stored encrypted; a version the row has left is 409 `request.stale_version`; no version or a malformed body is 400
+    `request.invalid`.
+  - `name`, in every view, is the stored name, or else the first question's first 60 code points cut at a word
+    boundary (`Searches.firstWords`).
+  - `POST /api/v1/campaigns/{campaignId}/turns` gains optional `conversationId` (continue it: it must be one of this
+    campaign's conversations, else 404 with nothing recorded) and `area` (start a new conversation of it; with
+    `conversationId` it must be that conversation's, else 400). With neither, the campaign's latest `questions`
+    conversation is continued (made when it has none), as before, so the previous frontend keeps working during the
+    deploy. `GET /api/v1/campaigns/{campaignId}/conversation` answers that same latest `questions` conversation.
+  - Every one of these routes answers `no-store`, and another account's conversation, an unknown or malformed id and
+    one of a campaign being deleted are the same 404 `request.not_found`.
+  - **History (internal 1.16.0).** `AnswerJobs.input` adds `history: [{question, answer}]` after
+    `Scopes.questionInput` (whose `textInput`, shared with the search input, is unchanged): the last 6 turns before
+    this one in its conversation that ended `done` and were not stopped (`Conversations.history`), oldest first, each
+    answer its joined `delta` texts (they hold no citation marker) cut at 4,000 code points; `[]` for a first question.
+    Retrieval still reads the question alone, and the history is never a source: the worker puts it inside the
+    document delimiter as escaped data and never gives its ids. The line `conversation.history_read` carries the count
+    only.
+  - Lines (`conversation.created`, `conversation.renamed`, `conversation.history_read`, `conversation.turn_recorded`
+    with its area) carry ids, counts and words, never a name, a question or an answer.
+  - Deploy order: backend → worker → frontend. The backend first (V30 is additive for the previous release, whose
+    inserts take the defaults; a 1.15 worker ignores the unknown `history` field), then the worker (its minimum
+    becomes 1.16.0), then the frontend (its minimum becomes 1.29.0). Rolling the backend back below 1.29.0: the
+    frontend and the worker go back first; the old backend continues the oldest conversation of a campaign whatever
+    its area, and ignores the names.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
@@ -1023,7 +1072,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     `ScopeSettings.STARTING` frozen on it and its language, and its job of kind `question.answer` on the interactive
     lane. Another owner's campaign, an unknown one or a malformed id is 404, with nothing recorded. The language is
     `pt-BR`, `en` or null when unsure (`Languages`: a count of each language's short words, no library, no model).
-    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10.
+    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10
+    (below: a campaign has many conversations by area, each with its turns).
   - `GET /api/v1/turns/{turnId}/events` is `text/event-stream` (`TurnStreams`): the stored events after
     `Last-Event-ID` (0 when absent or not a number), then new ones, each `id:` its sequence (1, 2, … per turn) and
     named `delta {text}`, `citation {passageId, offset}`, `done {silent, references}` (Story 2.5, below) or

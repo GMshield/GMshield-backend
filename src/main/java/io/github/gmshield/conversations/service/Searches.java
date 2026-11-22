@@ -198,11 +198,16 @@ public class Searches {
      * them is cut where they end).
      */
     static String firstWords(String text) {
+        return firstWords(text, FIRST_WORDS);
+    }
+
+    /** As {@link #firstWords(String)}, with at most {@code max} code points (Story 3.10: a conversation's name). */
+    static String firstWords(String text, int max) {
         String flat = SPACES.matcher(text).replaceAll(" ").strip();
-        if (flat.codePointCount(0, flat.length()) <= FIRST_WORDS) {
+        if (flat.codePointCount(0, flat.length()) <= max) {
             return flat;
         }
-        int end = flat.offsetByCodePoints(0, FIRST_WORDS);
+        int end = flat.offsetByCodePoints(0, max);
         if (flat.charAt(end) == ' ') {
             return flat.substring(0, end);
         }

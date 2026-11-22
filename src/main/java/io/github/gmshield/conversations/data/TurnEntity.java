@@ -88,4 +88,12 @@ class TurnEntity {
     UUID id() {
         return id;
     }
+
+    UUID conversationId() {
+        return conversationId;
+    }
+
+    Instant createdAt() {
+        return createdAt;
+    }
 }

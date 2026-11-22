@@ -3,8 +3,10 @@ package io.github.gmshield.conversations.data;
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,16 +29,88 @@ public class InMemoryConversationStore implements ConversationStore {
     @Override
     public synchronized void insertConversation(ConversationRow row) {
         ownerFor(row.ownerId());
-        if (conversations.values().stream().anyMatch(other -> other.ownerId().equals(row.ownerId())
-                && other.campaignId().equals(row.campaignId())) || conversations.putIfAbsent(row.id(), row) != null) {
-            throw new IllegalStateException("key refused");
+        if (!ConversationRow.QUESTIONS.equals(row.area()) && !ConversationRow.RULES.equals(row.area())
+                || conversations.putIfAbsent(row.id(), row) != null) {
+            throw new IllegalStateException("key or check refused");
         }
         RollbackUndo.onRollback(() -> conversations.remove(row.id()));
     }
 
+    /** As the table's index: the most recently asked first, then by id, newest first. */
+    private static final Comparator<ConversationRow> LISTED = Comparator.comparing(ConversationRow::lastAskedAt)
+            .thenComparing(ConversationRow::id).reversed();
+
     @Override
-    public Optional<ConversationRow> conversationOfCampaign(UUID campaignId) {
-        return owned(conversations).filter(row -> row.campaignId().equals(campaignId)).findFirst();
+    public Optional<ConversationRow> latestConversation(UUID campaignId, String area) {
+        return listed(campaignId, area).findFirst();
+    }
+
+    @Override
+    public List<ConversationRow> conversations(UUID campaignId, String area, int offset, int limit) {
+        return listed(campaignId, area).skip(offset).limit(limit).toList();
+    }
+
+    @Override
+    public long conversationCount(UUID campaignId, String area) {
+        return listed(campaignId, area).count();
+    }
+
+    private Stream<ConversationRow> listed(UUID campaignId, String area) {
+        return owned(conversations).filter(row -> row.campaignId().equals(campaignId) && row.area().equals(area))
+                .sorted(LISTED);
+    }
+
+    @Override
+    public Map<UUID, TurnRow> firstTurns(Collection<UUID> conversationIds) {
+        Map<UUID, TurnRow> first = new HashMap<>();
+        owned(turns).filter(row -> conversationIds.contains(row.conversationId()))
+                .sorted(Comparator.comparing(TurnRow::createdAt).thenComparing(TurnRow::id))
+                .forEach(row -> first.putIfAbsent(row.conversationId(), row));
+        return first;
+    }
+
+    @Override
+    public Map<UUID, Long> turnCounts(Collection<UUID> conversationIds) {
+        Map<UUID, Long> counts = new HashMap<>();
+        owned(turns).filter(row -> conversationIds.contains(row.conversationId()))
+                .forEach(row -> counts.merge(row.conversationId(), 1L, Long::sum));
+        return counts;
+    }
+
+    @Override
+    public List<TurnRow> newestTurns(UUID conversationId, int limit) {
+        List<TurnRow> all = turnsOf(conversationId);
+        return new ArrayList<>(all.subList(Math.max(0, all.size() - limit), all.size()));
+    }
+
+    @Override
+    public synchronized boolean markAsked(UUID id, Instant at) {
+        Optional<ConversationRow> found = findConversation(id);
+        found.ifPresent(before -> {
+            ownerFor(before.ownerId());
+            if (at.isAfter(before.lastAskedAt())) {
+                conversations.put(id, before.askedAt(at));
+                RollbackUndo.onRollback(() -> conversations.put(id, before));
+            }
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public synchronized Optional<ConversationRow> renameConversation(UUID id, long version, byte[] name) {
+        Optional<ConversationRow> found = findConversation(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        ConversationRow before = found.get();
+        ownerFor(before.ownerId());
+        if (before.version() != version) {
+            throw new ConversationConflict();
+        }
+        ConversationRow renamed = before.renamed(name);
+        conversations.put(id, renamed);
+        RollbackUndo.onRollback(() -> conversations.put(id, before));
+        return Optional.of(renamed);
     }
 
     @Override
