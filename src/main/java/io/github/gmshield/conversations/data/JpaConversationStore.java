@@ -2,8 +2,11 @@ package io.github.gmshield.conversations.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.OptimisticLockException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -11,17 +14,23 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import org.hibernate.StaleStateException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
 import org.springframework.stereotype.Repository;
 
 /**
  * The conversation tables through JPA, as the library's stores: every read is JPQL, which Hibernate filters by the
- * owner of the work; nothing is read by {@code find} or written by a bulk statement. The entity manager is looked up
+ * owner of the work; nothing is read by {@code find}, and the one bulk statement ({@link #markAsked}) runs only after
+ * the owner's row was read. The entity manager is looked up
  * on first use.
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
+
+    /** A campaign's conversations of one area, the most recently asked first (Story 3.10). */
+    private static final String LIST = "select c from Conversation c where c.campaignId = :campaign and c.area = :area"
+            + " order by c.lastAskedAt desc, c.id desc";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -38,16 +47,107 @@ class JpaConversationStore implements ConversationStore {
     }
 
     @Override
-    public Optional<ConversationRow> conversationOfCampaign(UUID campaignId) {
-        return em().createQuery("select c from Conversation c where c.campaignId = :campaign order by c.createdAt",
-                        ConversationEntity.class).setParameter("campaign", campaignId).setMaxResults(1)
-                .getResultList().stream().findFirst().map(ConversationEntity::row);
+    public Optional<ConversationRow> latestConversation(UUID campaignId, String area) {
+        return em().createQuery(LIST, ConversationEntity.class).setParameter("campaign", campaignId)
+                .setParameter("area", area).setMaxResults(1).getResultList().stream().findFirst()
+                .map(ConversationEntity::row);
+    }
+
+    @Override
+    public List<ConversationRow> conversations(UUID campaignId, String area, int offset, int limit) {
+        return em().createQuery(LIST, ConversationEntity.class).setParameter("campaign", campaignId)
+                .setParameter("area", area).setFirstResult(offset).setMaxResults(limit).getResultList().stream()
+                .map(ConversationEntity::row).toList();
+    }
+
+    @Override
+    public long conversationCount(UUID campaignId, String area) {
+        return em().createQuery("select count(c) from Conversation c where c.campaignId = :campaign"
+                        + " and c.area = :area", Long.class).setParameter("campaign", campaignId)
+                .setParameter("area", area).getSingleResult();
+    }
+
+    @Override
+    public Map<UUID, TurnRow> firstTurns(Collection<UUID> conversationIds) {
+        if (conversationIds.isEmpty()) {
+            return Map.of();
+        }
+        List<TurnEntity> found = em().createQuery("select t from Turn t where t.conversationId in :conversations"
+                        + " and t.createdAt = (select min(f.createdAt) from Turn f"
+                        + " where f.conversationId = t.conversationId)", TurnEntity.class)
+                .setParameter("conversations", conversationIds).getResultList();
+        Map<UUID, TurnEntity> first = new HashMap<>();
+        for (TurnEntity turn : found) {
+            first.merge(turn.conversationId(), turn, (one, other) -> one.id().compareTo(other.id()) <= 0 ? one : other);
+        }
+        Map<UUID, Set<UUID>> off = materialsOff(first.values().stream().map(TurnEntity::id).toList());
+        Map<UUID, TurnRow> rows = new HashMap<>();
+        first.forEach((conversation, turn) -> rows.put(conversation, turn.row(off.getOrDefault(turn.id(), Set.of()))));
+        return rows;
+    }
+
+    @Override
+    public Map<UUID, Long> turnCounts(Collection<UUID> conversationIds) {
+        if (conversationIds.isEmpty()) {
+            return Map.of();
+        }
+        Map<UUID, Long> counts = new HashMap<>();
+        em().createQuery("select t.conversationId, count(t) from Turn t where t.conversationId in :conversations"
+                        + " group by t.conversationId", Object[].class).setParameter("conversations", conversationIds)
+                .getResultList().forEach(row -> counts.put((UUID) row[0], (Long) row[1]));
+        return counts;
+    }
+
+    @Override
+    public List<TurnRow> newestTurns(UUID conversationId, int limit) {
+        List<TurnEntity> newest = new ArrayList<>(em().createQuery("select t from Turn t where t.conversationId"
+                        + " = :conversation order by t.createdAt desc, t.id desc", TurnEntity.class)
+                .setParameter("conversation", conversationId).setMaxResults(limit).getResultList());
+        newest.sort(Comparator.comparing(TurnEntity::createdAt).thenComparing(TurnEntity::id));
+        Map<UUID, Set<UUID>> off = materialsOff(newest.stream().map(TurnEntity::id).toList());
+        return newest.stream().map(turn -> turn.row(off.getOrDefault(turn.id(), Set.of()))).toList();
+    }
+
+    @Override
+    public boolean markAsked(UUID id, Instant at) {
+        EntityManager em = em();
+        if (conversation(id).isEmpty()) {
+            return false;
+        }
+        // One bulk update: it never moves the time back, never touches the version, and never fails on a rename
+        // committed meanwhile (it writes no versioned entity).
+        em.createQuery("update Conversation c set c.lastAskedAt = :at where c.id = :id and c.lastAskedAt < :at")
+                .setParameter("at", at).setParameter("id", id).executeUpdate();
+        return true;
+    }
+
+    @Override
+    public Optional<ConversationRow> renameConversation(UUID id, long version, byte[] name) {
+        Optional<ConversationEntity> found = conversation(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        ConversationEntity entity = found.get();
+        if (entity.version() != version) {
+            throw new ConversationConflict();
+        }
+        entity.rename(name);
+        try {
+            em().flush();
+        } catch (OptimisticLockException | StaleStateException moved) {
+            throw new ConversationConflict();
+        }
+        return Optional.of(entity.row());
     }
 
     @Override
     public Optional<ConversationRow> findConversation(UUID id) {
+        return conversation(id).map(ConversationEntity::row);
+    }
+
+    private Optional<ConversationEntity> conversation(UUID id) {
         return em().createQuery("select c from Conversation c where c.id = :id", ConversationEntity.class)
-                .setParameter("id", id).getResultList().stream().findFirst().map(ConversationEntity::row);
+                .setParameter("id", id).getResultList().stream().findFirst();
     }
 
     @Override

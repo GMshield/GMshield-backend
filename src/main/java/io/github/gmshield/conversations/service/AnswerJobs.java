@@ -34,13 +34,18 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.ObjectNode;
 
 /**
  * The job of kind {@value #KIND} (Story 2.4): the answer to one turn, on the interactive lane, calling a model.
  *
  * <ul>
  *   <li>Its input is the question input of the turn's campaign within the scope settings frozen on the turn
- *       ({@link Scopes#questionInput}), and its passages are read within that scope ({@link Scopes#passages}).</li>
+ *       ({@link Scopes#questionInput}), and its passages are read within that scope ({@link Scopes#passages}). From
+ *       Story 3.10 (internal contract 1.16.0) it adds {@code history: [{question, answer}]}, the conversation's earlier
+ *       turns oldest first ({@link Conversations#history}): data for the model, never a source and never searched
+ *       with; the line carries its count only.</li>
  *   <li>Each numbered batch of events the worker posts is stored once per claim, encrypted with the turn, its events
  *       taking the turn's next sequences; a number past the next one of its claim is
  *       {@code job.batch_out_of_order}. Once the turn has a batch, the job has delivered (no splice: it is never
@@ -110,7 +115,17 @@ public class AnswerJobs implements JobHandler {
     public JsonNode input(JobRef job) {
         TurnRow turn = turnOf(job);
         String question = vault.decryptText(Conversations.question(turn.id(), turn.ownerId()), turn.question());
-        return scopes.questionInput(scopeOf(turn, true), question);
+        ObjectNode input = scopes.questionInput(scopeOf(turn, true), question);
+        // Story 3.10: the conversation's earlier turns, as data for the model only (never retrieval, never a source).
+        List<Conversations.Earlier> earlier = conversations.history(turn);
+        ArrayNode history = input.putArray("history");
+        for (Conversations.Earlier one : earlier) {
+            history.addObject().put("question", one.question()).put("answer", one.answer());
+        }
+        log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("turnId", turn.id())
+                .addKeyValue("conversationId", turn.conversationId()).addKeyValue("history", earlier.size())
+                .log("conversation.history_read");
+        return input;
     }
 
     @Override

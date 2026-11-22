@@ -1,6 +1,7 @@
 package io.github.gmshield.conversations.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import io.github.gmshield.conversations.service.Area;
 import io.github.gmshield.conversations.service.ConversationProblems;
 import io.github.gmshield.conversations.service.Conversations;
 import io.github.gmshield.conversations.service.Searches;
@@ -21,6 +22,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -30,13 +32,17 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.json.JsonMapper;
 
 /**
  * The GM's conversation (Story 2.4): the current conversation, a new turn, a turn's answer as server-sent events, and
@@ -45,7 +51,9 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * Story 3.2, a campaign's conversation with its question count. From Story 3.5, a page of a version on the ground "the
  * current scope" (an allowed source of the campaign's current stored scope), and its picture, in the same shapes.
  * From Story 3.9, a search of the library: created as a job (202) and read by id, with its results re-checked against
- * the campaign's current scope each time.
+ * the campaign's current scope each time. From Story 3.10, conversations by area: a campaign's conversations of one area
+ * (paged by offset, the most recently asked first), one conversation, its stored turns with their events, its rename on
+ * its version, and a question that continues a conversation or starts one in an area.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -64,7 +72,16 @@ class ConversationController {
     static final String SOURCE_PICTURE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture";
     static final String SEARCHES = "/api/v1/campaigns/{campaignId}/searches";
     static final String SEARCH = "/api/v1/searches/{searchId}";
+    static final String CONVERSATIONS = "/api/v1/campaigns/{campaignId}/conversations";
+    static final String CONVERSATION = "/api/v1/conversations/{conversationId}";
+    static final String CONVERSATION_TURNS = "/api/v1/conversations/{conversationId}/turns";
     static final String WEBP = "image/webp";
+    private static final JsonMapper JSON = JsonMapper.builder().build();
+    private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() {
+    };
+    private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
+    /** A page's position: 0, or up to six digits with no leading zero. */
+    private static final Pattern OFFSET_TEXT = Pattern.compile("0|[1-9][0-9]{0,5}");
     /** A reference or page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is nowhere. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
     static final String LAST_EVENT_ID = "Last-Event-ID";
@@ -131,12 +148,140 @@ class ConversationController {
     @Schema(name = "NewTurn", requiredProperties = "question")
     record NewTurn(
             @Schema(description = "The GM's question: 1 to 4,000 code points, not blank", minLength = 1,
-                    maxLength = 4000) String question) {
+                    maxLength = 4000) String question,
+            @Schema(description = "The conversation to continue (contract 1.29.0): one of this campaign's. Absent or"
+                    + " null: a new conversation of area, or without area the campaign's latest questions conversation",
+                    types = {"string", "null"}, format = "uuid") String conversationId,
+            @Schema(description = "The area of a new conversation (contract 1.29.0); with conversationId it must be"
+                    + " that conversation's. Absent or null with no conversationId: the campaign's latest questions"
+                    + " conversation is continued (made when it has none)", types = {"string", "null"},
+                    allowableValues = {"questions", "rules"}) String area) {
 
         @Override
         public String toString() {
-            return "NewTurn[]";
+            return "NewTurn[conversationId=" + conversationId + ", area=" + area + "]";
         }
+    }
+
+    @Schema(name = "ConversationSummary", requiredProperties = {"id", "area", "name", "questions", "createdAt",
+        "lastAskedAt", "version"}, description = "A conversation in a list (contract 1.29.0)")
+    record SummaryView(
+            @Schema(description = "The conversation's id", format = "uuid") UUID id,
+            @Schema(allowableValues = {"questions", "rules"}) String area,
+            @Schema(description = "The GM's name for it, or else its first question's first 60 code points, cut at a"
+                    + " word boundary") String name,
+            @Schema(description = "How many questions it holds", format = "int64", minimum = "1", example = "3")
+            long questions,
+            @Schema(description = "When its first question was asked", format = "date-time") String createdAt,
+            @Schema(description = "When its newest question was asked", format = "date-time") String lastAskedAt,
+            @Schema(description = "Its version: a rename names it and raises it by one", format = "int64",
+                    minimum = "0") long version) {
+
+        static SummaryView of(Conversations.Summary summary) {
+            return new SummaryView(summary.id(), summary.area().word(), summary.name(), summary.questions(),
+                    summary.createdAt().toString(), summary.lastAskedAt().toString(), summary.version());
+        }
+
+        @Override
+        public String toString() {
+            return "SummaryView[id=" + id + "]";
+        }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "ConversationPage", requiredProperties = {"items", "total"},
+            description = "One page of a campaign's conversations of one area (contract 1.29.0)")
+    record PageView(
+            @ArraySchema(arraySchema = @Schema(description = "The most recently asked first"),
+                    schema = @Schema(implementation = SummaryView.class)) List<SummaryView> items,
+            @Schema(description = "The offset of the next page, as text; absent on the last", example = "20")
+            String nextCursor,
+            @Schema(description = "How many conversations the campaign has in this area", format = "int64",
+                    example = "27") long total) {
+    }
+
+    @Schema(name = "Conversation", requiredProperties = {"id", "campaignId", "area", "name", "version"},
+            description = "One conversation (contract 1.29.0)")
+    record ConversationView(
+            @Schema(format = "uuid") UUID id,
+            @Schema(format = "uuid") UUID campaignId,
+            @Schema(allowableValues = {"questions", "rules"}) String area,
+            @Schema(description = "The GM's name for it, or else its first question's first 60 code points, cut at a"
+                    + " word boundary") String name,
+            @Schema(description = "Its version: a rename names it and raises it by one", format = "int64",
+                    minimum = "0") long version) {
+
+        static ConversationView of(Conversations.Opened opened) {
+            return new ConversationView(opened.id(), opened.campaignId(), opened.area().word(), opened.name(),
+                    opened.version());
+        }
+
+        @Override
+        public String toString() {
+            return "ConversationView[id=" + id + ", version=" + version + "]";
+        }
+    }
+
+    @Schema(name = "ConversationChange", requiredProperties = {"version", "name"},
+            description = "A rename of a conversation (contract 1.29.0)")
+    record ConversationChangeBody(
+            @Schema(description = "The version the rename was made on, as the conversation was read", format = "int64",
+                    minimum = "0", example = "0") Long version,
+            @Schema(description = "The new name, 1 to 120 code points after trimming", minLength = 1, maxLength = 120,
+                    example = "Viagem ao norte") String name) {
+
+        @Override
+        public String toString() {
+            return "ConversationChangeBody[version=" + version + "]";
+        }
+    }
+
+    @Schema(name = "StoredTurnEvent", requiredProperties = {"sequence", "type", "data"},
+            description = "A stored event of a turn, as its stream sends it (contract 1.29.0)")
+    record StoredEventView(
+            @Schema(description = "Its sequence: the stream's event id", format = "int64", minimum = "1") long sequence,
+            @Schema(description = "The stream's event name", allowableValues = {"delta", "citation", "tier", "done",
+                "error"}) String type,
+            @Schema(description = "The event's data, by its type, as the stream sends it; a done event's built when"
+                    + " read", oneOf = {DeltaEvent.class, CitationEvent.class, TierEvent.class, DoneEvent.class,
+                        ErrorEvent.class}) Map<String, Object> data) {
+
+        @Override
+        public String toString() {
+            return "StoredEventView[sequence=" + sequence + ", type=" + type + "]";
+        }
+    }
+
+    @Schema(name = "StoredTurn", requiredProperties = {"id", "question", "language", "createdAt", "events"},
+            description = "A turn of a conversation with its stored events (contract 1.29.0). A turn whose answer is"
+                    + " still being written has no done or error event yet: its stream continues after the last"
+                    + " sequence")
+    record StoredTurnView(
+            @Schema(format = "uuid") UUID id,
+            @Schema(description = "The GM's question") String question,
+            @Schema(description = "The question's language, null when unsure", types = {"string", "null"},
+                    allowableValues = {"pt-BR", "en"}) String language,
+            @Schema(format = "date-time") String createdAt,
+            @ArraySchema(arraySchema = @Schema(description = "Its stored events, by sequence"),
+                    schema = @Schema(implementation = StoredEventView.class)) List<StoredEventView> events) {
+
+        static StoredTurnView of(Conversations.StoredTurn turn) {
+            return new StoredTurnView(turn.id(), turn.question(), turn.language(), turn.createdAt().toString(),
+                    turn.events().stream().map(event -> new StoredEventView(event.sequence(), event.type(),
+                            JSON.convertValue(event.data(), OBJECT))).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "StoredTurnView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "ConversationTurns", requiredProperties = "items",
+            description = "A conversation's turns (contract 1.29.0)")
+    record TurnsView(
+            @ArraySchema(arraySchema = @Schema(description = "Its newest 200 turns, oldest first"),
+                    schema = @Schema(implementation = StoredTurnView.class)) List<StoredTurnView> items) {
     }
 
     @Schema(name = "Turn", requiredProperties = {"id", "conversationId", "language"})
@@ -331,9 +476,10 @@ class ConversationController {
     }
 
     @GetMapping(path = OF_CAMPAIGN, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getCampaignConversation", summary = "The campaign's conversation (a campaign has at most"
-            + " one) and how many questions it holds, for an archived campaign too; request.not_found (404) when the"
-            + " campaign has none or is not the account's (unknown, another account's or malformed)",
+    @Operation(operationId = "getCampaignConversation", summary = "The campaign's latest questions conversation (from"
+            + " contract 1.29.0 a campaign has many: the one a question with no conversation continues) and how many"
+            + " questions it holds, for an archived campaign too; request.not_found (404) when the campaign has none or"
+            + " is not the account's (unknown, another account's or malformed)",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<OfCampaignView> ofCampaign(
@@ -347,9 +493,14 @@ class ConversationController {
 
     @PostMapping(path = TURNS, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
-    @Operation(operationId = "askQuestion", summary = "Ask a question in the campaign's conversation: the turn and its"
-            + " answer job are recorded together (201); request.invalid (400) for a blank question or one past 4,000"
-            + " code points, request.not_found (404) for a campaign that is not the account's; nothing is recorded then",
+    @Operation(operationId = "askQuestion", summary = "Ask a question in one of the campaign's conversations: the turn"
+            + " and its answer job are recorded together (201). From contract 1.29.0: with conversationId, in that"
+            + " conversation; with area only, in a new conversation of that area (a conversation is made by its first"
+            + " question); with neither, in the campaign's latest questions conversation. The conversation's newest"
+            + " question becomes this one. request.invalid (400) for a blank question or one past 4,000 code points, an"
+            + " area that is not one, or an area other than the conversation's; request.not_found (404) for a campaign"
+            + " that is not the account's or a conversationId that is not one of its conversations; nothing is"
+            + " recorded then",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<TurnView> ask(
@@ -357,9 +508,103 @@ class ConversationController {
             @PathVariable("campaignId") String campaignId,
             @RequestBody NewTurn body) {
         UUID campaign = parse(campaignId).orElseThrow(ConversationProblems::notFound);
-        Conversations.Asked asked = conversations.ask(campaign, body == null ? null : body.question());
+        if (body == null) {
+            throw ConversationProblems.invalid();
+        }
+        Area area = body.area() == null ? null : Area.of(body.area()).orElseThrow(ConversationProblems::invalid);
+        UUID conversation = body.conversationId() == null ? null
+                : parse(body.conversationId()).orElseThrow(ConversationProblems::notFound);
+        Conversations.Asked asked = conversations.ask(campaign, body.question(), conversation, area);
         return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
                 .body(new TurnView(asked.turnId(), asked.conversationId(), asked.language()));
+    }
+
+    @GetMapping(path = CONVERSATIONS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listConversations", summary = "The campaign's conversations of one area (contract 1.29.0),"
+            + " the most recently asked first, each with its name and question count. A page starts at an offset and"
+            + " names the total of the list. A conversation is made by its first question, so none is empty."
+            + " request.invalid (400) without an area or for one that is not one, a limit outside 1 to 50, or an offset"
+            + " outside 0 to 100000; request.not_found (404) for a campaign that is not the account's (unknown, another"
+            + " account's or malformed)",
+            parameters = {
+                @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "area", in = ParameterIn.QUERY, required = true, description = "The area listed",
+                        schema = @Schema(type = "string", allowableValues = {"questions", "rules"})),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the most recently"
+                        + " asked to skip, 0 to 100000", schema = @Schema(type = "integer", format = "int32",
+                                minimum = "0", maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<PageView> list(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(hidden = true) @RequestParam(value = "area", required = false) String area,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        Area listed = Area.of(area).orElseThrow(ConversationProblems::invalid);
+        int size = limit(limit);
+        int from = offset(offset);
+        Conversations.Page page = parse(campaignId).flatMap(campaign -> conversations.list(campaign, listed, from, size))
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new PageView(
+                page.items().stream().map(SummaryView::of).toList(),
+                page.nextOffset() == null ? null : page.nextOffset().toString(), page.total()));
+    }
+
+    @GetMapping(path = CONVERSATION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getConversation", summary = "One of the account's conversations (contract 1.29.0): its"
+            + " campaign, area, name and version; request.not_found (404) for any other id (unknown, another account's,"
+            + " malformed, or of a campaign being deleted)",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<ConversationView> conversation(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId) {
+        Conversations.Opened opened = parse(conversationId).flatMap(conversations::conversation)
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ConversationView.of(opened));
+    }
+
+    @GetMapping(path = CONVERSATION_TURNS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listConversationTurns", summary = "A conversation's turns (contract 1.29.0): its newest"
+            + " 200, oldest first, each with its question, language and stored events as its stream sends them (a"
+            + " done event's data built when read, so removed is as of then). A turn still being answered has no done"
+            + " or error event yet; its stream continues after its last sequence. request.not_found (404) for a"
+            + " conversation that is not the account's",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<TurnsView> turns(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId) {
+        List<Conversations.StoredTurn> turns = parse(conversationId).flatMap(conversations::turns)
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(new TurnsView(turns.stream().map(StoredTurnView::of).toList()));
+    }
+
+    @PatchMapping(path = CONVERSATION, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "renameConversation", summary = "Renames one of the account's conversations on the version"
+            + " it names (contract 1.29.0): the conversation as stored, its version raised by one."
+            + " request.conversation_name_invalid (400) for a name outside 1 to 120 code points after trimming (params"
+            + " min and max), request.stale_version (409) when the conversation has left that version, request.invalid"
+            + " (400) without a version or for a malformed body, request.not_found (404) for any other id; nothing"
+            + " changes then",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<ConversationView> rename(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId,
+            @RequestBody ConversationChangeBody body) {
+        UUID id = parse(conversationId).orElseThrow(ConversationProblems::notFound);
+        if (body == null || body.version() == null || body.version() < 0) {
+            throw ConversationProblems.invalid();
+        }
+        Conversations.Opened renamed = conversations.rename(id, body.version(), body.name())
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ConversationView.of(renamed));
     }
 
     @GetMapping(path = EVENTS)
@@ -561,6 +806,28 @@ class ConversationController {
             @PathVariable("searchId") String searchId) {
         Searches.Found found = parse(searchId).flatMap(searches::find).orElseThrow(ConversationProblems::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(SearchView.of(found));
+    }
+
+    /** A page's size: {@value Conversations#DEFAULT_LIMIT} without one, else 1 to 50, or {@code request.invalid}. */
+    private static int limit(String limit) {
+        if (limit == null) {
+            return Conversations.DEFAULT_LIMIT;
+        }
+        if (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Conversations.MAX_LIMIT) {
+            throw ConversationProblems.invalid();
+        }
+        return Integer.parseInt(limit);
+    }
+
+    /** The position a page starts at: 0 without one, else 0 to 100000, or {@code request.invalid}. */
+    private static int offset(String offset) {
+        if (offset == null) {
+            return 0;
+        }
+        if (!OFFSET_TEXT.matcher(offset).matches() || Integer.parseInt(offset) > Conversations.MAX_OFFSET) {
+            throw ConversationProblems.invalid();
+        }
+        return Integer.parseInt(offset);
     }
 
     /** A malformed number is no different from an unknown one. */
