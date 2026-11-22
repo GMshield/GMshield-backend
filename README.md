@@ -1039,8 +1039,10 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     `request.not_found`.
   - **History (internal 1.16.0).** `AnswerJobs.input` adds `history: [{question, answer}]` after
     `Scopes.questionInput` (whose `textInput`, shared with the search input, is unchanged): the last 6 turns before
-    this one in its conversation that ended `done` and were not stopped (`Conversations.history`), oldest first, each
-    answer its joined `delta` texts (they hold no citation marker) cut at 4,000 code points; `[]` for a first question.
+    this one in its conversation that ended `done` and were neither stopped nor (Story 3.11) dismissed
+    (`Conversations.history`), built for each claim (so a claim already made keeps what it was given), oldest first,
+    each answer its joined `delta` texts (they hold no citation marker) cut at 4,000 code points; `[]` for a first
+    question.
     Retrieval still reads the question alone, and the history is never a source: the worker puts it inside the
     document delimiter as escaped data and never gives its ids. The line `conversation.history_read` carries the count
     only.
@@ -1098,6 +1100,31 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     ```
     The second statement drops the record the old sweep ended without removing anything: a deletion is recorded once
     per target, so it would otherwise answer a new delete of the conversation as not found.
+
+- **Dismiss an answer (`conversations`, Story 3.11, public contract 1.31.0, migration V32, FR-31).** The GM removes an
+  answer they do not want from the conversation, with an undo. No list of dismissed answers.
+  - `V32__turn_dismissal.sql`: `turn.dismissed_at timestamptz` (null: shown). Additive: the previous release neither
+    reads nor writes it.
+  - `PUT /api/v1/turns/{id}/dismissal` (`dismissTurn`) answers 204 and sets `dismissed_at` when it is null;
+    `DELETE /api/v1/turns/{id}/dismissal` (`restoreTurn`) answers 204 and clears it. Both are safe to repeat, and
+    neither moves the conversation's version or `last_asked_at`. Only an ended turn is dismissed (`stopped_at` set, or
+    its last stored event `done` or `error`): otherwise 409 `conversation.turn_running` and nothing changes. Another
+    account's turn, an unknown or malformed id and a turn of a deleting conversation are 404 `request.not_found` on
+    both routes (`Conversations.shown`).
+  - `TurnEntity.dismissedAt` is mapped `updatable = false`: only the store's JPQL bulk updates
+    (`JpaConversationStore.markDismissed`, `clearDismissed`, each after the owner's row was read) write it, so a stop's
+    full-row flush of a turn loaded before a dismissal committed never undoes it (`ConversationStateIntegrationTest`).
+  - From the dismissal's commit: `newestTurns` (so `/turns` and `Conversations.history`), `turnCount` and `turnCounts`
+    (the list's `questions`, `GET /campaigns/{id}/conversation` and `/deletion`) take shown turns only. The history is
+    built for each claim of a question's job (a lapsed claim re-offered builds it again), so a claim already made keeps
+    the history it was given. Unchanged: the default name (`firstTurns` still takes the first
+    question, dismissed or not, so a name never changes on its own), the turn's own routes (events, stop, references
+    and their pages), and the conversation's deletion (`turnsOf` takes every turn).
+  - Lines `conversation.turn_dismissed` and `conversation.turn_restored` carry the owner, the turn and whether it
+    changed.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.31.0). The worker and
+    the internal contract (1.16.0) do not change. After a rollback every dismissed turn shows again and is sent as
+    history again; rolling forward hides them again.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

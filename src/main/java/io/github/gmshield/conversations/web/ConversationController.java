@@ -36,6 +36,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -56,7 +57,9 @@ import tools.jackson.databind.json.JsonMapper;
  * (paged by offset, the most recently asked first), one conversation, its stored turns with their events, its rename on
  * its version, and a question that continues a conversation or starts one in an area. From Story 3.10 part B, what goes
  * with a conversation (its question count) and its deletion (202, no body): from then on it and its turns are
- * {@code request.not_found} on every route.
+ * {@code request.not_found} on every route. From Story 3.11, the GM's dismissal of an ended turn (PUT) and its undo
+ * (DELETE) on {@code /turns/{turnId}/dismissal}: a dismissed turn is left out of its conversation's turns, its question
+ * counts and the history sent with a later question.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -69,6 +72,7 @@ class ConversationController {
     static final String OF_CAMPAIGN = "/api/v1/campaigns/{campaignId}/conversation";
     static final String EVENTS = "/api/v1/turns/{turnId}/events";
     static final String STOP = "/api/v1/turns/{turnId}/stop";
+    static final String DISMISSAL = "/api/v1/turns/{turnId}/dismissal";
     static final String REFERENCE_PAGE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}";
     static final String REFERENCE_PICTURE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture";
     static final String SOURCE_PAGE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}";
@@ -129,7 +133,8 @@ class ConversationController {
             description = "A campaign's conversation (contract 1.19.0)")
     record OfCampaignView(
             @Schema(description = "The conversation's id", format = "uuid") UUID id,
-            @Schema(description = "How many questions it holds", format = "int64", minimum = "0", example = "3")
+            @Schema(description = "How many questions it shows (from contract 1.31.0 a dismissed one is not counted)",
+                    format = "int64", minimum = "0", example = "3")
             long questions) {
     }
 
@@ -174,7 +179,8 @@ class ConversationController {
             @Schema(allowableValues = {"questions", "rules"}) String area,
             @Schema(description = "The GM's name for it, or else its first question's first 60 code points, cut at a"
                     + " word boundary") String name,
-            @Schema(description = "How many questions it holds", format = "int64", minimum = "1", example = "3")
+            @Schema(description = "How many questions it shows: from contract 1.31.0 a dismissed one is not counted, so"
+                    + " it may be 0", format = "int64", minimum = "0", example = "3")
             long questions,
             @Schema(description = "When its first question was asked", format = "date-time") String createdAt,
             @Schema(description = "When its newest question was asked", format = "date-time") String lastAskedAt,
@@ -229,8 +235,9 @@ class ConversationController {
     @Schema(name = "ConversationDeletion", requiredProperties = "questions",
             description = "What goes with a conversation if it is deleted (contract 1.30.0)")
     record ConversationDeletionView(
-            @Schema(description = "How many questions it holds: each goes with its answer, events and source"
-                    + " references", format = "int64", minimum = "0", example = "3") long questions) {
+            @Schema(description = "How many questions it shows (from contract 1.31.0 a dismissed one is not counted,"
+                    + " though it goes too): each goes with its answer, events and source references", format = "int64",
+                    minimum = "0", example = "3") long questions) {
     }
 
     @Schema(name = "ConversationChange", requiredProperties = {"version", "name"},
@@ -532,8 +539,9 @@ class ConversationController {
 
     @GetMapping(path = CONVERSATIONS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listConversations", summary = "The campaign's conversations of one area (contract 1.29.0),"
-            + " the most recently asked first, each with its name and question count. A page starts at an offset and"
-            + " names the total of the list. A conversation is made by its first question, so none is empty."
+            + " the most recently asked first, each with its name and question count (from contract 1.31.0 dismissed"
+            + " questions are not counted). A page starts at an offset and names the total of the list. A conversation"
+            + " is made by its first question, so none is empty, though all its questions may be dismissed."
             + " request.invalid (400) without an area or for one that is not one, a limit outside 1 to 50, or an offset"
             + " outside 0 to 100000; request.not_found (404) for a campaign that is not the account's (unknown, another"
             + " account's or malformed)",
@@ -582,8 +590,9 @@ class ConversationController {
     @Operation(operationId = "listConversationTurns", summary = "A conversation's turns (contract 1.29.0): its newest"
             + " 200, oldest first, each with its question, language and stored events as its stream sends them (a"
             + " done event's data built when read, so removed is as of then). A turn still being answered has no done"
-            + " or error event yet; its stream continues after its last sequence. request.not_found (404) for a"
-            + " conversation that is not the account's",
+            + " or error event yet; its stream continues after its last sequence. From contract 1.31.0 a dismissed turn"
+            + " is left out (the 200 are the newest shown ones). request.not_found (404) for a conversation that is not"
+            + " the account's",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<TurnsView> turns(
@@ -620,8 +629,9 @@ class ConversationController {
 
     @GetMapping(path = CONVERSATION_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getConversationDeletion", summary = "What goes with one of the account's conversations if"
-            + " it is deleted (contract 1.30.0): how many questions it holds, each with its answer. request.not_found"
-            + " (404) for any other id (unknown, another account's, malformed, or of a conversation or campaign being"
+            + " it is deleted (contract 1.30.0): how many questions it shows, each with its answer (from contract"
+            + " 1.31.0 a dismissed one is not counted, though it is deleted too). request.not_found (404) for any other"
+            + " id (unknown, another account's, malformed, or of a conversation or campaign being"
             + " deleted)",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -696,6 +706,45 @@ class ConversationController {
             @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("turnId") String turnId) {
         conversations.stop(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    private static final String DISMISSAL_NOT_FOUND = " request.not_found (404) for a turn that is not the account's"
+            + " (unknown, another account's or malformed) or of a conversation being deleted; nothing changes then."
+            + " Neither the conversation's version nor its newest question's time moves";
+
+    @PutMapping(path = DISMISSAL)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "dismissTurn", summary = "Dismiss the turn's answer (contract 1.31.0; 204): from now on the"
+            + " turn, with its question and answer, is left out of its conversation's turns and question counts and is"
+            + " never sent as history to a later question; its own events, references and reference pages still"
+            + " answer, and the conversation's default name stays its first question's. Only an ended turn (stopped,"
+            + " or with a done or error event) is dismissed: conversation.turn_running (409) otherwise, and nothing"
+            + " changes. A turn dismissed already stays as it is (204 too), so repeating it is safe."
+            + DISMISSAL_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The turn is dismissed"))
+    ResponseEntity<Void> dismiss(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.dismiss(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = DISMISSAL)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "restoreTurn", summary = "Undo the dismissal of the turn's answer (contract 1.31.0; 204):"
+            + " the turn is shown again where it was, listed with its conversation's turns, counted, and sent as"
+            + " history again. A turn that is shown already stays as it is (204 too), so repeating it is safe."
+            + DISMISSAL_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The turn is shown"))
+    ResponseEntity<Void> restore(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.restore(parse(turnId).orElseThrow(ConversationProblems::notFound));
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 

@@ -20,7 +20,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * The conversation tables in memory, for tests that run without PostgreSQL. Like Hibernate's {@code @TenantId}, it sees
  * the rows of the {@link OwnerContext}'s owner only; like the tables, a (claim, batch) is unique. A write undoes itself
  * when its transaction rolls back. A conversation's state (Story 3.10 part B) is kept beside its row: {@link #deleting}
- * holds the ids of the deleting ones, and every read but the deletion's own skips them.
+ * holds the ids of the deleting ones, and every read but the deletion's own skips them. A dismissed turn (Story 3.11)
+ * is left out of {@link #newestTurns}, {@link #turnCount} and {@link #turnCounts}, as the JPA store leaves it out.
  */
 public class InMemoryConversationStore implements ConversationStore {
 
@@ -76,14 +77,14 @@ public class InMemoryConversationStore implements ConversationStore {
     @Override
     public Map<UUID, Long> turnCounts(Collection<UUID> conversationIds) {
         Map<UUID, Long> counts = new HashMap<>();
-        owned(turns).filter(row -> conversationIds.contains(row.conversationId()))
+        owned(turns).filter(row -> conversationIds.contains(row.conversationId()) && row.dismissedAt() == null)
                 .forEach(row -> counts.merge(row.conversationId(), 1L, Long::sum));
         return counts;
     }
 
     @Override
     public List<TurnRow> newestTurns(UUID conversationId, int limit) {
-        List<TurnRow> all = turnsOf(conversationId);
+        List<TurnRow> all = turnsOf(conversationId).stream().filter(row -> row.dismissedAt() == null).toList();
         return new ArrayList<>(all.subList(Math.max(0, all.size() - limit), all.size()));
     }
 
@@ -141,7 +142,8 @@ public class InMemoryConversationStore implements ConversationStore {
 
     @Override
     public long turnCount(UUID conversationId) {
-        return owned(turns).filter(row -> row.conversationId().equals(conversationId)).count();
+        return owned(turns).filter(row -> row.conversationId().equals(conversationId) && row.dismissedAt() == null)
+                .count();
     }
 
     @Override
@@ -169,6 +171,32 @@ public class InMemoryConversationStore implements ConversationStore {
         TurnRow before = found.get();
         ownerFor(before.ownerId());
         turns.put(turnId, before.stopped(at));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
+    }
+
+    @Override
+    public synchronized boolean markDismissed(UUID turnId, Instant at) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || found.get().dismissedAt() != null) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.dismissed(at));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
+    }
+
+    @Override
+    public synchronized boolean clearDismissed(UUID turnId) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || found.get().dismissedAt() == null) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.dismissed(null));
         RollbackUndo.onRollback(() -> turns.put(turnId, before));
         return true;
     }

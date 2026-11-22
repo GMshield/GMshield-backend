@@ -13,6 +13,10 @@ import org.hibernate.annotations.TenantId;
  * {@code turn}: written once, but for {@code stopped_at}, set once by the GM's stop (Story 2.6). Hibernate fills
  * {@code owner_id} and filters every query by it. From Story 3.5 it freezes the other tier's switch too; the materials
  * switched off are {@link TurnMaterialOffEntity} rows.
+ *
+ * <p>Story 3.11 (V32): {@code dismissed_at} is mapped not updatable: only the store's bulk updates
+ * ({@code JpaConversationStore#markDismissed}, {@code #clearDismissed}) change it, so a stop's flush of this entity
+ * (loaded before a dismissal committed) never writes it back to null.
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -56,6 +60,9 @@ class TurnEntity {
     @Column(name = "stopped_at")
     private Instant stoppedAt;
 
+    @Column(name = "dismissed_at", updatable = false)
+    private Instant dismissedAt;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -73,6 +80,7 @@ class TurnEntity {
         this.modelKnowledge = row.modelKnowledge();
         this.createdAt = row.createdAt();
         this.stoppedAt = row.stoppedAt();
+        this.dismissedAt = row.dismissedAt();
     }
 
     void stop(Instant at) {
@@ -82,7 +90,7 @@ class TurnEntity {
     /** The row, with the materials switched off frozen with it (read from {@code turn_material_off}). */
     TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt);
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt);
     }
 
     UUID id() {

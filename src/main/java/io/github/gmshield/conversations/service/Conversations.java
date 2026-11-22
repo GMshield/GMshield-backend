@@ -90,8 +90,8 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@value #DEFAULT_NAME} code points cut at a word boundary. A conversation is the owner's only while its campaign
  *       is: another owner's, an unknown one and one of a campaign being deleted are all empty.</li>
  *   <li>{@link #history} (Story 3.10): the earlier turns of a turn's conversation that reach the model as data: the
- *       last {@value #HISTORY_TURNS} before it that ended {@code done} and were not stopped, oldest first, each answer
- *       its joined delta texts cut at {@value #HISTORY_ANSWER} code points.</li>
+ *       last {@value #HISTORY_TURNS} before it that ended {@code done} and were neither stopped nor (Story 3.11)
+ *       dismissed, oldest first, each answer its joined delta texts cut at {@value #HISTORY_ANSWER} code points.</li>
  *   <li>Story 3.10 part B, deleting a conversation. {@link #deletion} counts what goes (its questions);
  *       {@link #delete} starts the recorded, resumable deletion of {@link SystemDeletion#deleteConversation}, whose
  *       conversations part ({@link SystemConversationsDeletion}) marks it {@code deleting} and cancels its answer jobs in
@@ -101,6 +101,16 @@ import tools.jackson.databind.node.ObjectNode;
  *       turns ({@link #turn}, {@link #eventsAfter}, {@link #stop}, {@link #referencePage}, {@link #referencePicture}).
  *       The delete cancels its answer jobs, which ends their claims; a job call already under way when the
  *       conversation turned deleting still reads it ({@link #storedEvents}, {@link #history}) and ends normally.</li>
+ *   <li>Story 3.11, dismissing an answer. {@link #dismiss} records the GM's dismissal of an ended turn of the owner
+ *       (stopped, or with a {@code done} or {@code error} event; else {@code conversation.turn_running}, nothing
+ *       changes), {@link #restore} undoes it; both are safe to repeat, {@code request.not_found} for a turn that is not
+ *       the owner's or is of a deleting conversation, and neither changes the conversation's version or last question
+ *       time. From the dismissal's commit the turn, with its question and answer, is left out of {@link #history},
+ *       {@link #turns}, the question counts of {@link #list}, {@link #ofCampaign} and {@link #deletion}. The default
+ *       name stays the first question's, dismissed or not; the turn's own routes ({@link #turn},
+ *       {@link #eventsAfter}, {@link #references}, {@link #referencePage}) still answer; and deleting the conversation
+ *       removes it too. The history is built for each claim of a question's job, so a claim already made keeps the
+ *       history it was given.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -300,7 +310,7 @@ public class Conversations {
             JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
-                    settings.modelKnowledge(), settings.materialsOff(), now, null)));
+                    settings.modelKnowledge(), settings.materialsOff(), now, null, null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
                     .addKeyValue("turnId", turnId)
@@ -545,6 +555,46 @@ public class Conversations {
                     .log("conversation.turn_stopped");
             return stopped;
         });
+    }
+
+    /** Dismisses the owner's ended turn (Story 3.11), as the class says. */
+    public void dismiss(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
+                    .orElseThrow(ConversationProblems::notFound);
+            if (turn.dismissedAt() != null) {
+                return false;
+            }
+            // A turn that has ended never runs again, so no lock is needed: one seen ended stays ended.
+            if (!ended(turn)) {
+                throw ConversationProblems.turnRunning();
+            }
+            return store.markDismissed(turn.id(), now());
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.turn_dismissed");
+    }
+
+    /** Shows the owner's dismissed turn again (Story 3.11), as the class says. */
+    public void restore(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
+                    .orElseThrow(ConversationProblems::notFound);
+            return turn.dismissedAt() != null && store.clearDismissed(turn.id());
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.turn_restored");
+    }
+
+    /** Whether the turn has ended (Story 3.11): stopped, or its last stored event is {@code done} or {@code error}. */
+    private boolean ended(TurnRow turn) {
+        if (turn.stoppedAt() != null) {
+            return true;
+        }
+        long last = store.lastSequence(turn.id());
+        return last > 0 && storedEvents(turn.id(), last - 1).stream().anyMatch(TurnEvent::last);
     }
 
     /**

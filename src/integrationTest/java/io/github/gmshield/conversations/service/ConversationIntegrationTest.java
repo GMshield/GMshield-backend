@@ -62,6 +62,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * question's history. On Postgres too: the list most recently asked first (also when that differs from the order they
  * were made), an offset, an area-less question continuing the most recently asked conversation, the newest 200 turns
  * oldest first, and a rename whose row moved after it was read refused at the flush.
+ * Story 3.11 (V32): a dismissed turn left out of the conversation's turns, its question counts and the next claim's
+ * history, a second dismissal keeping the first time, and the undo putting it back.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -532,6 +534,86 @@ class ConversationIntegrationTest {
     }
 
     @Test
+    void aDismissedTurnLeavesTheTurnsTheCountsAndTheHistoryOnPostgresUntilItsUndo() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Conversations.Asked first = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 1?", null,
+                Area.QUESTIONS));
+        UUID conversation = first.conversationId();
+        answer(first.turnId(), "Resposta 1.");
+        UUID second = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 2?", conversation, null))
+                .turnId();
+        answer(second, "Resposta 2.");
+        UUID third = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 3?", conversation, null))
+                .turnId();
+        answer(third, "Resposta 3.");
+
+        OwnerContext.runAs(owner, () -> conversations.dismiss(second));
+
+        // Left out of the turns, every count and the next question's history.
+        assertThat(as(owner, () -> conversations.turns(conversation)).orElseThrow())
+                .extracting(Conversations.StoredTurn::id).containsExactly(first.turnId(), third);
+        assertQuestions(owner, campaign, conversation, 2);
+        UUID fourth = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 4?", conversation, null))
+                .turnId();
+        assertThat(historyOf(fourth)).containsExactly("Pergunta 1?", "Pergunta 3?");
+
+        // Twice: the first dismissal's time is kept.
+        Instant dismissedAt = dismissedAt(second);
+        assertThat(dismissedAt).isNotNull();
+        OwnerContext.runAs(owner, () -> conversations.dismiss(second));
+        assertThat(dismissedAt(second)).isEqualTo(dismissedAt);
+
+        // The undo: listed, counted and in the history again.
+        OwnerContext.runAs(owner, () -> conversations.restore(second));
+        assertThat(dismissedAt(second)).isNull();
+        assertThat(as(owner, () -> conversations.turns(conversation)).orElseThrow())
+                .extracting(Conversations.StoredTurn::id).containsExactly(first.turnId(), second, third, fourth);
+        assertQuestions(owner, campaign, conversation, 4);
+        UUID fifth = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Pergunta 5?", conversation, null))
+                .turnId();
+        assertThat(historyOf(fifth)).containsExactly("Pergunta 1?", "Pergunta 2?", "Pergunta 3?");
+    }
+
+    /** Claims the turn's job, posts {@code text} as its answer and reports it done. */
+    private void answer(UUID turnId, String text) {
+        UUID job = jdbc.sql("select job_id from turn where id = :id").param("id", turnId).query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(job, null, List.of("azure-openai"));
+        claims.events(job, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1,
+                List.of(JobEvent.delta(text))), List.of());
+        claims.report(job, claim.claimId(), claim.grant(), "done", null, null);
+    }
+
+    /** The questions of the history the claim of the turn's job is given. */
+    private List<String> historyOf(UUID turnId) {
+        UUID job = jdbc.sql("select job_id from turn where id = :id").param("id", turnId).query(UUID.class).single();
+        List<String> questions = new java.util.ArrayList<>();
+        claims.claim(job, null, List.of("azure-openai")).input().path("history")
+                .forEach(item -> questions.add(item.path("question").asString()));
+        return questions;
+    }
+
+    private Instant dismissedAt(UUID turnId) {
+        java.time.OffsetDateTime at = jdbc.sql("select dismissed_at from turn where id = :id").param("id", turnId)
+                .query(java.time.OffsetDateTime.class).list().getFirst();
+        return at == null ? null : at.toInstant();
+    }
+
+    /** The conversation's question count in its list, as the campaign's conversation, and in its deletion preview. */
+    private void assertQuestions(UUID owner, UUID campaign, UUID conversation, long questions) {
+        assertThat(as(owner, () -> conversations.list(campaign, Area.QUESTIONS, 0, 20)).orElseThrow().items())
+                .filteredOn(item -> item.id().equals(conversation)).extracting(Conversations.Summary::questions)
+                .containsExactly(questions);
+        Conversations.OfCampaign ofCampaign = as(owner, () -> conversations.ofCampaign(campaign)).orElseThrow();
+        assertThat(ofCampaign.id()).isEqualTo(conversation);
+        assertThat(ofCampaign.questions()).isEqualTo(questions);
+        assertThat(as(owner, () -> conversations.deletion(conversation)).orElseThrow()).isEqualTo(questions);
+    }
+
+    @Test
     void theListIsMostRecentlyAskedFirstOnPostgresAndAnAreaLessQuestionContinuesTheMostRecentlyAskedOne() {
         UUID owner = Ids.newId();
         UUID campaign = as(owner, () -> {
@@ -574,7 +656,7 @@ class ConversationIntegrationTest {
                 UUID turnId = Ids.newId();
                 store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
                         Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
-                        java.util.Set.of(), start.plusSeconds(number), null));
+                        java.util.Set.of(), start.plusSeconds(number), null, null));
                 ids.add(turnId);
             }
             return ids;
