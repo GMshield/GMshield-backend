@@ -43,6 +43,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <ul>
  *   <li>{@link #readyOfCampaign} and {@link #readyOfSystem}: the ids of the {@code ready} versions of the materials of a
  *       campaign ({@code material.campaign_id}), or that belong to a game system ({@code material_system}).</li>
+ *   <li>{@link #readySourcesOfCampaign}, {@link #readySourcesOfSystem} and {@link #readySourcesOfOwner} (Story 3.5):
+ *       the same {@code ready} versions, and every {@code ready} version of the owner, each with its material, so the
+ *       resolver can switch single materials off and work out the other tier. {@link #materialLabels}: the names
+ *       (decrypted) and creation times of the owner's materials with these ids.</li>
  *   <li>{@link #pendingPassages}: the ids of the passages of these versions that are not indexed: their index change
  *       has not ended ({@link IndexChanges#unended}), or its job failed ({@link IndexChanges#failed}; a failed run stays
  *       in the keyword fallback until a retry indexes it). A cancelled run is neither. The unended runs' passages
@@ -151,6 +155,20 @@ public class ScopeReads {
         }
     }
 
+    /** A {@code ready} version and its material (Story 3.5). */
+    @NamedInterface("service")
+    public record ReadySource(UUID versionId, UUID materialId) {
+    }
+
+    /** A material's name and when it was made (Story 3.5). {@code toString} names the id only. */
+    @NamedInterface("service")
+    public record MaterialLabel(UUID id, String name, java.time.Instant createdAt) {
+        @Override
+        public String toString() {
+            return "MaterialLabel[id=" + id + "]";
+        }
+    }
+
     /** A text line of a picture page and its box, {@code [left, top, right, bottom]} as fractions of the picture. */
     @NamedInterface("service")
     public record PageLine(String text, List<Double> box) {
@@ -215,6 +233,46 @@ public class ScopeReads {
     /** The ids of the owner's {@code ready} versions of the materials that belong to the game system, oldest first. */
     public List<UUID> readyOfSystem(UUID systemId) {
         return reading(() -> ids(materials.readyOfSystem(systemId)));
+    }
+
+    /** The owner's {@code ready} versions of the campaign's materials, each with its material, oldest first. */
+    public List<ReadySource> readySourcesOfCampaign(UUID campaignId) {
+        return reading(() -> sources(materials.readyOfCampaign(campaignId)));
+    }
+
+    /** The owner's {@code ready} versions of the game system's materials, each with its material, oldest first. */
+    public List<ReadySource> readySourcesOfSystem(UUID systemId) {
+        return reading(() -> sources(materials.readyOfSystem(systemId)));
+    }
+
+    /** Every {@code ready} version of the owner, each with its material, oldest first. */
+    public List<ReadySource> readySourcesOfOwner() {
+        return reading(() -> sources(materials.readyOfOwner()));
+    }
+
+    /**
+     * The owner's materials with these ids, each once with its name decrypted, in the order given; an id that is not
+     * the owner's material is left out.
+     */
+    public List<MaterialLabel> materialLabels(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return reading(() -> {
+            List<MaterialLabel> labels = new ArrayList<>();
+            for (UUID id : new LinkedHashSet<>(materialIds)) {
+                materials.findMaterial(id).ifPresent(row -> labels.add(new MaterialLabel(row.id(),
+                        vault.decryptText(new Binding(Uploads.MATERIAL, Uploads.FIELD_NAME, row.id(), row.ownerId()),
+                                row.name()), row.createdAt())));
+            }
+            return List.copyOf(labels);
+        });
+    }
+
+    private static List<ReadySource> sources(List<VersionRow> versions) {
+        Set<UUID> seen = new HashSet<>();
+        return versions.stream().filter(version -> seen.add(version.id()))
+                .map(version -> new ReadySource(version.id(), version.materialId())).toList();
     }
 
     /**

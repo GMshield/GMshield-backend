@@ -40,7 +40,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * The GM's conversation (Story 2.4): the current conversation, a new turn, a turn's answer as server-sent events, and
  * the GM's stop of an answer (Story 2.6), and from Story 2.7 a page of the version a stored source reference names, as
  * JSON with the same shape as {@code MaterialPageView}, and its picture, streamed as WebP with {@code nosniff}. From
- * Story 3.2, a campaign's conversation with its question count.
+ * Story 3.2, a campaign's conversation with its question count. From Story 3.5, a page of a version on the ground "the
+ * current scope" (an allowed source of the campaign's current stored scope), and its picture, in the same shapes.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -55,6 +56,8 @@ class ConversationController {
     static final String STOP = "/api/v1/turns/{turnId}/stop";
     static final String REFERENCE_PAGE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}";
     static final String REFERENCE_PICTURE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture";
+    static final String SOURCE_PAGE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}";
+    static final String SOURCE_PICTURE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture";
     static final String WEBP = "image/webp";
     /** A reference or page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is nowhere. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
@@ -356,6 +359,10 @@ class ConversationController {
         SourcePicture picture = parse(turnId).flatMap(turn -> number(number).flatMap(reference -> number(page)
                         .flatMap(wanted -> conversations.referencePicture(turn, reference, wanted))))
                 .orElseThrow(ConversationProblems::notFound);
+        writePicture(picture, response);
+    }
+
+    private static void writePicture(SourcePicture picture, HttpServletResponse response) throws IOException {
         response.setStatus(HttpStatus.OK.value());
         response.setContentType(WEBP);
         response.setContentLengthLong(picture.size());
@@ -364,6 +371,57 @@ class ConversationController {
         try (OutputStream out = response.getOutputStream()) {
             picture.writeTo(out);
         }
+    }
+
+    private static final String SOURCE_SUMMARY = " The ground is the path: the campaign's current scope (Story 3.5), as"
+            + " its stored settings resolve it now; the version must be an allowed source of it (the ready version of a"
+            + " material switched on in a tier switched on). Any page from 1 to its page total. request.not_found (404)"
+            + " for a campaign that is not the account's, a malformed id or number, a version outside that scope"
+            + " (another account's, unknown, not ready, or switched off: none is told apart), a page outside 1 to the"
+            + " page total, or a page with no view (unless it is unreadable)";
+
+    @GetMapping(path = SOURCE_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getScopeSourcePage", summary = "One page of a version in the campaign's current scope:"
+            + " the same shape as MaterialPageView, for a search result." + SOURCE_SUMMARY,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "200", description = "The page",
+                    content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
+                            schema = @Schema(ref = "#/components/schemas/MaterialPageView"))))
+    ResponseEntity<ReferencePageView> sourcePage(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The material version's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("versionId") String versionId,
+            @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer", format = "int32",
+                    minimum = "1")) @PathVariable("page") String page) {
+        SourcePage found = parse(campaignId).flatMap(campaign -> parse(versionId).flatMap(version -> number(page)
+                        .flatMap(wanted -> conversations.sourcePage(campaign, version, wanted))))
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ReferencePageView.of(found));
+    }
+
+    // No `produces`: a refusal is problem JSON, which an image's Accept would otherwise turn into a 406.
+    @GetMapping(path = SOURCE_PICTURE)
+    @Operation(operationId = "getScopeSourcePagePicture", summary = "The picture of one page of a version in the"
+            + " campaign's current scope, as WebP, streamed. request.not_found (404) also for a page with no picture."
+            + SOURCE_SUMMARY,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "200", description = "The page's picture",
+                    content = @Content(mediaType = WEBP, schema = @Schema(type = "string", format = "binary"))))
+    void sourcePicture(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The material version's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("versionId") String versionId,
+            @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer", format = "int32",
+                    minimum = "1")) @PathVariable("page") String page,
+            @Parameter(hidden = true) HttpServletResponse response) throws IOException {
+        SourcePicture picture = parse(campaignId).flatMap(campaign -> parse(versionId).flatMap(version -> number(page)
+                        .flatMap(wanted -> conversations.sourcePicture(campaign, version, wanted))))
+                .orElseThrow(ConversationProblems::notFound);
+        writePicture(picture, response);
     }
 
     /** A malformed number is no different from an unknown one. */

@@ -802,6 +802,13 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> readyOfOwner() {
+        return em().createQuery("select v from MaterialVersion v where v.state = :state order by v.createdAt, v.id",
+                        MaterialVersionEntity.class)
+                .setParameter("state", READY).getResultList().stream().map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
     public List<VersionRow> readyOfSystem(UUID systemId) {
         return em().createQuery("select v from MaterialVersion v join MaterialSystem s on s.materialId = v.materialId"
                         + " where s.systemId = :system and v.state = :state order by v.createdAt, v.id",

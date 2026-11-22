@@ -425,7 +425,9 @@ class ScopedPassagesFlowTest extends HttpTestSupport {
             assertThat(input.path("question").asString()).isEqualTo(question);
             assertThat(input.path("owner").asString()).isEqualTo(owner.toString());
             JsonNode tiers = input.path("tiers");
-            assertThat(tiers.size()).isEqualTo(2);
+            assertThat(tiers.size()).isEqualTo(3);
+            assertThat(tiers.get(2).path("tier").asString()).isEqualTo("other");
+            assertThat(tiers.get(2).path("sources").isEmpty()).isTrue();
             assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
             assertThat(tiers.get(0).path("sources")).extracting(JsonNode::asString).containsExactly(lib.a().toString());
             assertThat(tiers.get(0).path("pending")).extracting(JsonNode::asString)

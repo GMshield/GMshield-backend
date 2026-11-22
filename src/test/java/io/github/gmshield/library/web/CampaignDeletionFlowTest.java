@@ -146,6 +146,8 @@ class CampaignDeletionFlowTest {
     @Autowired
     private InMemoryJobStorage jobs;
     @Autowired
+    private io.github.gmshield.scope.data.InMemoryScopeStore scopes;
+    @Autowired
     private InMemoryJobStream stream;
     @Autowired
     private SystemDeletion deletion;
@@ -194,6 +196,13 @@ class CampaignDeletionFlowTest {
         Made ofSibling = material(gm, sibling, List.of(), "ready", 1);
         Made ofSystem = material(gm, null, List.of(gm.system()), "ready", 1);
         // A version the GM discarded before: it has its index removal already, and gets no second one.
+        // Story 3.5: both campaigns have stored scope settings, each with a material switched off.
+        assertThat(send(gm, "PUT", "/api/v1/campaigns/" + target + "/scope", "{\"version\":0,\"campaignTier\":true,"
+                + "\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,\"materialsOff\":[\""
+                + ready.materialId() + "\"]}").statusCode()).isEqualTo(200);
+        assertThat(send(gm, "PUT", "/api/v1/campaigns/" + sibling + "/scope", "{\"version\":0,\"campaignTier\":true,"
+                + "\"systemTier\":true,\"otherTier\":false,\"modelKnowledge\":false,\"materialsOff\":[\""
+                + ofSystem.materialId() + "\"]}").statusCode()).isEqualTo(200);
         UUID discardedBefore = version(gm, ready.materialId(), "discarded");
         as(gm.id(), () -> {
             index.insertRemoval(new IndexRemovalRow(Ids.newId(), gm.id(), discardedBefore));
@@ -267,6 +276,9 @@ class CampaignDeletionFlowTest {
         assertThat(deletion.sweep()).isEqualTo(1);
 
         assertThat(library.campaigns).doesNotContainKey(target).containsKeys(sibling, gm.campaign());
+        // Story 3.5: the target's scope settings went with it; the sibling's stay.
+        assertThat(scopes.rows).doesNotContainKey(target).containsKey(sibling);
+        assertThat(scopes.rows.get(sibling).scope().materialsOff()).containsExactly(ofSystem.materialId());
         assertThat(library.systems).containsKey(gm.system());
         assertThat(conversations.conversations.values()).noneMatch(conversation ->
                 conversation.campaignId().equals(target));

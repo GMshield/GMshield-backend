@@ -751,6 +751,12 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> readyOfOwner() {
+        UUID owner = OwnerContext.require();
+        return readyOf(material -> material.ownerId().equals(owner));
+    }
+
+    @Override
     public List<VersionRow> readyOfSystem(UUID systemId) {
         UUID owner = OwnerContext.require();
         java.util.Set<UUID> attached = systems.values().stream()

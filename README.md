@@ -802,10 +802,9 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
 - **What a campaign may use (`scope`, Story 2.2, AD-9, internal contract 1.8.0).** The one resolver: no other module
   reads library items for a campaign.
-  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge)`, a parameter of every resolve and stored
-    nowhere (Story 2.4 freezes it with a job, Story 3.5 stores it per campaign). `ScopeSettings.STARTING` is campaign
-    and system on, other and model knowledge off; `otherTier = true` is refused (`IllegalArgumentException`) until
-    Story 3.5.
+  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge, materialsOff)`, a parameter of every resolve
+    (Story 2.4 freezes it with a job; Story 3.5 stores it per campaign, below). `ScopeSettings.STARTING` is campaign
+    and system on, other and model knowledge off, every material on.
   - `Scopes.resolve(campaignId, settings)`, as the bound owner in one read transaction, answers a `ResolvedScope`
     (made only by `Scopes`): the campaign tier is the `ready` version of each material whose `campaign_id` is the
     campaign; the system tier the `ready` version of each material attached through `material_system` to the
@@ -853,6 +852,59 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     production kind carries a question until Story 2.4; the test-only kind `test.question` (`ScopedPassagesFlowTest`)
     proves that the claim reply carries the input and that the passages route serves the ids the worker found. The
     worker's search (`GMshield-worker`, `retrieval/search.py`) needs contract 1.8.0, unchanged here.
+- **A closed scope across three tiers (`scope`, Story 3.5, public contract 1.25.0, internal contract 1.13.0,
+  migration V27).** Each campaign's scope settings are stored in PostgreSQL only (never in a Qdrant point, and no
+  point is rewritten on a change, AD-10), and resolved by `Scopes` alone.
+  - **Storage.** `scope_setting` (owner, campaign with an owner-scoped key to `campaign`, `campaign_tier`,
+    `system_tier`, `other_tier`, `model_knowledge`, `version` as Hibernate `@Version`, created and updated times;
+    primary key (owner, campaign)) and `scope_material_off` (owner, campaign, material; primary key all three, no
+    reference to `material`), library tables through JPA only (`scope.data.JpaScopeStore`). A campaign with no row
+    reads as `STARTING` at version 0; the first change inserts the row at version 1 (a concurrent first insert hits
+    the key and is a stale version), so `library` writes nothing here when it creates a campaign. A material is on
+    unless it is listed as off, so a newly attached material starts on; an id whose material is gone is ignored when
+    resolving and dropped by the next change, which stores exactly the ids it lists.
+  - **Resolution.** The campaign tier is the `ready` versions of the campaign's materials; the system tier those of
+    its system's materials, minus the campaign tier's (while it is on); the other tier every other `ready` version of
+    the owner (the materials of the GM's other campaigns, archived ones included, and other systems; never one of the
+    campaign's or its system's, whatever the switches; read only while the tier is on). A tier switched off has no
+    source; a material switched off is left out of whichever tier it falls in. `Tier.OTHER` (`other`) follows
+    campaign and system everywhere, the question input's `tiers` included (three entries, always). `ScopeReads`
+    gains `readySourcesOfCampaign`, `readySourcesOfSystem`, `readySourcesOfOwner` (each version with its material)
+    and `materialLabels` (decrypted names).
+  - **Freezing.** `Conversations.ask` reads the stored settings (`CampaignScopes.settings`) and freezes them on the
+    turn: `turn.other_tier` (default false) beside the V17 switches, and one `turn_material_off` row (owner, turn,
+    material) per material off. `AnswerJobs` rebuilds the `ScopeSettings` from the turn on every passage fetch and
+    reference read, so a change made while a turn is answered applies from the next question and never turns into
+    `scope.passage_refused` mid-answer. `GET /api/v1/conversations/current` uses the stored settings.
+    `modelKnowledge = true` is stored and frozen but changes no answer until Story 3.8.
+  - `GET /api/v1/campaigns/{id}/scope` answers `{version, campaignTier, systemTier, otherTier, modelKnowledge,
+    materials: [{id, name, tier, on}]}`: the materials of every tier whatever the tier's switch, each with a `ready`
+    version, in tier order, then newest first (`Scopes.members`).
+  - `PUT /api/v1/campaigns/{id}/scope` takes `{version, campaignTier, systemTier, otherTier, modelKnowledge,
+    materialsOff: [ids]}` and answers the new view, its version raised by one. A version the settings have left is
+    409 `request.stale_version`; a missing field, a negative version, a null or malformed id, more than 1,000 ids or
+    a malformed body is 400 `request.invalid`; an id that is not the owner's material, or in none of the campaign's
+    tiers, is 400 `scope.material_unknown`; nothing changes then. Both routes answer 404 `request.not_found` for
+    another owner's, an unknown, a malformed or a deleting campaign, and send `Cache-Control: no-store`. Logs:
+    `scope.settings_changed` (ids, switches and counts).
+  - **The ground "the current scope".** `GET /api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}` and
+    `.../picture` (`conversations`, beside the reference routes, through `CampaignScopes.sourcePage`) serve a page of
+    a version that is an allowed source of the campaign's current stored scope (`Scopes.resolveSources`), with the
+    reference page's shape and headers; anything else is 404 `request.not_found`, never telling whether the version
+    exists. A reference stored with a turn keeps its own ground and ignores the current settings: a source that has
+    left the scope still opens there, and nothing new is drawn from it.
+  - **Deletion.** `scope.service.ScopeDeletion` is a `SystemDeletionHandler` (part `scope`, counting 0): a system's or
+    a campaign's removal deletes the settings and switch rows of the campaigns going (before their rows go), a
+    material's removal its switch rows in every campaign; a version's removal takes nothing.
+  - **Internal contract 1.13.0.** `JobPassage.tier` allows `other`. The worker (`retrieval.search.TIERS`) takes turns
+    across the three tiers and requires 1.13.0.
+  - Deploy order: the backend first (V27 is additive; until a GM changes a campaign's scope every campaign resolves as
+    before), then the worker (its minimum backend contract becomes 1.13.0) and the frontend (contract copy only; its
+    minimum stays 1.24.0). **Between the backend and the worker deploys questions fail**: the question input now always
+    lists the `other` tier, which a 1.12 worker refuses as `retrieval.input_invalid` (not retried), so deploy the
+    worker right after the backend. Rolling the backend back below 1.25.0: the scope tables and `turn.other_tier` are
+    ignored (every campaign resolves as `STARTING`, a frozen turn by its V17 switches alone), and the worker must go
+    back first, since it refuses a 1.24 backend.
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

@@ -152,7 +152,7 @@ class ScopesTest {
     }
 
     @Test
-    void aTierSwitchedOffHasNoSourceAndTheOtherTierIsRefusedUntilStory35() {
+    void aTierSwitchedOffHasNoSourceAndTheOtherTierIsAccepted() {
         Library2 lib = twoTiers();
 
         ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
@@ -168,9 +168,9 @@ class ScopesTest {
         assertThat(campaignOnly.sources(Tier.SYSTEM)).isEmpty();
         assertThat(campaignOnly.settings().modelKnowledge()).isTrue();
         assertThat(none.allowedSources()).isEmpty();
-        assertThat(ScopeSettings.STARTING).isEqualTo(new ScopeSettings(true, true, false, false));
-        assertThatThrownBy(() -> new ScopeSettings(true, true, true, false))
-                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(ScopeSettings.STARTING).isEqualTo(new ScopeSettings(true, true, false, false, Set.of()));
+        // Story 3.5: the other tier is no longer refused.
+        assertThat(new ScopeSettings(true, true, true, false).otherTier()).isTrue();
         // With the system tier off, B's passages are refused.
         assertRefused(lib.gm().owner(), campaignOnly, List.of(lib.aPassages().getFirst(), lib.bPassages().getFirst()));
     }
@@ -790,7 +790,9 @@ class ScopesTest {
         assertThat(input.path("question").asString()).isEqualTo("Qual é o alcance da Espada Vorpal?");
         assertThat(input.path("owner").asString()).isEqualTo(lib.gm().owner().toString());
         JsonNode tiers = input.path("tiers");
-        assertThat(tiers.size()).isEqualTo(2);
+        assertThat(tiers.size()).isEqualTo(3);
+        assertThat(tiers.get(2).path("tier").asString()).isEqualTo("other");
+        assertThat(tiers.get(2).path("sources").isEmpty()).isTrue();
         assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
         assertThat(strings(tiers.get(0).path("sources"))).containsExactly(lib.a().toString(), second.toString());
         assertThat(strings(tiers.get(0).path("pending"))).containsExactly(secondPassages.get(1).toString(),
@@ -806,7 +808,7 @@ class ScopesTest {
     }
 
     @Test
-    void aTierWithNoSourceIsStillListedWithEmptyListsAndAnEmptyScopeHasTwoEmptyTiers() {
+    void aTierWithNoSourceIsStillListedWithEmptyListsAndAnEmptyScopeHasThreeEmptyTiers() {
         Library2 lib = twoTiers();
         ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
                 new ScopeSettings(false, true, false, false)));
@@ -820,7 +822,9 @@ class ScopesTest {
         assertThat(input.path("tiers").get(0).path("sources").isEmpty()).isTrue();
         assertThat(input.path("tiers").get(0).path("pending").isEmpty()).isTrue();
         assertThat(strings(input.path("tiers").get(1).path("sources"))).containsExactly(lib.b().toString());
-        assertThat(none.path("tiers").size()).isEqualTo(2);
+        assertThat(none.path("tiers").size()).isEqualTo(3);
+        assertThat(none.path("tiers")).extracting(tier -> tier.path("tier").asString())
+                .containsExactly("campaign", "system", "other");
         for (JsonNode tier : none.path("tiers")) {
             assertThat(tier.path("sources").isArray()).isTrue();
             assertThat(tier.path("sources").isEmpty()).isTrue();

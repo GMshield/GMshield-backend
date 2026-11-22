@@ -246,14 +246,16 @@ public class AnswerJobs implements JobHandler {
     }
 
     /**
-     * The turn's scope: with its pending passages for a question input; without them ({@link Scopes#resolveSources})
-     * for the passages and references reads, which check only the allowed sources and tiers.
+     * The turn's scope, under the settings frozen with it (Story 3.5: the stored settings as the question was asked,
+     * so a change made meanwhile applies from the next question): with its pending passages for a question input;
+     * without them ({@link Scopes#resolveSources}) for the passages and references reads, which check only the allowed
+     * sources and tiers.
      */
     private ResolvedScope scopeOf(TurnRow turn, boolean withPending) {
         ConversationRow conversation = store.findConversation(turn.conversationId())
                 .orElseThrow(() -> new IllegalStateException("conversations.conversation_missing"));
-        ScopeSettings settings = new ScopeSettings(turn.campaignTier(), turn.systemTier(), false,
-                turn.modelKnowledge());
+        ScopeSettings settings = new ScopeSettings(turn.campaignTier(), turn.systemTier(), turn.otherTier(),
+                turn.modelKnowledge(), turn.materialsOff());
         return withPending ? scopes.resolve(conversation.campaignId(), settings)
                 : scopes.resolveSources(conversation.campaignId(), settings);
     }
