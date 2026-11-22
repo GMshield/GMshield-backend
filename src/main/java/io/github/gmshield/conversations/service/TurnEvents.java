@@ -72,16 +72,19 @@ final class TurnEvents {
     }
 
     /**
-     * The data of a {@code done} event (Story 2.5), built when streamed from the stored references:
-     * {@code {stopped, silent, references: [{number, materialName, sectionPath, page, passageIds, removed, tier?}]}},
-     * {@code tier} (Story 3.7) only on a reference stored with one. {@code stopped} (Story 2.6) is whether the GM
-     * stopped the answer; {@code silent} is true exactly when it was not stopped and there is no reference: a stopped
-     * answer is never the silent one.
+     * The data of a {@code done} event (Story 2.5), built when streamed from the turn's {@link Conversations.Ending}:
+     * {@code {stopped, silent, modelKnowledge, references: [{number, materialName, sectionPath, page, passageIds,
+     * removed, tier?}]}}, {@code tier} (Story 3.7) only on a reference stored with one. {@code stopped} (Story 2.6) is
+     * whether the GM stopped the answer; {@code silent} is true exactly when it was not stopped, there is no reference
+     * and (Story 3.8) no {@code model} tier event was stored: a stopped answer is never the silent one.
+     * {@code modelKnowledge} is the turn's frozen switch.
      */
-    static ObjectNode doneData(List<TurnReference> references, boolean stopped) {
+    static ObjectNode doneData(Conversations.Ending ending, boolean stopped) {
+        List<TurnReference> references = ending.references();
         ObjectNode data = JsonNodeFactory.instance.objectNode();
         data.put("stopped", stopped);
-        data.put("silent", !stopped && references.isEmpty());
+        data.put("silent", !stopped && references.isEmpty() && !ending.modelTier());
+        data.put("modelKnowledge", ending.modelKnowledge());
         ArrayNode list = data.putArray("references");
         for (TurnReference reference : references) {
             ObjectNode entry = list.addObject();
@@ -101,7 +104,7 @@ final class TurnEvents {
     }
 
     /** {@link #doneData} as one line of JSON. */
-    static String doneLine(List<TurnReference> references, boolean stopped) {
-        return JSON.writeValueAsString(doneData(references, stopped));
+    static String doneLine(Conversations.Ending ending, boolean stopped) {
+        return JSON.writeValueAsString(doneData(ending, stopped));
     }
 }

@@ -46,6 +46,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ({@code model_call_usage.estimated}), and the worker's {@code done} adding nothing.
  * Story 3.7: the reference's tier in {@code turn_reference.tier} (V28), null on an older row, and a tier marker stored
  * only when its tier has a source in the turn's scope.
+ * Story 3.8: a {@code model} tier marker stored only when the turn's frozen {@code model_knowledge} is on, and the
+ * turn's ending read from its row and its stored events.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -186,7 +188,7 @@ class ConversationIntegrationTest {
                 JobEvent.tier("campaign", 0), JobEvent.delta("Fire Bolt causa 1d10."),
                 JobEvent.citation(passages.get(2), 9), JobEvent.tier("system", 20),
                 JobEvent.citation(passages.get(1), 20), JobEvent.citation(Ids.newId(), 20),
-                JobEvent.citation(passages.get(0), 20))), List.of());
+                JobEvent.citation(passages.get(0), 20), JobEvent.tier("model", 20))), List.of());
         claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
 
         List<TurnReference> references = as(owner, () -> conversations.references(asked.turnId()));
@@ -198,11 +200,17 @@ class ConversationIntegrationTest {
         assertThat(references.getFirst().materialName()).isEqualTo("SRD 5.2.1");
         assertThat(references.getFirst().sectionPath()).containsExactly("Magias", "Fire Bolt");
         // Story 3.7: the tier is stored with the reference (V28), from the turn's frozen scope; the campaign marker is
-        // stored with the events, and the system one, whose tier has no source in this scope, is dropped.
+        // stored with the events, and the system one, whose tier has no source in this scope, is dropped. Story 3.8: so
+        // is the model one, since the starter campaign's model knowledge is off.
         assertThat(references).extracting(TurnReference::tier).containsExactly("campaign", "campaign");
         assertThat(as(owner, () -> conversations.eventsAfter(asked.turnId(), 0))).filteredOn(event ->
                 TurnEvent.TIER.equals(event.type())).extracting(TurnEvent::tier, TurnEvent::offset)
                 .containsExactly(org.assertj.core.groups.Tuple.tuple("campaign", 0));
+        assertThat(as(owner, () -> conversations.ending(asked.turnId()))).satisfies(ending -> {
+            assertThat(ending.modelKnowledge()).isFalse();
+            assertThat(ending.modelTier()).isFalse();
+            assertThat(ending.references()).hasSize(2);
+        });
         List<Map<String, Object>> rows = jdbc.sql("select owner_id, number, version_id, material_id, page,"
                 + " material_name, section_path, tier from turn_reference where turn_id = :turn order by number")
                 .param("turn", asked.turnId()).query().listOfRows();
@@ -298,6 +306,37 @@ class ConversationIntegrationTest {
             return null;
         })).isInstanceOfSatisfying(ApiException.class, refused ->
                 assertThat(refused.problem().code()).isEqualTo("request.not_found"));
+    }
+
+    @Test
+    void aModelMarkerIsStoredOnlyForATurnWhoseModelKnowledgeIsOnAndItsEndingSaysSo() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Conversations.Asked asked = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        // As if the switch had been on when the question was asked: the turn's frozen value decides.
+        jdbc.sql("update turn set model_knowledge = true where id = :id").param("id", asked.turnId()).update();
+        UUID jobId = jdbc.sql("select job_id from turn where id = :id").param("id", asked.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of("azure-openai"));
+        claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1, List.of(
+                JobEvent.tier("model", 0), JobEvent.delta("Em geral, 1d10."), JobEvent.tier("system", 15))), List.of());
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
+
+        assertThat(as(owner, () -> conversations.eventsAfter(asked.turnId(), 0))).extracting(TurnEvent::type,
+                TurnEvent::tier).containsExactly(org.assertj.core.groups.Tuple.tuple("tier", "model"),
+                org.assertj.core.groups.Tuple.tuple("delta", null), org.assertj.core.groups.Tuple.tuple("done", null));
+        Conversations.Ending ending = as(owner, () -> conversations.ending(asked.turnId()));
+        assertThat(ending.modelKnowledge()).isTrue();
+        assertThat(ending.modelTier()).isTrue();
+        assertThat(ending.references()).isEmpty();
+        // Another owner's turn reads as off, with nothing.
+        Conversations.Ending theirs = as(Ids.newId(), () -> conversations.ending(asked.turnId()));
+        assertThat(theirs.modelKnowledge()).isFalse();
+        assertThat(theirs.modelTier()).isFalse();
+        assertThat(theirs.references()).isEmpty();
     }
 
     private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page) {

@@ -739,6 +739,11 @@ class ConversationFlowTest {
                 "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\"}]}",
                 "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":-1}]}",
                 "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"xyz\",\"offset\":0}]}",
+                // Story 3.8: the model tier is a tier word like the others, with the same fields.
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"model\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"model\",\"offset\":0,"
+                        + "\"text\":\"a\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"MODEL\",\"offset\":0}]}",
                 "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":0,"
                         + "\"text\":\"a\"}]}",
                 "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":0,"
@@ -1129,6 +1134,109 @@ class ConversationFlowTest {
         assertThat(old.has("tier")).isFalse();
         assertThat(old.path("removed").asBoolean()).isFalse();
         assertThat(referencePage(gm, turnId, "3", "1").statusCode()).isEqualTo(200);
+    }
+
+    // --- Story 3.8: model knowledge only when I turn it on
+
+    @Test
+    void withModelKnowledgeOffAModelMarkerIsDroppedNeverRelayedAndTheAnswerStaysSilent() throws Exception {
+        Gm gm = signUp();
+        source(gm, gm.campaign(), List.of(1));
+
+        UUID turnId = answered(gm, QUESTION, List.of(delta("As fontes não dizem nada sobre isso."), tier("model", 36),
+                delta("\n\nDo conhecimento do modelo.")));
+
+        assertThat(conversations.turns.get(turnId).modelKnowledge()).isFalse();
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name).containsExactly("delta", "delta", "done");
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("modelKnowledge").asBoolean()).isFalse();
+        assertThat(done.path("silent").asBoolean()).isTrue();
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).isEqualTo("conversation.tiers_dropped");
+            Map<String, Object> pairs = new LinkedHashMap<>();
+            event.getKeyValuePairs().forEach(pair -> pairs.put(pair.key, pair.value));
+            assertThat(pairs).containsEntry("turnId", turnId).containsEntry("dropped", 1);
+        });
+        // The worker is told the switch is off.
+        UUID next = turnId(ask(gm, gm.campaign(), QUESTION));
+        assertThat(claim(jobOf(next)).input().path("modelKnowledge").asBoolean()).isFalse();
+    }
+
+    @Test
+    void withModelKnowledgeOnTheModelPartIsRelayedStoredAndReplayedBesideTheCitationsAndIsNotSilent()
+            throws Exception {
+        Gm gm = signUp();
+        UUID rule = source(gm, gm.campaign(), List.of(4)).passages().getFirst();
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, true, List.of()))
+                .statusCode()).isEqualTo(200);
+
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+        assertThat(claim.input().path("modelKnowledge").asBoolean()).isTrue();
+        assertThat(postEvents(claim, 1, List.of(delta("Na mesa, 2d10."), citation(rule, 14), delta("\n\n"),
+                tier("model", 16), delta("Em geral, 1d10.")), List.of()).statusCode()).isEqualTo(200);
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+
+        List<Event> events = streamAll(gm, turnId, null);
+        assertThat(events).extracting(Event::name).containsExactly("delta", "citation", "delta", "tier", "delta",
+                "done");
+        assertThat(JSON.readTree(events.get(3).data())).isEqualTo(JSON.readTree("{\"tier\":\"model\",\"offset\":16}"));
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("modelKnowledge").asBoolean()).isTrue();
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        // References never carry the model tier: only the cited passage, under its own tier.
+        assertThat(done.path("references")).extracting(reference -> reference.path("tier").asString())
+                .containsExactly("campaign");
+        // Replayed after the model marker: the same marker, and done still not silent.
+        assertThat(streamAll(gm, turnId, "3")).extracting(Event::id, Event::name).containsExactly(tuple("4", "tier"),
+                tuple("5", "delta"), tuple("6", "done"));
+        assertThat(done(gm, turnId, "4")).isEqualTo(done);
+        assertThat(conversations.batches.values().stream().filter(batch -> batch.turnId().equals(turnId)))
+                .allSatisfy(batch -> assertThat(new String(batch.payload(), StandardCharsets.ISO_8859_1))
+                        .doesNotContain("model"));
+        // The switch turned off afterwards changes nothing of this turn: done carries the frozen value.
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(1, true, true, false, false, List.of()))
+                .statusCode()).isEqualTo(200);
+        assertThat(done(gm, turnId, null)).isEqualTo(done);
+    }
+
+    @Test
+    void withModelKnowledgeOnAndNothingHandedOverOnlyTheModelPartIsNotSilentAndWithoutItTheAnswerIsSilent()
+            throws Exception {
+        Gm gm = signUp();
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, true, List.of()))
+                .statusCode()).isEqualTo(200);
+
+        UUID modelOnly = answered(gm, QUESTION, List.of(tier("model", 0), delta("Em geral, 1d10.")));
+        UUID nothing = answered(gm, QUESTION, List.of(delta("As fontes não dizem nada sobre isso.")));
+
+        JsonNode answered = done(gm, modelOnly, null);
+        assertThat(streamAll(gm, modelOnly, null)).extracting(Event::name).containsExactly("tier", "delta", "done");
+        assertThat(answered.path("modelKnowledge").asBoolean()).isTrue();
+        assertThat(answered.path("references").isEmpty()).isTrue();
+        assertThat(answered.path("silent").asBoolean()).isFalse();
+        assertThat(references.anyOfTurn(modelOnly)).isEmpty();
+        JsonNode silent = done(gm, nothing, null);
+        assertThat(silent.path("modelKnowledge").asBoolean()).isTrue();
+        assertThat(silent.path("silent").asBoolean()).isTrue();
+    }
+
+    @Test
+    void aStoppedAnswerWithAModelPartIsStoppedNotSilent() throws Exception {
+        Gm gm = signUp();
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, false, true, List.of()))
+                .statusCode()).isEqualTo(200);
+        UUID turnId = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(turnId));
+        assertThat(postEvents(claim, 1, List.of(tier("model", 0), delta("Em geral")), List.of()).statusCode())
+                .isEqualTo(200);
+
+        assertThat(stopTurn(gm, turnId).statusCode()).isEqualTo(204);
+
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("stopped").asBoolean()).isTrue();
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("modelKnowledge").asBoolean()).isTrue();
     }
 
     // --- Story 2.6: stop an answer
@@ -2029,8 +2137,9 @@ class ConversationFlowTest {
     }
 
     /**
-     * The data of the turn's done event, after the invariant: silent exactly when not stopped and with no reference
-     * (Story 2.6), and the turn has one final event, its last.
+     * The data of the turn's done event, after the invariant: silent exactly when not stopped, with no reference
+     * (Story 2.6) and with no model tier event (Story 3.8); modelKnowledge is the turn's frozen switch; and the turn has
+     * one final event, its last.
      */
     private JsonNode done(Gm gm, UUID turnId, String lastEventId) throws Exception {
         List<Event> events = streamAll(gm, turnId, lastEventId);
@@ -2040,9 +2149,13 @@ class ConversationFlowTest {
         JsonNode data = JSON.readTree(events.getLast().data());
         assertThat(data.path("stopped").isBoolean()).isTrue();
         assertThat(data.path("silent").isBoolean()).isTrue();
+        assertThat(data.path("modelKnowledge").isBoolean()).isTrue();
+        assertThat(data.path("modelKnowledge").asBoolean()).isEqualTo(conversations.turns.get(turnId).modelKnowledge());
         assertThat(data.path("references").isArray()).isTrue();
+        boolean modelTier = streamAll(gm, turnId, null).stream().anyMatch(event -> "tier".equals(event.name())
+                && "model".equals(JSON.readTree(event.data()).path("tier").asString()));
         assertThat(data.path("silent").asBoolean())
-                .isEqualTo(!data.path("stopped").asBoolean() && data.path("references").isEmpty());
+                .isEqualTo(!data.path("stopped").asBoolean() && data.path("references").isEmpty() && !modelTier);
         return data;
     }
 

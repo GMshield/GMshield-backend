@@ -63,7 +63,8 @@ import tools.jackson.databind.node.ObjectNode;
  *       whole request is refused with {@value #REFUSED_CODE} (403) before anything is decrypted, and the refusal names
  *       no id.</li>
  *   <li>{@link #questionInput} (Story 2.3): the input of an interactive job that carries a question, built from a
- *       resolved scope only: {@code {question, owner, tiers: [{tier, sources, pending}], tokenKey}}, the tiers in
+ *       resolved scope only: {@code {question, owner, modelKnowledge, tiers: [{tier, sources, pending}], tokenKey}}
+ *       ({@code modelKnowledge}, Story 3.8: the scope's settings' switch, frozen with the turn), the tiers in
  *       order (campaign, system, then other from Story 3.5, each always present, a tier with no source with empty
  *       lists), {@code pending}
  *       the first {@value #MAX_PENDING} of the tier's pending passages in order (the worker reads them within a time
@@ -402,6 +403,7 @@ public class Scopes {
         ObjectNode input = JsonNodeFactory.instance.objectNode();
         input.put("question", question);
         input.put("owner", scope.ownerId().toString());
+        input.put("modelKnowledge", scope.settings().modelKnowledge());
         ArrayNode tiers = input.putArray("tiers");
         for (Tier tier : Tier.values()) {
             ObjectNode entry = tiers.addObject();
@@ -428,6 +430,7 @@ public class Scopes {
                 .addKeyValue("pending", scope.pending().size())
                 .addKeyValue("pendingListed", listed)
                 .addKeyValue("pendingLeftOut", scope.pending().size() - listed)
+                .addKeyValue("modelKnowledge", scope.settings().modelKnowledge())
                 .log("scope.question_input");
         return input;
     }

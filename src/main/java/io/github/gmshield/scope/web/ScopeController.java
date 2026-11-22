@@ -71,8 +71,9 @@ class ScopeController {
             @Schema(description = "Whether the materials of the campaign's system are used") boolean systemTier,
             @Schema(description = "Whether the account's other materials (of its other campaigns, archived ones"
                     + " included, and of its other systems) are used") boolean otherTier,
-            @Schema(description = "Whether the model may answer from its own knowledge (stored; it changes no answer"
-                    + " yet)") boolean modelKnowledge,
+            @Schema(description = "Whether the model may answer from its own knowledge, each such part under the"
+                    + " model tier label and with no reference; a change applies from the next question")
+            boolean modelKnowledge,
             @ArraySchema(arraySchema = @Schema(description = "The materials of every tier, whatever the tier's switch,"
                     + " each with a ready version: in tier order (campaign, system, other), then newest first"),
                     schema = @Schema(implementation = MaterialView.class)) List<MaterialView> materials) {

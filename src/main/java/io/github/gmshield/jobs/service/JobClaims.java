@@ -373,13 +373,13 @@ public class JobClaims {
      * model calls that ended since the last batch. The live claim's grant comes first ({@code job.grant_refused}, 403),
      * then the batch ({@code job.events_invalid}, 400: a number below 1, more than {@value #MAX_EVENTS} events, an
      * event that is not a delta of 1 to {@value #MAX_DELTA} code points, a citation of a passage id at an offset from 0
-     * or (Story 3.7) a tier marker of a tier word at an offset from 0, each with no other field, more than
-     * {@value #MAX_USAGE} usages, or a usage without its call id or with a negative count). Then, as the owner and on
-     * the job's locked row, the handler stores the batch ({@link JobHandler#events}: once per claim and number, a gap
-     * {@code job.batch_out_of_order}, 409; a kind without events {@code job.events_refused}, 403) and the usage is
-     * recorded once per call id ({@link UsageReports}), in that one transaction. Answers whether the worker must stop
-     * (Story 2.6, the GM's stop): {@link JobHandler#stopRequested}, read in that same locked transaction after the
-     * batch, so a stop committed before it is always seen. Lines carry ids and counts only.
+     * or (Story 3.7) a tier marker of a tier word ({@code model} too from Story 3.8) at an offset from 0, each with no
+     * other field, more than {@value #MAX_USAGE} usages, or a usage without its call id or with a negative count).
+     * Then, as the owner and on the job's locked row, the handler stores the batch ({@link JobHandler#events}: once per
+     * claim and number, a gap {@code job.batch_out_of_order}, 409; a kind without events {@code job.events_refused},
+     * 403) and the usage is recorded once per call id ({@link UsageReports}), in that one transaction. Answers whether
+     * the worker must stop (Story 2.6, the GM's stop): {@link JobHandler#stopRequested}, read in that same locked
+     * transaction after the batch, so a stop committed before it is always seen. Lines carry ids and counts only.
      */
     public boolean events(UUID jobId, UUID claimId, String grant, JobEventBatch batch, List<CallUsage> calls) {
         Instant now = clock.now();
