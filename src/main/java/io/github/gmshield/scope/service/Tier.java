@@ -1,5 +1,7 @@
 package io.github.gmshield.scope.service;
 
+import java.util.Optional;
+
 /**
  * A tier of a campaign's scope (Story 2.2): every allowed source and every passage served belongs to one. The order of
  * the constants is the tier order everywhere (Story 3.5): campaign, system, other.
@@ -25,5 +27,15 @@ public enum Tier {
     /** The tier as the internal and public APIs write it. */
     public String word() {
         return word;
+    }
+
+    /** The tier this word names (Story 3.7); empty for {@code null} or any other word. */
+    public static Optional<Tier> of(String word) {
+        for (Tier tier : values()) {
+            if (tier.word.equals(word)) {
+                return Optional.of(tier);
+            }
+        }
+        return Optional.empty();
     }
 }

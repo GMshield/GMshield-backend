@@ -17,6 +17,7 @@ import io.github.gmshield.scope.service.CitedPlace;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.Scopes;
+import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.vault.service.Vault;
 import java.time.Clock;
@@ -50,7 +51,10 @@ import tools.jackson.databind.JsonNode;
  *   <li>The expansion runs in the transaction that ends the job: the passage ids of the turn's stored citations, in
  *       sequence order, are read again within the turn's scope ({@link Scopes#references}), which drops an unknown,
  *       foreign or out-of-scope id; the places left become references ({@link TurnReferences#group}), stored by value
- *       with the material's name and the section path encrypted. No reference makes the answer {@code silent}.</li>
+ *       with the material's name and the section path encrypted, and with the tier of its source in that scope (Story
+ *       3.7: frozen at answer time, as the scope labelled it). No reference makes the answer {@code silent}.</li>
+ *   <li>A {@code tier} marker (Story 3.7) is stored with the batch's events only when its tier has a source in the
+ *       turn's frozen scope; one with no source is dropped, never relayed.</li>
  *   <li>The GM's stop (Story 2.6, {@link Conversations#stop}) ends the turn at once: unless it has a final event, its
  *       citations so far become references as above, {@code done} marked {@code stopped} is appended and
  *       {@code turn.stopped_at} is set. From then on a batch stores no event (its usage is still recorded), the answer
@@ -133,7 +137,13 @@ public class AnswerJobs implements JobHandler {
             throw JobProblems.batchOutOfOrder();
         }
         List<TurnEvent> events = batch.events().stream().map(AnswerJobs::turnEvent).toList();
-        append(turn, batch.claimId(), batch.number(), events);
+        List<TurnEvent> kept = withTiersInScope(turn, events);
+        if (kept.size() < events.size()) {
+            log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("turnId", turn.id())
+                    .addKeyValue("batch", batch.number()).addKeyValue("dropped", events.size() - kept.size())
+                    .log("conversation.tiers_dropped");
+        }
+        append(turn, batch.claimId(), batch.number(), kept);
     }
 
     @Override
@@ -154,7 +164,7 @@ public class AnswerJobs implements JobHandler {
             return;
         }
         storeReferences(turn);
-        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, false)));
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, false, null)));
     }
 
     /**
@@ -167,7 +177,7 @@ public class AnswerJobs implements JobHandler {
             return false;
         }
         storeReferences(turn);
-        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, true)));
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, true, null)));
         if (!store.markStopped(turn.id(), clock.instant().truncatedTo(ChronoUnit.MICROS))) {
             throw new IllegalStateException("conversations.turn_missing");
         }
@@ -200,7 +210,7 @@ public class AnswerJobs implements JobHandler {
                     place.materialId(), place.page(), grouped.passageIds(),
                     vault.encryptText(TurnReferences.materialName(rowId, turn.ownerId()), place.materialName()),
                     vault.encrypt(TurnReferences.sectionPath(rowId, turn.ownerId()),
-                            TurnReferences.pathJson(place.sectionPath())), now));
+                            TurnReferences.pathJson(place.sectionPath())), now, place.tier().word()));
         }
         if (!rows.isEmpty()) {
             references.insertReferences(rows);
@@ -214,7 +224,8 @@ public class AnswerJobs implements JobHandler {
     @Override
     public void failed(JobRef job, String code) {
         store.turnOfJob(job.id()).filter(turn -> !ended(turn, "failed")).ifPresent(turn ->
-                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, code, false))));
+                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, code, false,
+                        null))));
     }
 
     /** Stores the events after the turn's last sequence, encrypted, and wakes its streams after the commit. */
@@ -260,9 +271,26 @@ public class AnswerJobs implements JobHandler {
                 : scopes.resolveSources(conversation.campaignId(), settings);
     }
 
+    /**
+     * The events without the tier markers whose tier has no source in the turn's frozen scope (Story 3.7): the tier
+     * shown is always the backend's, so a marker the worker could not have been handed is never stored or relayed.
+     */
+    private List<TurnEvent> withTiersInScope(TurnRow turn, List<TurnEvent> events) {
+        if (events.stream().noneMatch(event -> TurnEvent.TIER.equals(event.type()))) {
+            return events;
+        }
+        ResolvedScope scope = scopeOf(turn, false);
+        return events.stream().filter(event -> !TurnEvent.TIER.equals(event.type()) || Tier.of(event.tier())
+                .map(tier -> !scope.sources(tier).isEmpty()).orElse(false)).toList();
+    }
+
     private static TurnEvent turnEvent(JobEvent event) {
-        return JobEvent.DELTA.equals(event.type())
-                ? new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null, false)
-                : new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.offset(), null, false);
+        return switch (event.type()) {
+            case JobEvent.DELTA -> new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null, false, null);
+            case JobEvent.TIER -> new TurnEvent(0, TurnEvent.TIER, null, null, event.offset(), null, false,
+                    event.tier());
+            default -> new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.offset(), null, false,
+                    null);
+        };
     }
 }

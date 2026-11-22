@@ -242,7 +242,7 @@ public class Conversations {
                     vault.decryptText(TurnReferences.materialName(row.id(), row.ownerId()), row.materialName()),
                     TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
                             row.sectionPath())),
-                    row.page(), row.passageIds(), removed.contains(row.versionId()))).toList();
+                    row.page(), row.passageIds(), removed.contains(row.versionId()), row.tier())).toList();
         });
     }
 

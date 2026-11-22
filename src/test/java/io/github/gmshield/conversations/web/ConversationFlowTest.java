@@ -105,6 +105,11 @@ import tools.jackson.databind.json.JsonMapper;
  * superseded version still served, a version removed after the answer, a version neither ready nor superseded, a
  * foreign turn, no such reference; and an unreadable page, the picture's bytes and headers, malformed ids and
  * numbers, and the materials route that still refuses {@code ground=reference}.
+ *
+ * <p>Story 3.7: the house rule (a campaign material) and the book's rule (a system material) each under its tier
+ * marker, relayed, stored encrypted and replayed, each reference with its tier; a marker of a tier with no source in
+ * the frozen scope dropped; malformed markers refused; an other-tier reference; a tier kept after its source leaves the
+ * scope or is removed; and a reference stored before V28 with no tier that still opens.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -729,6 +734,18 @@ class ConversationFlowTest {
                 "{\"batch\":1,\"events\":[{\"type\":\"citation\",\"passageId\":\"" + UUID.randomUUID() + "\"}]}",
                 "{\"batch\":1,\"events\":[{\"type\":\"citation\",\"passageId\":\"" + UUID.randomUUID()
                         + "\",\"offset\":-1}]}",
+                // Story 3.7: a tier needs its tier word and its offset, and nothing else.
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"offset\":0}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":-1}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"xyz\",\"offset\":0}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":0,"
+                        + "\"text\":\"a\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"tier\",\"tier\":\"campaign\",\"offset\":0,"
+                        + "\"passageId\":\"" + UUID.randomUUID() + "\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"citation\",\"passageId\":\"" + UUID.randomUUID()
+                        + "\",\"offset\":0,\"tier\":\"campaign\"}]}",
+                "{\"batch\":1,\"events\":[{\"type\":\"delta\",\"text\":\"a\",\"tier\":\"campaign\"}]}",
                 "{\"batch\":1}",
                 "{\"batch\":1,\"events\":[],\"usage\":[{\"input\":1,\"cacheRead\":0,\"cacheWrite\":0,"
                         + "\"output\":1,\"reasoning\":0}]}",
@@ -1000,6 +1017,118 @@ class ConversationFlowTest {
                 return true;
             }
         })).isTrue();
+    }
+
+    // --- Story 3.7: the campaign's version leads
+
+    @Test
+    void theHouseRuleLeadsTheBooksRuleFollowsAndEachReferenceCarriesItsTier() throws Exception {
+        Gm gm = signUp();
+        Source houseRule = source(gm, gm.campaign(), List.of(4));
+        Source book = systemSource(gm, systemOf(gm));
+        UUID rule = houseRule.passages().getFirst();
+        UUID bookRule = book.passages().getFirst();
+
+        UUID turnId = answered(gm, QUESTION, List.of(tier("campaign", 0), delta("Na mesa, 2d10."),
+                citation(rule, 14), delta("\n\n"), tier("system", 16), delta("No livro, 1d10."), citation(bookRule, 31)));
+
+        List<Event> events = streamAll(gm, turnId, null);
+        assertThat(events).extracting(Event::name).containsExactly("tier", "delta", "citation", "delta", "tier",
+                "delta", "citation", "done");
+        List<Event> tiers = events.stream().filter(event -> "tier".equals(event.name())).toList();
+        assertThat(tiers).extracting(event -> JSON.readTree(event.data()))
+                .containsExactly(JSON.readTree("{\"tier\":\"campaign\",\"offset\":0}"),
+                        JSON.readTree("{\"tier\":\"system\",\"offset\":16}"));
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("references")).extracting(reference -> reference.path("tier").asString())
+                .containsExactly("campaign", "system");
+        assertThat(references.anyOfTurn(turnId)).extracting(TurnReferenceRow::tier)
+                .containsExactly("campaign", "system");
+        // Stored with the turn's events (encrypted, like the citations) and replayed after Last-Event-ID.
+        List<Event> replayed = streamAll(gm, turnId, "4");
+        assertThat(replayed).extracting(Event::id, Event::name).containsExactly(tuple("5", "tier"),
+                tuple("6", "delta"), tuple("7", "citation"), tuple("8", "done"));
+        assertThat(replayed.getFirst().data()).isEqualTo(tiers.get(1).data());
+        assertThat(conversations.batches.values().stream().filter(batch -> batch.turnId().equals(turnId)))
+                .allSatisfy(batch -> assertThat(new String(batch.payload(), StandardCharsets.ISO_8859_1))
+                        .doesNotContain("campaign").doesNotContain("system"));
+    }
+
+    @Test
+    void aTierWithNoSourceInTheFrozenScopeIsDroppedAndNeverRelayed() throws Exception {
+        Gm gm = signUp();
+        UUID own = source(gm, gm.campaign(), List.of(1)).passages().getFirst();
+        // Another campaign's material: the other tier is off, so it has no source in this turn's scope.
+        source(gm, campaign(gm, systemOf(gm), "Outra mesa"), List.of(1));
+
+        UUID turnId = answered(gm, QUESTION, List.of(tier("campaign", 0), delta("Um."), citation(own, 3),
+                tier("other", 3), tier("system", 3), delta(" Dois.")));
+
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name)
+                .containsExactly("tier", "delta", "citation", "delta", "done");
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getFormattedMessage()).isEqualTo("conversation.tiers_dropped");
+            Map<String, Object> pairs = new LinkedHashMap<>();
+            event.getKeyValuePairs().forEach(pair -> pairs.put(pair.key, pair.value));
+            assertThat(pairs).containsEntry("turnId", turnId).containsEntry("dropped", 2);
+        });
+        // A batch of dropped markers only is still a batch: the next number follows it.
+        UUID next = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim claim = claim(jobOf(next));
+        assertThat(postEvents(claim, 1, List.of(tier("other", 0)), List.of()).statusCode()).isEqualTo(200);
+        assertThat(postEvents(claim, 2, List.of(delta("Um.")), List.of()).statusCode()).isEqualTo(200);
+        report(claim, "{\"outcome\":\"done\"}");
+        assertThat(streamAll(gm, next, null)).extracting(Event::name).containsExactly("delta", "done");
+    }
+
+    @Test
+    void anOtherTierPassageCitedIsReferencedAsOtherAndItsMarkerKept() throws Exception {
+        Gm gm = signUp();
+        UUID own = source(gm, gm.campaign(), List.of(1)).passages().getFirst();
+        Source far = source(gm, campaign(gm, system(gm, "Outro sistema"), "Campanha distante"), List.of(2));
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, true, true, false, List.of()))
+                .statusCode()).isEqualTo(200);
+
+        UUID turnId = answered(gm, QUESTION, List.of(tier("campaign", 0), delta("Um."), citation(own, 3),
+                tier("other", 3), delta(" Dois."), citation(far.passages().getFirst(), 8)));
+
+        assertThat(streamAll(gm, turnId, null)).extracting(Event::name)
+                .containsExactly("tier", "delta", "citation", "tier", "delta", "citation", "done");
+        assertThat(done(gm, turnId, null).path("references")).extracting(reference -> reference.path("tier")
+                .asString()).containsExactly("campaign", "other");
+    }
+
+    @Test
+    void aReferenceKeepsItsTierAfterItsSourceLeavesTheScopeOrIsRemovedAndAnOldOneHasNone() throws Exception {
+        Gm gm = signUp();
+        Source kept = source(gm, gm.campaign(), List.of(1));
+        Source book = systemSource(gm, systemOf(gm));
+        Paged opened = pdf(gm, gm.campaign(), 2, 1);
+        UUID turnId = answered(gm, QUESTION, List.of(delta("Um."), citation(kept.passages().getFirst(), 3),
+                citation(book.passages().getFirst(), 3), citation(opened.passages().getFirst(), 3)));
+
+        // The system tier switched off and the campaign's material deleted: the stored tiers stay.
+        assertThat(send(gm, "PUT", scopePath(gm.campaign()), scopeBody(0, true, false, false, false, List.of()))
+                .statusCode()).isEqualTo(200);
+        as(gm.id(), () -> {
+            materials.deletePassages(kept.versionId());
+            materials.deleteVersion(kept.versionId());
+            return materials.deleteMaterial(kept.materialId());
+        });
+
+        JsonNode after = done(gm, turnId, null);
+        assertThat(after.path("references")).extracting(reference -> reference.path("tier").asString(),
+                reference -> reference.path("removed").asBoolean())
+                .containsExactly(tuple("campaign", true), tuple("system", false), tuple("campaign", false));
+        // A reference stored before V28 has no tier: the field is absent, and it still opens.
+        TurnReferenceRow row = references.anyOfTurn(turnId).get(2);
+        references.rows.put(row.id(), new TurnReferenceRow(row.id(), row.ownerId(), row.turnId(), row.number(),
+                row.versionId(), row.materialId(), row.page(), row.passageIds(), row.materialName(), row.sectionPath(),
+                row.createdAt(), null));
+        JsonNode old = done(gm, turnId, null).path("references").get(2);
+        assertThat(old.has("tier")).isFalse();
+        assertThat(old.path("removed").asBoolean()).isFalse();
+        assertThat(referencePage(gm, turnId, "3", "1").statusCode()).isEqualTo(200);
     }
 
     // --- Story 2.6: stop an answer
@@ -1979,6 +2108,14 @@ class ConversationFlowTest {
         Map<String, Object> event = new LinkedHashMap<>();
         event.put("type", "citation");
         event.put("passageId", passageId.toString());
+        event.put("offset", offset);
+        return event;
+    }
+
+    private static Map<String, Object> tier(String tier, int offset) {
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("type", "tier");
+        event.put("tier", tier);
         event.put("offset", offset);
         return event;
     }

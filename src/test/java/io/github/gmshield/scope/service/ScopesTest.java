@@ -490,7 +490,8 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.passages(sources, List.of(a0, b0))))
                 .extracting(ScopedPassage::id, ScopedPassage::tier)
                 .containsExactly(tuple(a0, Tier.CAMPAIGN), tuple(b0, Tier.SYSTEM));
-        assertThat(as(lib.gm().owner(), () -> scopes.references(sources, List.of(a0, b0)))).hasSize(2);
+        assertThat(as(lib.gm().owner(), () -> scopes.references(sources, List.of(a0, b0))))
+                .extracting(CitedPlace::tier).containsExactly(Tier.CAMPAIGN, Tier.SYSTEM);
         assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.passages(sources, List.of(lib.cPassages()
                 .getFirst())))).isInstanceOf(ApiException.class);
         assertThat(jobsAsked).hasValue(0);
@@ -711,6 +712,8 @@ class ScopesTest {
                 .containsExactly(tuple(a1, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 1"), 1),
                         tuple(a0, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1),
                         tuple(b0, lib.b(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1));
+        // Story 3.7: each place carries its source's tier in this scope, the scope's own label.
+        assertThat(places).extracting(CitedPlace::tier).containsExactly(Tier.CAMPAIGN, Tier.CAMPAIGN, Tier.SYSTEM);
         assertThat(places.getFirst().materialId()).isEqualTo(materials.versions.get(lib.a()).materialId());
         assertThat(places.getFirst().toString()).doesNotContain(ScopeFixture.MATERIAL_NAME).doesNotContain("Seção");
         assertThat(as(lib.gm().owner(), () -> scopes.references(scope, List.of(theirs, Ids.newId())))).isEmpty();
