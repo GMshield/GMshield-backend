@@ -10,6 +10,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -18,13 +19,16 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 /**
  * The conversation tables in memory, for tests that run without PostgreSQL. Like Hibernate's {@code @TenantId}, it sees
  * the rows of the {@link OwnerContext}'s owner only; like the tables, a (claim, batch) is unique. A write undoes itself
- * when its transaction rolls back.
+ * when its transaction rolls back. A conversation's state (Story 3.10 part B) is kept beside its row: {@link #deleting}
+ * holds the ids of the deleting ones, and every read but the deletion's own skips them.
  */
 public class InMemoryConversationStore implements ConversationStore {
 
     public final Map<UUID, ConversationRow> conversations = new ConcurrentHashMap<>();
     public final Map<UUID, TurnRow> turns = new ConcurrentHashMap<>();
     public final Map<UUID, EventBatchRow> batches = new ConcurrentHashMap<>();
+    /** The conversations whose state is {@code deleting} (Story 3.10 part B). */
+    public final Set<UUID> deleting = ConcurrentHashMap.newKeySet();
 
     @Override
     public synchronized void insertConversation(ConversationRow row) {
@@ -56,8 +60,8 @@ public class InMemoryConversationStore implements ConversationStore {
     }
 
     private Stream<ConversationRow> listed(UUID campaignId, String area) {
-        return owned(conversations).filter(row -> row.campaignId().equals(campaignId) && row.area().equals(area))
-                .sorted(LISTED);
+        return owned(conversations).filter(row -> row.campaignId().equals(campaignId) && row.area().equals(area)
+                && !deleting.contains(row.id())).sorted(LISTED);
     }
 
     @Override
@@ -115,7 +119,24 @@ public class InMemoryConversationStore implements ConversationStore {
 
     @Override
     public Optional<ConversationRow> findConversation(UUID id) {
+        return findConversationAnyState(id).filter(row -> !deleting.contains(row.id()));
+    }
+
+    @Override
+    public Optional<ConversationRow> findConversationAnyState(UUID id) {
         return owned(conversations).filter(row -> row.id().equals(id)).findFirst();
+    }
+
+    @Override
+    public synchronized boolean markDeleting(UUID id) {
+        Optional<ConversationRow> found = findConversationAnyState(id);
+        found.ifPresent(conversation -> {
+            ownerFor(conversation.ownerId());
+            if (deleting.add(id)) {
+                RollbackUndo.onRollback(() -> deleting.remove(id));
+            }
+        });
+        return found.isPresent();
     }
 
     @Override
@@ -232,6 +253,12 @@ public class InMemoryConversationStore implements ConversationStore {
     }
 
     @Override
+    public long countConversationsOfCampaigns(Collection<UUID> campaignIds) {
+        return owned(conversations).filter(row -> campaignIds.contains(row.campaignId())
+                && !deleting.contains(row.id())).count();
+    }
+
+    @Override
     public List<TurnRow> turnsOf(UUID conversationId) {
         return owned(turns).filter(row -> row.conversationId().equals(conversationId))
                 .sorted(Comparator.comparing(TurnRow::createdAt).thenComparing(TurnRow::id)).toList();
@@ -254,14 +281,20 @@ public class InMemoryConversationStore implements ConversationStore {
 
     @Override
     public synchronized boolean deleteConversation(UUID id) {
-        Optional<ConversationRow> found = findConversation(id);
+        Optional<ConversationRow> found = findConversationAnyState(id);
         found.ifPresent(conversation -> {
             ownerFor(conversation.ownerId());
             if (turns.values().stream().anyMatch(turn -> turn.conversationId().equals(id))) {
                 throw new IllegalStateException("a turn still names the conversation");
             }
             conversations.remove(id);
-            RollbackUndo.onRollback(() -> conversations.put(id, conversation));
+            boolean wasDeleting = deleting.remove(id);
+            RollbackUndo.onRollback(() -> {
+                conversations.put(id, conversation);
+                if (wasDeleting) {
+                    deleting.add(id);
+                }
+            });
         });
         return found.isPresent();
     }

@@ -11,6 +11,7 @@ import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.CampaignScopes;
 import io.github.gmshield.scope.service.Indexing;
 import io.github.gmshield.scope.service.IndexingFailure;
@@ -91,6 +92,15 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #history} (Story 3.10): the earlier turns of a turn's conversation that reach the model as data: the
  *       last {@value #HISTORY_TURNS} before it that ended {@code done} and were not stopped, oldest first, each answer
  *       its joined delta texts cut at {@value #HISTORY_ANSWER} code points.</li>
+ *   <li>Story 3.10 part B, deleting a conversation. {@link #deletion} counts what goes (its questions);
+ *       {@link #delete} starts the recorded, resumable deletion of {@link SystemDeletion#deleteConversation}, whose
+ *       conversations part ({@link SystemConversationsDeletion}) marks it {@code deleting} and cancels its answer jobs in
+ *       one transaction with the record, then removes its rows once their claims lapse. From that commit the
+ *       conversation is "not found" everywhere: its campaign's lists and counts, {@link #conversation}, {@link #turns},
+ *       {@link #rename}, a question naming it, and the campaign's latest {@code questions} conversation; so are its
+ *       turns ({@link #turn}, {@link #eventsAfter}, {@link #stop}, {@link #referencePage}, {@link #referencePicture}).
+ *       The delete cancels its answer jobs, which ends their claims; a job call already under way when the
+ *       conversation turned deleting still reads it ({@link #storedEvents}, {@link #history}) and ends normally.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -132,12 +142,13 @@ public class Conversations {
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<AnswerJobs> answers;
+    private final ObjectProvider<SystemDeletion> deletions;
     private final Clock clock;
 
     Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes,
                   CampaignScopes campaignScopes, Jobs jobs, Vault vault,
                   ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<AnswerJobs> answers,
-                  ObjectProvider<Clock> clock) {
+                  ObjectProvider<SystemDeletion> deletions, ObjectProvider<Clock> clock) {
         this.store = store;
         this.referenceStore = referenceStore;
         this.library = library;
@@ -147,6 +158,7 @@ public class Conversations {
         this.vault = vault;
         this.transactions = transactions;
         this.answers = answers;
+        this.deletions = deletions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
@@ -396,6 +408,29 @@ public class Conversations {
     }
 
     /**
+     * What goes with the owner's conversation if it is deleted (Story 3.10 part B): how many questions it holds; empty
+     * for a conversation that is not the owner's (a deleting one included).
+     */
+    public Optional<Long> deletion(UUID id) {
+        return reading(() -> visible(id).map(row -> store.turnCount(row.id())));
+    }
+
+    /**
+     * Deletes the owner's conversation (Story 3.10 part B), as the class says: true when its deletion was recorded now;
+     * false (nothing changes) for a conversation that is not the owner's, a deleting one included.
+     */
+    public boolean delete(UUID id) {
+        UUID owner = OwnerContext.require();
+        if (reading(() -> visible(id)).isEmpty()) {
+            return false;
+        }
+        boolean recorded = deletions.getObject().deleteConversation(id);
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("conversationId", id).addKeyValue("recorded", recorded)
+                .log("conversation.delete");
+        return recorded;
+    }
+
+    /**
      * The earlier turns of the owner's turn's conversation that reach the model with it (Story 3.10), as the class says:
      * oldest first; empty for the first question.
      */
@@ -411,7 +446,7 @@ public class Conversations {
                 if (row.stoppedAt() != null) {
                     continue;
                 }
-                List<TurnEvent> events = eventsAfter(row.id(), 0);
+                List<TurnEvent> events = storedEvents(row.id(), 0);
                 boolean done = events.stream().anyMatch(event -> TurnEvent.DONE.equals(event.type())
                         && !event.stopped());
                 boolean failed = events.stream().anyMatch(event -> TurnEvent.ERROR.equals(event.type()));
@@ -457,7 +492,7 @@ public class Conversations {
 
     /** A stored turn with its events as the stream sends them; a {@code done}'s data built now (Story 2.5). */
     private StoredTurn stored(TurnRow row) {
-        List<TurnEvent> events = eventsAfter(row.id(), 0);
+        List<TurnEvent> events = storedEvents(row.id(), 0);
         List<StoredEvent> stored = new ArrayList<>();
         for (TurnEvent event : events) {
             ObjectNode data = TurnEvent.DONE.equals(event.type())
@@ -479,17 +514,25 @@ public class Conversations {
         return text.codePointCount(0, text.length()) <= max ? text : text.substring(0, text.offsetByCodePoints(0, max));
     }
 
-    /** The owner's turn with this id; empty for an unknown id or another owner's. */
+    /**
+     * The owner's turn with this id; empty for an unknown id, another owner's, or (Story 3.10 part B) one of a deleting
+     * conversation.
+     */
     public Optional<Turn> turn(UUID turnId) {
-        return turnId == null ? Optional.empty() : reading(() -> store.findTurn(turnId)
+        return turnId == null ? Optional.empty() : reading(() -> shown(turnId)
                 .map(row -> new Turn(row.id(), row.conversationId(), row.language())));
+    }
+
+    /** The owner's turn, while its conversation is {@code ready} (Story 3.10 part B). */
+    private Optional<TurnRow> shown(UUID turnId) {
+        return store.findTurn(turnId).filter(turn -> store.findConversation(turn.conversationId()).isPresent());
     }
 
     /** Stops the owner's turn's answer, as the class says. */
     public void stop(UUID turnId) {
         UUID owner = OwnerContext.require();
         writing(() -> {
-            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : store.findTurn(turnId))
+            TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
                     .orElseThrow(ConversationProblems::notFound);
             UUID jobId = turn.jobId();
             String state = jobs.lock(jobId).orElseThrow(() -> new IllegalStateException("conversations.job_missing"));
@@ -504,8 +547,21 @@ public class Conversations {
         });
     }
 
-    /** The owner's turn's stored events after {@code sequence}, in order. */
+    /**
+     * The owner's turn's stored events after {@code sequence}, in order; none for (Story 3.10 part B) a turn of a
+     * deleting conversation.
+     */
     public List<TurnEvent> eventsAfter(UUID turnId, long sequence) {
+        return reading(() -> turnId == null || shown(turnId).isEmpty() ? List.<TurnEvent>of()
+                : storedEvents(turnId, sequence));
+    }
+
+    /**
+     * The owner's turn's stored events after {@code sequence}, in order, whatever its conversation's state: for its
+     * answer job, whose call may be under way when the conversation turns deleting (Story 3.10 part B), and for reads
+     * that checked the turn already.
+     */
+    List<TurnEvent> storedEvents(UUID turnId, long sequence) {
         return reading(() -> {
             List<TurnEvent> events = new ArrayList<>();
             for (EventBatchRow row : store.batchesAfter(turnId, sequence)) {
@@ -543,7 +599,7 @@ public class Conversations {
         return reading(() -> {
             boolean modelKnowledge = turnId != null && store.findTurn(turnId).map(TurnRow::modelKnowledge)
                     .orElse(false);
-            boolean modelTier = modelKnowledge && eventsAfter(turnId, 0).stream().anyMatch(Conversations::modelTier);
+            boolean modelTier = modelKnowledge && storedEvents(turnId, 0).stream().anyMatch(Conversations::modelTier);
             return new Ending(references(turnId), modelKnowledge, modelTier);
         });
     }

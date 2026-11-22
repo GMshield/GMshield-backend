@@ -44,7 +44,8 @@ public interface ConversationStore {
 
     /**
      * A question was asked in the owner's conversation at {@code at} (Story 3.10): its {@code last_asked_at} moves
-     * there (never back); its version stays. False for an unknown conversation or another owner's.
+     * there (never back); its version stays. False for an unknown conversation, another owner's or (Story 3.10 part B)
+     * a deleting one.
      */
     boolean markAsked(UUID id, Instant at);
 
@@ -55,7 +56,20 @@ public interface ConversationStore {
      */
     Optional<ConversationRow> renameConversation(UUID id, long version, byte[] name);
 
+    /** The current owner's {@code ready} conversation (Story 3.10 part B: a deleting one is not found). */
     Optional<ConversationRow> findConversation(UUID id);
+
+    /**
+     * The current owner's conversation, {@code ready} or {@code deleting} (Story 3.10 part B): for its deletion, and for
+     * an answer job's call already under way when the conversation turned deleting.
+     */
+    Optional<ConversationRow> findConversationAnyState(UUID id);
+
+    /**
+     * The current owner's conversation becomes {@code deleting} (Story 3.10 part B), its version unchanged; true also
+     * when it was already, false for an unknown conversation or another owner's.
+     */
+    boolean markDeleting(UUID id);
 
     /** How many turns the current owner's conversation has (Story 3.2); 0 for an unknown one or another owner's. */
     long turnCount(UUID conversationId);
@@ -86,8 +100,11 @@ public interface ConversationStore {
 
     // --- a system's deletion (Story 3.1 part B)
 
-    /** The current owner's conversations of these campaigns, oldest first. */
+    /** The current owner's conversations of these campaigns, oldest first, deleting ones included. */
     List<ConversationRow> conversationsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** How many {@code ready} conversations the current owner's campaigns have (Story 3.10 part B). */
+    long countConversationsOfCampaigns(Collection<UUID> campaignIds);
 
     /** The current owner's turns of a conversation, oldest first. */
     List<TurnRow> turnsOf(UUID conversationId);
@@ -98,6 +115,9 @@ public interface ConversationStore {
      */
     boolean deleteTurn(UUID turnId);
 
-    /** Deletes the current owner's conversation, which must have no turn left; false when there is none. */
+    /**
+     * Deletes the current owner's conversation, {@code ready} or {@code deleting}, which must have no turn left; false
+     * when there is none.
+     */
     boolean deleteConversation(UUID id);
 }

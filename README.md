@@ -1006,7 +1006,7 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
 - **Conversations by area (`conversations`, Story 3.10 part A, public contract 1.29.0, internal contract 1.16.0,
   migration V30).** A campaign has many conversations, each in one area of the sidebar: `questions` (Consultas) or
   `rules` (Criação de Regras). A conversation is made by its first question, never by "Nova conversa", so none is
-  empty. Deleting a conversation is part B.
+  empty. Deleting a conversation is part B (below).
   - `V30__conversation_areas.sql`: `conversation` gains `area` (checked to the two words; existing rows `questions`),
     `name` (bytea, null until the GM renames it; vault binding `conversation`/`name`), `version` (Hibernate `@Version`,
     raised by a rename only) and `last_asked_at` (an existing row takes its newest turn's time; asking moves it forward
@@ -1035,7 +1035,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     conversation is continued (made when it has none), as before, so the previous frontend keeps working during the
     deploy. `GET /api/v1/campaigns/{campaignId}/conversation` answers that same latest `questions` conversation.
   - Every one of these routes answers `no-store`, and another account's conversation, an unknown or malformed id and
-    one of a campaign being deleted are the same 404 `request.not_found`.
+    one of a campaign being deleted (from part B, a conversation being deleted too) are the same 404
+    `request.not_found`.
   - **History (internal 1.16.0).** `AnswerJobs.input` adds `history: [{question, answer}]` after
     `Scopes.questionInput` (whose `textInput`, shared with the search input, is unchanged): the last 6 turns before
     this one in its conversation that ended `done` and were not stopped (`Conversations.history`), oldest first, each
@@ -1050,6 +1051,53 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     becomes 1.16.0), then the frontend (its minimum becomes 1.29.0). Rolling the backend back below 1.29.0: the
     frontend and the worker go back first; the old backend continues the oldest conversation of a campaign whatever
     its area, and ignores the names.
+
+- **Delete a conversation (`conversations`, Story 3.10 part B, public contract 1.30.0, migration V31, AD-22).** The
+  recorded, resumable deletion of a system (3.1 part B), extended to a `deletion` row of kind `conversation`, recorded
+  as a material's is (3.4 part B). What goes: the conversation, its turns, their event batches, `turn_material_off`
+  rows and source references. Nothing of the other conversations, its campaign, the searches or the materials changes;
+  `model_call_usage` stays (it names a job, never a turn). No undo, no bulk delete.
+  - `V31__conversation_deletion.sql`: `conversation.state` (`ready` | `deleting`, default `ready`, checked), and
+    `deletion_kind_check` widened with `conversation`. Additive: the previous release neither reads nor writes the
+    state (its inserts take the default).
+  - `GET /api/v1/conversations/{id}/deletion` (`getConversationDeletion`) answers `{questions}` (its turn count), what
+    the confirmation dialog names.
+  - `DELETE /api/v1/conversations/{id}` (`deleteConversation`) answers 202 with no body. `Conversations.delete` checks
+    the conversation (the account's, `ready`, its campaign the account's), then `SystemDeletion.deleteConversation`
+    writes, in one transaction, the `deletion` row (once per target) and each handler's `prepare` with
+    `Going.ofConversation(id)`: `conversations` sets `state = 'deleting'` (a JPQL bulk update after the owner's row was
+    read: it never raises the version) and locks and cancels the conversation's unended answer jobs; `not_before` is
+    the latest lapse of those claims, or now. `materials` and `scope` ignore it. `library` keeps the id opaque. Logs:
+    `conversation.delete`, `library.conversation_deleting`, `conversation.deletion_prepared`, then
+    `conversation.deletion_removed` and `library.conversation_deleted` (ids, counts and times only).
+  - From that commit the conversation is `request.not_found` everywhere: its campaign's list and `total`, GET, `/turns`,
+    PATCH, DELETE and `/deletion`, a question naming it, the area-less question's latest `questions` conversation (the
+    question continues the next latest one, or makes one), `GET /campaigns/{id}/conversation`, a campaign's or a
+    system's deletion counts; and its turns' events, stop and reference pages and pictures. The cancel ends the answer
+    jobs' claims (a later worker call is refused, `job.grant_refused`); a job call already under way when the
+    conversation turned deleting still reads it (`Conversations.storedEvents`,
+    `ConversationStore.findConversationAnyState`) and ends normally.
+  - Removal at `not_before`, as a one-shot after the commit and through the sweep (which resumes it after a restart):
+    in one transaction the references, then each turn with its batches and materials-off rows, then the conversation;
+    then `deletion.done_at`. Every step is safe to repeat.
+  - A campaign or a system deleted meanwhile takes the conversation too (`conversationsOfCampaigns` reads every state);
+    the conversation's own deletion then finds nothing left and is marked done.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.30.0). The worker does
+    not change. After a rollback a deleting conversation shows again, with whatever its removal has not removed yet;
+    that release's sweep takes a pending `conversation` row as a system it cannot find and marks it done. **Before
+    rolling forward again**, make such conversations ready, or they stay `deleting` (hidden) forever with no pending
+    deletion to remove them, so the GM can delete them again:
+    ```sql
+    update conversation c set state = 'ready'
+     where c.state = 'deleting'
+       and not exists (select 1 from deletion d where d.kind = 'conversation' and d.target_id = c.id
+                                                 and d.done_at is null);
+    delete from deletion d
+     where d.kind = 'conversation' and d.done_at is not null
+       and exists (select 1 from conversation c where c.id = d.target_id);
+    ```
+    The second statement drops the record the old sweep ended without removing anything: a deletion is recorded once
+    per target, so it would otherwise answer a new delete of the conversation as not found.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

@@ -61,6 +61,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  * delete: the record is written (once per target: a second delete changes nothing) in one transaction with every
  * handler's prepare, and a pass is done once the handlers' removal ends. The same sweep, one-shot passes, claim wait
  * and preparing again run it.
+ *
+ * <p>Story 3.10 part B: deleting one of the owner's conversations ({@link #deleteConversation}) is the same process
+ * again, of kind {@code conversation}, recorded as a material's is. {@code library} keeps the id opaque: the
+ * {@code conversations} module checks the target first, and its handler, given {@code Going.ofConversation}, marks the
+ * conversation {@code deleting} and cancels its answer jobs in the GM's transaction, then removes its rows; every other
+ * handler ignores it. A campaign's or a system's deletion meanwhile takes the conversation too: its own deletion then
+ * finds nothing left and is marked done.
  */
 @Service
 public class SystemDeletion {
@@ -195,6 +202,16 @@ public class SystemDeletion {
     }
 
     /**
+     * Records the deletion of the owner's conversation {@code conversationId} (Story 3.10 part B), as the class says;
+     * the {@code conversations} module has found it the owner's and {@code ready}. Answers whether it was recorded now:
+     * false when its deletion was recorded already (nothing changes then).
+     */
+    public boolean deleteConversation(UUID conversationId) {
+        return recordDeletion(DeletionRow.CONVERSATION, conversationId,
+                SystemDeletionHandler.Going.ofConversation(conversationId));
+    }
+
+    /**
      * Whether the deletion of the owner's material {@code materialId} is recorded, pending or done (Story 3.4 part B:
      * from then on its count and its versions are not found).
      */
@@ -308,8 +325,9 @@ public class SystemDeletion {
         for (SystemDeletionHandler handler : handlers()) {
             handler.remove(prepared.going());
         }
-        if (prepared.going().ofMaterials()) {
-            // A material or a version: nothing of library's own goes; the handlers' removal ended, so the record does.
+        if (prepared.going().ofOneItem()) {
+            // A material, a version or a conversation: nothing of library's own goes; the handlers' removal ended, so
+            // the record does.
             writing(() -> deletions.done(owner, row.id(), now()));
             prepared.going().about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("deletionId", row.id())
                     .log("library." + row.kind() + "_deleted");
@@ -334,26 +352,27 @@ public class SystemDeletion {
 
     /**
      * Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. A
-     * material or a version (Story 3.4 part B) is not library's to find: the handlers find what is left of it, and
-     * nothing when it is gone.
+     * material or a version (Story 3.4 part B), or a conversation (Story 3.10 part B), is not library's to find: the
+     * handlers find what is left of it, and nothing when it is gone.
      */
     private boolean targetDeleting(DeletionRow row) {
         return switch (row.kind()) {
             case DeletionRow.CAMPAIGN -> store.campaignDeleting(row.targetId());
-            case DeletionRow.MATERIAL, DeletionRow.VERSION -> true;
+            case DeletionRow.MATERIAL, DeletionRow.VERSION, DeletionRow.CONVERSATION -> true;
             default -> store.deleting(row.targetId());
         };
     }
 
     /**
      * What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone, or
-     * (kinds {@code material} and {@code version}) that one id.
+     * (kinds {@code material}, {@code version} and {@code conversation}) that one id.
      */
     private SystemDeletionHandler.Going goingOf(DeletionRow row) {
         return switch (row.kind()) {
             case DeletionRow.CAMPAIGN -> goingOfCampaign(row.targetId());
             case DeletionRow.MATERIAL -> SystemDeletionHandler.Going.ofMaterial(row.targetId());
             case DeletionRow.VERSION -> SystemDeletionHandler.Going.ofVersion(row.targetId());
+            case DeletionRow.CONVERSATION -> SystemDeletionHandler.Going.ofConversation(row.targetId());
             default -> new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
         };
     }
