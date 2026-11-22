@@ -2,6 +2,8 @@ package io.github.gmshield.conversations.service;
 
 import io.github.gmshield.conversations.data.ConversationRow;
 import io.github.gmshield.conversations.data.ConversationStore;
+import io.github.gmshield.conversations.data.SearchRow;
+import io.github.gmshield.conversations.data.SearchStore;
 import io.github.gmshield.conversations.data.TurnReferenceStore;
 import io.github.gmshield.conversations.data.TurnRow;
 import io.github.gmshield.jobs.service.Jobs;
@@ -9,6 +11,7 @@ import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.library.service.SystemDeletionHandler;
 import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,6 +41,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 3.4 part B: a material's deletion or a version's removal ({@link Going#ofMaterials}) takes nothing here:
  * a turn's references are stored by value, and one whose version is gone reads as a removed source.
+ *
+ * <p>Story 3.9: the searches of the campaigns go too: {@link #prepare} locks and cancels their {@code library.search}
+ * jobs with the answer jobs, and {@link #remove} deletes each search with its results, in one transaction. A
+ * material's deletion takes none: a search's results are re-checked against the scope each time it is read, so a
+ * result whose material is gone is no longer shown. {@link #count} counts conversations only.
  */
 @Service
 class SystemConversationsDeletion implements SystemDeletionHandler {
@@ -46,13 +54,15 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     private final ConversationStore store;
     private final TurnReferenceStore references;
+    private final SearchStore searches;
     private final Jobs jobs;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    SystemConversationsDeletion(ConversationStore store, TurnReferenceStore references, Jobs jobs,
+    SystemConversationsDeletion(ConversationStore store, TurnReferenceStore references, SearchStore searches, Jobs jobs,
                                 ObjectProvider<PlatformTransactionManager> transactions) {
         this.store = store;
         this.references = references;
+        this.searches = searches;
         this.jobs = jobs;
         this.transactions = transactions;
     }
@@ -75,8 +85,9 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
         if (going.ofMaterials()) {
             return Optional.empty();
         }
-        List<UUID> jobIds = store.conversationsOfCampaigns(going.campaignIds()).stream()
-                .flatMap(conversation -> store.turnsOf(conversation.id()).stream()).map(TurnRow::jobId).toList();
+        List<UUID> jobIds = new ArrayList<>(store.conversationsOfCampaigns(going.campaignIds()).stream()
+                .flatMap(conversation -> store.turnsOf(conversation.id()).stream()).map(TurnRow::jobId).toList());
+        jobIds.addAll(searches.searchesOfCampaigns(going.campaignIds()).stream().map(SearchRow::jobId).toList());
         Optional<Instant> lapse = jobs.claimLapse(jobIds);
         int cancelled = 0;
         for (UUID jobId : jobs.unended(jobIds)) {
@@ -105,8 +116,14 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
                 return found.size();
             });
         }
+        Integer removedSearches = writing(() -> {
+            List<SearchRow> found = searches.searchesOfCampaigns(going.campaignIds());
+            found.forEach(search -> searches.deleteSearch(search.id()));
+            return found.size();
+        });
         going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("conversations", conversations.size())
-                .addKeyValue("turns", turns).log("conversation.system_deletion_removed");
+                .addKeyValue("turns", turns).addKeyValue("searches", removedSearches)
+                .log("conversation.system_deletion_removed");
     }
 
 

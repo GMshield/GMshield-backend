@@ -48,6 +48,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * only when its tier has a source in the turn's scope.
  * Story 3.8: a {@code model} tier marker stored only when the turn's frozen {@code model_knowledge} is on, and the
  * turn's ending read from its row and its stored events.
+ * Story 3.9: a search on PostgreSQL ({@code search}, {@code search_result}, V29): recorded with its job and the query
+ * encrypted, its claim's input, its results stored in rank order and read back with their places, a result dropped
+ * once its version is no longer ready, a forged result refused whole, the checks of the tables, another owner, and
+ * only the newest 20 searches kept.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -66,6 +70,8 @@ class ConversationIntegrationTest {
     private MaterialStore materials;
     @Autowired
     private Conversations conversations;
+    @Autowired
+    private Searches searches;
     @Autowired
     private JobClaims claims;
     @Autowired
@@ -337,6 +343,99 @@ class ConversationIntegrationTest {
         assertThat(theirs.modelKnowledge()).isFalse();
         assertThat(theirs.modelTier()).isFalse();
         assertThat(theirs.references()).isEmpty();
+    }
+
+    @Test
+    void aSearchItsResultsAndItsPruningAreStoredOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        List<UUID> passages = List.of(Ids.newId(), Ids.newId());
+        as(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "SRD 5.2.1"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, passages.get(0), 0, 4),
+                    passage(owner, version, passages.get(1), 1, 9)));
+            return null;
+        });
+
+        UUID searchId = OwnerContext.callAs(owner, () -> searches.create(campaign, "Fire Bolt", null, null));
+
+        Map<String, Object> row = jdbc.sql("select owner_id, campaign_id, job_id, query, tier, material_id, state, code"
+                + " from search where id = :id").param("id", searchId).query().singleRow();
+        assertThat(row.get("owner_id")).isEqualTo(owner);
+        assertThat(row.get("campaign_id")).isEqualTo(campaign);
+        assertThat(row.get("state")).isEqualTo("pending");
+        assertThat(row.get("tier")).isNull();
+        assertThat(new String((byte[]) row.get("query"), StandardCharsets.ISO_8859_1)).doesNotContain("Fire Bolt");
+        UUID jobId = (UUID) row.get("job_id");
+        assertThat(jdbc.sql("select kind, lane from job where id = :id").param("id", jobId).query().singleRow())
+                .containsEntry("kind", SearchJobs.KIND).containsEntry("lane", "interactive");
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of());
+        assertThat(claim.input().path("query").asString()).isEqualTo("Fire Bolt");
+        assertThat(claim.input().path("tiers").get(0).path("sources").get(0).asString()).isEqualTo(version.toString());
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, tools.jackson.databind.node.JsonNodeFactory
+                .instance.objectNode().set("ids", tools.jackson.databind.node.JsonNodeFactory.instance.arrayNode()
+                        .add(passages.get(1).toString()).add(passages.get(0).toString())));
+
+        Searches.Found found = as(owner, () -> searches.find(searchId)).orElseThrow();
+
+        assertThat(found.state()).isEqualTo("done");
+        assertThat(found.query()).isEqualTo("Fire Bolt");
+        assertThat(found.results()).extracting(Searches.Result::passageId, Searches.Result::page,
+                Searches.Result::materialName, Searches.Result::firstWords).containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(passages.get(1), 9, "SRD 5.2.1",
+                                "Fire Bolt deals 1d10 Fire damage 1"),
+                        org.assertj.core.groups.Tuple.tuple(passages.get(0), 4, "SRD 5.2.1",
+                                "Fire Bolt deals 1d10 Fire damage 0"));
+        assertThat(jdbc.sql("select rank, passage_id, version_id, tier from search_result where search_id = :id"
+                + " order by rank").param("id", searchId).query().listOfRows()).extracting(result -> result.get("rank"),
+                result -> result.get("passage_id"), result -> result.get("tier")).containsExactly(
+                        org.assertj.core.groups.Tuple.tuple(1, passages.get(1), "campaign"),
+                        org.assertj.core.groups.Tuple.tuple(2, passages.get(0), "campaign"));
+        assertThat(jdbc.sql("select state, code from search where id = :id").param("id", searchId).query().singleRow())
+                .containsEntry("state", "done").containsEntry("code", null);
+        // Another owner finds nothing.
+        UUID other = Ids.newId();
+        assertThat(as(other, () -> searches.find(searchId))).isEmpty();
+        // A forged result is refused whole and the search fails with scope.passage_refused.
+        UUID forged = OwnerContext.callAs(owner, () -> searches.create(campaign, "Vorpal",
+                io.github.gmshield.scope.service.Tier.CAMPAIGN, material));
+        UUID forgedJob = jdbc.sql("select job_id from search where id = :id").param("id", forged).query(UUID.class)
+                .single();
+        JobClaims.Claim forgedClaim = claims.claim(forgedJob, null, List.of());
+        claims.report(forgedJob, forgedClaim.claimId(), forgedClaim.grant(), "done", null,
+                tools.jackson.databind.node.JsonNodeFactory.instance.objectNode().set("ids",
+                        tools.jackson.databind.node.JsonNodeFactory.instance.arrayNode().add(Ids.newId().toString())));
+        assertThat(jdbc.sql("select state, code, tier, material_id from search where id = :id").param("id", forged)
+                .query().singleRow()).containsEntry("state", "failed").containsEntry("code", "scope.passage_refused")
+                .containsEntry("tier", "campaign").containsEntry("material_id", material);
+        // The tables' checks.
+        assertThatThrownBy(() -> jdbc.sql("update search set state = 'failed', code = null where id = :id")
+                .param("id", searchId).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("search_code_check");
+        assertThatThrownBy(() -> jdbc.sql("update search_result set rank = 21 where search_id = :id and rank = 1")
+                .param("id", searchId).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("search_result_rank_check");
+        // A version no longer ready drops its results on the next read.
+        as(owner, () -> materials.discardVersion(version, Instant.now()));
+        assertThat(as(owner, () -> searches.find(searchId)).orElseThrow().results()).isEmpty();
+        // Only the newest 20 of the owner's searches are kept.
+        for (int i = 0; i < 20; i++) {
+            OwnerContext.callAs(owner, () -> searches.create(campaign, "Fire Bolt", null, null));
+        }
+        assertThat(jdbc.sql("select count(*) from search where owner_id = :owner").param("owner", owner)
+                .query(Long.class).single()).isEqualTo(20);
+        assertThat(jdbc.sql("select count(*) from search where id = :id").param("id", searchId).query(Long.class)
+                .single()).isZero();
+        assertThat(jdbc.sql("select count(*) from search_result where search_id = :id").param("id", searchId)
+                .query(Long.class).single()).isZero();
     }
 
     private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page) {

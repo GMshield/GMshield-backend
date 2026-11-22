@@ -13,6 +13,7 @@ import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.conversations.data.InMemoryConversationStore;
+import io.github.gmshield.conversations.data.InMemorySearchStore;
 import io.github.gmshield.conversations.data.InMemoryTurnReferenceStore;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
@@ -144,6 +145,8 @@ class CampaignDeletionFlowTest {
     @Autowired
     private InMemoryTurnReferenceStore references;
     @Autowired
+    private InMemorySearchStore searches;
+    @Autowired
     private InMemoryJobStorage jobs;
     @Autowired
     private io.github.gmshield.scope.data.InMemoryScopeStore scopes;
@@ -189,6 +192,9 @@ class CampaignDeletionFlowTest {
         UUID firstTurn = turnId(ask(gm, target));
         UUID secondTurn = turnId(ask(gm, target));
         UUID siblingTurn = turnId(ask(gm, sibling));
+        // Story 3.9: a search of each campaign.
+        UUID targetSearch = searchId(gm, target);
+        UUID siblingSearch = searchId(gm, sibling);
         Made ready = material(gm, target, List.of(), "ready", 2);
         Made reviewing = material(gm, target, List.of(), "needs_review", 1);
         // Its one version was discarded: it goes, and the dialog does not count it.
@@ -261,6 +267,10 @@ class CampaignDeletionFlowTest {
         assertThat(jobs.rows.get(conversations.turns.get(firstTurn).jobId()).state()).isEqualTo("cancelled");
         assertThat(jobs.rows.get(conversations.turns.get(secondTurn).jobId()).state()).isEqualTo("cancelled");
         assertThat(jobs.rows.get(conversations.turns.get(siblingTurn).jobId()).state()).isNotEqualTo("cancelled");
+        assertThat(jobs.rows.get(searches.searches.get(targetSearch).jobId()).state()).isEqualTo("cancelled");
+        assertThat(jobs.rows.get(searches.searches.get(siblingSearch).jobId()).state()).isNotEqualTo("cancelled");
+        assertNotFound(get(gm, "/api/v1/searches/" + targetSearch));
+        assertThat(get(gm, "/api/v1/searches/" + siblingSearch).statusCode()).isEqualTo(200);
         // The same name is free at once in the same system.
         assertThat(post(gm, "/api/v1/campaigns", Map.of("name", "Mesa de sexta", "systemId", gm.system().toString()))
                 .statusCode()).isEqualTo(201);
@@ -285,6 +295,7 @@ class CampaignDeletionFlowTest {
         assertThat(conversations.turns).doesNotContainKeys(firstTurn, secondTurn).containsKey(siblingTurn);
         assertThat(references.rows.values()).noneMatch(reference ->
                 List.of(firstTurn, secondTurn).contains(reference.turnId()));
+        assertThat(searches.searches).doesNotContainKey(targetSearch).containsKey(siblingSearch);
         assertThat(materials.materials).doesNotContainKeys(ready.materialId(), reviewing.materialId(),
                 hidden.materialId()).containsKeys(ofSibling.materialId(), ofSystem.materialId());
         assertThat(materials.systems.values()).filteredOn(link -> link.materialId().equals(ofSystem.materialId()))
@@ -464,6 +475,14 @@ class CampaignDeletionFlowTest {
 
     private HttpResponse<String> ask(Gm gm, UUID campaign) throws Exception {
         return send(gm, "POST", "/api/v1/campaigns/" + campaign + "/turns", "{\"question\":\"Quanto dano?\"}");
+    }
+
+    /** A search of the campaign (Story 3.9); answers its id. */
+    private UUID searchId(Gm gm, UUID campaign) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns/" + campaign + "/searches",
+                "{\"query\":\"Quanto dano\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(202);
+        return UUID.fromString(json(created).path("id").asString());
     }
 
     private static UUID turnId(HttpResponse<String> asked) {
