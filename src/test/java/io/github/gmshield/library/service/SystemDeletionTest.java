@@ -29,6 +29,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * part B); likewise a campaign's (Story 3.2 part B), and a campaign whose system was deleted meanwhile ends as done.
  * Story 3.4 part B: a material's deletion and a version's removal are recorded once, prepared in the same transaction
  * (waiting for the latest claim lapse), and done once the handlers' removal ends, with nothing of library's touched.
+ * Story 3.10 part B: a conversation's deletion is the same, its id kept opaque, waiting for the claims its prepare
+ * answers; a second delete records nothing.
  */
 class SystemDeletionTest {
 
@@ -242,5 +244,46 @@ class SystemDeletionTest {
         assertThat(deletion.run(owner, row.id())).isFalse();
         assertThat(handler.removed).isEmpty();
         assertThat(deletion.sweep()).isZero();
+    }
+
+    @Test
+    void aConversationsDeletionIsRecordedOnceWaitsForItsClaimsAndIsDoneOnceTheHandlersRemovalEnds() {
+        Recording handler = new Recording();
+        handler.lapse = NOW.plusSeconds(45);
+        SystemDeletion deletion = deletion(handler);
+        UUID owner = Ids.newId();
+        UUID system = Ids.newId();
+        UUID campaign = Ids.newId();
+        insert(owner, system, campaign);
+        UUID conversation = Ids.newId();
+        SystemDeletionHandler.Going going = SystemDeletionHandler.Going.ofConversation(conversation);
+        assertThat(going.ofOneConversation()).isTrue();
+        assertThat(going.ofOneItem()).isTrue();
+        assertThat(going.ofMaterials()).isFalse();
+        assertThat(going.campaignIds()).isEmpty();
+
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteConversation(conversation))).isTrue();
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteConversation(conversation))).isFalse();
+
+        DeletionRow row = deletions.rows.values().stream().findFirst().orElseThrow();
+        assertThat(deletions.rows).hasSize(1);
+        assertThat(row.kind()).isEqualTo(DeletionRow.CONVERSATION);
+        assertThat(row.targetId()).isEqualTo(conversation);
+        assertThat(row.notBefore()).isEqualTo(NOW.plusSeconds(45));
+        assertThat(handler.prepared).containsExactly(going);
+        verify(schedule).once(any(), eq(NOW.plusSeconds(45)));
+        // Not due yet: the pass does nothing.
+        assertThat(deletion.run(owner, row.id())).isFalse();
+        assertThat(handler.removed).isEmpty();
+
+        // Due, and the claims have lapsed: the pass removes it and ends the record; nothing of library's goes.
+        handler.lapse = null;
+        deletions.rows.put(row.id(), new DeletionRow(row.id(), owner, row.kind(), conversation, NOW, NOW, null));
+        assertThat(deletion.run(owner, row.id())).isTrue();
+        assertThat(handler.removed).containsExactly(going);
+        assertThat(deletions.rows.get(row.id()).doneAt()).isEqualTo(NOW);
+        assertThat(store.campaigns).containsKey(campaign);
+        assertThat(store.systems).containsKey(system);
+        assertThat(deletion.run(owner, row.id())).isFalse();
     }
 }

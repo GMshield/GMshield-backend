@@ -68,6 +68,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ({@code Going.ofVersion}) that one version alone, the same way, and the material stays. An unknown id, another
  * owner's, or one already gone is nothing to do. Neither counts anything here: the dialog's counts are
  * {@link MaterialDeletions#count}.
+ *
+ * <p>Story 3.10 part B: a conversation's deletion ({@code Going.ofConversation}) takes nothing here.
  */
 @Service
 class SystemMaterialsDeletion implements SystemDeletionHandler {
@@ -111,7 +113,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public long count(Going going) {
-        if (going.ofMaterials()) {
+        if (going.ofOneItem()) {
             return 0;
         }
         return going(going).stream()
@@ -122,6 +124,9 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public Optional<Instant> prepare(Going going) {
+        if (going.ofOneConversation()) {
+            return Optional.empty();
+        }
         Instant now = now();
         Instant latest = null;
         int discarded = 0;
@@ -154,6 +159,9 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
+        if (going.ofOneConversation()) {
+            return;
+        }
         if (going.versionId() != null) {
             // One version: the material stays.
             int left = removeVersion(owner, going.versionId()) ? 0 : 1;

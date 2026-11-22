@@ -31,6 +31,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -53,7 +54,9 @@ import tools.jackson.databind.json.JsonMapper;
  * From Story 3.9, a search of the library: created as a job (202) and read by id, with its results re-checked against
  * the campaign's current scope each time. From Story 3.10, conversations by area: a campaign's conversations of one area
  * (paged by offset, the most recently asked first), one conversation, its stored turns with their events, its rename on
- * its version, and a question that continues a conversation or starts one in an area.
+ * its version, and a question that continues a conversation or starts one in an area. From Story 3.10 part B, what goes
+ * with a conversation (its question count) and its deletion (202, no body): from then on it and its turns are
+ * {@code request.not_found} on every route.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -75,6 +78,7 @@ class ConversationController {
     static final String CONVERSATIONS = "/api/v1/campaigns/{campaignId}/conversations";
     static final String CONVERSATION = "/api/v1/conversations/{conversationId}";
     static final String CONVERSATION_TURNS = "/api/v1/conversations/{conversationId}/turns";
+    static final String CONVERSATION_DELETION = "/api/v1/conversations/{conversationId}/deletion";
     static final String WEBP = "image/webp";
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() {
@@ -220,6 +224,13 @@ class ConversationController {
         public String toString() {
             return "ConversationView[id=" + id + ", version=" + version + "]";
         }
+    }
+
+    @Schema(name = "ConversationDeletion", requiredProperties = "questions",
+            description = "What goes with a conversation if it is deleted (contract 1.30.0)")
+    record ConversationDeletionView(
+            @Schema(description = "How many questions it holds: each goes with its answer, events and source"
+                    + " references", format = "int64", minimum = "0", example = "3") long questions) {
     }
 
     @Schema(name = "ConversationChange", requiredProperties = {"version", "name"},
@@ -556,7 +567,7 @@ class ConversationController {
     @GetMapping(path = CONVERSATION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getConversation", summary = "One of the account's conversations (contract 1.29.0): its"
             + " campaign, area, name and version; request.not_found (404) for any other id (unknown, another account's,"
-            + " malformed, or of a campaign being deleted)",
+            + " malformed, of a campaign being deleted, or from contract 1.30.0 a conversation being deleted)",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<ConversationView> conversation(
@@ -607,6 +618,41 @@ class ConversationController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ConversationView.of(renamed));
     }
 
+    @GetMapping(path = CONVERSATION_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getConversationDeletion", summary = "What goes with one of the account's conversations if"
+            + " it is deleted (contract 1.30.0): how many questions it holds, each with its answer. request.not_found"
+            + " (404) for any other id (unknown, another account's, malformed, or of a conversation or campaign being"
+            + " deleted)",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")))
+    ResponseEntity<ConversationDeletionView> conversationDeletion(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId) {
+        long questions = parse(conversationId).flatMap(conversations::deletion)
+                .orElseThrow(ConversationProblems::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new ConversationDeletionView(questions));
+    }
+
+    @DeleteMapping(path = CONVERSATION)
+    @Operation(operationId = "deleteConversation", summary = "Deletes one of the account's conversations (contract"
+            + " 1.30.0; 202, no body): from now on it is not found on every route (its campaign's list and counts, the"
+            + " conversation, its turns, a question naming it, the campaign's latest questions conversation, and its"
+            + " turns' events, stop and reference pages), its answers still being written are cancelled, and its turns,"
+            + " their events and source references are removed in the background. Nothing of its campaign, of the other"
+            + " conversations, of the searches or of the materials changes. Cannot be undone. request.not_found (404)"
+            + " for any other id, a conversation already being deleted included",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion started"))
+    ResponseEntity<Void> deleteConversation(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId) {
+        if (!parse(conversationId).map(conversations::delete).orElse(false)) {
+            throw ConversationProblems.notFound();
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
+    }
+
     @GetMapping(path = EVENTS)
     @Operation(operationId = "streamTurnEvents", summary = "The turn's answer as server-sent events: the stored events"
             + " after Last-Event-ID (0 when absent), then new ones as they are written. Events: delta (TurnDeltaEvent),"
@@ -615,7 +661,7 @@ class ConversationController {
             + " citation. A comment line ': keep-alive' every 15 s; the stream closes after done or"
             + " error, and after 30 minutes without either: the client then reopens it with Last-Event-ID, the id of"
             + " the last event it received. Leaving never touches the answer. request.not_found (404) for a turn that"
-            + " is not the account's",
+            + " is not the account's, or (contract 1.30.0) of a conversation being deleted",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")),
             responses = @ApiResponse(responseCode = "200", description = "The event stream",
@@ -642,7 +688,8 @@ class ConversationController {
     @Operation(operationId = "stopTurn", summary = "Stop the turn's answer (204): its stream ends at once with a done"
             + " event marked stopped, after the text and citations stored so far, and the worker is told to stop at its"
             + " next batch. A turn whose answer has ended already is left as it is (204 too), so repeating it is safe."
-            + " request.not_found (404) for a turn that is not the account's",
+            + " request.not_found (404) for a turn that is not the account's, or (contract 1.30.0) of a conversation"
+            + " being deleted",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<Void> stop(
@@ -655,8 +702,9 @@ class ConversationController {
     private static final String REFERENCE_SUMMARY = " The ground is the path: a source reference stored with a turn of"
             + " the account's campaign (AD-9). The page is read from the version the reference names, even when a newer"
             + " one was accepted since; any page from 1 to its page total. request.not_found (404) for a turn that is"
-            + " not the account's, a malformed or unknown id or number, no such reference, a version removed since, a"
-            + " page outside 1 to the page total, or a page with no view (unless it is unreadable)";
+            + " not the account's (from contract 1.30.0, one of a conversation being deleted too), a malformed or"
+            + " unknown id or number, no such reference, a version removed since, a page outside 1 to the page total,"
+            + " or a page with no view (unless it is unreadable)";
 
     @GetMapping(path = REFERENCE_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getReferencePage", summary = "One page of the version a turn's source reference names:"

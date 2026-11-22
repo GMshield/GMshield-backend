@@ -21,16 +21,20 @@ import org.springframework.stereotype.Repository;
 
 /**
  * The conversation tables through JPA, as the library's stores: every read is JPQL, which Hibernate filters by the
- * owner of the work; nothing is read by {@code find}, and the one bulk statement ({@link #markAsked}) runs only after
- * the owner's row was read. The entity manager is looked up
- * on first use.
+ * owner of the work; nothing is read by {@code find}, and the bulk statements ({@link #markAsked}, and from Story
+ * 3.10 part B {@link #markDeleting}) run only after the owner's row was read. The entity manager is looked up on first
+ * use.
+ *
+ * <p>Story 3.10 part B: every read of a conversation takes {@code ready} rows only, but the deletion's own
+ * ({@link #markDeleting}, {@link #findConversationAnyState}, {@link #conversationsOfCampaigns},
+ * {@link #deleteConversation}) and the answer job's ({@link #findConversationAnyState}).
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
 
     /** A campaign's conversations of one area, the most recently asked first (Story 3.10). */
     private static final String LIST = "select c from Conversation c where c.campaignId = :campaign and c.area = :area"
-            + " order by c.lastAskedAt desc, c.id desc";
+            + " and c.state = 'ready' order by c.lastAskedAt desc, c.id desc";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -63,7 +67,7 @@ class JpaConversationStore implements ConversationStore {
     @Override
     public long conversationCount(UUID campaignId, String area) {
         return em().createQuery("select count(c) from Conversation c where c.campaignId = :campaign"
-                        + " and c.area = :area", Long.class).setParameter("campaign", campaignId)
+                        + " and c.area = :area and c.state = 'ready'", Long.class).setParameter("campaign", campaignId)
                 .setParameter("area", area).getSingleResult();
     }
 
@@ -145,7 +149,31 @@ class JpaConversationStore implements ConversationStore {
         return conversation(id).map(ConversationEntity::row);
     }
 
+    @Override
+    public Optional<ConversationRow> findConversationAnyState(UUID id) {
+        return anyState(id).map(ConversationEntity::row);
+    }
+
+    @Override
+    public boolean markDeleting(UUID id) {
+        if (anyState(id).isEmpty()) {
+            return false;
+        }
+        // One bulk update, after the owner's row was read, as markAsked: it never raises the version, so it never
+        // fails on a rename committed meanwhile.
+        em().createQuery("update Conversation c set c.state = 'deleting' where c.id = :id").setParameter("id", id)
+                .executeUpdate();
+        return true;
+    }
+
+    /** The owner's {@code ready} conversation with this id. */
     private Optional<ConversationEntity> conversation(UUID id) {
+        return em().createQuery("select c from Conversation c where c.id = :id and c.state = 'ready'",
+                        ConversationEntity.class).setParameter("id", id).getResultList().stream().findFirst();
+    }
+
+    /** The owner's conversation with this id, {@code ready} or {@code deleting}. */
+    private Optional<ConversationEntity> anyState(UUID id) {
         return em().createQuery("select c from Conversation c where c.id = :id", ConversationEntity.class)
                 .setParameter("id", id).getResultList().stream().findFirst();
     }
@@ -238,6 +266,15 @@ class JpaConversationStore implements ConversationStore {
     }
 
     @Override
+    public long countConversationsOfCampaigns(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery("select count(c) from Conversation c where c.campaignId in :campaigns"
+                + " and c.state = 'ready'", Long.class).setParameter("campaigns", campaignIds).getSingleResult();
+    }
+
+    @Override
     public List<TurnRow> turnsOf(UUID conversationId) {
         List<TurnEntity> turns = em().createQuery("select t from Turn t where t.conversationId = :conversation"
                         + " order by t.createdAt, t.id", TurnEntity.class).setParameter("conversation", conversationId)
@@ -266,8 +303,7 @@ class JpaConversationStore implements ConversationStore {
     @Override
     public boolean deleteConversation(UUID id) {
         EntityManager em = em();
-        Optional<ConversationEntity> found = em.createQuery("select c from Conversation c where c.id = :id",
-                ConversationEntity.class).setParameter("id", id).getResultList().stream().findFirst();
+        Optional<ConversationEntity> found = anyState(id);
         found.ifPresent(conversation -> {
             em.remove(conversation);
             em.flush();

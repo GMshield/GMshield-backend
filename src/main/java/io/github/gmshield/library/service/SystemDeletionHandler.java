@@ -13,7 +13,9 @@ import org.slf4j.spi.LoggingEventBuilder;
  * module that implements it ({@code materials}, {@code conversations}). Each call names what goes, collected again at
  * each call: the system and its campaigns, or (Story 3.2 part B, a campaign's deletion) no system and the one campaign,
  * or (Story 3.4 part B) one material, or one version of a material, by id alone: {@code library} knows nothing of
- * either, and the module that owns them interprets the id.
+ * either, and the module that owns them interprets the id. Story 3.10 part B adds one conversation, by its id alone in
+ * the same way: only {@code conversations} acts on it, and every other handler ignores it, as it ignores a material
+ * in a module that has none.
  *
  * <ul>
  *   <li>{@link #count}: how many of its own items go, for the confirmation dialog; inside a read-only transaction.</li>
@@ -30,9 +32,10 @@ public interface SystemDeletionHandler {
      * What goes: the owner's system and the ids of all its campaigns; for a campaign's deletion (Story 3.2 part B)
      * {@code systemId} is null and {@code campaignIds} names that campaign alone, so nothing of its system goes. From
      * Story 3.4 part B, a material's deletion names only {@code materialId}, and a version's removal only
-     * {@code versionId}: no system and no campaign go then.
+     * {@code versionId}: no system and no campaign go then. From Story 3.10 part B, a conversation's deletion names only
+     * {@code conversationId}, an id {@code library} keeps opaque.
      */
-    record Going(UUID systemId, List<UUID> campaignIds, UUID materialId, UUID versionId) {
+    record Going(UUID systemId, List<UUID> campaignIds, UUID materialId, UUID versionId, UUID conversationId) {
 
         public Going {
             campaignIds = List.copyOf(campaignIds);
@@ -40,17 +43,22 @@ public interface SystemDeletionHandler {
 
         /** A system, or (null system) a campaign, and its campaigns going. */
         public Going(UUID systemId, List<UUID> campaignIds) {
-            this(systemId, campaignIds, null, null);
+            this(systemId, campaignIds, null, null, null);
         }
 
         /** One material going, with all its versions (Story 3.4 part B). */
         public static Going ofMaterial(UUID materialId) {
-            return new Going(null, List.of(), Objects.requireNonNull(materialId, "materialId"), null);
+            return new Going(null, List.of(), Objects.requireNonNull(materialId, "materialId"), null, null);
         }
 
         /** One version of a material going; the material stays (Story 3.4 part B). */
         public static Going ofVersion(UUID versionId) {
-            return new Going(null, List.of(), null, Objects.requireNonNull(versionId, "versionId"));
+            return new Going(null, List.of(), null, Objects.requireNonNull(versionId, "versionId"), null);
+        }
+
+        /** One conversation going, with its turns (Story 3.10 part B); nothing of its campaign goes. */
+        public static Going ofConversation(UUID conversationId) {
+            return new Going(null, List.of(), null, null, Objects.requireNonNull(conversationId, "conversationId"));
         }
 
         /** Whether one material or one version goes, and no system or campaign (Story 3.4 part B). */
@@ -58,12 +66,29 @@ public interface SystemDeletionHandler {
             return materialId != null || versionId != null;
         }
 
+        /** Whether one conversation goes, and nothing else (Story 3.10 part B). */
+        public boolean ofOneConversation() {
+            return conversationId != null;
+        }
+
+        /**
+         * Whether one item goes, by its id alone (a material, a version or a conversation), and no system or campaign:
+         * {@code library} has nothing of its own to remove then.
+         */
+        public boolean ofOneItem() {
+            return ofMaterials() || ofOneConversation();
+        }
+
         /**
          * A handler's log line about what goes, so it matches the deletion's own lines: {@code systemId} when a system
          * goes, else {@code campaignId} for a single campaign; then how many campaigns. For a material or a version,
-         * {@code materialId} or {@code versionId} alone. Ids and counts only.
+         * {@code materialId} or {@code versionId} alone, and for a conversation {@code conversationId} alone. Ids and
+         * counts only.
          */
         public LoggingEventBuilder about(LoggingEventBuilder event) {
+            if (conversationId != null) {
+                return event.addKeyValue("conversationId", conversationId);
+            }
             if (materialId != null) {
                 return event.addKeyValue("materialId", materialId);
             }
@@ -83,7 +108,10 @@ public interface SystemDeletionHandler {
     /** The name of the count this handler gives: {@code conversations} or {@code materials}. */
     String part();
 
-    /** How many of this module's items go with the system, or with the campaign (0 for a material or a version). */
+    /**
+     * How many of this module's items go with the system, or with the campaign (0 for a material, a version or a
+     * conversation).
+     */
     long count(Going going);
 
     /** Cancels and hides what goes, in the caller's transaction; the latest claim lapse of what it cancelled, if any. */

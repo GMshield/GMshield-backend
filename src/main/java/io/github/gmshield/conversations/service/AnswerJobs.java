@@ -204,7 +204,7 @@ public class AnswerJobs implements JobHandler {
     /** Whether the turn's last stored event is a final one ({@code done} or {@code error}); logs {@code by} when so. */
     private boolean ended(TurnRow turn, String by) {
         long last = store.lastSequence(turn.id());
-        boolean ended = last > 0 && conversations.eventsAfter(turn.id(), last - 1).stream().anyMatch(TurnEvent::last);
+        boolean ended = last > 0 && conversations.storedEvents(turn.id(), last - 1).stream().anyMatch(TurnEvent::last);
         if (ended) {
             log.atInfo().addKeyValue("jobId", turn.jobId()).addKeyValue("turnId", turn.id()).addKeyValue("by", by)
                     .log("conversation.turn_already_ended");
@@ -214,7 +214,7 @@ public class AnswerJobs implements JobHandler {
 
     /** The turn's citations become its stored references, as the class says. */
     private void storeReferences(TurnRow turn) {
-        List<UUID> cited = conversations.eventsAfter(turn.id(), 0).stream()
+        List<UUID> cited = conversations.storedEvents(turn.id(), 0).stream()
                 .filter(event -> TurnEvent.CITATION.equals(event.type())).map(TurnEvent::passageId)
                 .filter(Objects::nonNull).distinct().toList();
         List<CitedPlace> places = cited.isEmpty() ? List.of() : scopes.references(scopeOf(turn, false), cited);
@@ -280,7 +280,9 @@ public class AnswerJobs implements JobHandler {
      * sources and tiers.
      */
     private ResolvedScope scopeOf(TurnRow turn, boolean withPending) {
-        ConversationRow conversation = store.findConversation(turn.conversationId())
+        // Any state: a job call already under way when its conversation turned deleting ends normally (Story 3.10
+        // part B); the delete's cancel ends the claim, so no later call of the job comes.
+        ConversationRow conversation = store.findConversationAnyState(turn.conversationId())
                 .orElseThrow(() -> new IllegalStateException("conversations.conversation_missing"));
         ScopeSettings settings = new ScopeSettings(turn.campaignTier(), turn.systemTier(), turn.otherTier(),
                 turn.modelKnowledge(), turn.materialsOff());
