@@ -123,6 +123,11 @@ import tools.jackson.databind.json.JsonMapper;
  * read with their places, a result dropped once it leaves the scope, a forged result refused whole, nothing found, a bad
  * query, another owner's search or a deleted campaign's, a failed job, and only the newest 20 searches kept. Every
  * assertion is on the passage ids handed over; no model is called.
+ *
+ * <p>Story 3.11: every backend row of its I/O matrix but the deleting conversation (in
+ * {@code ConversationDeletionFlowTest}): a dismissed turn left out of the turns, the counts and the next question's
+ * history, its undo, both repeated, a stopped and a failed turn dismissed, a running or waiting one refused with
+ * {@code conversation.turn_running}, the default name kept, and another owner's turn on both routes.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -2705,6 +2710,211 @@ class ConversationFlowTest {
         }
         assertThat(conversations.conversations.get(theirs).name()).isNull();
         assertThat(conversations.conversations.get(theirs).version()).isZero();
+    }
+
+    // --- Story 3.11: dismiss an answer
+
+    @Test
+    void aDismissedTurnLeavesTheTurnsTheCountsAndTheHistoryUntilItsUndo() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        List<UUID> turns = new ArrayList<>();
+        UUID conversation = null;
+        for (int number = 1; number <= 3; number++) {
+            turns.add(answeredIn(gm, conversation, "Pergunta " + number + "?", "Resposta " + number + ".",
+                    passages.getFirst()));
+            conversation = conversations.turns.get(turns.getFirst()).conversationId();
+        }
+        UUID second = turns.get(1);
+        long version = conversations.conversations.get(conversation).version();
+        Instant lastAsked = conversations.conversations.get(conversation).lastAskedAt();
+
+        HttpResponse<String> dismissed = dismissal(gm, "PUT", second.toString());
+
+        assertThat(dismissed.statusCode()).as(dismissed.body()).isEqualTo(204);
+        assertThat(dismissed.body()).isEmpty();
+        assertThat(dismissed.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        Instant at = conversations.turns.get(second).dismissedAt();
+        assertThat(at).isEqualTo(clock.instant().truncatedTo(ChronoUnit.MICROS));
+        // Twice: 204, and the first dismissal's time is kept.
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(dismissal(gm, "PUT", second.toString()).statusCode()).isEqualTo(204);
+        assertThat(conversations.turns.get(second).dismissedAt()).isEqualTo(at);
+        // Left out of the turns and every count; neither the version nor the last question's time moves.
+        assertThat(turnIds(gm, conversation)).containsExactly(turns.get(0).toString(), turns.get(2).toString());
+        assertQuestions(gm, conversation, 2);
+        assertThat(conversations.conversations.get(conversation).version()).isEqualTo(version);
+        assertThat(conversations.conversations.get(conversation).lastAskedAt()).isEqualTo(lastAsked);
+        // Its own routes still answer: its events, ending with its reference.
+        assertThat(done(gm, second, null).path("references")).hasSize(1);
+        // The next question's history holds turns 1 and 3 only.
+        UUID fourth = turnId(askIn(gm, gm.campaign(), "Pergunta 4?", conversation, null));
+        Claim claim = claim(jobOf(fourth));
+        assertThat(claim.input().path("history")).extracting(item -> item.path("question").asString())
+                .containsExactly("Pergunta 1?", "Pergunta 3?");
+        assertThat(claim.input().path("history")).extracting(item -> item.path("answer").asString())
+                .containsExactly("Resposta 1.", "Resposta 3.");
+        postEvents(claim, 1, List.of(delta("Resposta 4.")), List.of());
+        report(claim, "{\"outcome\":\"done\"}");
+        clock.advance(Duration.ofSeconds(1));
+        version = conversations.conversations.get(conversation).version();
+        lastAsked = conversations.conversations.get(conversation).lastAskedAt();
+
+        HttpResponse<String> restored = dismissal(gm, "DELETE", second.toString());
+
+        // The undo: listed where it was, counted and in the history again.
+        assertThat(restored.statusCode()).as(restored.body()).isEqualTo(204);
+        assertThat(restored.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(conversations.turns.get(second).dismissedAt()).isNull();
+        // A shown turn: 204, no change.
+        assertThat(dismissal(gm, "DELETE", second.toString()).statusCode()).isEqualTo(204);
+        assertThat(dismissal(gm, "DELETE", turns.getFirst().toString()).statusCode()).isEqualTo(204);
+        assertThat(conversations.turns.get(turns.getFirst()).dismissedAt()).isNull();
+        assertThat(turnIds(gm, conversation)).containsExactly(turns.get(0).toString(), second.toString(),
+                turns.get(2).toString(), fourth.toString());
+        assertQuestions(gm, conversation, 4);
+        assertThat(conversations.conversations.get(conversation).version()).isEqualTo(version);
+        assertThat(conversations.conversations.get(conversation).lastAskedAt()).isEqualTo(lastAsked);
+        UUID fifth = turnId(askIn(gm, gm.campaign(), "Pergunta 5?", conversation, null));
+        assertThat(claim(jobOf(fifth)).input().path("history")).extracting(item -> item.path("question").asString())
+                .containsExactly("Pergunta 1?", "Pergunta 2?", "Pergunta 3?", "Pergunta 4?");
+        // Lines carry ids and words, never a question or an answer.
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo(
+                "conversation.turn_dismissed"));
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo(
+                "conversation.turn_restored"));
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Pergunta").doesNotContain("Resposta"));
+    }
+
+    @Test
+    void aDismissedFirstQuestionStillNamesItsConversationAndIsNotCounted() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID first = answeredIn(gm, null, "Como funciona o descanso longo?", "Oito horas.", passages.getFirst());
+        UUID conversation = conversations.turns.get(first).conversationId();
+        UUID second = answeredIn(gm, conversation, "E o curto?", "Uma hora.", passages.getFirst());
+        UUID third = answeredIn(gm, conversation, "E os dados de vida?", "Gaste-os.", passages.getFirst());
+
+        assertThat(dismissal(gm, "PUT", first.toString()).statusCode()).isEqualTo(204);
+
+        assertQuestions(gm, conversation, 2);
+        assertThat(turnIds(gm, conversation)).containsExactly(second.toString(), third.toString());
+        JsonNode listed = json(get(gm, conversationsPath(gm.campaign(), "questions"))).path("items").get(0);
+        assertThat(listed.path("name").asString()).isEqualTo("Como funciona o descanso longo?");
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation)).path("name").asString())
+                .isEqualTo("Como funciona o descanso longo?");
+        // Every question dismissed: the conversation stays listed, with no question counted.
+        assertThat(dismissal(gm, "PUT", second.toString()).statusCode()).isEqualTo(204);
+        assertThat(dismissal(gm, "PUT", third.toString()).statusCode()).isEqualTo(204);
+        assertQuestions(gm, conversation, 0);
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/turns")).path("items")).isEmpty();
+        assertThat(json(get(gm, conversationsPath(gm.campaign(), "questions"))).path("items").get(0).path("name")
+                .asString()).isEqualTo("Como funciona o descanso longo?");
+    }
+
+    @Test
+    void onlyAnEndedTurnIsDismissedAStoppedOrAFailedOneToo() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID done = answered(gm, QUESTION, List.of(delta("Um.")));
+        UUID stopped = turnId(ask(gm, gm.campaign(), QUESTION));
+        postEvents(claim(jobOf(stopped)), 1, List.of(delta("Dois")), List.of());
+        assertThat(stopTurn(gm, stopped).statusCode()).isEqualTo(204);
+        UUID failed = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim failing = claim(jobOf(failed));
+        postEvents(failing, 1, List.of(delta("Tr")), List.of());
+        report(failing, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}");
+        UUID running = turnId(ask(gm, gm.campaign(), QUESTION));
+        postEvents(claim(jobOf(running)), 1, List.of(delta("Quatro")), List.of());
+        UUID waiting = turnId(ask(gm, gm.campaign(), QUESTION));
+        UUID conversation = conversations.turns.get(done).conversationId();
+
+        // Still being written (claimed with a delta, or not claimed yet): 409, nothing changes.
+        for (UUID turn : List.of(running, waiting)) {
+            String state = jobs.row(jobOf(turn)).state();
+            long batches = conversations.batches.values().stream().filter(batch -> batch.turnId().equals(turn))
+                    .count();
+            assertProblem(dismissal(gm, "PUT", turn.toString()), 409, "conversation.turn_running");
+            assertThat(conversations.turns.get(turn).dismissedAt()).isNull();
+            assertThat(conversations.turns.get(turn).stoppedAt()).isNull();
+            assertThat(jobs.row(jobOf(turn)).state()).isEqualTo(state);
+            assertThat(conversations.batches.values().stream().filter(batch -> batch.turnId().equals(turn)))
+                    .hasSize((int) batches);
+            // Its undo has nothing to clear.
+            assertThat(dismissal(gm, "DELETE", turn.toString()).statusCode()).isEqualTo(204);
+            assertThat(conversations.turns.get(turn).dismissedAt()).isNull();
+        }
+        // Done, stopped ("Interrompida") and failed have ended: each is dismissed.
+        for (UUID turn : List.of(done, stopped, failed)) {
+            assertThat(dismissal(gm, "PUT", turn.toString()).statusCode()).isEqualTo(204);
+            assertThat(conversations.turns.get(turn).dismissedAt()).isNotNull();
+        }
+        assertThat(conversations.turns.get(stopped).stoppedAt()).isNotNull();
+        assertThat(turnIds(gm, conversation)).containsExactly(running.toString(), waiting.toString());
+    }
+
+    @Test
+    void anotherOwnersTurnAnUnknownOneOrAMalformedIdIsNotFoundOnBothDismissalRoutes() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        accepted(them, 1);
+        UUID shown = answered(them, QUESTION, List.of(delta("Um.")));
+        UUID dismissed = answered(them, "Outra?", List.of(delta("Dois.")));
+        assertThat(dismissal(them, "PUT", dismissed.toString()).statusCode()).isEqualTo(204);
+        Instant at = conversations.turns.get(dismissed).dismissedAt();
+
+        for (String id : List.of(shown.toString(), dismissed.toString(), UUID.randomUUID().toString(), "nope")) {
+            for (String method : List.of("PUT", "DELETE")) {
+                HttpResponse<String> refused = dismissal(gm, method, id);
+                assertNotFound(refused);
+                assertThat(refused.body()).doesNotContain(shown.toString()).doesNotContain(dismissed.toString());
+            }
+        }
+
+        assertThat(conversations.turns.get(shown).dismissedAt()).isNull();
+        assertThat(conversations.turns.get(dismissed).dismissedAt()).isEqualTo(at);
+    }
+
+    private HttpResponse<String> dismissal(Gm gm, String method, String turnId) throws Exception {
+        return send(gm, method, "/api/v1/turns/" + turnId + "/dismissal", "");
+    }
+
+    /** Asks in the conversation (a new questions one when null), answers with the text and one citation; a second on. */
+    private UUID answeredIn(Gm gm, UUID conversation, String question, String answer, UUID passage) throws Exception {
+        UUID turnId = turnId(askIn(gm, gm.campaign(), question, conversation,
+                conversation == null ? "questions" : null));
+        Claim claim = claim(jobOf(turnId));
+        assertThat(postEvents(claim, 1, List.of(delta(answer), citation(passage, 0)), List.of()).statusCode())
+                .isEqualTo(200);
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+        clock.advance(Duration.ofSeconds(1));
+        return turnId;
+    }
+
+    private List<String> turnIds(Gm gm, UUID conversation) throws Exception {
+        HttpResponse<String> read = get(gm, "/api/v1/conversations/" + conversation + "/turns");
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        List<String> ids = new ArrayList<>();
+        json(read).path("items").forEach(item -> ids.add(item.path("id").asString()));
+        return ids;
+    }
+
+    /** The conversation's question count in its list, its deletion preview and the campaign's conversation. */
+    private void assertQuestions(Gm gm, UUID conversation, long questions) throws Exception {
+        JsonNode listed = json(get(gm, conversationsPath(gm.campaign(), "questions"))).path("items");
+        List<Long> counted = new ArrayList<>();
+        listed.forEach(one -> {
+            if (one.path("id").asString().equals(conversation.toString())) {
+                counted.add(one.path("questions").asLong());
+            }
+        });
+        assertThat(counted).as(listed.toString()).containsExactly(questions);
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/deletion")).path("questions").asLong())
+                .isEqualTo(questions);
+        JsonNode ofCampaign = json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/conversation"));
+        assertThat(ofCampaign.path("id").asString()).isEqualTo(conversation.toString());
+        assertThat(ofCampaign.path("questions").asLong()).isEqualTo(questions);
     }
 
     private static String conversationsPath(UUID campaign, String area) {

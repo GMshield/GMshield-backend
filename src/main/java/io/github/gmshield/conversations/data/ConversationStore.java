@@ -36,10 +36,16 @@ public interface ConversationStore {
      */
     Map<UUID, TurnRow> firstTurns(Collection<UUID> conversationIds);
 
-    /** How many turns each of these conversations of the current owner has (Story 3.10); one with none is absent. */
+    /**
+     * How many shown turns each of these conversations of the current owner has (Story 3.10; from Story 3.11 a
+     * dismissed turn is not counted); one with none is absent.
+     */
     Map<UUID, Long> turnCounts(Collection<UUID> conversationIds);
 
-    /** The current owner's newest {@code limit} turns of a conversation (Story 3.10), oldest first. */
+    /**
+     * The current owner's newest {@code limit} shown turns of a conversation (Story 3.10; from Story 3.11 a dismissed
+     * turn is left out), oldest first.
+     */
     List<TurnRow> newestTurns(UUID conversationId, int limit);
 
     /**
@@ -71,7 +77,10 @@ public interface ConversationStore {
      */
     boolean markDeleting(UUID id);
 
-    /** How many turns the current owner's conversation has (Story 3.2); 0 for an unknown one or another owner's. */
+    /**
+     * How many shown turns the current owner's conversation has (Story 3.2; from Story 3.11 a dismissed turn is not
+     * counted); 0 for an unknown one or another owner's.
+     */
     long turnCount(UUID conversationId);
 
     void insertTurn(TurnRow row);
@@ -80,6 +89,19 @@ public interface ConversationStore {
 
     /** Sets the owner's turn's {@code stopped_at} (Story 2.6); false for an unknown turn or another owner's. */
     boolean markStopped(UUID turnId, Instant at);
+
+    /**
+     * Sets the owner's turn's {@code dismissed_at} to {@code at} when it is null (Story 3.11), by one bulk update after
+     * the owner's row was read: true when this call changed the row; false when it was dismissed already, or for an
+     * unknown turn or another owner's. Changes nothing else.
+     */
+    boolean markDismissed(UUID turnId, Instant at);
+
+    /**
+     * Clears the owner's turn's {@code dismissed_at} (Story 3.11), as {@link #markDismissed}: true when this call changed
+     * the row; false when it was shown already, or for an unknown turn or another owner's.
+     */
+    boolean clearDismissed(UUID turnId);
 
     /** The current owner's turn answered by this job. */
     Optional<TurnRow> turnOfJob(UUID jobId);
@@ -106,7 +128,7 @@ public interface ConversationStore {
     /** How many {@code ready} conversations the current owner's campaigns have (Story 3.10 part B). */
     long countConversationsOfCampaigns(Collection<UUID> campaignIds);
 
-    /** The current owner's turns of a conversation, oldest first. */
+    /** The current owner's turns of a conversation, oldest first, dismissed ones included (Story 3.11). */
     List<TurnRow> turnsOf(UUID conversationId);
 
     /**

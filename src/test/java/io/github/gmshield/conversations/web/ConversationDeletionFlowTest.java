@@ -74,7 +74,8 @@ import tools.jackson.databind.json.JsonMapper;
  * campaign, the searches, the materials, the usage); the removal waiting for a running answer's claim; a removal
  * resumed by the sweep after a stop mid-way; a campaign deleted meanwhile, after which both deletions end done; another
  * owner's conversation on both routes. The removal against PostgreSQL is in
- * {@code ConversationDeletionIntegrationTest}.
+ * {@code ConversationDeletionIntegrationTest}. Story 3.11: a deleting conversation's turns are not found on both
+ * dismissal routes, and a dismissed turn goes with its conversation.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -383,6 +384,36 @@ class ConversationDeletionFlowTest {
         assertThat(get(owner, "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(200);
         assertThat(json(get(owner, "/api/v1/conversations/" + conversation + "/deletion")).path("questions").asLong())
                 .isEqualTo(1);
+    }
+
+    @Test
+    void aDeletingConversationsTurnIsNotFoundOnBothDismissalRoutesAndItsDismissedTurnIsRemovedWithIt() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID dismissed = answered(gm, null, "questions", source);
+        UUID conversation = conversations.turns.get(dismissed).conversationId();
+        tick();
+        UUID shown = answered(gm, conversation, null, source);
+        // Story 3.11: a dismissed turn is not counted, but the deletion takes it too.
+        assertThat(send(gm, "PUT", "/api/v1/turns/" + dismissed + "/dismissal").statusCode()).isEqualTo(204);
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/deletion")).path("questions").asLong())
+                .isEqualTo(1);
+
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(202);
+
+        for (UUID turn : List.of(dismissed, shown)) {
+            assertNotFound(send(gm, "PUT", "/api/v1/turns/" + turn + "/dismissal"));
+            assertNotFound(send(gm, "DELETE", "/api/v1/turns/" + turn + "/dismissal"));
+        }
+        assertThat(conversations.turns.get(dismissed).dismissedAt()).isNotNull();
+        assertThat(conversations.turns.get(shown).dismissedAt()).isNull();
+
+        assertThat(deletion.sweep()).isEqualTo(1);
+
+        assertThat(conversations.turns).doesNotContainKeys(dismissed, shown);
+        assertThat(conversations.conversations).doesNotContainKey(conversation);
+        assertThat(conversations.batches.values()).noneMatch(batch -> batch.turnId().equals(dismissed));
+        assertThat(references.rows.values()).noneMatch(reference -> reference.turnId().equals(dismissed));
     }
 
     // --- helpers

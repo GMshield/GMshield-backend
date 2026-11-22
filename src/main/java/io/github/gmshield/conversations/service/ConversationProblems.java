@@ -15,6 +15,10 @@ public final class ConversationProblems {
     static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");
 
+    /** A dismissal of a turn whose answer is still being written (Story 3.11): only an ended turn is dismissed. */
+    static final ApiProblem TURN_RUNNING =
+            ApiProblem.of(409, "conversation", "turn_running", "Turn running");
+
     private ConversationProblems() {
     }
 
@@ -31,6 +35,11 @@ public final class ConversationProblems {
     /** A conversation's name outside 1 to {@value Conversations#NAME_MAX} code points after trimming (Story 3.10). */
     public static ApiException nameInvalid() {
         return new ApiException(NAME_INVALID);
+    }
+
+    /** A dismissal of a turn that has not ended (Story 3.11). */
+    public static ApiException turnRunning() {
+        return new ApiException(TURN_RUNNING);
     }
 
     /** A rename on a version the conversation has left (Story 3.10). */

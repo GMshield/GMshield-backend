@@ -28,6 +28,10 @@ import org.springframework.stereotype.Repository;
  * <p>Story 3.10 part B: every read of a conversation takes {@code ready} rows only, but the deletion's own
  * ({@link #markDeleting}, {@link #findConversationAnyState}, {@link #conversationsOfCampaigns},
  * {@link #deleteConversation}) and the answer job's ({@link #findConversationAnyState}).
+ *
+ * <p>Story 3.11: {@code turn.dismissed_at} is written by bulk updates only ({@link #markDismissed},
+ * {@link #clearDismissed}), and {@link #newestTurns}, {@link #turnCount} and {@link #turnCounts} take shown turns
+ * only; {@link #firstTurns} (the default name), {@link #findTurn} and {@link #turnsOf} (the deletion) take them all.
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
@@ -97,7 +101,7 @@ class JpaConversationStore implements ConversationStore {
         }
         Map<UUID, Long> counts = new HashMap<>();
         em().createQuery("select t.conversationId, count(t) from Turn t where t.conversationId in :conversations"
-                        + " group by t.conversationId", Object[].class).setParameter("conversations", conversationIds)
+                        + " and t.dismissedAt is null group by t.conversationId", Object[].class).setParameter("conversations", conversationIds)
                 .getResultList().forEach(row -> counts.put((UUID) row[0], (Long) row[1]));
         return counts;
     }
@@ -105,7 +109,8 @@ class JpaConversationStore implements ConversationStore {
     @Override
     public List<TurnRow> newestTurns(UUID conversationId, int limit) {
         List<TurnEntity> newest = new ArrayList<>(em().createQuery("select t from Turn t where t.conversationId"
-                        + " = :conversation order by t.createdAt desc, t.id desc", TurnEntity.class)
+                        + " = :conversation and t.dismissedAt is null order by t.createdAt desc, t.id desc",
+                        TurnEntity.class)
                 .setParameter("conversation", conversationId).setMaxResults(limit).getResultList());
         newest.sort(Comparator.comparing(TurnEntity::createdAt).thenComparing(TurnEntity::id));
         Map<UUID, Set<UUID>> off = materialsOff(newest.stream().map(TurnEntity::id).toList());
@@ -180,7 +185,8 @@ class JpaConversationStore implements ConversationStore {
 
     @Override
     public long turnCount(UUID conversationId) {
-        return em().createQuery("select count(t) from Turn t where t.conversationId = :conversation", Long.class)
+        return em().createQuery("select count(t) from Turn t where t.conversationId = :conversation"
+                        + " and t.dismissedAt is null", Long.class)
                 .setParameter("conversation", conversationId).getSingleResult();
     }
 
@@ -211,6 +217,26 @@ class JpaConversationStore implements ConversationStore {
             em.flush();
         });
         return found.isPresent();
+    }
+
+    @Override
+    public boolean markDismissed(UUID turnId, Instant at) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        // One bulk update, after the owner's row was read: a stop's flush never writes the column (it is not
+        // updatable), so neither undoes the other; a dismissal already recorded keeps its time.
+        return em().createQuery("update Turn t set t.dismissedAt = :at where t.id = :id and t.dismissedAt is null")
+                .setParameter("at", at).setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean clearDismissed(UUID turnId) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        return em().createQuery("update Turn t set t.dismissedAt = null where t.id = :id and t.dismissedAt is not null")
+                .setParameter("id", turnId).executeUpdate() > 0;
     }
 
     @Override
