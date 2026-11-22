@@ -65,6 +65,9 @@ class GoogleOidcClientTest {
         server.start();
         client = new GoogleOidcClient(CLIENT_ID, CLIENT_SECRET, REDIRECT, GoogleOidcClient.AUTHORIZATION_ENDPOINT,
                 URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/token"), Clock.fixed(NOW, ZoneOffset.UTC));
+        // Server and background threads log while a test reads the list: a copy-on-write list never throws
+        // ConcurrentModificationException there (an ArrayList did, in a develop run of ConversationFlowTest).
+        logged.list = new java.util.concurrent.CopyOnWriteArrayList<>();
         logged.start();
         root.addAppender(logged);
     }

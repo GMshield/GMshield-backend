@@ -267,6 +267,9 @@ class ScopedPassagesFlowTest extends HttpTestSupport {
         // One ingestion job at a time: end whatever an earlier test left offered, running or waiting.
         jobRows.rows.replaceAll((id, row) -> row.state().equals("offered") || row.state().equals("running")
                 || row.state().equals("waiting") ? row.released("cancelled", null, row.updatedAt()) : row);
+        // Server and background threads log while a test reads the list: a copy-on-write list never throws
+        // ConcurrentModificationException there (an ArrayList did, in a develop run of ConversationFlowTest).
+        logged.list = new java.util.concurrent.CopyOnWriteArrayList<>();
         logged.start();
         root.addAppender(logged);
     }
