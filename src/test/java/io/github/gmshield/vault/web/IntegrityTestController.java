@@ -4,10 +4,15 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
 import java.util.UUID;
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-/** Test only: reads a value moved to another row, the way a request would meet a tampered row. Outside both APIs. */
+/**
+ * Test only: reads a value moved to another row, the way a request would meet a tampered row. Outside both APIs.
+ * Profile {@code unit}: the integration tests' contexts, which scan the test classes too, leave it out.
+ */
+@Profile("unit")
 @RestController
 public class IntegrityTestController {
 
