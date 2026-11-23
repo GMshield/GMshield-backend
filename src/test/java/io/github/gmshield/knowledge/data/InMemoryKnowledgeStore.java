@@ -47,8 +47,11 @@ public class InMemoryKnowledgeStore implements KnowledgeStore {
             if (row.core() != null && ofSystem(row.systemId()).anyMatch(other -> row.core().equals(other.core()))) {
                 throw new KnowledgeConflict(KnowledgeConflict.Reason.CORE_TAKEN);
             }
-            if (nameTaken(row.systemId(), row.nameFingerprint(), row.id())) {
+            if (nameTaken(row.systemId(), row.nameFingerprint(), row.id()) || keyTaken(row.systemId(), row.key())) {
                 throw new KnowledgeConflict(KnowledgeConflict.Reason.NAME_TAKEN);
+            }
+            if ((row.core() == null) == (row.proposalId() == null)) {
+                throw new IllegalStateException("origin check refused");
             }
         }
         rows.forEach(row -> {
@@ -120,6 +123,17 @@ public class InMemoryKnowledgeStore implements KnowledgeStore {
             recordTypes.remove(row.id());
             RollbackUndo.onRollback(() -> recordTypes.put(row.id(), row));
         });
+    }
+
+    @Override
+    public void lockOntology(UUID systemId) {
+        // One process, synchronized writes: nothing to lock.
+        OwnerContext.require();
+    }
+
+    @Override
+    public boolean keyTaken(UUID systemId, String key) {
+        return ofSystem(systemId).anyMatch(row -> row.key().equals(key));
     }
 
     /** The current owner's rows of the system. */

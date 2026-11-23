@@ -20,6 +20,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
+import io.github.gmshield.knowledge.data.InMemoryOntologyStore;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
@@ -191,6 +192,16 @@ class CrossOwnerAuditFlowTest {
                     "recordId", "record", "page", "1").own("systemId"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}/picture", "systemId", "system",
                     "recordId", "record", "page", "1").headers("Accept", "image/webp").own("systemId"),
+            // a system's and a material's ontology proposals, the decisions on one, and a system's terms (Story 4.4)
+            route("GET", "/api/v1/systems/{id}/proposals", "id", "system"),
+            route("GET", "/api/v1/systems/{id}/terms", "id", "system"),
+            route("GET", "/api/v1/materials/{id}/proposals", "id", "material"),
+            route("POST", "/api/v1/proposals/{id}/approval", "id", "proposal")
+                    .json("{\"version\":{proposalVersion},\"name\":\"Tomado\"}"),
+            route("POST", "/api/v1/proposals/{id}/merge", "id", "proposal")
+                    .json("{\"version\":{proposalVersion},\"targetId\":\"{recordType}\"}"),
+            route("POST", "/api/v1/proposals/{id}/rejection", "id", "proposal")
+                    .json("{\"version\":{proposalVersion}}"),
             // campaigns
             route("GET", "/api/v1/campaigns/{id}", "id", "campaign"),
             route("PATCH", "/api/v1/campaigns/{id}", "id", "campaign")
@@ -320,6 +331,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryRecordStore records;
     @Autowired
+    private InMemoryOntologyStore ontology;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -389,7 +402,8 @@ class CrossOwnerAuditFlowTest {
     void start() {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
-                    library, deletions, scopes, knowledge, records, materials, uploads, index, conversations, references,
+                    library, deletions, scopes, knowledge, records, ontology, materials, uploads, index, conversations,
+                    references,
                     searches, clock, vault), START);
         }
         stores.start();
@@ -505,7 +519,11 @@ class CrossOwnerAuditFlowTest {
                 probe("?system= in GET /campaigns", "system", 404, "request.not_found", 200,
                         id -> new Request("GET", "/api/v1/campaigns?system=" + id, null, List.of())),
                 probe("?system= in GET /materials", "system", 404, "request.not_found", 200,
-                        id -> new Request("GET", "/api/v1/materials?system=" + id, null, List.of())));
+                        id -> new Request("GET", "/api/v1/materials?system=" + id, null, List.of())),
+                // Story 4.4: a merge into another account's record type is refused as an unknown target is.
+                probe("targetId in POST /proposals/{id}/merge", "recordType", 400, "ontology.merge_target_invalid", 200,
+                        id -> json("POST", "/api/v1/proposals/" + b.get("proposal") + "/merge", "{\"version\":"
+                                + b.get("proposalVersion") + ",\"targetId\":\"" + id + "\"}")));
     }
 
     @Test
@@ -612,6 +630,16 @@ class CrossOwnerAuditFlowTest {
         assertThat(records.path("total").asLong()).as(records.toString()).isEqualTo(1);
         assertThat(records.path("items").get(0).path("name").asString()).isEqualTo("Fire Bolt");
         items.put("record", records.path("items").get(0).path("id").asString());
+        // Story 4.4: the material's two proposals in the system, a record type kept pending and a term approved.
+        items.put("proposal", proposal(gm, system, "record_type").path("id").asString());
+        JsonNode term = proposal(gm, system, "term");
+        String termProposal = term.path("id").asString();
+        items.put("termProposal", termProposal);
+        // The second version proposed both again: they moved to it, their versions raised.
+        HttpResponse<String> approved = send(gm, "POST", "/api/v1/proposals/" + termProposal + "/approval",
+                "{\"version\":" + term.path("version").asLong() + "}");
+        assertThat(approved.statusCode()).as(approved.body()).isEqualTo(200);
+        items.put("term", json(approved).path("resultId").asString());
 
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
@@ -646,6 +674,7 @@ class CrossOwnerAuditFlowTest {
 
         items.put("systemVersion", version(gm, "/api/v1/systems/" + system));
         items.put("recordTypeVersion", version(gm, "/api/v1/record-types/" + items.get("recordType")));
+        items.put("proposalVersion", proposal(gm, system, "record_type").path("version").asString());
         items.put("campaignVersion", version(gm, "/api/v1/campaigns/" + gm.campaign()));
         items.put("scopeVersion", version(gm, "/api/v1/campaigns/" + gm.campaign() + "/scope"));
         items.put("materialVersion", version(gm, "/api/v1/materials/" + first.materialId()));
@@ -685,15 +714,30 @@ class CrossOwnerAuditFlowTest {
                 .materialId());
         items.put("conversation", json(ask(gm, "{\"question\":\"Quem leva a coroa?\"}")).path("conversationId")
                 .asString());
+        // Story 4.4: a pending record type proposal of B's system, and B's spell type, for the merge's control.
+        items.put("proposal", proposal(gm, UUID.fromString(items.get("system")), "record_type").path("id").asString());
+        items.put("recordType", json(get(gm, "/api/v1/systems/" + items.get("system") + "/record-types"))
+                .path("items").get(1).path("id").asString());
         World world = new World(gm, items, Set.of());
         refresh(world);
         return world;
+    }
+
+    /** The first pending proposal of this kind in the system, as its proposals list names it (Story 4.4). */
+    private JsonNode proposal(Gm gm, Object system, String kind) throws Exception {
+        for (JsonNode item : json(get(gm, "/api/v1/systems/" + system + "/proposals?limit=50")).path("items")) {
+            if (kind.equals(item.path("kind").asString())) {
+                return item;
+            }
+        }
+        throw new AssertionError("no pending " + kind + " proposal in " + system);
     }
 
     /** B's versions read again: its material's and its campaign's scope settings'. */
     private void refresh(World b) throws Exception {
         b.items().put("materialVersion", version(b.gm(), "/api/v1/materials/" + b.get("material")));
         b.items().put("scopeVersion", version(b.gm(), "/api/v1/campaigns/" + b.gm().campaign() + "/scope"));
+        b.items().put("proposalVersion", proposal(b.gm(), b.get("system"), "record_type").path("version").asString());
     }
 
     // --- checks
@@ -742,7 +786,9 @@ class CrossOwnerAuditFlowTest {
                 "/api/v1/conversations/current", "/api/v1/campaigns/" + b.gm().campaign() + "/scope",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=questions",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=rules",
-                "/api/v1/systems/" + b.get("system") + "/record-types")) {
+                "/api/v1/systems/" + b.get("system") + "/record-types",
+                "/api/v1/systems/" + b.get("system") + "/proposals", "/api/v1/systems/" + b.get("system") + "/terms",
+                "/api/v1/materials/" + b.get("material") + "/proposals")) {
             Answer list = send(b.gm(), new Request("GET", path, null, List.of()));
             softly.assertThat(list.status()).as("B's %s: %s", path, list.body()).isEqualTo(200);
             softly.assertThat(leaks(list, a, Set.of())).as("B's %s names A's items", path).isEmpty();
@@ -1004,9 +1050,14 @@ class CrossOwnerAuditFlowTest {
                 "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
                 "application/json");
         assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        UUID passage = stores.passage(uploaded.versionId());
+        // Story 4.4: and two proposals quoted from that passage, a record type and a term.
         report(records, json(claimed), "{\"pipelineVersion\":\"2\",\"records\":[{\"type\":\"spell\",\"name\":"
                 + "\"Fire Bolt\",\"fields\":[{\"name\":\"Damage\",\"value\":\"1d10 Fire\"}],\"passageIds\":[\""
-                + stores.passage(uploaded.versionId()) + "\"]}],\"next\":[]}");
+                + passage + "\"]}],\"proposals\":[{\"kind\":\"record_type\",\"name\":\"Bolt\",\"definition\":\"\","
+                + "\"examples\":[{\"passageId\":\"" + passage + "\",\"quote\":\"Fire Bolt deals\"}]},{\"kind\":\"term\","
+                + "\"name\":\"Fire damage\",\"definition\":\"deals 1d10 Fire damage\",\"examples\":[{\"passageId\":\""
+                + passage + "\",\"quote\":\"1d10 Fire damage\"}]}],\"next\":[]}");
         HttpResponse<String> accepted = send(gm, "POST", "/api/v1/materials/" + uploaded.materialId() + "/accept", "");
         assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
         assertThat(json(accepted).path("state").asString()).isEqualTo("ready");

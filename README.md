@@ -1240,7 +1240,7 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     400, params `min` and `max`) that no other type of the system has, core ones included
     (`ontology.record_type_name_taken`, 409), and removed (204; `request.stale_version`, 409, when a rename committed
     meanwhile; from Story 4.2 409 `ontology.record_type_in_use` for one that types records). Story 4.4 adds the
-    approval that creates them.
+    approval that creates them (below).
   - Another owner's system or record type, an unknown or malformed id, and a system being deleted (or a record type of
     one) are 404 `request.not_found` on every route. `/api/v1/record-types` joins `LibraryOwnerFilter.LIBRARY_ROUTES`,
     and the four routes join the cross-owner audit (`CrossOwnerAuditFlowTest`, whose world now holds A's core record
@@ -1420,6 +1420,47 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - Deploy order: backend → worker (its minimum backend contract becomes 1.19.0) → frontend (its minimum public
     contract becomes 1.37.0) → pipeline. An older worker never asks for records, so answers stay passage-only until it
     is deployed; an older frontend ignores `kind` and shows a record reference as a passage line.
+
+- **Ontology proposals (`knowledge`, `materials`, Story 4.4 part A, public contract 1.38.0, internal contract 1.20.0,
+  migration V39).** A records step's report may carry `proposals`: record types and terms its passages name, each a
+  `kind` (`record_type` or `term`), a `name` (1 to 120 code points), a `definition` (at most 500, a term's quoted
+  definition) and 1 to 3 `examples` (`passageId`, `quote` of at most 200); at most 20 per report, only from a records
+  step (else 400 `job.result_invalid`, `ingestion.proposal_invalid`).
+  - **Checked quotes.** `IngestionSteps.storeProposals` decrypts the cited passages of the step's pages and looks for
+    each quote in its passage's text, both in NFC with whitespace collapsed (`Quotes`): an example not found is dropped,
+    a proposal left with none is dropped, and so is a term whose definition is not in a cited passage, and a proposal
+    whose name is in none of its kept quotes or its kept definition (case aside). U+0085 counts as whitespace, as in the
+    worker. A system being deleted gets none. Log
+    `ingestion.proposals_recorded` (counts only).
+  - **Stored per system** (`materials.service.OntologyProposals`, implemented by `knowledge.service.Proposals`): one
+    `proposal` row for each system the material counts under (its systems, or its campaign's). Dropped: a name the
+    system has (a record type, a term, an alias, or a core type's name in pt-BR or en, compared by `Library.uniqueForm`
+    through one fingerprint, `NameSpace`) and a name already proposed for the same system and material, whatever its
+    state, so a rejected one is never raised again; a repeat within the same version adds its examples up to three, and
+    a pending one of another version (a superseded one) moves to the new version with the new examples. An approved
+    type's key never takes a core key (a suffix `_2` … `_999` follows), and its slug is at most 28 characters.
+    Name, definition and examples are vault ciphertexts (entity `proposal`).
+  - **Routes.** `GET /api/v1/systems/{id}/proposals` and `GET /api/v1/materials/{id}/proposals` (pending ones, oldest
+    first, `{items, total}`, `limit`/`offset` as the record types); `POST /api/v1/proposals/{id}/approval` (`{version,
+    name?}`: a record type with a stable `key`, the slug of the approved name, or a term with its quoted definition),
+    `/merge` (`{version, targetId}`: a term proposal adds its name as an alias of a term of its system; a type proposal
+    only closes into a type of its system; else 400 `ontology.merge_target_invalid`) and `/rejection` (`{version}`); `GET
+    /api/v1/systems/{id}/terms`. A decision names the proposal's version (409 `request.stale_version` when it moved or
+    was decided); a taken name is 409 `ontology.name_taken`, a name outside 1 to 120 code points 400
+    `ontology.name_invalid`. Each runs with the system's ontology locked (`KnowledgeStore.lockOntology`). A record type
+    now answers `key` and `origin` (`{kind: core|proposal, proposalId, materialId, materialName}`), and a rename checks
+    the same name space. `/api/v1/proposals` joins `LIBRARY_ROUTES`; the six routes join the cross-owner audit.
+  - **Clearing.** Whatever removes a version's records (a restart, a reprocess, a passages report) and a version's
+    removal (a discard, a refused upload, a deletion) remove its pending proposals and detach its decided ones; a
+    material's deletion removes its proposals that were not approved (an alias merged from one keeps its term) and
+    detaches the approved ones, whose origin then has no material. A system's deletion removes its aliases, terms,
+    record types and proposals, in that order.
+  - **V39.** `proposal`, `term`, `term_alias`; `record_type.key` (backfilled from `core`; null in a core row the previous
+    release writes, read as its core key) and `record_type.proposal_id` (null exactly for a core type). Approved types
+    have no records until part B extracts them.
+  - Log lines (ids and counts only): `knowledge.proposal_approved`, `knowledge.proposal_merged`,
+    `knowledge.proposal_rejected`. Deploy order: backend → worker (pipeline 9) → frontend (minimum public contract
+    1.38.0).
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

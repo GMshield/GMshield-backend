@@ -1265,7 +1265,8 @@ class RecordsFlowTest {
     private UUID notCore(Gm gm, UUID system, String name) {
         UUID id = Ids.newId();
         OwnerContext.runAs(gm.id(), () -> knowledge.insertRecordTypes(List.of(new RecordTypeRow(id, gm.id(), system,
-                null, vault.encryptText(new Binding("record_type", "name", id, gm.id()), name),
+                null, "t" + id.toString().substring(0, 8), Ids.newId(),
+                vault.encryptText(new Binding("record_type", "name", id, gm.id()), name),
                 vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0, Instant.now()))));
         return id;
     }

@@ -82,7 +82,35 @@ class OntologyController {
         this.records = records;
     }
 
-    @Schema(name = "RecordType", requiredProperties = {"id", "name", "core", "records", "version"})
+    @Schema(name = "Origin", requiredProperties = {"kind", "proposalId", "materialId", "materialName"})
+    record OriginView(
+            @Schema(description = "core for a core type; proposal for a record type or term the GM approved from a"
+                    + " material's proposal", allowableValues = {"core", "proposal"}, example = "proposal") String kind,
+            @Schema(description = "The approving proposal; null for a core type", format = "uuid",
+                    types = {"string", "null"}, example = "0190a0b0-0000-7000-8000-000000000030") String proposalId,
+            @Schema(description = "The material that proposed it; null for a core type, and once that material was"
+                    + " deleted", format = "uuid", types = {"string", "null"},
+                    example = "0190a0b0-0000-7000-8000-000000000004") String materialId,
+            @Schema(description = "That material's name; null when materialId is null", types = {"string", "null"},
+                    example = "Livro do Jogador") String materialName) {
+
+        static final OriginView CORE = new OriginView("core", null, null, null);
+
+        static OriginView of(Ontology.Origin origin) {
+            if (origin == null) {
+                return CORE;
+            }
+            return new OriginView("proposal", origin.proposalId().toString(),
+                    origin.materialId() == null ? null : origin.materialId().toString(), origin.materialName());
+        }
+
+        @Override
+        public String toString() {
+            return "OriginView[kind=" + kind + ", proposalId=" + proposalId + ", materialId=" + materialId + "]";
+        }
+    }
+
+    @Schema(name = "RecordType", requiredProperties = {"id", "name", "core", "key", "origin", "records", "version"})
     record RecordTypeView(
             @Schema(description = "The record type's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
@@ -93,6 +121,11 @@ class OntologyController {
                     + " that is not core", types = {"string", "null"}, allowableValues = {"rule", "spell", "item",
                     "creature", "character_sheet", "encounter", "dungeon", "note"}, example = "character_sheet")
             String core,
+            @Schema(description = "The record type's stable key (contract 1.38.0): a core type's core key, or the slug of"
+                    + " an approved type's name at its approval (lower-case letters, digits and underscores); it never"
+                    + " changes, a rename included", pattern = "^[a-z0-9_]{1,32}$", example = "feat") String key,
+            @Schema(description = "Where the record type came from (contract 1.38.0): core, or the approving proposal"
+                    + " and its material") OriginView origin,
             @Schema(description = "How many records of the system have this type: from contract 1.34.0, the records"
                     + " of the accepted versions of the materials of the system and of its campaigns",
                     format = "int64", minimum = "0",
@@ -101,7 +134,9 @@ class OntologyController {
                     example = "0") long version) {
 
         static RecordTypeView of(Ontology.RecordType type) {
-            return new RecordTypeView(type.id().toString(), type.name(), type.core(), type.records(), type.version());
+            return new RecordTypeView(type.id().toString(), type.name(), type.core(), type.key(),
+                    type.core() == null ? OriginView.of(type.origin()) : OriginView.CORE, type.records(),
+                    type.version());
         }
 
         @Override
@@ -486,12 +521,12 @@ class OntologyController {
     }
 
     /** A malformed id is no different from an unknown one. */
-    private static Optional<UUID> parse(String id) {
+    static Optional<UUID> parse(String id) {
         return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
     }
 
     /** A page's size: the default without one, else 1 to 50, or {@code request.invalid}. */
-    private static int limit(String limit) {
+    static int limit(String limit) {
         if (limit == null) {
             return Ontology.DEFAULT_LIMIT;
         }
@@ -502,7 +537,7 @@ class OntologyController {
     }
 
     /** The position a page starts at: 0 without one, else 0 to {@value Ontology#MAX_OFFSET}, or {@code request.invalid}. */
-    private static int offset(String offset) {
+    static int offset(String offset) {
         if (offset == null) {
             return 0;
         }
@@ -512,15 +547,15 @@ class OntologyController {
         return Integer.parseInt(offset);
     }
 
-    private static ApiException invalid() {
+    static ApiException invalid() {
         return new ApiException(ApiProblem.forStatus(400));
     }
 
-    private static ApiException notFound() {
+    static ApiException notFound() {
         return new ApiException(ApiProblem.forStatus(404));
     }
 
-    private static <T> ResponseEntity<T> found(Optional<T> body) {
+    static <T> ResponseEntity<T> found(Optional<T> body) {
         return body.map(value -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(value))
                 .orElseThrow(OntologyController::notFound);
     }

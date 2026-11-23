@@ -232,6 +232,38 @@ class OntologyIntegrationTest {
         assertThat(count("record_type", "system_id = ?", a.system())).isEqualTo(8);
     }
 
+    // --- Story 4.4: a core row the release before V39 wrote, with no key
+
+    @Autowired
+    private io.github.gmshield.knowledge.service.Proposals proposals;
+
+    @Test
+    void aCoreRowWithoutAKeyReadsWithItsCoreKeyAndNoApprovedTypeTakesThatKey() throws Exception {
+        Owner a = owner();
+        UUID system = oldSystem(a.id(), "Antigo");
+        UUID spell = Ids.newId();
+        jdbc.sql("insert into record_type (id, owner_id, system_id, core, name, name_fingerprint) values (?, ?, ?, ?, ?,"
+                + " ?)").params(spell, a.id(), system, "spell", vault.encryptText(new Binding("record_type", "name", spell,
+                a.id()), "spell"), vault.fingerprint("record_type", "name", "spell")).update();
+
+        Ontology.RecordType read = as(a.id(), () -> ontology.recordTypes(system, 0, 50)).orElseThrow().items().getFirst();
+        assertThat(read.core()).isEqualTo("spell");
+        assertThat(read.key()).isEqualTo("spell");
+        assertThat(read.origin()).isNull();
+
+        // A pending proposal approved as "Spell!": its slug is the core key, so it takes the next one.
+        UUID proposal = Ids.newId();
+        jdbc.sql("insert into proposal (id, owner_id, system_id, kind, name, name_fingerprint, examples, state,"
+                + " created_at) values (?, ?, ?, 'record_type', ?, ?, ?, 'pending', now())")
+                .params(proposal, a.id(), system, vault.encryptText(new Binding("proposal", "name", proposal, a.id()),
+                        "Spell!"), vault.fingerprint("record_type", "name", Library.uniqueForm("Spell!")),
+                        vault.encrypt(new Binding("proposal", "examples", proposal, a.id()),
+                                "[]".getBytes(StandardCharsets.UTF_8))).update();
+        UUID approved = as(a.id(), () -> proposals.approve(proposal, 0, null)).orElseThrow().resultId();
+        assertThat(jdbc.sql("select key from record_type where id = ?").param(approved).query(String.class).single())
+                .isEqualTo("spell_2");
+    }
+
     // --- deletion
 
     @Test
@@ -239,6 +271,15 @@ class OntologyIntegrationTest {
         Owner a = owner();
         UUID system = as(a.id(), () -> library.createSystem(new Library.SystemFields("Passageiro", null, null))).id();
         write(a.id(), () -> store.insertRecordTypes(List.of(row(a.id(), system, null, "Veículo"))));
+        // Story 4.4: a term with an alias, each naming its proposal; they go first, the proposals last.
+        UUID proposal = approvedProposal(a.id(), system, "Pontos de Vida");
+        UUID term = Ids.newId();
+        jdbc.sql("insert into term (id, owner_id, system_id, name, name_fingerprint, definition, proposal_id,"
+                + " created_at) values (?, ?, ?, ?, ?, ?, ?, now())").params(term, a.id(), system, new byte[] {1},
+                new byte[] {1}, new byte[] {1}, proposal).update();
+        jdbc.sql("insert into term_alias (id, owner_id, system_id, term_id, name, name_fingerprint, proposal_id,"
+                + " created_at) values (?, ?, ?, ?, ?, ?, ?, now())").params(Ids.newId(), a.id(), system, term,
+                new byte[] {2}, new byte[] {2}, proposal).update();
 
         assertThat(as(a.id(), () -> deletion.delete(system))).isTrue();
         assertThat(as(a.id(), () -> ontology.recordTypes(system, 0, 50))).isEmpty();
@@ -249,6 +290,9 @@ class OntologyIntegrationTest {
 
         assertThat(count("system", "id = ?", system)).isZero();
         assertThat(count("record_type", "system_id = ?", system)).isZero();
+        assertThat(count("term_alias", "system_id = ?", system)).isZero();
+        assertThat(count("term", "system_id = ?", system)).isZero();
+        assertThat(count("proposal", "system_id = ?", system)).isZero();
         assertThat(count("record_type", "system_id = ?", a.system())).isEqualTo(8);
     }
 
@@ -271,11 +315,29 @@ class OntologyIntegrationTest {
         return id;
     }
 
+    /**
+     * A record type row: a core one, or (from Story 4.4) one that is not core, approved from a proposal stored here with
+     * SQL, as an approval leaves it.
+     */
     private RecordTypeRow row(UUID owner, UUID system, String core, String name) {
         UUID id = Ids.newId();
-        return new RecordTypeRow(id, owner, system, core, vault.encryptText(new Binding("record_type", "name", id, owner),
-                name), vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0,
+        UUID proposal = core == null ? approvedProposal(owner, system, name) : null;
+        return new RecordTypeRow(id, owner, system, core, core == null ? "t" + id.toString().substring(0, 8) : core,
+                proposal, vault.encryptText(new Binding("record_type", "name", id, owner), name),
+                vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0,
                 Instant.now().truncatedTo(ChronoUnit.MICROS));
+    }
+
+    /** An approved record type proposal of the system, with no material (Story 4.4): its id. */
+    private UUID approvedProposal(UUID owner, UUID system, String name) {
+        UUID id = Ids.newId();
+        jdbc.sql("insert into proposal (id, owner_id, system_id, kind, name, name_fingerprint, examples, state,"
+                + " decided_at, created_at) values (?, ?, ?, 'record_type', ?, ?, ?, 'approved', now(), now())")
+                .params(id, owner, system, vault.encryptText(new Binding("proposal", "name", id, owner), name),
+                        vault.fingerprint("record_type", "name", Library.uniqueForm(name)),
+                        vault.encrypt(new Binding("proposal", "examples", id, owner),
+                                "[]".getBytes(StandardCharsets.UTF_8))).update();
+        return id;
     }
 
     /** A raw insert, past the application, to prove what the table itself refuses. */

@@ -51,4 +51,14 @@ public interface KnowledgeStore {
 
     /** Deletes every record type of the current owner's system {@code systemId}; safe to repeat. */
     void deleteOfSystem(UUID systemId);
+
+    /**
+     * Locks the ontology of the current owner's system {@code systemId} until the caller's transaction ends (Story 4.4):
+     * its core record types, for writing, so two changes of its one name space (types, terms and aliases) run one after
+     * the other. A system without them locks nothing.
+     */
+    void lockOntology(UUID systemId);
+
+    /** Whether a record type of the current owner's system {@code systemId} has this key (Story 4.4). */
+    boolean keyTaken(UUID systemId, String key);
 }

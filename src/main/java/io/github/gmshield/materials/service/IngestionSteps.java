@@ -7,6 +7,7 @@ import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.JobResultInvalid;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.OutlineRow;
 import io.github.gmshield.materials.data.PageRangeRow;
@@ -109,6 +110,13 @@ import tools.jackson.databind.node.ObjectNode;
  *       truncation, an outage after its last attempt) never fails the version: its pages are marked unread, and the
  *       chain still ends. Whatever replaces or removes the version's passages (a passages report, a restart, a
  *       reprocess) removes its records first and clears those marks.</li>
+ *   <li>From Story 4.4, a records step's report may carry {@code proposals}: record types and terms its passages name,
+ *       at most {@value #MAX_PROPOSALS}, each with up to {@value #MAX_EXAMPLES} examples quoted from a passage it cites
+ *       (and a term with its quoted definition). Each quote is checked against the decrypted text of the passage it
+ *       cites, whitespace collapsed: an example not found there is dropped, a proposal left with no example is
+ *       dropped, and a term whose definition is not found in the passages it cites is dropped too. What is left goes
+ *       to {@link OntologyProposals} for every system the material counts under (its systems, or its campaign's).
+ *       Whatever removes the version's records clears its pending proposals as well.</li>
  * </ul>
  *
  * Every step row gets {@code ended_at} when its job is completed, finally fails or is cancelled here. Every call runs
@@ -151,6 +159,18 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     static final int MAX_FIELD_VALUE = 8_000;
     static final int MAX_RECORD_PASSAGES = 100;
     static final String RECORD_INVALID = "ingestion.record_invalid";
+    /**
+     * A records report's proposals (Story 4.4): at most {@value #MAX_PROPOSALS}, each a name of at most
+     * {@value #MAX_PROPOSAL_NAME} code points, a definition of at most {@value #MAX_DEFINITION}, and at most
+     * {@value #MAX_EXAMPLES} examples, each a quote of at most {@value #MAX_QUOTE}.
+     */
+    static final int MAX_PROPOSALS = 20;
+    static final int MAX_PROPOSAL_NAME = 120;
+    static final int MAX_DEFINITION = 500;
+    static final int MAX_EXAMPLES = 3;
+    static final int MAX_QUOTE = 200;
+    static final Set<String> PROPOSAL_KINDS = Set.of(OntologyProposals.RECORD_TYPE, OntologyProposals.TERM);
+    static final String PROPOSAL_INVALID = "ingestion.proposal_invalid";
     public static final String PASSWORD_REQUIRED = "ingestion.password_required";
     public static final String TOO_MANY_STEPS = "ingestion.too_many_steps";
     public static final String STEP_FAILED = "ingestion.step_failed";
@@ -194,12 +214,17 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     private final IngestionSettings settings;
     private final Vault vault;
     private final ExtractedRecords records;
+    private final OntologyProposals proposals;
+    private final Library library;
     private final ObjectProvider<Clock> clock;
 
     IngestionSteps(Jobs jobs, MaterialStore materials, UploadStorage uploads, FileStore files, IngestionSettings settings,
-                   Vault vault, ExtractedRecords records, ObjectProvider<Clock> clock) {
+                   Vault vault, ExtractedRecords records, OntologyProposals proposals, Library library,
+                   ObjectProvider<Clock> clock) {
         this.jobs = jobs;
         this.records = records;
+        this.proposals = proposals;
+        this.library = library;
         this.materials = materials;
         this.uploads = uploads;
         this.files = files;
@@ -466,6 +491,10 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             // else: passages would replace every record of the version, and next steps would start a chain of its own.
             throw new JobResultInvalid(RECORD_INVALID);
         }
+        if (report.carriesProposals() && !step.inputPassages()) {
+            // Proposals ride on a records step only (Story 4.4).
+            throw new JobResultInvalid(PROPOSAL_INVALID);
+        }
         // A chain's first report (a new chain, or a restarted one) sets the page total, even over the kept one: another
         // pipeline may split the same file into other pages. Every later report must keep it.
         boolean first = version.pipelineVersion() == null;
@@ -507,6 +536,9 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         }
         if (report.carriesRecords()) {
             replaceRecords(job, step, report);
+        }
+        if (report.carriesProposals()) {
+            storeProposals(job, step, version, report);
         }
         if (!report.pageViews().isEmpty()) {
             replacePageViews(job, version, report, now);
@@ -969,11 +1001,103 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 .addKeyValue("sections", report.outline().size()).log("ingestion.passages_recorded");
     }
 
-    /** The version's records go, and its records steps' unread marks (Story 4.2); answers how many records went. */
+    /**
+     * The version's records go, and its records steps' unread marks (Story 4.2), and from Story 4.4 its pending
+     * proposals (its decided ones stay); answers how many records went.
+     */
     private int removeRecords(UUID versionId) {
         int removed = records.removeVersion(versionId);
         materials.clearRecordsUnread(versionId);
+        proposals.clearPending(versionId);
         return removed;
+    }
+
+    /**
+     * A records step's proposals (Story 4.4), as the class says: each example's quote is looked for in the decrypted
+     * text of the passage it cites (a passage of the version on the step's pages; any other is not found), whitespace
+     * collapsed; the kept ones go to {@link OntologyProposals} for each system the material counts under. Logs counts
+     * only.
+     */
+    private void storeProposals(JobRef job, StepRow step, VersionRow version, Report report) {
+        Map<UUID, PassageRow> given = new HashMap<>();
+        materials.passagesOnPages(step.versionId(), step.firstPage(), step.lastPage())
+                .forEach(passage -> given.put(passage.id(), passage));
+        Map<UUID, String> texts = new HashMap<>();
+        List<OntologyProposals.Proposed> kept = new ArrayList<>();
+        int examplesDropped = 0;
+        int proposalsDropped = 0;
+        for (Report.ReportedProposal proposal : report.proposals()) {
+            List<OntologyProposals.Example> examples = new ArrayList<>();
+            List<String> cited = new ArrayList<>();
+            for (Report.ReportedExample example : proposal.examples()) {
+                PassageRow passage = given.get(example.passageId());
+                String text = passage == null ? null : texts.computeIfAbsent(passage.id(), id -> Quotes.collapsed(
+                        vault.decryptText(Passages.text(id, passage.ownerId()), passage.text())));
+                if (text == null || !text.contains(Quotes.collapsed(example.quote()))) {
+                    examplesDropped++;
+                    continue;
+                }
+                cited.add(text);
+                examples.add(new OntologyProposals.Example(passage.page(), example.quote().strip()));
+            }
+            String definition = definition(proposal.definition(), cited);
+            if (examples.isEmpty() || OntologyProposals.TERM.equals(proposal.kind()) && definition == null
+                    || !named(proposal.name(), examples, definition)) {
+                proposalsDropped++;
+                continue;
+            }
+            kept.add(new OntologyProposals.Proposed(proposal.kind(), proposal.name().strip(), definition, examples));
+        }
+        List<UUID> systems = systemsOf(version.materialId());
+        OntologyProposals.Outcome outcome = kept.isEmpty() || systems.isEmpty()
+                ? new OntologyProposals.Outcome(0, 0, 0)
+                : proposals.store(version.materialId(), version.id(), systems, kept);
+        log.atInfo().addKeyValue("versionId", step.versionId()).addKeyValue("jobId", job.id())
+                .addKeyValue("proposals", report.proposals().size()).addKeyValue("systems", systems.size())
+                .addKeyValue("stored", outcome.stored()).addKeyValue("extended", outcome.extended())
+                .addKeyValue("dropped", outcome.dropped() + proposalsDropped)
+                .addKeyValue("examplesDropped", examplesDropped).log("ingestion.proposals_recorded");
+    }
+
+    /**
+     * Whether a proposal's name is itself in the material: in one of its kept quotes or its kept definition, whitespace
+     * collapsed and case aside. A name the passages never write (invented, or asked for by a planted line) is dropped.
+     */
+    private static boolean named(String name, List<OntologyProposals.Example> examples, String definition) {
+        String wanted = Quotes.collapsed(name).toLowerCase(java.util.Locale.ROOT);
+        if (definition != null && Quotes.collapsed(definition).toLowerCase(java.util.Locale.ROOT).contains(wanted)) {
+            return true;
+        }
+        return examples.stream().anyMatch(example -> Quotes.collapsed(example.quote()).toLowerCase(java.util.Locale.ROOT)
+                .contains(wanted));
+    }
+
+    /** A proposal's definition when one of the cited passages holds it (whitespace collapsed); null otherwise. */
+    private static String definition(String definition, List<String> cited) {
+        if (definition == null || definition.isBlank()) {
+            return null;
+        }
+        String wanted = Quotes.collapsed(definition);
+        return cited.stream().anyMatch(text -> text.contains(wanted)) ? definition.strip() : null;
+    }
+
+    /**
+     * The systems a material counts under (Story 4.4): those it belongs to, or its campaign's; a system being deleted is
+     * left out (its deletion may already have removed its proposals).
+     */
+    private List<UUID> systemsOf(UUID materialId) {
+        List<UUID> systems = new ArrayList<>();
+        materials.findMaterial(materialId).ifPresent(material -> {
+            if (material.campaignId() != null) {
+                library.campaign(material.campaignId()).ifPresent(campaign -> systems.add(campaign.system().id()));
+            }
+            materials.systemsOf(materialId).forEach(system -> {
+                if (!systems.contains(system.systemId()) && library.system(system.systemId()).isPresent()) {
+                    systems.add(system.systemId());
+                }
+            });
+        });
+        return List.copyOf(systems);
     }
 
     /**
@@ -1199,7 +1323,27 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      */
     record Report(String pipelineVersion, Integer pageTotal, UUID original, List<Batch> batches, List<Batch> texts,
                   List<Range> layers, List<Range> pages, List<Next> next, List<Passage> passages,
-                  List<Passages.Entry> outline, List<PageView> pageViews, List<ReportedRecord> records) {
+                  List<Passages.Entry> outline, List<PageView> pageViews, List<ReportedRecord> records,
+                  List<ReportedProposal> proposals) {
+
+        /**
+         * A proposal of a records step (Story 4.4): its kind, its name, its definition (empty when none) and its
+         * examples. No content shown.
+         */
+        record ReportedProposal(String kind, String name, String definition, List<ReportedExample> examples) {
+            @Override
+            public String toString() {
+                return "ReportedProposal[kind=" + kind + ", examples=" + examples.size() + "]";
+            }
+        }
+
+        /** An example of a proposal: the passage it cites and its quote. No content shown. */
+        record ReportedExample(UUID passageId, String quote) {
+            @Override
+            public String toString() {
+                return "ReportedExample[passageId=" + passageId + "]";
+            }
+        }
 
         /** An extracted record (Story 4.2): its type key, name, fields in order and passage ids. No content shown. */
         record ReportedRecord(String type, String name, List<ExtractedRecords.Field> fields, List<UUID> passageIds) {
@@ -1281,9 +1425,55 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             }
             List<Range> pages = ranges(result.path("pages"), "outcome", OUTCOMES);
             List<ReportedRecord> records = present(result.path("records")) ? records(result.path("records")) : null;
+            List<ReportedProposal> proposals = present(result.path("proposals"))
+                    ? proposals(result.path("proposals")) : null;
             return new Report(version.asString(), total, original, files(result.path("batches")),
                     files(result.path("texts")), ranges(result.path("layers"), "layer", LAYERS), pages,
-                    List.copyOf(next), passages, outline, pageViews(result.path("pageViews"), pages), records);
+                    List.copyOf(next), passages, outline, pageViews(result.path("pageViews"), pages), records,
+                    proposals);
+        }
+
+        /**
+         * A records report's proposals (Story 4.4), checked for their shape only (the quotes are checked against the
+         * passages later): at most {@value #MAX_PROPOSALS}, each a {@code kind} of {@link #PROPOSAL_KINDS}, a
+         * non-blank {@code name} of at most {@value #MAX_PROPOSAL_NAME} code points, a {@code definition} of at most
+         * {@value #MAX_DEFINITION} (absent or empty for none) and at most {@value #MAX_EXAMPLES} {@code examples}, each
+         * a {@code passageId} and a non-blank {@code quote} of at most {@value #MAX_QUOTE}. Anything else refuses the
+         * report.
+         */
+        private static List<ReportedProposal> proposals(JsonNode node) {
+            if (!node.isArray() || node.size() > MAX_PROPOSALS) {
+                throw new JobResultInvalid(PROPOSAL_INVALID);
+            }
+            List<ReportedProposal> found = new ArrayList<>(node.size());
+            for (JsonNode item : node) {
+                JsonNode kind = item.path("kind");
+                JsonNode name = item.path("name");
+                JsonNode definition = item.path("definition");
+                JsonNode examples = item.path("examples");
+                if (!item.isObject() || !kind.isString() || !PROPOSAL_KINDS.contains(kind.asString())
+                        || !name.isString() || name.asString().isBlank()
+                        || !within(name.asString().strip(), 1, MAX_PROPOSAL_NAME)
+                        || present(definition) && (!definition.isString()
+                        || !within(definition.asString(), 0, MAX_DEFINITION))
+                        || !examples.isArray() || examples.size() > MAX_EXAMPLES) {
+                    throw new JobResultInvalid(PROPOSAL_INVALID);
+                }
+                List<ReportedExample> quoted = new ArrayList<>(examples.size());
+                for (JsonNode example : examples) {
+                    JsonNode passage = example.path("passageId");
+                    JsonNode quote = example.path("quote");
+                    if (!example.isObject() || !passage.isString() || !UUID_TEXT.matcher(passage.asString()).matches()
+                            || !quote.isString() || quote.asString().isBlank()
+                            || !within(quote.asString(), 1, MAX_QUOTE)) {
+                        throw new JobResultInvalid(PROPOSAL_INVALID);
+                    }
+                    quoted.add(new ReportedExample(UUID.fromString(passage.asString()), quote.asString()));
+                }
+                found.add(new ReportedProposal(kind.asString(), name.asString(),
+                        present(definition) ? definition.asString() : "", List.copyOf(quoted)));
+            }
+            return List.copyOf(found);
         }
 
         /** A records report's records (Story 4.2), checked as the record says; anything else refuses the report. */
@@ -1547,6 +1737,11 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         /** Whether the report gives a records step's records (Story 4.2), which replace its run's earlier ones. */
         boolean carriesRecords() {
             return records != null;
+        }
+
+        /** Whether the report gives a records step's proposals (Story 4.4). */
+        boolean carriesProposals() {
+            return proposals != null;
         }
 
         /**

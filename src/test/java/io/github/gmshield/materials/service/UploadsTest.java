@@ -75,7 +75,8 @@ class UploadsTest {
                 TestLibraries.library(new InMemoryLibraryStore(), vault,
                         beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class)),
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
-                (version, upload) -> started.add(new UUID[] {version.id(), upload.id()}), TestMaterials.NO_RECORDS);
+                (version, upload) -> started.add(new UUID[] {version.id(), upload.id()}), TestMaterials.NO_RECORDS,
+                TestMaterials.NO_PROPOSALS);
         sweep = new UploadSweep(uploads, materials, service, beans.getBeanProvider(PlatformTransactionManager.class),
                 beans.getBeanProvider(Clock.class));
     }
@@ -336,7 +337,7 @@ class UploadsTest {
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
                 (version, upload) -> {
                     throw new IllegalStateException("jobs down");
-                }, TestMaterials.NO_RECORDS);
+                }, TestMaterials.NO_RECORDS, TestMaterials.NO_PROPOSALS);
         byte[] content = pdf(MIB);
         UUID id = create(content.length, "book.pdf");
         patch(id, 0, content);

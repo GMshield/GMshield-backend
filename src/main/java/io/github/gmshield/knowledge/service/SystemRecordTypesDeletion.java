@@ -1,6 +1,7 @@
 package io.github.gmshield.knowledge.service;
 
 import io.github.gmshield.knowledge.data.KnowledgeStore;
+import io.github.gmshield.knowledge.data.OntologyStore;
 import io.github.gmshield.library.service.SystemDeletionHandler;
 import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Instant;
@@ -15,7 +16,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The ontology's part of a system's deletion (Story 4.1, AD-22), as the owner of the work: when a system goes, its record
- * types, before the system's own row (the key on (owner, system) needs it). A campaign's deletion, a material's, a
+ * types, before the system's own row (the key on (owner, system) needs it). From Story 4.4 its term aliases, terms,
+ * record types and proposals, in that order (each names the ones after it). A campaign's deletion, a material's, a
  * version's or a conversation's takes nothing here. It counts nothing (no dialog names record types) and cancels
  * nothing (no job is the ontology's), and its removal, in one transaction, is safe to repeat.
  */
@@ -27,10 +29,13 @@ class SystemRecordTypesDeletion implements SystemDeletionHandler {
     private static final Logger log = LoggerFactory.getLogger(SystemRecordTypesDeletion.class);
 
     private final KnowledgeStore store;
+    private final OntologyStore ontology;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    SystemRecordTypesDeletion(KnowledgeStore store, ObjectProvider<PlatformTransactionManager> transactions) {
+    SystemRecordTypesDeletion(KnowledgeStore store, OntologyStore ontology,
+                              ObjectProvider<PlatformTransactionManager> transactions) {
         this.store = store;
+        this.ontology = ontology;
         this.transactions = transactions;
     }
 
@@ -55,8 +60,11 @@ class SystemRecordTypesDeletion implements SystemDeletionHandler {
         if (going.systemId() == null) {
             return;
         }
-        new TransactionTemplate(transactions.getObject())
-                .executeWithoutResult(status -> store.deleteOfSystem(going.systemId()));
+        new TransactionTemplate(transactions.getObject()).executeWithoutResult(status -> {
+            ontology.deleteTermsOfSystem(going.systemId());
+            store.deleteOfSystem(going.systemId());
+            ontology.deleteProposalsOfSystem(going.systemId());
+        });
         going.about(log.atInfo().addKeyValue("ownerId", owner)).log("knowledge.deletion_removed");
     }
 }

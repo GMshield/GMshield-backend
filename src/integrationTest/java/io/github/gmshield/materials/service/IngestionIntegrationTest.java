@@ -57,6 +57,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -1785,6 +1786,131 @@ class IngestionIntegrationTest {
     private long spellCount(UUID owner, UUID system) throws Exception {
         return as(owner, () -> ontology.recordTypes(system, 0, 8)).orElseThrow().items().stream()
                 .filter(type -> "spell".equals(type.core())).findFirst().orElseThrow().records();
+    }
+
+    // --- Story 4.4 (part A): ontology proposals on Postgres
+
+    @Autowired
+    private io.github.gmshield.knowledge.service.Proposals proposals;
+    @Autowired
+    private io.github.gmshield.knowledge.service.Terms terms;
+    @Autowired
+    private io.github.gmshield.library.service.SystemDeletion systemDeletion;
+
+    @Test
+    void proposalsAreStoredEncryptedShareTheSystemsNameSpaceAndGoWithTheirVersionAndMaterialOnPostgres()
+            throws Exception {
+        UUID owner = Ids.newId();
+        write(owner, () -> library.createStarter(Language.EN));
+        UUID system = jdbc.sql("select id from system where owner_id = ?").param(owner).query(UUID.class).single();
+        Chain chain = completed(owner, pdf(MIB), new Uploads.Details(null, null, null, List.of(system.toString())));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId()
+                        + "\"},\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + ",{\"stage\":\"passages\",\"firstPage\":1,"
+                        + "\"lastPage\":3,\"input\":\"texts\"}]}"));
+        layoutReport(chain, claimOffered(chain), 1, 3, List.of(), List.of(1, 2, 3));
+        JobClaims.Claim passages = claimOffered(chain);
+        claims.report(passages.jobId(), passages.claimId(), passages.grant(), "done", null, null,
+                JSON.readTree(passagesReport("Talentos são habilidades. Pontos de Vida (PV): medem a saúde", "Regras",
+                        "Talentos").replace("\"pipelineVersion\":\"4\"", "\"pipelineVersion\":\"5\"")
+                        .replace("\"next\":[]", "\"next\":[{\"stage\":\"records\",\"firstPage\":1,\"lastPage\":3,"
+                                + "\"input\":\"passages\"}]")));
+        UUID page3 = passageOn(chain, 3);
+        UUID job = jdbc.sql("select s.job_id from ingestion_step s join job j on j.id = s.job_id"
+                + " where s.version_id = ? and j.state = 'offered'").param(chain.versionId()).query(UUID.class).single();
+        JobClaims.Claim records = claims.claim(job, null, List.of("azure-openai"));
+        claims.report(job, records.claimId(), records.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"records\":[],\"proposals\":[" + String.join(",",
+                        pgProposal("record_type", "Talento", "", page3, "Talentos são"),
+                        pgProposal("record_type", "Habilidade", "", page3, "habilidades"),
+                        pgProposal("term", "Pontos de Vida", "Pontos de Vida (PV): medem a saúde", page3, "PV"),
+                        pgProposal("term", "PV", "Pontos de Vida (PV)", page3, "(PV)")) + "],\"next\":[]}"));
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+
+        // Encrypted on PostgreSQL: name, definition and examples hold vault ciphertexts, bound to the proposal.
+        List<Map<String, Object>> rows = jdbc.sql("select id, owner_id, system_id, material_id, version_id, kind, name,"
+                + " definition, examples, state from proposal where material_id = ? order by id")
+                .param(chain.materialId()).query().listOfRows();
+        assertThat(rows).hasSize(4).allSatisfy(row -> assertThat(row).containsEntry("owner_id", owner)
+                .containsEntry("system_id", system).containsEntry("version_id", chain.versionId())
+                .containsEntry("state", "pending"));
+        for (Map<String, Object> row : rows) {
+            for (String column : List.of("name", "definition", "examples")) {
+                byte[] stored = (byte[]) row.get(column);
+                if (stored != null) {
+                    assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContain("Talento")
+                            .doesNotContain("Pontos").doesNotContain("PV").doesNotContain("habilidades");
+                }
+            }
+        }
+        UUID talent = rows.getFirst().get("id") instanceof UUID id ? id : null;
+        assertThat(vault.decryptText(new Binding("proposal", "name", talent, owner), (byte[]) rows.getFirst()
+                .get("name"))).isEqualTo("Talento");
+        // The table refuses a second proposal of the same name for the same system and material.
+        assertThatThrownBy(() -> jdbc.sql("insert into proposal (id, owner_id, system_id, material_id, kind, name,"
+                + " name_fingerprint, examples, state, created_at) select ?, owner_id, system_id, material_id, kind,"
+                + " name, name_fingerprint, examples, 'pending', now() from proposal where id = ?")
+                .params(Ids.newId(), talent).update()).isInstanceOf(DataIntegrityViolationException.class);
+
+        // Approved: a record type with its key and origin, a term; one name space for both.
+        UUID skill = (UUID) rows.get(1).get("id");
+        UUID hp = (UUID) rows.get(2).get("id");
+        UUID pv = (UUID) rows.get(3).get("id");
+        UUID type = as(owner, () -> proposals.approve(talent, 0, "Feat")).orElseThrow().resultId();
+        assertThat(jdbc.sql("select key, proposal_id, core from record_type where id = ?").param(type).query()
+                .singleRow()).containsEntry("key", "feat").containsEntry("proposal_id", talent)
+                .containsEntry("core", null);
+        UUID term = as(owner, () -> proposals.approve(hp, 0, null)).orElseThrow().resultId();
+        Map<String, Object> termRow = jdbc.sql("select name, definition, proposal_id from term where id = ?").param(term)
+                .query().singleRow();
+        assertThat(termRow).containsEntry("proposal_id", hp);
+        assertThat(new String((byte[]) termRow.get("name"), StandardCharsets.ISO_8859_1)
+                + new String((byte[]) termRow.get("definition"), StandardCharsets.ISO_8859_1))
+                .doesNotContain("Pontos").doesNotContain("saúde");
+        for (String taken : List.of("FEAT", "pontos de vida", "Spell", "Magia")) {
+            assertThat(messages(org.assertj.core.api.Assertions.catchThrowable(() -> as(owner,
+                    () -> proposals.approve(skill, 0, taken))))).as(taken).contains("ontology.name_taken");
+        }
+        as(owner, () -> proposals.merge(pv, 0, term));
+        assertThat(jdbc.sql("select count(*) from term_alias where term_id = ? and proposal_id = ?").params(term, pv)
+                .query(Long.class).single()).isOne();
+        assertThat(as(owner, () -> terms.terms(system, 0, 50)).orElseThrow().items().getFirst().aliases())
+                .containsExactly("PV");
+        // Another owner reads and decides nothing.
+        UUID other = Ids.newId();
+        assertThat(as(other, () -> proposals.ofSystem(system, 0, 50))).isEmpty();
+        assertThat(as(other, () -> proposals.reject(skill, 0))).isEmpty();
+
+        // A discard: the pending proposal goes, the decided ones stay without their version.
+        as(owner, () -> actions.act(chain.materialId(), "discard"));
+        assertThat(jdbc.sql("select count(*) from proposal where id = ?").param(skill).query(Long.class).single())
+                .isZero();
+        assertThat(jdbc.sql("select count(*) from proposal where material_id = ? and version_id is null")
+                .param(chain.materialId()).query(Long.class).single()).isEqualTo(3);
+
+        // The material's deletion: only the approved ones stay, without it; the alias stays, without its proposal.
+        freeTheIngestionLane();
+        assertThat(as(owner, () -> systemDeletion.deleteMaterial(chain.materialId()))).isTrue();
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(chain.materialId())
+                .query(UUID.class).single();
+        assertThat(systemDeletion.run(owner, deletionId)).isTrue();
+        assertThat(jdbc.sql("select count(*) from material where id = ?").param(chain.materialId()).query(Long.class)
+                .single()).isZero();
+        assertThat(jdbc.sql("select id from proposal where system_id = ? and material_id is null order by id")
+                .param(system).query(UUID.class).list()).containsExactly(talent, hp);
+        assertThat(jdbc.sql("select proposal_id from term_alias where term_id = ?").param(term).query()
+                .singleRow()).containsEntry("proposal_id", null);
+        assertThat(as(owner, () -> ontology.recordType(type)).orElseThrow().origin())
+                .isEqualTo(new Ontology.Origin(talent, null, null));
+    }
+
+    private static String pgProposal(String kind, String name, String definition, UUID passage, String quote) {
+        return "{\"kind\":\"" + kind + "\",\"name\":\"" + name + "\",\"definition\":\"" + definition
+                + "\",\"examples\":[{\"passageId\":\"" + passage + "\",\"quote\":\"" + quote + "\"}]}";
     }
 
     // --- Story 4.3: a system's records on Postgres

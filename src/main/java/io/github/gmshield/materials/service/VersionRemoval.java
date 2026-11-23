@@ -45,13 +45,16 @@ public class VersionRemoval {
     private final FileStore files;
     private final IngestionSteps ingestion;
     private final ExtractedRecords records;
+    private final OntologyProposals proposals;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
     VersionRemoval(MaterialStore materials, FileStore files, IngestionSteps ingestion, ExtractedRecords records,
+                   OntologyProposals proposals,
                    ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.materials = materials;
         this.records = records;
+        this.proposals = proposals;
         this.files = files;
         this.ingestion = ingestion;
         this.transactions = transactions;
@@ -73,6 +76,8 @@ public class VersionRemoval {
             // Page views first: each names its picture file.
             materials.deletePageViews(versionId);
             records.removeVersion(versionId);
+            // Story 4.4: its pending proposals go; its decided ones stay, no longer naming it.
+            proposals.clearPending(versionId);
             materials.deletePassages(versionId);
             materials.deleteOutline(versionId);
             materials.deletePageRanges(versionId);

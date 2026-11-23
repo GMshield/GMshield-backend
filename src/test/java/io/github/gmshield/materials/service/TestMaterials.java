@@ -73,6 +73,24 @@ public final class TestMaterials {
         }
     };
 
+    /** Proposals that are never stored (Story 4.4), for the tests that build the services by hand. */
+    public static final OntologyProposals NO_PROPOSALS = new OntologyProposals() {
+        @Override
+        public Outcome store(UUID materialId, UUID versionId, Collection<UUID> systemIds, List<Proposed> proposals) {
+            return new Outcome(0, 0, proposals.size());
+        }
+
+        @Override
+        public int clearPending(UUID versionId) {
+            return 0;
+        }
+
+        @Override
+        public int removeMaterial(UUID materialId) {
+            return 0;
+        }
+    };
+
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */
     public static Optional<Materials.Passage> passage(Materials materials, UUID id) {
         return materials.passage(id);

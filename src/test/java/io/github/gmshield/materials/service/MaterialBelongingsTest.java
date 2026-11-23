@@ -101,7 +101,7 @@ class MaterialBelongingsTest {
                 beans.getBeanProvider(Clock.class));
         service = new Uploads(materials, uploads, vault, TestVaults.files(vault, root), library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
-                (version, upload) -> { }, TestMaterials.NO_RECORDS);
+                (version, upload) -> { }, TestMaterials.NO_RECORDS, TestMaterials.NO_PROPOSALS);
         reads = new Materials(materials, uploads, vault, TestVaults.files(vault, root), ids -> java.util.Set.of(),
                 library, new IngestionSettings(4), TestMaterials.NO_RECORDS,
                 beans.getBeanProvider(PlatformTransactionManager.class));
