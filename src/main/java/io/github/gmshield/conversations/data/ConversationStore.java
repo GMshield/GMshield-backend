@@ -1,8 +1,11 @@
 package io.github.gmshield.conversations.data;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -13,10 +16,73 @@ public interface ConversationStore {
 
     void insertConversation(ConversationRow row);
 
-    /** The current owner's conversation of a campaign. */
-    Optional<ConversationRow> conversationOfCampaign(UUID campaignId);
+    /**
+     * The current owner's conversation of a campaign in {@code area} whose newest question was asked last (Story 3.10);
+     * empty when it has none there.
+     */
+    Optional<ConversationRow> latestConversation(UUID campaignId, String area);
 
+    /**
+     * The current owner's conversations of a campaign in {@code area} (Story 3.10), the most recently asked first (then
+     * by id, newest first), skipping the first {@code offset}, at most {@code limit}.
+     */
+    List<ConversationRow> conversations(UUID campaignId, String area, int offset, int limit);
+
+    /** How many conversations the current owner's campaign has in {@code area} (Story 3.10). */
+    long conversationCount(UUID campaignId, String area);
+
+    /**
+     * The first turn of each of these conversations of the current owner (Story 3.10: the oldest, then by id), by
+     * conversation; a conversation with no turn, or another owner's, is absent.
+     */
+    Map<UUID, TurnRow> firstTurns(Collection<UUID> conversationIds);
+
+    /**
+     * How many shown turns each of these conversations of the current owner has (Story 3.10; from Story 3.11 a
+     * dismissed turn is not counted); one with none is absent.
+     */
+    Map<UUID, Long> turnCounts(Collection<UUID> conversationIds);
+
+    /**
+     * The current owner's newest {@code limit} shown turns of a conversation (Story 3.10; from Story 3.11 a dismissed
+     * turn is left out), oldest first.
+     */
+    List<TurnRow> newestTurns(UUID conversationId, int limit);
+
+    /**
+     * A question was asked in the owner's conversation at {@code at} (Story 3.10): its {@code last_asked_at} moves
+     * there (never back); its version stays. False for an unknown conversation, another owner's or (Story 3.10 part B)
+     * a deleting one.
+     */
+    boolean markAsked(UUID id, Instant at);
+
+    /**
+     * Renames the owner's conversation (Story 3.10) on {@code version} to the ciphertext {@code name}, raising its
+     * version by one; empty for an unknown conversation or another owner's. Throws {@link ConversationConflict} when the
+     * row is no longer at {@code version}; nothing changes then.
+     */
+    Optional<ConversationRow> renameConversation(UUID id, long version, byte[] name);
+
+    /** The current owner's {@code ready} conversation (Story 3.10 part B: a deleting one is not found). */
     Optional<ConversationRow> findConversation(UUID id);
+
+    /**
+     * The current owner's conversation, {@code ready} or {@code deleting} (Story 3.10 part B): for its deletion, and for
+     * an answer job's call already under way when the conversation turned deleting.
+     */
+    Optional<ConversationRow> findConversationAnyState(UUID id);
+
+    /**
+     * The current owner's conversation becomes {@code deleting} (Story 3.10 part B), its version unchanged; true also
+     * when it was already, false for an unknown conversation or another owner's.
+     */
+    boolean markDeleting(UUID id);
+
+    /**
+     * How many shown turns the current owner's conversation has (Story 3.2; from Story 3.11 a dismissed turn is not
+     * counted); 0 for an unknown one or another owner's.
+     */
+    long turnCount(UUID conversationId);
 
     void insertTurn(TurnRow row);
 
@@ -24,6 +90,48 @@ public interface ConversationStore {
 
     /** Sets the owner's turn's {@code stopped_at} (Story 2.6); false for an unknown turn or another owner's. */
     boolean markStopped(UUID turnId, Instant at);
+
+    /**
+     * Sets the owner's turn's {@code dismissed_at} to {@code at} when it is null (Story 3.11), by one bulk update after
+     * the owner's row was read: true when this call changed the row; false when it was dismissed already, or for an
+     * unknown turn or another owner's. Changes nothing else.
+     */
+    boolean markDismissed(UUID turnId, Instant at);
+
+    /**
+     * Clears the owner's turn's {@code dismissed_at} (Story 3.11), as {@link #markDismissed}: true when this call changed
+     * the row; false when it was shown already, or for an unknown turn or another owner's.
+     */
+    boolean clearDismissed(UUID turnId);
+
+    /**
+     * Sets the owner's turn's {@code bookmarked_at} to {@code at} when it is null (Story 3.12), by one bulk update
+     * after the owner's row was read: true when this call changed the row; false when it was saved already, or for an
+     * unknown turn or another owner's. Changes nothing else.
+     */
+    boolean markBookmarked(UUID turnId, Instant at);
+
+    /**
+     * Clears the owner's turn's {@code bookmarked_at} (Story 3.12), as {@link #markBookmarked}: true when this call
+     * changed the row; false when it was not saved, or for an unknown turn or another owner's.
+     */
+    boolean clearBookmarked(UUID turnId);
+
+    /**
+     * The campaigns of the current owner's listed saved turns (Story 3.12): bookmarked, not dismissed, of a
+     * {@code ready} conversation.
+     */
+    Set<UUID> savedCampaigns();
+
+    /**
+     * The current owner's listed saved turns of conversations of these campaigns (Story 3.12; listed as
+     * {@link #savedCampaigns} says), the newest saved first (then by id, newest first), skipping the first
+     * {@code offset}, at most {@code limit}.
+     */
+    List<TurnRow> savedTurns(Collection<UUID> campaignIds, int offset, int limit);
+
+    /** How many listed saved turns the current owner has in conversations of these campaigns (Story 3.12). */
+    long savedCount(Collection<UUID> campaignIds);
 
     /** The current owner's turn answered by this job. */
     Optional<TurnRow> turnOfJob(UUID jobId);
@@ -41,4 +149,27 @@ public interface ConversationStore {
 
     /** The turn's batches with an event after {@code sequence}, by first sequence. */
     List<EventBatchRow> batchesAfter(UUID turnId, long sequence);
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    /** The current owner's conversations of these campaigns, oldest first, deleting ones included. */
+    List<ConversationRow> conversationsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** How many {@code ready} conversations the current owner's campaigns have (Story 3.10 part B). */
+    long countConversationsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** The current owner's turns of a conversation, oldest first, dismissed ones included (Story 3.11). */
+    List<TurnRow> turnsOf(UUID conversationId);
+
+    /**
+     * Deletes the current owner's turn with its event batches (its references must be gone); false when there is no
+     * such turn.
+     */
+    boolean deleteTurn(UUID turnId);
+
+    /**
+     * Deletes the current owner's conversation, {@code ready} or {@code deleting}, which must have no turn left; false
+     * when there is none.
+     */
+    boolean deleteConversation(UUID id);
 }

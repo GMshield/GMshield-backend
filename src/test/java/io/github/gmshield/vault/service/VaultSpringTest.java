@@ -65,6 +65,9 @@ class VaultSpringTest extends HttpTestSupport {
     void failedCheckIsTheIntegrityProblemWithNoContentAndALogLineWithIds() throws Exception {
         ListAppender<ILoggingEvent> logged = new ListAppender<>();
         Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        // Server and background threads log while a test reads the list: a copy-on-write list never throws
+        // ConcurrentModificationException there (an ArrayList did, in a develop run of ConversationFlowTest).
+        logged.list = new java.util.concurrent.CopyOnWriteArrayList<>();
         logged.start();
         root.addAppender(logged);
         HttpResponse<String> response;

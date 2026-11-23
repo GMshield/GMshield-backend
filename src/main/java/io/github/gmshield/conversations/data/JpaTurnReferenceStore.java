@@ -36,6 +36,16 @@ class JpaTurnReferenceStore implements TurnReferenceStore {
                 .map(TurnReferenceEntity::row).toList();
     }
 
+    @Override
+    public int deleteReferences(UUID turnId) {
+        EntityManager em = em();
+        List<TurnReferenceEntity> found = em.createQuery("select r from TurnReference r where r.turnId = :turn",
+                TurnReferenceEntity.class).setParameter("turn", turnId).getResultList();
+        found.forEach(em::remove);
+        em.flush();
+        return found.size();
+    }
+
     /** The shared, transaction-bound entity manager: each transaction (or each call outside one) has its own session. */
     private EntityManager em() {
         EntityManager current = shared;

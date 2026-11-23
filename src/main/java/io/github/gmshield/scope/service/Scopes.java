@@ -11,7 +11,13 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Comparator;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -35,7 +41,10 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #resolve}: a campaign of the owner and its {@link ScopeSettings} become a {@link ResolvedScope}. The
  *       campaign tier is the {@code ready} version of each material of the campaign; the system tier the {@code ready}
  *       version of each material that belongs to the campaign's game system (a version already in the campaign tier
- *       is left out of it). A tier switched off has no source. {@code pending} names the in-scope passages that are not
+ *       is left out of it); from Story 3.5 the other tier every other {@code ready} version of the owner (the
+ *       materials of the GM's other campaigns, archived ones included, and other systems). A tier switched off has no
+ *       source, and a material switched off ({@link ScopeSettings#materialsOff}) is left out of whichever tier it
+ *       falls in. {@code pending} names the in-scope passages that are not
  *       indexed: their index change has not ended, or its job failed (they stay in the keyword fallback; the unended
  *       runs' passages come first). A campaign that is not found (unknown, or another owner's) is
  *       {@code request.not_found} (404). {@link #resolveSources} is the same without {@code pending} (not computed,
@@ -54,8 +63,10 @@ import tools.jackson.databind.node.ObjectNode;
  *       whole request is refused with {@value #REFUSED_CODE} (403) before anything is decrypted, and the refusal names
  *       no id.</li>
  *   <li>{@link #questionInput} (Story 2.3): the input of an interactive job that carries a question, built from a
- *       resolved scope only: {@code {question, owner, tiers: [{tier, sources, pending}], tokenKey}}, the tiers in
- *       order (campaign, then system, each always present, a tier with no source with empty lists), {@code pending}
+ *       resolved scope only: {@code {question, owner, modelKnowledge, tiers: [{tier, sources, pending}], tokenKey}}
+ *       ({@code modelKnowledge}, Story 3.8: the scope's settings' switch, frozen with the turn), the tiers in
+ *       order (campaign, system, then other from Story 3.5, each always present, a tier with no source with empty
+ *       lists), {@code pending}
  *       the first {@value #MAX_PENDING} of the tier's pending passages in order (the worker reads them within a time
  *       budget; the total and how many were left out are logged as counts), and {@code tokenKey} Base64 of the
  *       owner's {@link Vault#ownerTokenKey}, whose buffer is zeroed once encoded. The question is 1 to
@@ -64,7 +75,8 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #references} (Story 2.5): where cited passages stand within a resolved scope, in the order cited, each
  *       once. A citation is model output, so an id that is not a passage of an allowed source that is still
  *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; the line carries the
- *       dropped count only. No passage text is decrypted.</li>
+ *       dropped count only. Each place carries the tier of its source in that scope (Story 3.7), so a reference
+ *       keeps the tier it had when it was cited. No passage text is decrypted.</li>
  *   <li>{@link #removedVersions} (Story 2.5): which of these versions are removed for the owner (gone,
  *       {@code discarded}, pending removal, or of a material that is gone), so a stored reference shows as removed.</li>
  *   <li>{@link #referencePage} and {@link #referencePicture} (Story 2.7): one page of the version a source reference
@@ -72,6 +84,17 @@ import tools.jackson.databind.node.ObjectNode;
  *       that campaign" (AD-9), which the caller has checked against the turn. The campaign must be the owner's. The
  *       version is served even when a newer one was accepted since, never once it is removed
  *       ({@link #removedVersions}); any page from 1 to its page total, one per call. Empty for anything else.</li>
+ *   <li>Story 3.5: {@link #members} lists the materials of every tier, whatever its switch, for the settings view
+ *       ({@link CampaignScopes}); {@link #sourcePage} and {@link #sourcePicture} serve a page of an allowed source of a
+ *       resolved scope, the ground "the current scope".</li>
+ *   <li>Story 3.9 (search): {@link #resolve(UUID, ScopeSettings, ScopeFilter)} and
+ *       {@link #resolveSources(UUID, ScopeSettings, ScopeFilter)} narrow the allowed sources by a {@link ScopeFilter}
+ *       before anything else is read, so a narrowed scope's pending passages are those of its own sources and a filter
+ *       never adds a source. {@link #searchInput} is {@link #questionInput}'s shape with {@code query} (1 to
+ *       {@value #MAX_QUERY} code points) in place of {@code question}. {@link #results} reads search results within a
+ *       resolved scope, in the order given, each once: an id that is not a passage of an allowed source still
+ *       {@code ready} is dropped, never refused (a result stored earlier may have left the scope since); each carries
+ *       its place, its material's name, its text and its tier.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -85,6 +108,8 @@ public class Scopes {
             "Passage outside the scope");
     /** The longest question, in characters (code points). */
     public static final int MAX_QUESTION = 4000;
+    /** The longest search query, in characters (code points) (Story 3.9). */
+    public static final int MAX_QUERY = 500;
     /**
      * The most pending passages of a tier a question input lists, in order: the worker reads no more, and reads them a
      * page at a time within its time budget.
@@ -116,25 +141,51 @@ public class Scopes {
      * a {@link #questionInput}.
      */
     public ResolvedScope resolveSources(UUID campaignId, ScopeSettings settings) {
-        return resolve(campaignId, settings, false);
+        return resolve(campaignId, settings, ScopeFilter.NONE, false);
+    }
+
+    /**
+     * {@link #resolve(UUID, ScopeSettings)} narrowed by {@code filter} (Story 3.9): only the allowed sources the filter
+     * keeps, and only their pending passages.
+     */
+    public ResolvedScope resolve(UUID campaignId, ScopeSettings settings, ScopeFilter filter) {
+        return resolve(campaignId, settings, filter, true);
+    }
+
+    /** {@link #resolveSources(UUID, ScopeSettings)} narrowed by {@code filter} (Story 3.9). */
+    public ResolvedScope resolveSources(UUID campaignId, ScopeSettings settings, ScopeFilter filter) {
+        return resolve(campaignId, settings, filter, false);
     }
 
     private ResolvedScope resolve(UUID campaignId, ScopeSettings settings, boolean withPending) {
+        return resolve(campaignId, settings, ScopeFilter.NONE, withPending);
+    }
+
+    private ResolvedScope resolve(UUID campaignId, ScopeSettings settings, ScopeFilter filter, boolean withPending) {
         Objects.requireNonNull(settings, "settings");
+        Objects.requireNonNull(filter, "filter");
         UUID owner = OwnerContext.require();
         return reading(() -> {
             Library.Campaign campaign = campaignOf(campaignId);
-            List<UUID> campaignSources = campaignSources(campaign, settings);
-            List<UUID> systemSources = systemSources(campaign, settings, campaignSources);
-            List<UUID> campaignPending = withPending ? pendingOf(campaignSources) : List.of();
-            List<UUID> systemPending = withPending ? pendingOf(systemSources) : List.of();
-            ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, campaignSources, systemSources,
-                    campaignPending, systemPending);
+            Map<Tier, List<ScopeReads.ReadySource>> allowed = narrowed(allowed(campaign, settings), filter);
+            Map<Tier, List<UUID>> sources = new EnumMap<>(Tier.class);
+            Map<Tier, List<UUID>> pending = new EnumMap<>(Tier.class);
+            Map<UUID, UUID> materialOf = new HashMap<>();
+            for (Tier tier : Tier.values()) {
+                List<UUID> ids = allowed.get(tier).stream().map(ScopeReads.ReadySource::versionId).toList();
+                allowed.get(tier).forEach(source -> materialOf.put(source.versionId(), source.materialId()));
+                sources.put(tier, ids);
+                pending.put(tier, withPending ? pendingOf(ids) : List.of());
+            }
+            ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, sources, pending, materialOf);
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
-                    .addKeyValue("campaignSources", campaignSources.size())
-                    .addKeyValue("systemSources", systemSources.size())
-                    .addKeyValue("pending", campaignPending.size() + systemPending.size())
-                    .addKeyValue("pendingRead", withPending).log("scope.resolved");
+                    .addKeyValue("campaignSources", sources.get(Tier.CAMPAIGN).size())
+                    .addKeyValue("systemSources", sources.get(Tier.SYSTEM).size())
+                    .addKeyValue("otherSources", sources.get(Tier.OTHER).size())
+                    .addKeyValue("materialsOff", settings.materialsOff().size())
+                    .addKeyValue("pending", scope.pending().size())
+                    .addKeyValue("pendingRead", withPending)
+                    .addKeyValue("filtered", !ScopeFilter.NONE.equals(filter)).log("scope.resolved");
             return scope;
         });
     }
@@ -154,9 +205,9 @@ public class Scopes {
         UUID owner = OwnerContext.require();
         return reading(() -> {
             Library.Campaign campaign = campaignOf(campaignId);
-            List<UUID> campaignSources = campaignSources(campaign, settings);
-            List<UUID> sources = new ArrayList<>(campaignSources);
-            sources.addAll(systemSources(campaign, settings, campaignSources));
+            List<UUID> sources = new ArrayList<>();
+            allowed(campaign, settings).values()
+                    .forEach(tier -> tier.forEach(source -> sources.add(source.versionId())));
             Indexing indexing = sources.isEmpty() ? null : reads.indexing(sources)
                     .map(count -> new Indexing(count.remaining())).orElse(null);
             IndexingFailure failed = sources.isEmpty() ? null : reads.failed(sources)
@@ -181,16 +232,106 @@ public class Scopes {
         return found.get();
     }
 
-    private List<UUID> campaignSources(Library.Campaign campaign, ScopeSettings settings) {
-        return settings.campaignTier() ? reads.readyOfCampaign(campaign.id()) : List.of();
+    /**
+     * The members of each tier, whatever its switch (Story 3.5): the campaign tier the {@code ready} versions of the
+     * campaign's materials; the system tier those of its system's materials, minus the campaign tier's when
+     * {@code campaignOn} (with the campaign tier off, a version of both stays in the system tier, as before Story 3.5);
+     * the other tier (read only when {@code withOther}, else empty) every other {@code ready} version of the owner,
+     * never one of the campaign's or its system's. Each oldest first.
+     */
+    private Map<Tier, List<ScopeReads.ReadySource>> members(Library.Campaign campaign, boolean withOther,
+                                                            boolean campaignOn) {
+        Map<Tier, List<ScopeReads.ReadySource>> members = new EnumMap<>(Tier.class);
+        List<ScopeReads.ReadySource> ofCampaign = reads.readySourcesOfCampaign(campaign.id());
+        Set<UUID> inCampaign = new HashSet<>();
+        ofCampaign.forEach(source -> inCampaign.add(source.versionId()));
+        List<ScopeReads.ReadySource> ofSystem = reads.readySourcesOfSystem(campaign.system().id()).stream()
+                .filter(source -> !campaignOn || !inCampaign.contains(source.versionId())).toList();
+        Set<UUID> taken = new HashSet<>(inCampaign);
+        ofSystem.forEach(source -> taken.add(source.versionId()));
+        List<ScopeReads.ReadySource> other = withOther
+                ? reads.readySourcesOfOwner().stream().filter(source -> taken.add(source.versionId())).toList()
+                : List.of();
+        members.put(Tier.CAMPAIGN, ofCampaign);
+        members.put(Tier.SYSTEM, ofSystem);
+        members.put(Tier.OTHER, other);
+        return members;
     }
 
-    /** The system tier's sources: a version already in the campaign tier is left out of it. */
-    private List<UUID> systemSources(Library.Campaign campaign, ScopeSettings settings, List<UUID> campaignSources) {
-        return settings.systemTier()
-                ? reads.readyOfSystem(campaign.system().id()).stream()
-                        .filter(source -> !campaignSources.contains(source)).toList()
-                : List.of();
+    /**
+     * The allowed sources of each tier under {@code settings}: a tier switched off has none, and a material switched off
+     * is left out.
+     */
+    private Map<Tier, List<ScopeReads.ReadySource>> allowed(Library.Campaign campaign, ScopeSettings settings) {
+        Map<Tier, List<ScopeReads.ReadySource>> allowed = new EnumMap<>(Tier.class);
+        members(campaign, settings.otherTier(), settings.campaignTier()).forEach((tier, members) ->
+                allowed.put(tier, settings.on(tier)
+                        ? members.stream().filter(source -> settings.materialOn(source.materialId())).toList()
+                        : List.of()));
+        return allowed;
+    }
+
+    /** The allowed sources the filter keeps, by tier (Story 3.9): never one more. */
+    private static Map<Tier, List<ScopeReads.ReadySource>> narrowed(Map<Tier, List<ScopeReads.ReadySource>> allowed,
+                                                                   ScopeFilter filter) {
+        if (ScopeFilter.NONE.equals(filter)) {
+            return allowed;
+        }
+        Map<Tier, List<ScopeReads.ReadySource>> kept = new EnumMap<>(Tier.class);
+        allowed.forEach((tier, sources) -> kept.put(tier, sources.stream()
+                .filter(source -> filter.keeps(tier, source.materialId())).toList()));
+        return kept;
+    }
+
+    /** A material of a campaign's scope (Story 3.5): its id, its name and its tier. */
+    record Member(UUID materialId, String name, Tier tier) {
+        @Override
+        public String toString() {
+            return "Member[materialId=" + materialId + ", tier=" + tier + "]";
+        }
+    }
+
+    /**
+     * The materials of every tier of the owner's campaign, whatever the tier's switch (Story 3.5), each once: in tier
+     * order, then newest first. Each has a {@code ready} version. An unknown campaign is {@code request.not_found}.
+     */
+    List<Member> members(UUID campaignId) {
+        OwnerContext.require();
+        return reading(() -> {
+            Library.Campaign campaign = campaignOf(campaignId);
+            Map<Tier, List<ScopeReads.ReadySource>> members = members(campaign, true, true);
+            Map<UUID, Tier> tierOf = new LinkedHashMap<>();
+            for (Tier tier : Tier.values()) {
+                members.get(tier).forEach(source -> tierOf.putIfAbsent(source.materialId(), tier));
+            }
+            Comparator<ScopeReads.MaterialLabel> newest = Comparator.comparing(ScopeReads.MaterialLabel::createdAt,
+                    Comparator.nullsLast(Comparator.reverseOrder()))
+                    .thenComparing(ScopeReads.MaterialLabel::id, Comparator.reverseOrder());
+            return reads.materialLabels(tierOf.keySet()).stream()
+                    .sorted(Comparator.comparing((ScopeReads.MaterialLabel label) -> tierOf.get(label.id()))
+                            .thenComparing(newest))
+                    .map(label -> new Member(label.id(), label.name(), tierOf.get(label.id()))).toList();
+        });
+    }
+
+    /** Page {@code page} of an allowed source of {@code scope} (Story 3.5: the ground "the current scope"), else empty. */
+    Optional<SourcePage> sourcePage(ResolvedScope scope, UUID versionId, int page) {
+        requireOwner(scope);
+        return reading(() -> scope.materialOf(versionId)
+                .flatMap(material -> reads.versionPage(material, versionId, page)).map(Scopes::page));
+    }
+
+    /** The picture of that page, as {@link #sourcePage} finds it; empty also for a page with no picture. */
+    Optional<SourcePicture> sourcePicture(ResolvedScope scope, UUID versionId, int page) {
+        requireOwner(scope);
+        return reading(() -> scope.materialOf(versionId)
+                .flatMap(material -> reads.versionPicture(material, versionId, page)).map(Scopes::picture));
+    }
+
+    private static void requireOwner(ResolvedScope scope) {
+        if (!OwnerContext.require().equals(scope.ownerId())) {
+            throw new IllegalStateException("scope.owner_mismatch");
+        }
     }
 
     /** The passages with these ids within {@code scope}, as the class says. */
@@ -224,11 +365,39 @@ public class Scopes {
         List<UUID> cited = ids.stream().filter(Objects::nonNull).distinct().toList();
         List<CitedPlace> places = reading(() -> reads.places(cited, scope.allowedSources())).stream()
                 .map(place -> new CitedPlace(place.passageId(), place.versionId(), place.materialId(),
-                        place.materialName(), place.sectionPath(), place.page())).toList();
+                        place.materialName(), place.sectionPath(), place.page(), scope.tierOf(place.versionId())
+                        .orElseThrow(() -> new IllegalStateException("scope.tier_missing")))).toList();
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", cited.size())
                 .addKeyValue("kept", places.size()).addKeyValue("dropped", cited.size() - places.size())
                 .log("scope.references_read");
         return places;
+    }
+
+    /** The search results with these ids within {@code scope}, as the class says (Story 3.9). */
+    public List<ScopedResult> results(ResolvedScope scope, List<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        if (!OwnerContext.require().equals(scope.ownerId())) {
+            throw new IllegalStateException("scope.owner_mismatch");
+        }
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        Set<UUID> allowed = scope.allowedSources();
+        List<ScopedResult> results = wanted.isEmpty() || allowed.isEmpty() ? List.of() : reading(() -> {
+            List<ScopeReads.Place> places = reads.places(wanted, allowed);
+            // Every place left is a passage of an allowed source still ready, in this transaction: its text reads.
+            Map<UUID, ScopeReads.Passage> texts = new HashMap<>();
+            reads.passages(places.stream().map(ScopeReads.Place::passageId).toList(), allowed)
+                    .orElseThrow(() -> new IllegalStateException("scope.result_unreadable"))
+                    .forEach(passage -> texts.put(passage.id(), passage));
+            return places.stream().map(place -> new ScopedResult(place.passageId(), place.versionId(),
+                    place.materialId(), place.materialName(), place.sectionPath(), place.page(),
+                    texts.get(place.passageId()).text(), scope.tierOf(place.versionId())
+                    .orElseThrow(() -> new IllegalStateException("scope.tier_missing")))).toList();
+        });
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("requested", wanted.size())
+                .addKeyValue("kept", results.size()).addKeyValue("dropped", wanted.size() - results.size())
+                .log("scope.results_read");
+        return results;
     }
 
     /** Which of these versions are removed for the owner, as the class says. */
@@ -296,12 +465,35 @@ public class Scopes {
         if (question == null || question.isEmpty() || question.codePointCount(0, question.length()) > MAX_QUESTION) {
             throw new IllegalArgumentException("scope.question_invalid");
         }
+        return textInput(scope, "question", question, "scope.question_input");
+    }
+
+    /**
+     * The input of a {@code library.search} job (Story 3.9): {@link #questionInput}'s shape with {@code query} in place
+     * of {@code question}, within {@code scope} (narrowed by the search's filters). The query is 1 to
+     * {@value #MAX_QUERY} characters (code points), else {@code IllegalArgumentException}.
+     */
+    public ObjectNode searchInput(ResolvedScope scope, String query) {
+        Objects.requireNonNull(scope, "scope");
+        if (query == null || query.isEmpty() || query.codePointCount(0, query.length()) > MAX_QUERY) {
+            throw new IllegalArgumentException("scope.query_invalid");
+        }
+        return textInput(scope, "query", query, "scope.search_input");
+    }
+
+    /**
+     * {@code {<field>: text, owner, modelKnowledge, tiers: [{tier, sources, pending}], tokenKey}} within {@code scope},
+     * as {@link #questionInput} says; {@code line} names the log line, which carries counts only.
+     */
+    private ObjectNode textInput(ResolvedScope scope, String field, String text, String line) {
+        Objects.requireNonNull(scope, "scope");
         if (!OwnerContext.require().equals(scope.ownerId())) {
             throw new IllegalStateException("scope.owner_mismatch");
         }
         ObjectNode input = JsonNodeFactory.instance.objectNode();
-        input.put("question", question);
+        input.put(field, text);
         input.put("owner", scope.ownerId().toString());
+        input.put("modelKnowledge", scope.settings().modelKnowledge());
         ArrayNode tiers = input.putArray("tiers");
         for (Tier tier : Tier.values()) {
             ObjectNode entry = tiers.addObject();
@@ -317,15 +509,19 @@ public class Scopes {
         } finally {
             Arrays.fill(key, (byte) 0);
         }
-        int listed = Math.min(scope.pending(Tier.CAMPAIGN).size(), MAX_PENDING)
-                + Math.min(scope.pending(Tier.SYSTEM).size(), MAX_PENDING);
+        int listed = 0;
+        for (Tier tier : Tier.values()) {
+            listed += Math.min(scope.pending(tier).size(), MAX_PENDING);
+        }
         log.atInfo().addKeyValue("campaignId", scope.campaignId())
                 .addKeyValue("campaignSources", scope.sources(Tier.CAMPAIGN).size())
                 .addKeyValue("systemSources", scope.sources(Tier.SYSTEM).size())
+                .addKeyValue("otherSources", scope.sources(Tier.OTHER).size())
                 .addKeyValue("pending", scope.pending().size())
                 .addKeyValue("pendingListed", listed)
                 .addKeyValue("pendingLeftOut", scope.pending().size() - listed)
-                .log("scope.question_input");
+                .addKeyValue("modelKnowledge", scope.settings().modelKnowledge())
+                .log(line);
         return input;
     }
 

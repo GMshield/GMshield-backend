@@ -102,6 +102,16 @@ final class ScopeFixture {
         });
     }
 
+    /** A newer version of the owner's material in {@code state} (Story 3.4: a replacement); answers its id. */
+    UUID version(UUID owner, UUID materialId, String state) {
+        return as(owner, () -> {
+            UUID versionId = Ids.newId();
+            Instant at = next();
+            materials.insertVersion(new VersionRow(versionId, owner, materialId, state, "pdf", 1000L, at, at));
+            return versionId;
+        });
+    }
+
     /** {@code count} passages of the version, by ordinal from 0; answers their ids in that order. */
     List<UUID> passages(UUID owner, UUID versionId, String tag, int count) {
         return as(owner, () -> {
@@ -159,6 +169,30 @@ final class ScopeFixture {
             }
             return null;
         });
+    }
+
+    /**
+     * Story 3.3: the material of the owner's version now belongs to {@code campaign} when it is not null, else to
+     * {@code systems}, as a change of where it belongs writes it (its version is read first).
+     */
+    void move(UUID owner, UUID versionId, UUID campaign, UUID... systems) {
+        as(owner, () -> {
+            UUID materialId = materials.versions.get(versionId).materialId();
+            long version = materials.materials.get(materialId).version();
+            Instant at = next();
+            return materials.changeBelonging(materialId, version, campaign, java.util.Arrays.stream(systems)
+                    .map(system -> new MaterialSystemRow(Ids.newId(), owner, materialId, system, at)).toList(), at);
+        });
+    }
+
+    /** A new system of the owner (Story 3.3), with no campaign. */
+    UUID system(UUID owner, String name) {
+        return as(owner, () -> library.createSystem(new Library.SystemFields(name, null, null)).id());
+    }
+
+    /** A new campaign of the owner's system {@code system} (Story 3.3). */
+    UUID campaignOf(UUID owner, UUID system, String name) {
+        return as(owner, () -> library.createCampaign(system, name).orElseThrow().id());
     }
 
     /** Moves the owner's version to {@code state}. */

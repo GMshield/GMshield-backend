@@ -250,6 +250,12 @@ class JdbcUploadStorage implements UploadStorage {
         }
 
         @Override
+        public List<UploadRow> allOfVersion(UUID owner, UUID versionId) {
+            return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version" + IN_ORDER)
+                    .param("owner", owner).param("version", versionId).query(Sql::row).list();
+        }
+
+        @Override
         public List<UploadRow> completeOfVersion(UUID owner, UUID versionId) {
             return jdbc.get().sql(COLUMNS + "where owner_id = :owner and version_id = :version and state = 'complete'"
                             + IN_ORDER)

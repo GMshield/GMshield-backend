@@ -77,10 +77,16 @@ class ImageSetController {
             @Schema(description = "Its language, or detect", allowableValues = {"pt-BR", "en", "detect"}) String language,
             @Schema(description = "One of the account's campaigns it belongs to (never with system)", format = "uuid")
             String campaign,
-            @Schema(description = "One of the account's systems it belongs to (never with campaign)", format = "uuid")
-            String system,
+            @Schema(description = "One of the account's systems it belongs to (never with campaign or systems)",
+                    format = "uuid") String system,
+            @ArraySchema(arraySchema = @Schema(description = "One to 100 of the account's systems it belongs to (never"
+                    + " with campaign or system; contract 1.21.0)"), schema = @Schema(type = "string", format = "uuid"))
+            List<String> systems,
             @ArraySchema(arraySchema = @Schema(description = "The images, in the order of their pages: 1 to 500"),
-                    schema = @Schema(implementation = ImageRequest.class)) List<ImageRequest> images) {
+                    schema = @Schema(implementation = ImageRequest.class)) List<ImageRequest> images,
+            @Schema(description = "One of the account's materials that this set replaces (contract 1.23.0): the set"
+                    + " becomes its new version, and the material keeps its name, kind, language and place. Never with"
+                    + " kind, language, campaign, system or systems", format = "uuid") String material) {
 
         @Override
         public String toString() {
@@ -121,9 +127,15 @@ class ImageSetController {
             + " material, its order confirmed: the material, its version in uploading and one tus upload per image,"
             + " each expiring after 6 hours. The first ingestion step starts by itself once every image is complete."
             + SET_TOO_LARGE + " upload.metadata_invalid (400) for a name (the set's or an image's) or a kind, language,"
-            + " campaign or system that is not valid (it never says which); request.invalid (400) for a body without"
+            + " campaign or system that is not valid, an empty list or more than 100 systems, or a campaign, system and"
+            + " systems given together (it never says which), or a material with a kind, language, campaign, system or"
+            + " systems; request.invalid (400) for a body without"
             + " images or an image without a size of at least 1 byte; request.unsupported_media_type (415) for a body"
-            + " that is not JSON;" + SESSION_SUMMARY,
+            + " that is not JSON. With material (contract 1.23.0) the set is a new version of that material, which must"
+            + " be ready: material.version_in_progress (409) while another version of it is uploading, waiting,"
+            + " processing, needs review or failed; material.not_ready (409) when every version of it is discarded;"
+            + " request.not_found (404) for another account's material, an unknown or malformed one, or one whose every"
+            + " place is being deleted;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")),
             responses = @ApiResponse(responseCode = "201", description = "Created",
@@ -139,8 +151,12 @@ class ImageSetController {
             }
             return image.image();
         }).toList();
+        if ((body.system() != null && body.systems() != null) || (body.systems() != null && body.systems().isEmpty())) {
+            throw UploadProblems.metadataInvalid();
+        }
+        List<String> systems = body.system() != null ? List.of(body.system()) : body.systems();
         ImageSets.Created created = sets.create(body.name(), new Uploads.Details(body.kind(), body.language(),
-                body.campaign(), body.system()), images);
+                body.campaign(), systems, body.material()), images);
         return ResponseEntity.status(201).cacheControl(CacheControl.noStore()).body(new CreatedView(
                 created.setId().toString(), created.materialId().toString(), created.expiresAt().toString(),
                 created.images().stream().map(member -> new MemberView(member.position(),

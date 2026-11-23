@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.gmshield.scope.service.CitedPlace;
+import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
 import java.util.List;
 import java.util.UUID;
@@ -22,8 +23,8 @@ class TurnReferencesTest {
         UUID versionB = Ids.newId();
 
         List<TurnReferences.Grouped> grouped = TurnReferences.group(List.of(
-                new CitedPlace(a, versionA, Ids.newId(), "Livro do Jogador", SECTION, 5),
-                new CitedPlace(b, versionB, Ids.newId(), "Bestiário", SECTION, 5)));
+                new CitedPlace(a, versionA, Ids.newId(), "Livro do Jogador", SECTION, 5, Tier.CAMPAIGN),
+                new CitedPlace(b, versionB, Ids.newId(), "Bestiário", SECTION, 5, Tier.CAMPAIGN)));
 
         assertThat(grouped).extracting(TurnReferences.Grouped::number, group -> group.place().materialName(),
                 TurnReferences.Grouped::passageIds)
@@ -39,9 +40,9 @@ class TurnReferencesTest {
         UUID third = Ids.newId();
 
         List<TurnReferences.Grouped> grouped = TurnReferences.group(List.of(
-                new CitedPlace(first, version, material, "Livro", List.of("Magias", "Fire Bolt"), 7),
-                new CitedPlace(second, version, material, "Livro", List.of("Magias", "Frostbite"), 7),
-                new CitedPlace(third, version, material, "Livro", List.of("Magias", "Fire Bolt"), 7)));
+                new CitedPlace(first, version, material, "Livro", List.of("Magias", "Fire Bolt"), 7, Tier.CAMPAIGN),
+                new CitedPlace(second, version, material, "Livro", List.of("Magias", "Frostbite"), 7, Tier.CAMPAIGN),
+                new CitedPlace(third, version, material, "Livro", List.of("Magias", "Fire Bolt"), 7, Tier.CAMPAIGN)));
 
         assertThat(grouped).extracting(TurnReferences.Grouped::number, group -> group.place().sectionPath(),
                 TurnReferences.Grouped::passageIds)
@@ -56,8 +57,8 @@ class TurnReferencesTest {
         UUID second = Ids.newId();
 
         List<TurnReferences.Grouped> grouped = TurnReferences.group(List.of(
-                new CitedPlace(first, version, Ids.newId(), "Livro", SECTION, 7),
-                new CitedPlace(second, version, Ids.newId(), "Livro", SECTION, 8)));
+                new CitedPlace(first, version, Ids.newId(), "Livro", SECTION, 7, Tier.CAMPAIGN),
+                new CitedPlace(second, version, Ids.newId(), "Livro", SECTION, 8, Tier.CAMPAIGN)));
 
         assertThat(grouped).extracting(TurnReferences.Grouped::number, group -> group.place().page())
                 .containsExactly(tuple(1, 7), tuple(2, 8));

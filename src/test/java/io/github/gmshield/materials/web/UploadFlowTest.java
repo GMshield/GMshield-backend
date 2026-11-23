@@ -389,12 +389,33 @@ class UploadFlowTest {
             page.path("items").forEach(item -> names.add(item.path("name").asString()));
         }
         assertThat(names).containsExactlyInAnyOrder("a.pdf", "b.pdf", "c.pdf");
+        // A numbered page: every page names the total for its states, and a page can start at a position.
+        assertThat(first.path("total").asLong()).isEqualTo(3);
+        assertThat(second.path("total").asLong()).isEqualTo(3);
+        JsonNode last = json(get(gm, "/api/v1/materials?state=uploading&limit=2&offset=2"));
+        assertThat(last.path("items").size()).isEqualTo(1);
+        assertThat(last.path("items").get(0).path("id").asString()).isEqualTo(second.path("items").get(0).path("id").asString());
+        assertThat(last.has("nextCursor")).isFalse();
+        assertThat(last.path("total").asLong()).isEqualTo(3);
+        JsonNode middle = json(get(gm, "/api/v1/materials?state=uploading&limit=1&offset=1"));
+        assertThat(middle.path("items").get(0).path("id").asString()).isEqualTo(first.path("items").get(1).path("id").asString());
+        assertThat(middle.path("nextCursor").asString()).isEqualTo(cursor);
+        // Another state has its own total, and a position past the end is an empty page.
+        assertThat(json(get(gm, "/api/v1/materials?state=ready")).path("total").asLong()).isZero();
+        JsonNode past = json(get(gm, "/api/v1/materials?offset=7"));
+        assertThat(past.path("items").size()).isZero();
+        assertThat(past.path("total").asLong()).isEqualTo(3);
+        for (String query : List.of("offset=-1", "offset=x", "offset=01", "offset=100001", "offset=1&cursor=" + cursor)) {
+            HttpResponse<String> refused = get(gm, "/api/v1/materials?state=uploading&" + query);
+            assertThat(refused.statusCode()).as(query).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        }
     }
 
     @Test
     void theListNeedsAKnownStateALimitFromOneToFiftyAndAWellFormedCursorAndASession() throws Exception {
         Gm gm = signUp();
-        for (String query : List.of("", "?limit=5", "?state=", "?state=lost", "?state=waiting&state=lost",
+        for (String query : List.of("?state=", "?state=lost", "?state=waiting&state=lost",
                 "?state=waiting&limit=0", "?state=waiting&limit=51", "?state=waiting&limit=x", "?state=waiting&limit=01",
                 "?state=waiting&cursor=nope")) {
             HttpResponse<String> response = get(gm, "/api/v1/materials" + query);
@@ -403,10 +424,343 @@ class UploadFlowTest {
         }
         assertThat(get(gm, "/api/v1/materials?state=waiting&limit=50&cursor=" + UUID.randomUUID()).statusCode())
                 .isEqualTo(200);
+        // Story 3.3: without a state, every material.
+        assertThat(get(gm, "/api/v1/materials").statusCode()).isEqualTo(200);
+        assertThat(get(gm, "/api/v1/materials?limit=5").statusCode()).isEqualTo(200);
         HttpResponse<String> noSession = send("GET", "/api/v1/materials?state=waiting", null);
         assertThat(noSession.statusCode()).isEqualTo(401);
         assertThat(json(noSession).path("code").asString()).isEqualTo("session.required");
         assertThat(send("GET", "/api/v1/materials/" + UUID.randomUUID(), null).statusCode()).isEqualTo(401);
+    }
+
+    // --- Story 3.3: where a material belongs
+
+    @Test
+    void aMaterialCarriesItsVersionSizeAndPlaceAndAnUploadToTwoSystemsIsTwoRows() throws Exception {
+        Gm gm = signUp();
+        JsonNode current = json(get(gm, "/api/v1/campaigns/current"));
+        String first = current.path("system").path("id").asString();
+        String second = system(gm, "Pathfinder");
+        byte[] content = pdf(1000);
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", metadata("srd.pdf") + ",systems " + b64(first + "," + second));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        String location = created.headers().firstValue("Location").orElseThrow();
+        patch(gm, location, 0, content);
+        String materialId = json(complete(gm, location, sha256Hex(content))).path("materialId").asString();
+
+        JsonNode read = json(get(gm, "/api/v1/materials/" + materialId));
+
+        assertThat(as(gm, () -> materials.systemsOf(UUID.fromString(materialId)))).hasSize(2);
+        assertThat(read.path("version").asLong()).isZero();
+        assertThat(read.path("size").asLong()).isEqualTo(1000);
+        assertThat(read.path("belonging").path("campaign").isNull()).isTrue();
+        List<String> names = new ArrayList<>();
+        read.path("belonging").path("systems").forEach(place -> names.add(place.path("name").asString()));
+        assertThat(names).containsExactlyInAnyOrder(current.path("system").path("name").asString(), "Pathfinder");
+        // A campaign's material names the campaign and its system; one with no place names neither.
+        String campaign = current.path("id").asString();
+        HttpResponse<String> ofCampaign = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "10", "Upload-Metadata", metadata("notas.md") + ",campaign " + b64(campaign));
+        HttpResponse<String> loose = create(gm, 10, "solto.pdf");
+        JsonNode listed = json(get(gm, "/api/v1/materials?state=uploading"));
+        assertThat(ofCampaign.statusCode()).isEqualTo(201);
+        assertThat(loose.statusCode()).isEqualTo(201);
+        JsonNode looseItem = listed.path("items").get(0);
+        assertThat(looseItem.path("belonging").toString()).isEqualTo("{\"campaign\":null,\"systems\":[]}");
+        assertThat(looseItem.has("size")).isFalse();
+        JsonNode campaignItem = listed.path("items").get(1).path("belonging").path("campaign");
+        assertThat(campaignItem.path("id").asString()).isEqualTo(campaign);
+        assertThat(campaignItem.path("name").asString()).isEqualTo(current.path("name").asString());
+        assertThat(campaignItem.path("system").path("id").asString()).isEqualTo(first);
+        // The single system key still works.
+        assertThat(send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS, "Upload-Length", "10",
+                "Upload-Metadata", metadata("a.pdf") + ",system " + b64(first)).statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    void systemsWithACampaignOrTheSingleSystemKeyAnEmptyIdOrOverAHundredAreInvalidMetadata() throws Exception {
+        Gm gm = signUp();
+        JsonNode current = json(get(gm, "/api/v1/campaigns/current"));
+        String system = current.path("system").path("id").asString();
+        int before = materials.materials.size();
+        List<String> refused = List.of(",campaign " + b64(current.path("id").asString()) + ",systems " + b64(system),
+                ",system " + b64(system) + ",systems " + b64(system), ",systems " + b64(system + ","),
+                ",systems " + b64(String.join(",", java.util.Collections.nCopies(101, system))), ",systems");
+        for (String details : refused) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                    "Upload-Length", "10", "Upload-Metadata", metadata("a.txt") + details);
+            assertProblem(response, 400, "upload.metadata_invalid");
+        }
+        assertThat(materials.materials).hasSize(before);
+    }
+
+    @Test
+    void anImageSetTakesSeveralSystems() throws Exception {
+        Gm gm = signUp();
+        String first = json(get(gm, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String second = system(gm, "Pathfinder");
+        String body = "{\"name\":\"Fichas\",\"systems\":[\"" + first + "\",\"" + second
+                + "\"],\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}";
+
+        HttpResponse<String> created = sendJson(gm, "POST", "/api/v1/image-sets", body);
+
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID materialId = UUID.fromString(json(created).path("materialId").asString());
+        assertThat(as(gm, () -> materials.systemsOf(materialId))).hasSize(2);
+        assertThat(sendJson(gm, "POST", "/api/v1/image-sets", body.replace("\"systems\"", "\"system\":\"" + first
+                + "\",\"systems\"")).statusCode()).isEqualTo(400);
+        // An empty list names no system: refused, as tus refuses an empty value.
+        int before = materials.materials.size();
+        HttpResponse<String> empty = sendJson(gm, "POST", "/api/v1/image-sets",
+                "{\"name\":\"Fichas\",\"systems\":[],\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}");
+        assertThat(empty.statusCode()).as(empty.body()).isEqualTo(400);
+        assertThat(json(empty).path("code").asString()).isEqualTo("upload.metadata_invalid");
+        assertThat(materials.materials).hasSize(before);
+    }
+
+    @Test
+    void anImageSetWithTheSingleSystemFieldAloneStillBelongsToThatSystem() throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        String mine = json(get(gm, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String theirs = json(get(other, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String body = "{\"name\":\"Fichas\",\"system\":\"%s\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}";
+
+        // What a 1.20 frontend sends between the two deploys.
+        HttpResponse<String> created = sendJson(gm, "POST", "/api/v1/image-sets", body.formatted(mine));
+
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID materialId = UUID.fromString(json(created).path("materialId").asString());
+        assertThat(as(gm, () -> materials.systemsOf(materialId))).singleElement()
+                .satisfies(row -> assertThat(row.systemId()).isEqualTo(UUID.fromString(mine)));
+        int before = materials.materials.size();
+        HttpResponse<String> foreign = sendJson(gm, "POST", "/api/v1/image-sets", body.formatted(theirs));
+        assertThat(foreign.statusCode()).as(foreign.body()).isEqualTo(400);
+        assertThat(json(foreign).path("code").asString()).isEqualTo("upload.metadata_invalid");
+        assertThat(materials.materials).hasSize(before);
+    }
+
+    @Test
+    void aMaterialsPlaceChangesOnItsVersionAndEveryRefusalChangesNothing() throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        JsonNode current = json(get(gm, "/api/v1/campaigns/current"));
+        String campaign = current.path("id").asString();
+        String system = current.path("system").path("id").asString();
+        String second = system(gm, "Pathfinder");
+        String materialId = uploaded(gm, ",campaign " + b64(campaign));
+        String path = "/api/v1/materials/" + materialId;
+        int jobsBefore = jobs.rows.size();
+
+        HttpResponse<String> moved = sendJson(gm, "PATCH", path, change(0, null, List.of(system)));
+
+        assertThat(moved.statusCode()).as(moved.body()).isEqualTo(200);
+        assertThat(moved.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(moved).path("version").asLong()).isEqualTo(1);
+        assertThat(json(moved).path("belonging").path("campaign").isNull()).isTrue();
+        assertThat(json(moved).path("belonging").path("systems").get(0).path("id").asString()).isEqualTo(system);
+        HttpResponse<String> both = sendJson(gm, "PATCH", path, change(1, null, List.of(system, second)));
+        assertThat(both.statusCode()).as(both.body()).isEqualTo(200);
+        assertThat(json(both).path("belonging").path("systems").size()).isEqualTo(2);
+        HttpResponse<String> back = sendJson(gm, "PATCH", path, change(2, campaign, null));
+        assertThat(json(back).path("belonging").path("campaign").path("id").asString()).isEqualTo(campaign);
+        assertThat(json(get(gm, path)).path("version").asLong()).isEqualTo(3);
+        // Nothing is processed again: no job came of the three changes.
+        assertThat(jobs.rows).hasSize(jobsBefore);
+
+        // Stale.
+        HttpResponse<String> stale = sendJson(gm, "PATCH", path, change(0, null, List.of(system)));
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        // Bad bodies: both, neither, [], 101 ids, unknown, another owner's, being deleted.
+        String theirSystem = json(get(other, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String deleting = system(gm, "Indo");
+        assertThat(send("DELETE", "/api/v1/systems/" + deleting, null, session(gm)).statusCode()).isEqualTo(202);
+        List<String> tooMany = new ArrayList<>();
+        for (int i = 0; i <= 100; i++) {
+            tooMany.add(system);
+        }
+        for (String body : List.of(change(3, campaign, List.of(system)), "{\"version\":3,\"belonging\":{}}",
+                "{\"version\":3}", change(3, null, List.of()), change(3, null, tooMany),
+                change(3, null, List.of(UUID.randomUUID().toString())), change(3, null, List.of(theirSystem)),
+                change(3, "not-a-uuid", null), change(3, null, List.of(deleting)))) {
+            HttpResponse<String> refused = sendJson(gm, "PATCH", path, body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).as(body).isEqualTo("material.belonging_invalid");
+            assertThat(refused.body()).doesNotContain(theirSystem);
+        }
+        for (String body : List.of("{\"belonging\":{\"campaign\":\"" + campaign + "\"}}", "{\"version\":-1}",
+                "not json")) {
+            HttpResponse<String> refused = sendJson(gm, "PATCH", path, body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).as(body).isEqualTo("request.invalid");
+        }
+        // Another owner's material, an unknown or a malformed id.
+        JsonNode notFound = json(sendJson(other, "PATCH", "/api/v1/materials/" + UUID.randomUUID(),
+                change(3, null, List.of(theirSystem))));
+        for (String id : List.of(materialId, "not-a-uuid")) {
+            HttpResponse<String> response = sendJson(other, "PATCH", "/api/v1/materials/" + id,
+                    change(3, null, List.of(theirSystem)));
+            assertThat(response.statusCode()).isEqualTo(404);
+            assertThat(withoutTraceId(json(response))).isEqualTo(withoutTraceId(notFound));
+            assertThat(response.body()).doesNotContain(materialId);
+        }
+        JsonNode after = json(get(gm, path));
+        assertThat(after.path("version").asLong()).isEqualTo(3);
+        assertThat(after.path("belonging").path("campaign").path("id").asString()).isEqualTo(campaign);
+    }
+
+    @Test
+    void aMaterialWhoseOnlyPlaceIsBeingDeletedLeavesEveryListAndCannotBeChanged() throws Exception {
+        Gm gm = signUp();
+        String system = json(get(gm, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String going = system(gm, "Indo");
+        String kept = uploaded(gm, ",systems " + b64(going + "," + system));
+        String gone = uploaded(gm, ",systems " + b64(going));
+
+        assertThat(send("DELETE", "/api/v1/systems/" + going, null, session(gm)).statusCode()).isEqualTo(202);
+
+        List<String> ids = new ArrayList<>();
+        json(get(gm, "/api/v1/materials")).path("items").forEach(item -> ids.add(item.path("id").asString()));
+        assertThat(ids).contains(kept).doesNotContain(gone);
+        HttpResponse<String> refused = sendJson(gm, "PATCH", "/api/v1/materials/" + gone, change(0, null,
+                List.of(system)));
+        assertThat(refused.statusCode()).isEqualTo(404);
+    }
+
+    // --- Story 3.4: a replacement names a material and nothing else
+
+    @Test
+    void aReplacementNamesOnlyTheMaterialAndAnythingElseIsInvalidMetadata() throws Exception {
+        Gm gm = signUp();
+        JsonNode current = json(get(gm, "/api/v1/campaigns/current"));
+        String campaign = current.path("id").asString();
+        String system = current.path("system").path("id").asString();
+        String materialId = ready(gm, uploaded(gm, ",kind " + b64("rulebook") + ",campaign " + b64(campaign)));
+        int versions = materials.versions.size();
+        String named = ",material " + b64(materialId);
+
+        // Matrix row "Bad metadata".
+        for (String details : List.of(named + ",kind " + b64("rulebook"), named + ",language " + b64("en"),
+                named + ",campaign " + b64(campaign), named + ",system " + b64(system),
+                named + ",systems " + b64(system), ",material")) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                    "Upload-Length", "1000", "Upload-Metadata", metadata("novo.pdf") + details);
+            assertProblem(response, 400, "upload.metadata_invalid");
+        }
+        for (String field : List.of("\"kind\":\"rulebook\"", "\"language\":\"en\"", "\"campaign\":\"" + campaign
+                + "\"", "\"system\":\"" + system + "\"", "\"systems\":[\"" + system + "\"]")) {
+            HttpResponse<String> response = sendJson(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Fotos\","
+                    + field + ",\"material\":\"" + materialId + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}");
+            assertThat(response.statusCode()).as(field).isEqualTo(400);
+            assertThat(json(response).path("code").asString()).isEqualTo("upload.metadata_invalid");
+        }
+        assertThat(materials.versions).hasSize(versions);
+
+        // A valid one: a new version of the same material, which keeps its name, kind and place.
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "2000", "Upload-Metadata", metadata("novo.pdf") + named);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        assertThat(materials.versions).hasSize(versions + 1);
+        JsonNode material = json(get(gm, "/api/v1/materials/" + materialId));
+        assertThat(material.path("state").asString()).isEqualTo("uploading");
+        assertThat(material.path("name").asString()).isEqualTo("material.pdf");
+        assertThat(material.path("kind").asString()).isEqualTo("rulebook");
+        assertThat(material.path("belonging").path("campaign").path("id").asString()).isEqualTo(campaign);
+        assertThat(material.path("upload").path("length").asLong()).isEqualTo(2000);
+        assertThat(material.path("serving").toString()).isEqualTo("{\"pages\":null,\"size\":1000}");
+        // Matrix row "Busy": a second one waits for the first, by tus and by image set.
+        HttpResponse<String> busy = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", metadata("outro.pdf") + named);
+        assertProblem(busy, 409, "material.version_in_progress");
+        HttpResponse<String> busySet = sendJson(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Fotos\",\"material\":\""
+                + materialId + "\",\"images\":[{\"name\":\"a.jpg\",\"length\":10}]}");
+        assertThat(busySet.statusCode()).isEqualTo(409);
+        assertThat(json(busySet).path("code").asString()).isEqualTo("material.version_in_progress");
+        assertThat(materials.versions).hasSize(versions + 1);
+
+        // A refused format ends the new version alone: the material stays, ready on its old one.
+        String location = created.headers().firstValue("Location").orElseThrow();
+        byte[] notAFile = new byte[2000];
+        assertProblem(patch(gm, location, 0, notAFile), 415, "upload.format_refused");
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(json(get(gm, "/api/v1/materials/" + materialId)).path("state").asString()).isEqualTo("ready");
+    }
+
+    @Test
+    void anotherOwnersUnknownMalformedOrDeletingMaterialIsNotFoundForAReplacement() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String system = json(get(a, "/api/v1/campaigns/current")).path("system").path("id").asString();
+        String mine = ready(a, uploaded(a, ""));
+        String going = system(a, "Indo");
+        String gone = ready(a, uploaded(a, ",systems " + b64(going)));
+        assertThat(send("DELETE", "/api/v1/systems/" + going, null, session(a)).statusCode()).isEqualTo(202);
+        int versions = materials.versions.size();
+
+        // Matrix row "Other owner", and an unknown, a malformed or a deleting material: one answer.
+        for (Object[] attempt : new Object[][] {{b, mine}, {a, UUID.randomUUID().toString()}, {a, "not-a-uuid"},
+            {a, gone}}) {
+            HttpResponse<String> response = send("POST", "/api/v1/uploads", null, session((Gm) attempt[0]),
+                    "Tus-Resumable", TUS, "Upload-Length", "1000", "Upload-Metadata", metadata("novo.pdf")
+                            + ",material " + b64((String) attempt[1]));
+            assertProblem(response, 404, "request.not_found");
+            assertThat(response.body()).doesNotContain(mine);
+        }
+        assertThat(materials.versions).hasSize(versions);
+        assertThat(system).isNotBlank();
+    }
+
+    /** The material's only version becomes ready, as an accept leaves it: its id. */
+    private String ready(Gm gm, String materialId) {
+        UUID id = UUID.fromString(materialId);
+        materials.versions.replaceAll((versionId, row) -> row.materialId().equals(id)
+                ? new io.github.gmshield.materials.data.VersionRow(row.id(), row.ownerId(), row.materialId(), "ready",
+                        row.format(), row.sizeBytes(), row.createdAt(), row.updatedAt(), row.pageTotal(),
+                        row.pipelineVersion(), row.failureCode())
+                : row);
+        return materialId;
+    }
+
+    private String system(Gm gm, String name) throws Exception {
+        HttpResponse<String> created = sendJson(gm, "POST", "/api/v1/systems", "{\"name\":\"" + name + "\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return json(created).path("id").asString();
+    }
+
+    /** A verified 1000-byte PDF with these metadata details: its material's id. */
+    private String uploaded(Gm gm, String details) throws Exception {
+        byte[] content = pdf(1000);
+        HttpResponse<String> created = send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS,
+                "Upload-Length", "1000", "Upload-Metadata", metadata("material.pdf") + details);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        String location = created.headers().firstValue("Location").orElseThrow();
+        patch(gm, location, 0, content);
+        return json(complete(gm, location, sha256Hex(content))).path("materialId").asString();
+    }
+
+    private static String change(long version, String campaign, List<String> systems) {
+        Map<String, Object> belonging = new LinkedHashMap<>();
+        if (campaign != null) {
+            belonging.put("campaign", campaign);
+        }
+        if (systems != null) {
+            belonging.put("systems", systems);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("version", version);
+        body.put("belonging", belonging);
+        return JSON.writeValueAsString(body);
+    }
+
+    private HttpResponse<String> sendJson(Gm gm, String method, String path, String body) throws Exception {
+        return send(method, path, body.getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type",
+                "application/json");
+    }
+
+    private static <T> T as(Gm gm, java.util.function.Supplier<T> work) {
+        return OwnerContext.callAs(gm.id(), work::get);
     }
 
     private HttpResponse<String> get(Gm gm, String path) throws Exception {

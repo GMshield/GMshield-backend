@@ -152,7 +152,7 @@ class ScopesTest {
     }
 
     @Test
-    void aTierSwitchedOffHasNoSourceAndTheOtherTierIsRefusedUntilStory35() {
+    void aTierSwitchedOffHasNoSourceAndTheOtherTierIsAccepted() {
         Library2 lib = twoTiers();
 
         ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
@@ -168,9 +168,9 @@ class ScopesTest {
         assertThat(campaignOnly.sources(Tier.SYSTEM)).isEmpty();
         assertThat(campaignOnly.settings().modelKnowledge()).isTrue();
         assertThat(none.allowedSources()).isEmpty();
-        assertThat(ScopeSettings.STARTING).isEqualTo(new ScopeSettings(true, true, false, false));
-        assertThatThrownBy(() -> new ScopeSettings(true, true, true, false))
-                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(ScopeSettings.STARTING).isEqualTo(new ScopeSettings(true, true, false, false, Set.of()));
+        // Story 3.5: the other tier is no longer refused.
+        assertThat(new ScopeSettings(true, true, true, false).otherTier()).isTrue();
         // With the system tier off, B's passages are refused.
         assertRefused(lib.gm().owner(), campaignOnly, List.of(lib.aPassages().getFirst(), lib.bPassages().getFirst()));
     }
@@ -490,7 +490,8 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.passages(sources, List.of(a0, b0))))
                 .extracting(ScopedPassage::id, ScopedPassage::tier)
                 .containsExactly(tuple(a0, Tier.CAMPAIGN), tuple(b0, Tier.SYSTEM));
-        assertThat(as(lib.gm().owner(), () -> scopes.references(sources, List.of(a0, b0)))).hasSize(2);
+        assertThat(as(lib.gm().owner(), () -> scopes.references(sources, List.of(a0, b0))))
+                .extracting(CitedPlace::tier).containsExactly(Tier.CAMPAIGN, Tier.SYSTEM);
         assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.passages(sources, List.of(lib.cPassages()
                 .getFirst())))).isInstanceOf(ApiException.class);
         assertThat(jobsAsked).hasValue(0);
@@ -539,6 +540,132 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.passages(scope, List.of(lib.bPassages().getFirst())))).hasSize(1);
     }
 
+    // --- Story 3.4: a material replaced
+
+    @Test
+    void theOldVersionServesWhileItsReplacementIsProcessedAndOnlyTheNewOneAfterItIsAccepted() {
+        Library2 lib = twoTiers();
+        UUID materialId = materials.versions.get(lib.a()).materialId();
+        UUID replacement = fixture.version(lib.gm().owner(), materialId, "processing");
+        List<UUID> newPassages = fixture.passages(lib.gm().owner(), replacement, "N", 2);
+
+        for (String state : List.of("processing", "needs_review")) {
+            fixture.state(lib.gm().owner(), replacement, state);
+            ResolvedScope during = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                    ScopeSettings.STARTING));
+            assertThat(during.sources(Tier.CAMPAIGN)).as(state).containsExactly(lib.a());
+            assertThat(as(lib.gm().owner(), () -> scopes.passages(during, List.of(lib.aPassages().getFirst()))))
+                    .as(state).extracting(ScopedPassage::id).containsExactly(lib.aPassages().getFirst());
+            assertRefused(lib.gm().owner(), during, List.of(newPassages.getFirst()));
+        }
+
+        // The accept: the new version ready, the old one superseded.
+        fixture.state(lib.gm().owner(), replacement, "ready");
+        fixture.state(lib.gm().owner(), lib.a(), "superseded");
+        ResolvedScope after = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+
+        assertThat(after.sources(Tier.CAMPAIGN)).containsExactly(replacement);
+        assertThat(after.allowedSources()).doesNotContain(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(after, List.of(newPassages.getFirst()))))
+                .extracting(ScopedPassage::id).containsExactly(newPassages.getFirst());
+        assertRefused(lib.gm().owner(), after, List.of(lib.aPassages().getFirst()));
+    }
+
+    @Test
+    void aDiscardedReplacementLeavesTheOldVersionServing() {
+        Library2 lib = twoTiers();
+        UUID materialId = materials.versions.get(lib.a()).materialId();
+        UUID replacement = fixture.version(lib.gm().owner(), materialId, "needs_review");
+        fixture.passages(lib.gm().owner(), replacement, "N", 2);
+
+        fixture.discard(lib.gm().owner(), replacement);
+
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        assertThat(scope.sources(Tier.CAMPAIGN)).containsExactly(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(scope, List.of(lib.aPassages().getFirst()))))
+                .hasSize(1);
+    }
+
+    // --- Story 3.3: where a material belongs changes
+
+    @Test
+    void aCampaignsMaterialIsAbsentFromASiblingCampaignOfTheSameSystem() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+
+        assertThat(theirs.allowedSources()).doesNotContain(lib.a());
+        assertRefused(lib.gm().owner(), theirs, List.of(lib.aPassages().getFirst()));
+    }
+
+    @Test
+    void aMaterialMovedFromItsCampaignToTheSystemLeavesTheCampaignTierAndJoinsTheSystemTierOfEveryCampaignOfIt() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        fixture.move(lib.gm().owner(), lib.a(), null, lib.gm().system());
+
+        ResolvedScope mine = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+        assertThat(mine.sources(Tier.CAMPAIGN)).isEmpty();
+        assertThat(mine.sources(Tier.SYSTEM)).containsExactlyInAnyOrder(lib.a(), lib.b());
+        assertThat(theirs.sources(Tier.SYSTEM)).containsExactlyInAnyOrder(lib.a(), lib.b());
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(theirs, List.of(lib.aPassages().getFirst()))))
+                .singleElement().satisfies(passage -> assertThat(passage.tier()).isEqualTo(Tier.SYSTEM));
+    }
+
+    @Test
+    void aMaterialMovedToAnotherCampaignIsInThatCampaignsTierOnly() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+
+        fixture.move(lib.gm().owner(), lib.a(), sibling);
+
+        ResolvedScope mine = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope theirs = as(lib.gm().owner(), () -> scopes.resolve(sibling, ScopeSettings.STARTING));
+        assertThat(mine.allowedSources()).containsExactly(lib.b());
+        assertRefused(lib.gm().owner(), mine, List.of(lib.aPassages().getFirst()));
+        assertThat(theirs.sources(Tier.CAMPAIGN)).containsExactlyInAnyOrder(lib.a(), lib.c());
+    }
+
+    @Test
+    void aMaterialOfSeveralSystemsIsInTheSystemTierOfEachOnesCampaignsAndOfNoOtherSystem() {
+        Library2 lib = twoTiers();
+        UUID second = fixture.system(lib.gm().owner(), "Pathfinder");
+        UUID secondCampaign = fixture.campaignOf(lib.gm().owner(), second, "Mesa de sábado");
+        UUID third = fixture.system(lib.gm().owner(), "Tormenta");
+        UUID thirdCampaign = fixture.campaignOf(lib.gm().owner(), third, "Mesa de domingo");
+
+        fixture.move(lib.gm().owner(), lib.a(), null, lib.gm().system(), second);
+
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING))
+                .sources(Tier.SYSTEM)).contains(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(secondCampaign, ScopeSettings.STARTING))
+                .sources(Tier.SYSTEM)).containsExactly(lib.a());
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(thirdCampaign, ScopeSettings.STARTING))
+                .allowedSources()).isEmpty();
+    }
+
+    @Test
+    void aMaterialMovedOutAfterAQuestionResolvedIsRefusedAtTheNextFetchWhichResolvesAgain() {
+        Library2 lib = twoTiers();
+        UUID sibling = materials.materials.get(materials.versions.get(lib.c()).materialId()).campaignId();
+        // The question's first fetch, as AnswerJobs makes it: the scope resolved for that fetch.
+        ResolvedScope first = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(first, List.of(lib.aPassages().getFirst()))))
+                .hasSize(1);
+
+        fixture.move(lib.gm().owner(), lib.a(), sibling);
+
+        // The next fetch of the same question resolves again and no longer has A.
+        ResolvedScope next = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+        assertRefused(lib.gm().owner(), next, List.of(lib.bPassages().getFirst(), lib.aPassages().getFirst()));
+        assertThat(as(lib.gm().owner(), () -> scopes.passages(next, List.of(lib.bPassages().getFirst())))).hasSize(1);
+    }
+
     @Test
     void anotherOwnersScopeANullIdOrNoOwnerIsRefused() {
         Library2 lib = twoTiers();
@@ -585,6 +712,8 @@ class ScopesTest {
                 .containsExactly(tuple(a1, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 1"), 1),
                         tuple(a0, lib.a(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1),
                         tuple(b0, lib.b(), ScopeFixture.MATERIAL_NAME, List.of("Capítulo", "Seção 0"), 1));
+        // Story 3.7: each place carries its source's tier in this scope, the scope's own label.
+        assertThat(places).extracting(CitedPlace::tier).containsExactly(Tier.CAMPAIGN, Tier.CAMPAIGN, Tier.SYSTEM);
         assertThat(places.getFirst().materialId()).isEqualTo(materials.versions.get(lib.a()).materialId());
         assertThat(places.getFirst().toString()).doesNotContain(ScopeFixture.MATERIAL_NAME).doesNotContain("Seção");
         assertThat(as(lib.gm().owner(), () -> scopes.references(scope, List.of(theirs, Ids.newId())))).isEmpty();
@@ -660,11 +789,15 @@ class ScopesTest {
 
         JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Qual é o alcance da Espada Vorpal?"));
 
-        assertThat(fieldNames(input)).containsExactly("question", "owner", "tiers", "tokenKey");
+        assertThat(fieldNames(input)).containsExactly("question", "owner", "modelKnowledge", "tiers", "tokenKey");
         assertThat(input.path("question").asString()).isEqualTo("Qual é o alcance da Espada Vorpal?");
+        assertThat(input.path("modelKnowledge").isBoolean()).isTrue();
+        assertThat(input.path("modelKnowledge").asBoolean()).isFalse();
         assertThat(input.path("owner").asString()).isEqualTo(lib.gm().owner().toString());
         JsonNode tiers = input.path("tiers");
-        assertThat(tiers.size()).isEqualTo(2);
+        assertThat(tiers.size()).isEqualTo(3);
+        assertThat(tiers.get(2).path("tier").asString()).isEqualTo("other");
+        assertThat(tiers.get(2).path("sources").isEmpty()).isTrue();
         assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
         assertThat(strings(tiers.get(0).path("sources"))).containsExactly(lib.a().toString(), second.toString());
         assertThat(strings(tiers.get(0).path("pending"))).containsExactly(secondPassages.get(1).toString(),
@@ -680,7 +813,24 @@ class ScopesTest {
     }
 
     @Test
-    void aTierWithNoSourceIsStillListedWithEmptyListsAndAnEmptyScopeHasTwoEmptyTiers() {
+    void theQuestionInputCarriesTheScopesModelKnowledgeSwitchAndNothingElseChanges() {
+        Library2 lib = twoTiers();
+        ResolvedScope off = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        ResolvedScope on = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                new ScopeSettings(true, true, false, true)));
+
+        JsonNode withoutIt = as(lib.gm().owner(), () -> scopes.questionInput(off, "Vorpal?"));
+        JsonNode withIt = as(lib.gm().owner(), () -> scopes.questionInput(on, "Vorpal?"));
+
+        assertThat(withoutIt.path("modelKnowledge").asBoolean()).isFalse();
+        assertThat(withIt.path("modelKnowledge").isBoolean()).isTrue();
+        assertThat(withIt.path("modelKnowledge").asBoolean()).isTrue();
+        // The switch changes no source and no passage handed over.
+        assertThat(withIt.path("tiers")).isEqualTo(withoutIt.path("tiers"));
+    }
+
+    @Test
+    void aTierWithNoSourceIsStillListedWithEmptyListsAndAnEmptyScopeHasThreeEmptyTiers() {
         Library2 lib = twoTiers();
         ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
                 new ScopeSettings(false, true, false, false)));
@@ -694,7 +844,9 @@ class ScopesTest {
         assertThat(input.path("tiers").get(0).path("sources").isEmpty()).isTrue();
         assertThat(input.path("tiers").get(0).path("pending").isEmpty()).isTrue();
         assertThat(strings(input.path("tiers").get(1).path("sources"))).containsExactly(lib.b().toString());
-        assertThat(none.path("tiers").size()).isEqualTo(2);
+        assertThat(none.path("tiers").size()).isEqualTo(3);
+        assertThat(none.path("tiers")).extracting(tier -> tier.path("tier").asString())
+                .containsExactly("campaign", "system", "other");
         for (JsonNode tier : none.path("tiers")) {
             assertThat(tier.path("sources").isArray()).isTrue();
             assertThat(tier.path("sources").isEmpty()).isTrue();
@@ -773,6 +925,114 @@ class ScopesTest {
                 .isInstanceOf(IllegalStateException.class);
         assertThatThrownBy(() -> scopes.questionInput(scope, "Vorpal?"))
                 .isInstanceOf(OwnerContext.NoOwnerException.class);
+    }
+
+    // --- search (Story 3.9)
+
+    @Test
+    void aFilterOnlyNarrowsTheScopeAndItsPendingPassagesAreThoseOfItsOwnSources() {
+        Library2 lib = twoTiers();
+        UUID second = fixture.material(lib.gm().owner(), lib.gm().campaign(), null, "ready").getFirst();
+        List<UUID> secondPassages = fixture.passages(lib.gm().owner(), second, "S", 2);
+        UUID job = Ids.newId();
+        UUID systemJob = Ids.newId();
+        fixture.indexChange(lib.gm().owner(), job, second, 0, 1);
+        fixture.indexChange(lib.gm().owner(), systemJob, lib.b(), 0, 1);
+        unended.addAll(List.of(job, systemJob));
+        UUID aMaterial = materials.versions.get(lib.a()).materialId();
+        UUID secondMaterial = materials.versions.get(second).materialId();
+        UUID bMaterial = materials.versions.get(lib.b()).materialId();
+        ScopeSettings all = new ScopeSettings(true, true, true, false);
+
+        ResolvedScope campaignOnly = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), all,
+                new ScopeFilter(Tier.CAMPAIGN, null)));
+        ResolvedScope oneMaterial = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), all,
+                new ScopeFilter(null, secondMaterial)));
+        ResolvedScope both = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), all,
+                new ScopeFilter(Tier.CAMPAIGN, aMaterial)));
+
+        assertThat(campaignOnly.sources(Tier.CAMPAIGN)).containsExactly(lib.a(), second);
+        assertThat(campaignOnly.sources(Tier.SYSTEM)).isEmpty();
+        assertThat(campaignOnly.sources(Tier.OTHER)).isEmpty();
+        assertThat(campaignOnly.pending(Tier.CAMPAIGN)).containsExactlyElementsOf(secondPassages);
+        assertThat(campaignOnly.pending(Tier.SYSTEM)).isEmpty();
+        assertThat(oneMaterial.allowedSources()).containsExactly(second);
+        assertThat(oneMaterial.pending()).containsExactlyElementsOf(secondPassages);
+        assertThat(both.allowedSources()).containsExactly(lib.a());
+        assertThat(both.pending()).isEmpty();
+        // A filter never widens: a tier switched off, a material switched off or in another tier leaves nothing.
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING,
+                new ScopeFilter(Tier.OTHER, null))).allowedSources()).isEmpty();
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                new ScopeSettings(true, true, true, false, Set.of(secondMaterial)),
+                new ScopeFilter(null, secondMaterial))).allowedSources()).isEmpty();
+        assertThat(as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), all,
+                new ScopeFilter(Tier.CAMPAIGN, bMaterial))).allowedSources()).isEmpty();
+        // No filter is the scope itself.
+        assertThat(as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(), all, ScopeFilter.NONE))
+                .allowedSources()).isEqualTo(as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                all)).allowedSources());
+        assertThat(new ScopeFilter(Tier.CAMPAIGN, aMaterial).toString()).doesNotContain(aMaterial.toString());
+    }
+
+    @Test
+    void theSearchInputIsTheQuestionInputsShapeWithQueryAndAQueryIsOneTo500Characters() {
+        Library2 lib = twoTiers();
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+        String longest = "🐉".repeat(500);
+
+        JsonNode input = as(lib.gm().owner(), () -> scopes.searchInput(scope, "Espada Vorpal"));
+
+        assertThat(fieldNames(input)).containsExactly("query", "owner", "modelKnowledge", "tiers", "tokenKey");
+        assertThat(input.path("query").asString()).isEqualTo("Espada Vorpal");
+        JsonNode asQuestion = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Espada Vorpal"));
+        assertThat(input.path("tiers")).isEqualTo(asQuestion.path("tiers"));
+        assertThat(input.path("owner")).isEqualTo(asQuestion.path("owner"));
+        assertThat(as(lib.gm().owner(), () -> scopes.searchInput(scope, longest)).path("query").asString())
+                .isEqualTo(longest);
+        for (String query : java.util.Arrays.asList(null, "", "a".repeat(501), longest + "a")) {
+            assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.searchInput(scope, query)))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessage("scope.query_invalid");
+        }
+        assertThat(Scopes.MAX_QUERY).isEqualTo(500);
+        ScopeFixture.Starter them = fixture.starter();
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.searchInput(scope, "Vorpal")))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void resultsOfTheScopeAreReadWithTheirPlaceTextAndTierAndEveryOtherIdIsDroppedNeverRefused() {
+        Library2 lib = twoTiers();
+        ScopeFixture.Starter them = fixture.starter();
+        UUID theirVersion = fixture.material(them.owner(), them.campaign(), null, "ready").getFirst();
+        UUID theirs = fixture.passages(them.owner(), theirVersion, "T", 1).getFirst();
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+        UUID a0 = lib.aPassages().getFirst();
+        UUID b1 = lib.bPassages().get(1);
+        List<UUID> asked = new ArrayList<>(List.of(b1, theirs, lib.cPassages().getFirst(), a0, b1));
+        asked.add(null);
+        asked.add(Ids.newId());
+
+        List<ScopedResult> results = as(lib.gm().owner(), () -> scopes.results(scope, asked));
+
+        assertThat(results).extracting(ScopedResult::passageId, ScopedResult::versionId, ScopedResult::tier,
+                        ScopedResult::text, ScopedResult::materialName, ScopedResult::page)
+                .containsExactly(tuple(b1, lib.b(), Tier.SYSTEM, "B 1", ScopeFixture.MATERIAL_NAME, 1),
+                        tuple(a0, lib.a(), Tier.CAMPAIGN, "A 0", ScopeFixture.MATERIAL_NAME, 1));
+        assertThat(results.getFirst().sectionPath()).containsExactly("Capítulo", "Seção 1");
+        assertThat(results.getFirst().materialId()).isEqualTo(materials.versions.get(lib.b()).materialId());
+        assertThat(results.getFirst().toString()).doesNotContain("B 1").doesNotContain(ScopeFixture.MATERIAL_NAME);
+        assertThat(as(lib.gm().owner(), () -> scopes.results(scope, List.of()))).isEmpty();
+        // A version no longer ready is dropped; a narrowed scope drops the rest.
+        fixture.state(lib.gm().owner(), lib.b(), "superseded");
+        assertThat(as(lib.gm().owner(), () -> scopes.results(scope, List.of(b1, a0))))
+                .extracting(ScopedResult::passageId).containsExactly(a0);
+        ResolvedScope systemOnly = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING, new ScopeFilter(Tier.SYSTEM, null)));
+        assertThat(as(lib.gm().owner(), () -> scopes.results(systemOnly, List.of(a0)))).isEmpty();
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.results(scope, List.of(a0))))
+                .isInstanceOf(IllegalStateException.class);
     }
 
     private static List<String> fieldNames(JsonNode node) {

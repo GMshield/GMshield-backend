@@ -24,14 +24,74 @@ public interface MaterialStore {
     List<MaterialSystemRow> systemsOf(UUID materialId);
 
     /**
-     * The current owner's materials whose newest version (the latest created, then the greatest id) is in one of
-     * {@code states}, each with that version: newest material first (descending id, a UUID v7), only those whose id is
-     * below {@code before} when it is given, at most {@code limit}.
+     * The current owner's game systems of all these materials, in one read (Story 3.3: the places of a page of
+     * materials), by material and oldest first; another owner's material has none.
      */
-    List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit);
+    List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds);
 
-    /** The current owner's material with this id and its newest version; empty for an unknown id or another owner's. */
-    Optional<NewestVersion> newest(UUID materialId);
+    /**
+     * Where the current owner's material {@code id} belongs changes (Story 3.3), with the material locked first: to the
+     * campaign {@code campaignId} and no system when it is not null, else to the systems of {@code systems} (rows of
+     * this material and owner, at least one) and no campaign. An attachment to a system not among them goes, one already
+     * there stays as it is, and the others are added; the material's version rises by one. Answers the material as
+     * stored; empty for an unknown id or another owner's. Throws {@link StaleMaterialVersion} when the material is not at
+     * {@code version}, and nothing is written. Never touches a version, a passage or the index.
+     */
+    Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId, List<MaterialSystemRow> systems,
+                                          Instant now);
+
+    /**
+     * The current owner's materials whose current version is in one of {@code states}, each with that version: newest
+     * material first (descending id, a UUID v7), only those whose id is below {@code before} when it is given, at most
+     * {@code limit}. From Story 3.4 a material's current version is its newest version (the latest created, then the
+     * greatest id) that is not {@code discarded}, or its newest one when every version is discarded.
+     */
+    List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit);
+
+    /**
+     * As {@link #currentIn}, only the materials attached to the system {@code systemId} ({@code material_system}) or
+     * whose campaign is one of {@code campaignIds} (Story 3.1: a system's materials).
+     */
+    List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                         UUID before, int limit);
+
+    /**
+     * As {@link #currentIn}, by position instead of by cursor (a numbered page): the materials after the {@code offset}
+     * newest ones, at most {@code limit}.
+     */
+    List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit);
+
+    /** How many materials {@link #currentIn} lists in all for these states. */
+    long currentCount(Collection<String> states);
+
+    /** As {@link #currentAttached}, by position instead of by cursor. */
+    List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                             int offset, int limit);
+
+    /** How many materials {@link #currentAttached} lists in all for these states, this system and these campaigns. */
+    long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds);
+
+    /** The current owner's material with this id and its current version; empty for an unknown id or another owner's. */
+    Optional<CurrentVersion> current(UUID materialId);
+
+    /**
+     * The current owner's material with this id, read again under a row lock held until the end of the transaction
+     * (Story 3.4: two new versions of one material take turns); empty for an unknown id or another owner's.
+     */
+    Optional<MaterialRow> lockMaterial(UUID id);
+
+    /**
+     * The current owner's {@code ready} versions of these materials, oldest first (Story 3.4: the version that keeps
+     * serving while a new one is processed); another owner's material has none.
+     */
+    List<VersionRow> readyOf(Collection<UUID> materialIds);
+
+    /**
+     * The current owner's {@code superseded} versions of these materials, newest first (the latest created, then the
+     * greatest id), in one read (Story 3.4 part B: the earlier versions the GM may remove); another owner's material
+     * has none.
+     */
+    List<VersionRow> supersededOf(Collection<UUID> materialIds);
 
     /** The current owner's material with this id; empty for an unknown id or another owner's. */
     Optional<MaterialRow> findMaterial(UUID id);
@@ -238,6 +298,12 @@ public interface MaterialStore {
      */
     List<VersionRow> readyOfSystem(UUID systemId);
 
+    /**
+     * Every {@code ready} version of the current owner, oldest first (Story 3.5: the other tier is what is left of them
+     * once the campaign's and its system's are taken out).
+     */
+    List<VersionRow> readyOfOwner();
+
     /** The ids of the current owner's passages of a version from ordinal {@code first} to {@code last}, in order. */
     List<UUID> passageIds(UUID versionId, int first, int last);
 
@@ -252,4 +318,21 @@ public interface MaterialStore {
      * false when there is none.
      */
     boolean deleteMaterial(UUID id);
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    /** The current owner's materials whose campaign is one of {@code campaignIds}, by id. */
+    List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds);
+
+    /** The current owner's materials attached to the system {@code systemId} and to no other system, by id. */
+    List<MaterialRow> materialsOnlyOfSystem(UUID systemId);
+
+    /** The current owner's materials attached to the system {@code systemId} and to another system as well, by id. */
+    List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId);
+
+    /** The current owner's material is no longer attached to the system {@code systemId}; false when it was not. */
+    boolean detachSystem(UUID materialId, UUID systemId);
+
+    /** Deletes every step of the current owner's version, ended or not; answers how many went. */
+    int deleteSteps(UUID versionId);
 }

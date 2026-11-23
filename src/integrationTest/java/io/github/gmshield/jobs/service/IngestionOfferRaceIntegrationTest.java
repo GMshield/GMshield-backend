@@ -33,6 +33,7 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false", "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.library.deletion-sweep.enabled=false",
     "gmshield.materials.index-retry-sweep.enabled=false"})
 @ActiveProfiles("test-mode")
 class IngestionOfferRaceIntegrationTest {

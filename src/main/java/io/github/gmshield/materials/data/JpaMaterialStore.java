@@ -3,13 +3,17 @@ package io.github.gmshield.materials.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.OptimisticLockException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import org.hibernate.StaleStateException;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
 import org.springframework.stereotype.Repository;
@@ -24,6 +28,8 @@ import org.springframework.stereotype.Repository;
 class JpaMaterialStore implements MaterialStore {
 
     private static final String READY = "ready";
+    private static final String SUPERSEDED = "superseded";
+    private static final String DISCARDED = "discarded";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -58,38 +64,232 @@ class JpaMaterialStore implements MaterialStore {
         return systemEntitiesOf(materialId).stream().map(MaterialSystemEntity::row).toList();
     }
 
+    @Override
+    public List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select s from MaterialSystem s where s.materialId in :ids"
+                        + " order by s.materialId, s.createdAt, s.id", MaterialSystemEntity.class)
+                .setParameter("ids", materialIds).getResultList().stream().map(MaterialSystemEntity::row).toList();
+    }
+
     /**
-     * The newest version of a material is the one no other version of it follows (later, or as late with a greater id).
-     * Two constant query texts rather than a null parameter, whose type PostgreSQL could not tell.
+     * Story 3.3: the material, found by JPQL (so within the owner), is refreshed under a row lock, so two changes of one
+     * material take turns and the second reads the first's version, even when its session read the material before.
+     * Attachments that stay are left as they are (no delete then insert of one key), so the key on
+     * (owner, material, system) never sees a row twice whatever order Hibernate writes in.
      */
-    private static final String NEWEST = "select m, v from Material m join MaterialVersion v on v.materialId = m.id"
+    @Override
+    public Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId, List<MaterialSystemRow> systems,
+                                                 Instant now) {
+        Optional<MaterialEntity> found = material(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        MaterialEntity entity = found.get();
+        EntityManager em = em();
+        try {
+            em.refresh(entity, LockModeType.PESSIMISTIC_WRITE);
+        } catch (OptimisticLockException | StaleStateException moved) {
+            throw new StaleMaterialVersion();
+        }
+        if (entity.version() != version) {
+            throw new StaleMaterialVersion();
+        }
+        List<MaterialSystemRow> wanted = campaignId == null ? systems : List.of();
+        Set<UUID> kept = new HashSet<>();
+        Set<UUID> wantedIds = new HashSet<>();
+        wanted.forEach(row -> wantedIds.add(row.systemId()));
+        for (MaterialSystemEntity link : systemEntitiesOf(id)) {
+            UUID system = link.row().systemId();
+            if (wantedIds.contains(system)) {
+                kept.add(system);
+            } else {
+                em.remove(link);
+            }
+        }
+        for (MaterialSystemRow row : wanted) {
+            if (kept.add(row.systemId())) {
+                em.persist(new MaterialSystemEntity(row));
+            }
+        }
+        entity.belong(campaignId, now);
+        try {
+            em.flush();
+        } catch (OptimisticLockException | StaleStateException moved) {
+            throw new StaleMaterialVersion();
+        }
+        return Optional.of(entity.row());
+    }
+
+    /**
+     * Story 3.4: the current version of a material is its newest version that is not {@code discarded}, or, when every
+     * version is discarded, its newest one; newest means the latest created, then the greatest id. So {@code v} is
+     * current when no other version {@code n} of its material beats it: a version not discarded beats a discarded one
+     * and a newer one not discarded; a discarded one beats only a newer discarded one. Two constant query texts rather
+     * than a null parameter, whose type PostgreSQL could not tell.
+     */
+    private static final String NEWER = "(n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id))";
+    private static final String CURRENT_FROM = " from Material m join MaterialVersion v on v.materialId = m.id"
             + " where v.state in :states"
             + " and not exists (select n.id from MaterialVersion n where n.materialId = m.id"
-            + " and (n.createdAt > v.createdAt or (n.createdAt = v.createdAt and n.id > v.id)))";
-    private static final String NEWEST_IN = NEWEST + " order by m.id desc";
-    private static final String NEWEST_IN_BEFORE = NEWEST + " and m.id < :before order by m.id desc";
+            + " and ((n.state <> 'discarded' and (v.state = 'discarded' or " + NEWER + "))"
+            + " or (v.state = 'discarded' and " + NEWER + ")))";
+    /** The materials with their current version in the states asked: what the lists read, and what their totals count. */
+    private static final String CURRENT = "select m, v" + CURRENT_FROM;
+    private static final String CURRENT_COUNT = "select count(m)" + CURRENT_FROM;
+    private static final String CURRENT_IN = CURRENT + " order by m.id desc";
+    private static final String CURRENT_IN_BEFORE = CURRENT + " and m.id < :before order by m.id desc";
 
     @Override
-    public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
+    public List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit) {
         if (states.isEmpty() || limit < 1) {
             return List.of();
         }
-        var query = em().createQuery(before == null ? NEWEST_IN : NEWEST_IN_BEFORE, Object[].class).setParameter("states", states).setMaxResults(limit);
+        var query = em().createQuery(before == null ? CURRENT_IN : CURRENT_IN_BEFORE, Object[].class).setParameter("states", states).setMaxResults(limit);
         if (before != null) {
             query.setParameter("before", before);
         }
         return query.getResultList().stream()
-                .map(pair -> new NewestVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    /**
+     * Story 3.1: attached to a system, or (with campaigns) to one of its campaigns. Four constant query texts, one per
+     * combination, so no query text is put together at run time.
+     */
+    private static final String ATTACHED_TO_SYSTEM = " and (exists (select a.id from MaterialSystem a"
+            + " where a.materialId = m.id and a.systemId = :system)";
+    private static final String ATTACHED = CURRENT + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN = CURRENT + ATTACHED_TO_SYSTEM + " or m.campaignId in :campaigns)";
+    private static final String BEFORE_NEWEST_FIRST = " and m.id < :before order by m.id desc";
+    private static final String NEWEST_FIRST = " order by m.id desc";
+    private static final String ATTACHED_FIRST = ATTACHED + NEWEST_FIRST;
+    private static final String ATTACHED_BEFORE = ATTACHED + BEFORE_NEWEST_FIRST;
+    private static final String ATTACHED_OR_CAMPAIGN_FIRST = ATTACHED_OR_CAMPAIGN + NEWEST_FIRST;
+    private static final String ATTACHED_OR_CAMPAIGN_BEFORE = ATTACHED_OR_CAMPAIGN + BEFORE_NEWEST_FIRST;
+    private static final String ATTACHED_COUNT = CURRENT_COUNT + ATTACHED_TO_SYSTEM + ")";
+    private static final String ATTACHED_OR_CAMPAIGN_COUNT = CURRENT_COUNT + ATTACHED_TO_SYSTEM
+            + " or m.campaignId in :campaigns)";
+
+    @Override
+    public List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                              UUID before, int limit) {
+        if (states.isEmpty() || limit < 1) {
+            return List.of();
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        String text;
+        if (byCampaign) {
+            text = before == null ? ATTACHED_OR_CAMPAIGN_FIRST : ATTACHED_OR_CAMPAIGN_BEFORE;
+        } else {
+            text = before == null ? ATTACHED_FIRST : ATTACHED_BEFORE;
+        }
+        var query = em().createQuery(text, Object[].class).setParameter("states", states)
+                .setParameter("system", systemId).setMaxResults(limit);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        if (before != null) {
+            query.setParameter("before", before);
+        }
+        return query.getResultList().stream()
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
                 .toList();
     }
 
     @Override
-    public Optional<NewestVersion> newest(UUID materialId) {
-        return material(materialId).flatMap(material -> em()
-                .createQuery("select v from MaterialVersion v where v.materialId = :id order by v.createdAt desc, v.id desc",
-                        MaterialVersionEntity.class)
-                .setParameter("id", materialId).setMaxResults(1).getResultList().stream().findFirst()
-                .map(version -> new NewestVersion(material.row(), version.row())));
+    public List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit) {
+        if (states.isEmpty() || limit < 1 || offset < 0) {
+            return List.of();
+        }
+        return em().createQuery(CURRENT_IN, Object[].class).setParameter("states", states).setFirstResult(offset)
+                .setMaxResults(limit).getResultList().stream()
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    @Override
+    public long currentCount(Collection<String> states) {
+        if (states.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery(CURRENT_COUNT, Long.class).setParameter("states", states).getSingleResult();
+    }
+
+    @Override
+    public List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                                  int offset, int limit) {
+        if (states.isEmpty() || limit < 1 || offset < 0) {
+            return List.of();
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        var query = em().createQuery(byCampaign ? ATTACHED_OR_CAMPAIGN_FIRST : ATTACHED_FIRST, Object[].class)
+                .setParameter("states", states).setParameter("system", systemId).setFirstResult(offset)
+                .setMaxResults(limit);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        return query.getResultList().stream()
+                .map(pair -> new CurrentVersion(((MaterialEntity) pair[0]).row(), ((MaterialVersionEntity) pair[1]).row()))
+                .toList();
+    }
+
+    @Override
+    public long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+        if (states.isEmpty()) {
+            return 0;
+        }
+        boolean byCampaign = !campaignIds.isEmpty();
+        var query = em().createQuery(byCampaign ? ATTACHED_OR_CAMPAIGN_COUNT : ATTACHED_COUNT, Long.class)
+                .setParameter("states", states).setParameter("system", systemId);
+        if (byCampaign) {
+            query.setParameter("campaigns", campaignIds);
+        }
+        return query.getSingleResult();
+    }
+
+    @Override
+    public Optional<CurrentVersion> current(UUID materialId) {
+        return material(materialId).flatMap(material -> currentOf(versionsOf(materialId))
+                .map(version -> new CurrentVersion(material.row(), version)));
+    }
+
+    /** The current version among a material's versions, oldest first: the last not discarded, else the last. */
+    static Optional<VersionRow> currentOf(List<VersionRow> oldestFirst) {
+        return oldestFirst.stream().filter(version -> !DISCARDED.equals(version.state())).reduce((first, second) -> second)
+                .or(() -> oldestFirst.stream().reduce((first, second) -> second));
+    }
+
+    @Override
+    public Optional<MaterialRow> lockMaterial(UUID id) {
+        Optional<MaterialEntity> found = material(id);
+        found.ifPresent(entity -> em().refresh(entity, LockModeType.PESSIMISTIC_WRITE));
+        return found.map(MaterialEntity::row);
+    }
+
+    @Override
+    public List<VersionRow> supersededOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select v from MaterialVersion v where v.materialId in :ids and v.state = :state"
+                        + " order by v.createdAt desc, v.id desc", MaterialVersionEntity.class)
+                .setParameter("ids", materialIds).setParameter("state", SUPERSEDED).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
+    public List<VersionRow> readyOf(Collection<UUID> materialIds) {
+        if (materialIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select v from MaterialVersion v where v.materialId in :ids and v.state = :state"
+                        + " order by v.createdAt, v.id", MaterialVersionEntity.class)
+                .setParameter("ids", materialIds).setParameter("state", READY).getResultList().stream()
+                .map(MaterialVersionEntity::row).toList();
     }
 
     @Override
@@ -602,6 +802,13 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> readyOfOwner() {
+        return em().createQuery("select v from MaterialVersion v where v.state = :state order by v.createdAt, v.id",
+                        MaterialVersionEntity.class)
+                .setParameter("state", READY).getResultList().stream().map(MaterialVersionEntity::row).toList();
+    }
+
+    @Override
     public List<VersionRow> readyOfSystem(UUID systemId) {
         return em().createQuery("select v from MaterialVersion v join MaterialSystem s on s.materialId = v.materialId"
                         + " where s.systemId = :system and v.state = :state order by v.createdAt, v.id",
@@ -645,6 +852,54 @@ class JpaMaterialStore implements MaterialStore {
             em().flush();
         });
         return material.isPresent();
+    }
+
+    /** Story 3.1 part B: attached to the system, and to no other system or to another one as well. */
+    private static final String ATTACHED_HERE = "select m from Material m where exists (select a.id from MaterialSystem a"
+            + " where a.materialId = m.id and a.systemId = :system)";
+    private static final String ONLY_OF_SYSTEM = ATTACHED_HERE + " and not exists (select o.id from MaterialSystem o"
+            + " where o.materialId = m.id and o.systemId <> :system) order by m.id";
+    private static final String ALSO_OF_OTHER_SYSTEMS = ATTACHED_HERE + " and exists (select o.id from MaterialSystem o"
+            + " where o.materialId = m.id and o.systemId <> :system) order by m.id";
+
+    @Override
+    public List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select m from Material m where m.campaignId in :campaigns order by m.id",
+                        MaterialEntity.class).setParameter("campaigns", campaignIds).getResultList().stream()
+                .map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsOnlyOfSystem(UUID systemId) {
+        return em().createQuery(ONLY_OF_SYSTEM, MaterialEntity.class).setParameter("system", systemId).getResultList()
+                .stream().map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId) {
+        return em().createQuery(ALSO_OF_OTHER_SYSTEMS, MaterialEntity.class).setParameter("system", systemId)
+                .getResultList().stream().map(MaterialEntity::row).toList();
+    }
+
+    @Override
+    public boolean detachSystem(UUID materialId, UUID systemId) {
+        List<MaterialSystemEntity> found = systemEntitiesOf(materialId).stream()
+                .filter(entity -> entity.row().systemId().equals(systemId)).toList();
+        found.forEach(em()::remove);
+        em().flush();
+        return !found.isEmpty();
+    }
+
+    @Override
+    public int deleteSteps(UUID versionId) {
+        List<IngestionStepEntity> found = em().createQuery("select s from IngestionStep s where s.versionId = :version",
+                IngestionStepEntity.class).setParameter("version", versionId).getResultList();
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
     }
 
     private Optional<MaterialEntity> material(UUID id) {

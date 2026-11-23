@@ -58,6 +58,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * member starts the set's chain only once no member is open or failed ({@link #startIfReady}), with the version
  * locked so that two members completing at once start it once.
  *
+ * <p>From Story 3.4, a replacement ({@link Details#material}): the upload adds a new version in {@code uploading} to
+ * one of the owner's materials, which keeps its name, kind, language and place, after the check of
+ * {@link NewVersions#lockReady} with the material locked. The new version goes through ingestion and review like a
+ * first one; the {@code ready} version keeps serving until the GM accepts the new one. A refused format, a whole-file
+ * mismatch or an expiry ends only the new version: the material stays {@code ready} on the old one.
+ *
  * <p>Another owner's upload, an unknown one and one being removed are all "not found". Nothing here logs a name, a
  * hash, a kind or where a material belongs; the file is never held whole in memory.
  */
@@ -79,6 +85,8 @@ public class Uploads {
     static final String DISCARDED = "discarded";
     /** The most images an image set may hold (Story 1.21); its bytes in all are at most {@link #MAX_LENGTH}. */
     public static final int MAX_IMAGES = 500;
+    /** The most systems a material may belong to (Story 3.3). */
+    public static final int MAX_SYSTEMS = 100;
     /** The longest name a material may have, in characters. */
     static final int MAX_NAME = 255;
     /** What a material may be (Story 1.14). */
@@ -114,11 +122,32 @@ public class Uploads {
     /**
      * What the GM said about a file (Story 1.14), as the tus metadata gave it: each may be null (an older frontend sends
      * none). {@code kind} is one of {@link #KINDS}; {@code language} one of {@link #LANGUAGES} or {@value #DETECT};
-     * {@code campaign} or {@code system} the id of one of the owner's, never both. {@code toString} shows nothing.
+     * {@code campaign} the id of one of the owner's campaigns, or {@code systems} (Story 3.3: one to
+     * {@value #MAX_SYSTEMS}) ids of the owner's systems, never both. From Story 3.4, {@code material}: the id of one of
+     * the owner's materials this file replaces, never with any of the others. {@code toString} shows nothing.
      */
-    public record Details(String kind, String language, String campaign, String system) {
+    public record Details(String kind, String language, String campaign, List<String> systems, String material) {
 
-        public static final Details NONE = new Details(null, null, null, null);
+        public static final Details NONE = new Details(null, null, null, (List<String>) null);
+
+        /** What the GM said about a new material (Story 3.3). */
+        public Details(String kind, String language, String campaign, List<String> systems) {
+            this(kind, language, campaign, systems, null);
+        }
+
+        /** A replacement of the material {@code material} (Story 3.4), with nothing else said. */
+        public static Details replacing(String material) {
+            return new Details(null, null, null, null, material);
+        }
+
+        /** One system, or none when {@code system} is null (Story 1.14's single {@code system} key). */
+        public Details(String kind, String language, String campaign, String system) {
+            this(kind, language, campaign, system == null ? null : List.of(system));
+        }
+
+        public Details {
+            systems = systems == null ? null : java.util.Collections.unmodifiableList(new java.util.ArrayList<>(systems));
+        }
 
         @Override
         public String toString() {
@@ -126,8 +155,18 @@ public class Uploads {
         }
     }
 
-    /** The details once checked: the language null when left to detection. */
-    record Checked(String kind, String language, UUID campaign, UUID system) {
+    /**
+     * The details once checked: the language null when left to detection; the campaign, or the systems (each once, in
+     * the order given; empty for none).
+     */
+    record Checked(String kind, String language, UUID campaign, List<UUID> systems) {
+    }
+
+    /**
+     * Where a material belongs once checked (Story 3.3): one campaign, or one or more systems (each once, in the order
+     * given), or neither.
+     */
+    record Place(UUID campaign, List<UUID> systems) {
     }
 
     /** A new upload: its id and when it expires. */
@@ -158,7 +197,11 @@ public class Uploads {
             throw UploadProblems.tooLarge(MAX_LENGTH);
         }
         String material = validName(name);
-        Checked checked = checked(details == null ? Details.NONE : details);
+        Details given = details == null ? Details.NONE : details;
+        if (given.material() != null) {
+            return replace(owner, length, replaced(given));
+        }
+        Checked checked = checked(given);
         Instant now = now();
         UUID materialId = Ids.newId();
         UUID versionId = Ids.newId();
@@ -176,6 +219,48 @@ public class Uploads {
     }
 
     /**
+     * A replacement (Story 3.4): a new version of the owner's material {@code materialId} and its upload, in one
+     * transaction with the material locked ({@link NewVersions#lockReady}).
+     */
+    private Created replace(UUID owner, long length, UUID materialId) {
+        Instant now = now();
+        UUID versionId = Ids.newId();
+        UUID uploadId = Ids.newId();
+        Instant expiresAt = now.plus(LIFETIME);
+        inTransaction(() -> {
+            insertReplacement(owner, materialId, versionId, now);
+            uploads.joined().insert(new UploadRow(uploadId, owner, versionId, length, 0, 0, null, expiresAt, null, null,
+                    UploadRow.OPEN, now, now));
+            return null;
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("uploadId", uploadId).addKeyValue("materialId", materialId)
+                .addKeyValue("versionId", versionId).addKeyValue("length", length).log("upload.replacement_created");
+        return new Created(uploadId, expiresAt);
+    }
+
+    /**
+     * The material a replacement names (Story 3.4), with nothing else said: a kind, language, campaign or system with
+     * it is {@code upload.metadata_invalid}, and so is an empty id; a malformed one reads like an unknown one
+     * ({@code request.not_found}).
+     */
+    static UUID replaced(Details details) {
+        if (details.kind() != null || details.language() != null || details.campaign() != null
+                || details.systems() != null || details.material().isBlank()) {
+            throw UploadProblems.metadataInvalid();
+        }
+        return id(details.material(), UploadProblems::notFound);
+    }
+
+    /**
+     * A new version in {@code uploading} of the owner's material, in the caller's transaction, after the check of
+     * {@link NewVersions#lockReady} with the material locked (Story 3.4).
+     */
+    void insertReplacement(UUID owner, UUID materialId, UUID versionId, Instant now) {
+        NewVersions.lockReady(materials, library, materialId);
+        materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
+    }
+
+    /**
      * The material (its name encrypted, its details) and its version in {@code uploading}, in the caller's transaction
      * (Stories 1.13, 1.14 and 1.21).
      */
@@ -183,8 +268,8 @@ public class Uploads {
         materials.insertMaterial(new MaterialRow(materialId, owner,
                 vault.encryptText(new Binding(MATERIAL, FIELD_NAME, materialId, owner), name), now,
                 checked.kind(), checked.language(), checked.campaign()));
-        if (checked.system() != null) {
-            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, checked.system(), now));
+        for (UUID system : checked.systems()) {
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, materialId, system, now));
         }
         materials.insertVersion(new VersionRow(versionId, owner, materialId, UPLOADING, null, null, now, now));
     }
@@ -429,13 +514,18 @@ public class Uploads {
         }
     }
 
-    /** A refused format: the upload, its version and its material go in one transaction, then any piece. */
+    /**
+     * A refused format: the upload, its version and its material go in one transaction, then any piece. From Story 3.4
+     * a replacement's material keeps its other versions and stays.
+     */
     private void refuse(UploadRow row, UUID owner) {
         inTransaction(() -> {
             VersionRow version = materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
             uploads.joined().delete(row.id());
             materials.deleteVersion(version.id());
-            materials.deleteMaterial(version.materialId());
+            if (materials.versionsOf(version.materialId()).isEmpty()) {
+                materials.deleteMaterial(version.materialId());
+            }
             return null;
         });
         files.deleteFile(owner, row.id());
@@ -561,9 +651,9 @@ public class Uploads {
     }
 
     /**
-     * The details checked against the owner's library: a campaign or a system must be the owner's (another owner's id
-     * reads like an unknown one). The check comes before the transaction; the database's owner-scoped keys still hold
-     * should the item go meanwhile.
+     * The details checked against the owner's library: a campaign or the systems must be the owner's (another owner's
+     * id reads like an unknown one), never both, and at most {@value #MAX_SYSTEMS} systems. The check comes before the
+     * transaction; the database's owner-scoped keys still hold should the item go meanwhile.
      */
     Checked checked(Details details) {
         if (details.kind() != null && !KINDS.contains(details.kind())) {
@@ -573,26 +663,49 @@ public class Uploads {
         if (language != null && !language.equals(DETECT) && !LANGUAGES.contains(language)) {
             throw UploadProblems.metadataInvalid();
         }
-        if (details.campaign() != null && details.system() != null) {
+        List<String> systems = details.systems() == null ? List.of() : details.systems();
+        if (details.campaign() != null && !systems.isEmpty()) {
             throw UploadProblems.metadataInvalid();
         }
-        UUID campaign = id(details.campaign());
-        UUID system = id(details.system());
-        if (campaign != null && library.campaign(campaign).isEmpty()) {
-            throw UploadProblems.metadataInvalid();
-        }
-        if (system != null && library.system(system).isEmpty()) {
-            throw UploadProblems.metadataInvalid();
-        }
-        return new Checked(details.kind(), DETECT.equals(language) ? null : language, campaign, system);
+        Place place = place(details.campaign(), systems, UploadProblems::metadataInvalid);
+        return new Checked(details.kind(), DETECT.equals(language) ? null : language, place.campaign(), place.systems());
     }
 
-    private static UUID id(String text) {
+    /**
+     * Where a material belongs, checked against the owner's library in one read (Story 3.3): {@code campaign} (the id
+     * of one of the owner's campaigns, archived or not), or {@code systems} (at most {@value #MAX_SYSTEMS} ids as sent;
+     * a repeated id is stored once), or neither. Any malformed, unknown, another owner's or deleting id, or more than
+     * {@value #MAX_SYSTEMS} ids as sent, is {@code invalid}. The caller refuses a campaign with systems.
+     */
+    Place place(String campaign, List<String> systems, Supplier<ApiException> invalid) {
+        if (systems.size() > MAX_SYSTEMS) {
+            throw invalid.get();
+        }
+        UUID campaignId = id(campaign, invalid);
+        java.util.LinkedHashSet<UUID> systemIds = new java.util.LinkedHashSet<>();
+        for (String system : systems) {
+            if (system == null) {
+                throw invalid.get();
+            }
+            systemIds.add(id(system, invalid));
+        }
+        if (campaignId == null && systemIds.isEmpty()) {
+            return new Place(null, List.of());
+        }
+        Library.Places found = library.places(campaignId == null ? List.of() : List.of(campaignId), systemIds);
+        if ((campaignId != null && !found.campaigns().containsKey(campaignId))
+                || !found.systems().keySet().containsAll(systemIds)) {
+            throw invalid.get();
+        }
+        return new Place(campaignId, List.copyOf(systemIds));
+    }
+
+    private static UUID id(String text, Supplier<ApiException> invalid) {
         if (text == null) {
             return null;
         }
         if (!UUID_TEXT.matcher(text).matches()) {
-            throw UploadProblems.metadataInvalid();
+            throw invalid.get();
         }
         return UUID.fromString(text);
     }

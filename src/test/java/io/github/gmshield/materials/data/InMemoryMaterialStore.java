@@ -81,25 +81,144 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
-    public List<NewestVersion> newestIn(Collection<String> states, UUID before, int limit) {
+    public List<MaterialSystemRow> systemsOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return systems.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && materialIds.contains(row.materialId()))
+                .sorted(Comparator.comparing(MaterialSystemRow::materialId).thenComparing(MaterialSystemRow::createdAt)
+                        .thenComparing(MaterialSystemRow::id)).toList();
+    }
+
+    /** How many times {@link #changeBelonging} wrote (Story 3.3). */
+    public final AtomicInteger belongingChanges = new AtomicInteger();
+
+    @Override
+    public synchronized Optional<MaterialRow> changeBelonging(UUID id, long version, UUID campaignId,
+                                                              List<MaterialSystemRow> wanted, Instant now) {
+        Optional<MaterialRow> found = findMaterial(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        MaterialRow before = found.get();
+        UUID owner = ownerFor(before.ownerId());
+        if (before.version() != version) {
+            throw new StaleMaterialVersion();
+        }
+        List<MaterialSystemRow> rows = campaignId == null ? wanted : List.of();
+        java.util.Set<UUID> wantedIds = new java.util.HashSet<>();
+        rows.forEach(row -> wantedIds.add(row.systemId()));
+        java.util.Set<UUID> kept = new java.util.HashSet<>();
+        for (MaterialSystemRow link : List.copyOf(systems.values())) {
+            if (!link.ownerId().equals(owner) || !link.materialId().equals(id)) {
+                continue;
+            }
+            if (wantedIds.contains(link.systemId())) {
+                kept.add(link.systemId());
+            } else {
+                systems.remove(link.id());
+                RollbackUndo.onRollback(() -> systems.put(link.id(), link));
+            }
+        }
+        for (MaterialSystemRow row : rows) {
+            if (kept.add(row.systemId())) {
+                insertMaterialSystem(row);
+            }
+        }
+        MaterialRow after = new MaterialRow(before.id(), before.ownerId(), before.name(), before.createdAt(),
+                before.kind(), before.language(), campaignId, before.version() + 1);
+        materials.put(id, after);
+        RollbackUndo.onRollback(() -> materials.put(id, before));
+        belongingChanges.incrementAndGet();
+        return Optional.of(after);
+    }
+
+    @Override
+    public List<CurrentVersion> currentIn(Collection<String> states, UUID before, int limit) {
         UUID owner = OwnerContext.require();
         return materials.values().stream()
                 .filter(row -> row.ownerId().equals(owner) && (before == null || row.id().compareTo(before) < 0))
                 .sorted(Comparator.comparing(MaterialRow::id).reversed())
-                .map(row -> newestOf(row).orElse(null))
+                .map(row -> currentOf(row).orElse(null))
                 .filter(found -> found != null && states.contains(found.version().state()))
                 .limit(Math.max(limit, 0)).toList();
     }
 
     @Override
-    public Optional<NewestVersion> newest(UUID materialId) {
-        return findMaterial(materialId).flatMap(this::newestOf);
+    public List<CurrentVersion> currentAttached(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                              UUID before, int limit) {
+        UUID owner = OwnerContext.require();
+        return currentIn(states, before, Integer.MAX_VALUE).stream()
+                .filter(found -> (found.material().campaignId() != null && campaignIds.contains(found.material().campaignId()))
+                        || systems.values().stream().anyMatch(row -> row.ownerId().equals(owner)
+                                && row.materialId().equals(found.material().id()) && row.systemId().equals(systemId)))
+                .limit(Math.max(limit, 0)).toList();
     }
 
-    private Optional<NewestVersion> newestOf(MaterialRow material) {
-        return versions.values().stream().filter(version -> version.materialId().equals(material.id()))
-                .max(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id))
-                .map(version -> new NewestVersion(material, version));
+    @Override
+    public List<CurrentVersion> currentFrom(Collection<String> states, int offset, int limit) {
+        return currentIn(states, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0))
+                .toList();
+    }
+
+    @Override
+    public long currentCount(Collection<String> states) {
+        return currentIn(states, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public List<CurrentVersion> currentAttachedFrom(Collection<String> states, UUID systemId, Collection<UUID> campaignIds,
+                                                  int offset, int limit) {
+        return currentAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0))
+                .limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public long currentAttachedCount(Collection<String> states, UUID systemId, Collection<UUID> campaignIds) {
+        return currentAttached(states, systemId, campaignIds, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public Optional<CurrentVersion> current(UUID materialId) {
+        return findMaterial(materialId).flatMap(this::currentOf);
+    }
+
+    /**
+     * The material's current version (Story 3.4): its newest version (the latest created, then the greatest id) that
+     * is not discarded, else its newest one.
+     */
+    private Optional<CurrentVersion> currentOf(MaterialRow material) {
+        Comparator<VersionRow> newest = Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id);
+        List<VersionRow> mine = versions.values().stream().filter(version -> version.materialId().equals(material.id()))
+                .toList();
+        return mine.stream().filter(version -> !"discarded".equals(version.state())).max(newest)
+                .or(() -> mine.stream().max(newest))
+                .map(version -> new CurrentVersion(material, version));
+    }
+
+    /** How many times {@link #lockMaterial} locked a material (Story 3.4). */
+    public final AtomicInteger materialLocks = new AtomicInteger();
+
+    @Override
+    public Optional<MaterialRow> lockMaterial(UUID id) {
+        Optional<MaterialRow> found = findMaterial(id);
+        found.ifPresent(row -> materialLocks.incrementAndGet());
+        return found;
+    }
+
+    @Override
+    public List<VersionRow> supersededOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(version -> version.ownerId().equals(owner)
+                        && materialIds.contains(version.materialId()) && "superseded".equals(version.state()))
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id).reversed()).toList();
+    }
+
+    @Override
+    public List<VersionRow> readyOf(Collection<UUID> materialIds) {
+        UUID owner = OwnerContext.require();
+        return versions.values().stream().filter(version -> version.ownerId().equals(owner)
+                        && materialIds.contains(version.materialId()) && "ready".equals(version.state()))
+                .sorted(Comparator.comparing(VersionRow::createdAt).thenComparing(VersionRow::id)).toList();
     }
 
     @Override
@@ -632,6 +751,12 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<VersionRow> readyOfOwner() {
+        UUID owner = OwnerContext.require();
+        return readyOf(material -> material.ownerId().equals(owner));
+    }
+
+    @Override
     public List<VersionRow> readyOfSystem(UUID systemId) {
         UUID owner = OwnerContext.require();
         java.util.Set<UUID> attached = systems.values().stream()
@@ -716,5 +841,64 @@ public class InMemoryMaterialStore implements MaterialStore {
             throw new IllegalStateException("no transaction");
         }
         return owner;
+    }
+
+    // --- a system's deletion (Story 3.1 part B)
+
+    @Override
+    public List<MaterialRow> materialsOfCampaigns(Collection<UUID> campaignIds) {
+        UUID owner = OwnerContext.require();
+        return materials.values().stream().filter(row -> row.ownerId().equals(owner) && row.campaignId() != null
+                && campaignIds.contains(row.campaignId())).sorted(Comparator.comparing(MaterialRow::id)).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsOnlyOfSystem(UUID systemId) {
+        return attachedTo(systemId).filter(row -> !attachedElsewhere(row.id(), systemId)).toList();
+    }
+
+    @Override
+    public List<MaterialRow> materialsAlsoOfOtherSystems(UUID systemId) {
+        return attachedTo(systemId).filter(row -> attachedElsewhere(row.id(), systemId)).toList();
+    }
+
+    private java.util.stream.Stream<MaterialRow> attachedTo(UUID systemId) {
+        UUID owner = OwnerContext.require();
+        return materials.values().stream().filter(row -> row.ownerId().equals(owner) && systems.values().stream()
+                        .anyMatch(link -> link.ownerId().equals(owner) && link.materialId().equals(row.id())
+                                && link.systemId().equals(systemId)))
+                .sorted(Comparator.comparing(MaterialRow::id));
+    }
+
+    private boolean attachedElsewhere(UUID materialId, UUID systemId) {
+        UUID owner = OwnerContext.require();
+        return systems.values().stream().anyMatch(link -> link.ownerId().equals(owner)
+                && link.materialId().equals(materialId) && !link.systemId().equals(systemId));
+    }
+
+    @Override
+    public synchronized boolean detachSystem(UUID materialId, UUID systemId) {
+        UUID owner = OwnerContext.require();
+        List<MaterialSystemRow> found = systems.values().stream().filter(link -> link.ownerId().equals(owner)
+                && link.materialId().equals(materialId) && link.systemId().equals(systemId)).toList();
+        for (MaterialSystemRow link : found) {
+            ownerFor(link.ownerId());
+            systems.remove(link.id());
+            RollbackUndo.onRollback(() -> systems.put(link.id(), link));
+        }
+        return !found.isEmpty();
+    }
+
+    @Override
+    public synchronized int deleteSteps(UUID versionId) {
+        UUID owner = OwnerContext.require();
+        List<StepRow> found = steps.values().stream().filter(step -> step.ownerId().equals(owner)
+                && step.versionId().equals(versionId)).toList();
+        for (StepRow step : found) {
+            ownerFor(step.ownerId());
+            steps.remove(step.id());
+            RollbackUndo.onRollback(() -> steps.put(step.id(), step));
+        }
+        return found.size();
     }
 }

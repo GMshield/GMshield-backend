@@ -29,11 +29,18 @@ gmshield:
     sweep:
       enabled: false
   # Nor does the upload sweep (Story 1.13), the version removal sweep (Story 1.20) or the index retry sweep (indexing at
-  # worker start): the tests call them.
+  # worker start), whose switch also stops the index removal retry sweep (Story 3.4 part B): the tests call them.
   materials:
     upload-sweep:
       enabled: false
     version-removal-sweep:
       enabled: false
     index-retry-sweep:
+      enabled: false
+  # Nor does the system deletion sweep, nor its one-shot passes (Story 3.1 part B): the tests run them.
+  library:
+    deletion-sweep:
+      enabled: false
+    # Nor does the campaign fingerprint fill at start (Story 3.2): the tests run it.
+    campaign-fingerprints:
       enabled: false

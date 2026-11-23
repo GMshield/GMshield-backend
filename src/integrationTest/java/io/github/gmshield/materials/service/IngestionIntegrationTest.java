@@ -67,6 +67,7 @@ import tools.jackson.databind.json.JsonMapper;
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
     "gmshield.materials.version-removal-sweep.enabled=false",
+    "gmshield.library.deletion-sweep.enabled=false",
     "gmshield.materials.index-retry-sweep.enabled=false",
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-ingestion-it"})
 @ActiveProfiles("test-mode")
@@ -963,6 +964,88 @@ class IngestionIntegrationTest {
         assertThat(state(chain.versionId())).isEqualTo("ready");
     }
 
+    // --- Story 3.4: a second version on Postgres
+
+    @Test
+    void aReplacementThroughTheRealFlowIsReviewedAndItsAcceptSupersedesTheOldVersionOnPostgres() throws Exception {
+        Chain first = reviewed(4, List.of());
+        as(first.owner(), () -> actions.act(first.materialId(), "accept"));
+        freeTheIngestionLane();
+        UUID oldPassage = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1")
+                .param(first.versionId()).query(UUID.class).single();
+
+        Chain second = reviewed(completed(first.owner(), pdf(MIB + 3),
+                Uploads.Details.replacing(first.materialId().toString())), 4, List.of());
+
+        assertThat(second.materialId()).isEqualTo(first.materialId());
+        assertThat(state(first.versionId())).isEqualTo("ready");
+        Materials.Material reviewing = as(first.owner(), () -> materials.find(first.materialId())).orElseThrow();
+        assertThat(reviewing.state()).isEqualTo("needs_review");
+        assertThat(reviewing.serving()).isEqualTo(new Materials.Serving(4, (long) MIB));
+        assertThat(as(first.owner(), () -> materials.passage(oldPassage))).isPresent();
+
+        // The accept's JPQL versionsOf finds the old version and supersedes it.
+        Materials.Material accepted = as(first.owner(), () -> actions.act(first.materialId(), "accept")).orElseThrow();
+
+        assertThat(accepted.state()).isEqualTo("ready");
+        assertThat(accepted.serving()).isNull();
+        assertThat(accepted.actions()).containsExactly("reprocess");
+        assertThat(state(second.versionId())).isEqualTo("ready");
+        assertThat(state(first.versionId())).isEqualTo("superseded");
+        assertThat(jdbc.sql("select count(*) from material_version where material_id = ? and state = 'ready'")
+                .param(first.materialId()).query(Long.class).single()).isOne();
+        // The superseded version keeps its passages (part B removes them), and none is read as the material's.
+        assertThat(jdbc.sql("select count(*) from passage where version_id = ?").param(first.versionId())
+                .query(Long.class).single()).isPositive();
+        assertThat(as(first.owner(), () -> materials.passage(oldPassage))).isEmpty();
+    }
+
+    @Test
+    void reprocessingAnAcceptedVersionCopiesItsOriginalUnderANewFileIdOnPostgres() throws Exception {
+        Chain chain = reviewed(4, List.of());
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+        freeTheIngestionLane();
+        Map<String, Object> original = jdbc.sql("select file_id, size_bytes, piece_count from version_file"
+                + " where version_id = ? and role = 'original'").param(chain.versionId()).query().singleRow();
+        UUID originalFile = (UUID) original.get("file_id");
+        List<Map<String, Object>> filesBefore = jdbc.sql("select * from version_file where version_id = ? order by id")
+                .param(chain.versionId()).query().listOfRows();
+        Map<String, Object> versionBefore = jdbc.sql("select * from material_version where id = ?")
+                .param(chain.versionId()).query().singleRow();
+        long passagesBefore = jdbc.sql("select count(*) from passage where version_id = ?").param(chain.versionId())
+                .query(Long.class).single();
+
+        Materials.Material reprocessed = as(chain.owner(), () -> actions.act(chain.materialId(), "reprocess"))
+                .orElseThrow();
+
+        assertThat(reprocessed.state()).isEqualTo("waiting");
+        assertThat(reprocessed.serving()).isEqualTo(new Materials.Serving(4, (long) MIB));
+        UUID fresh = jdbc.sql("select id from material_version where material_id = ? and id <> ?")
+                .params(chain.materialId(), chain.versionId()).query(UUID.class).single();
+        assertThat(jdbc.sql("select state, format, page_total, pipeline_version from material_version where id = ?")
+                .param(fresh).query().singleRow()).containsEntry("state", "waiting").containsEntry("format", "pdf")
+                .containsEntry("page_total", 4).containsEntry("pipeline_version", null);
+        Map<String, Object> copy = jdbc.sql("select file_id, size_bytes, piece_count from version_file"
+                + " where version_id = ? and role = 'original'").param(fresh).query().singleRow();
+        UUID copied = (UUID) copy.get("file_id");
+        assertThat(copied).isNotEqualTo(originalFile);
+        assertThat(copy.get("size_bytes")).isEqualTo(original.get("size_bytes"));
+        int pieces = (Integer) original.get("piece_count");
+        assertThat(readBack(chain.owner(), copied, pieces)).isEqualTo(readBack(chain.owner(), originalFile, pieces));
+        assertThat(jdbc.sql("select stage, input_file_id from ingestion_step where version_id = ?").param(fresh)
+                .query().singleRow()).containsEntry("stage", "clean").containsEntry("input_file_id", copied);
+        // The accepted version is not changed in any way.
+        assertThat(jdbc.sql("select * from material_version where id = ?").param(chain.versionId()).query()
+                .singleRow()).isEqualTo(versionBefore);
+        assertThat(jdbc.sql("select * from version_file where version_id = ? order by id").param(chain.versionId())
+                .query().listOfRows()).isEqualTo(filesBefore);
+        assertThat(jdbc.sql("select count(*) from passage where version_id = ?").param(chain.versionId())
+                .query(Long.class).single()).isEqualTo(passagesBefore);
+        assertThatThrownBy(() -> as(chain.owner(), () -> actions.act(chain.materialId(), "reprocess")))
+                .isInstanceOfSatisfying(ApiException.class, refused -> assertThat(refused.problem().code())
+                        .isEqualTo("material.action_unavailable"));
+    }
+
     @Test
     void aDiscardLeavesNoRowOrFileOfItsVersionAndTheSweepFinishesAnInterruptedOneOnPostgres() throws Exception {
         Chain chain = reviewed(3, List.of(3));
@@ -1185,7 +1268,11 @@ class IngestionIntegrationTest {
      * unreadable, then its passages: it needs review.
      */
     private Chain reviewed(int total, List<Integer> unreadable) throws Exception {
-        Chain chain = completed(pdf(MIB));
+        return reviewed(completed(pdf(MIB)), total, unreadable);
+    }
+
+    /** {@link #reviewed(int, List)} for a chain already completed (Story 3.4: a replacement's). */
+    private Chain reviewed(Chain chain, int total, List<Integer> unreadable) throws Exception {
         JobClaims.Claim clean = claims.claim(chain.jobId());
         JobFiles.Stored original = store(chain, clean, pdf(4000));
         JobFiles.Stored batch = store(chain, clean, pdf(3000));
@@ -1333,8 +1420,12 @@ class IngestionIntegrationTest {
     // --- helpers
 
     private Chain completed(byte[] content) throws Exception {
-        UUID owner = Ids.newId();
-        UUID id = as(owner, () -> uploads.create(content.length, "Livro.pdf")).uploadId();
+        return completed(Ids.newId(), content, Uploads.Details.NONE);
+    }
+
+    /** A completed PDF of {@code owner}, with these details (Story 3.4: a replacement names its material). */
+    private Chain completed(UUID owner, byte[] content, Uploads.Details details) throws Exception {
+        UUID id = as(owner, () -> uploads.create(content.length, "Livro.pdf", details)).uploadId();
         for (int offset = 0; offset < content.length; offset += 4 * MIB) {
             byte[] part = java.util.Arrays.copyOfRange(content, offset, Math.min(content.length, offset + 4 * MIB));
             long start = offset;

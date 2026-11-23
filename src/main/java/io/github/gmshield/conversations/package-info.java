@@ -4,7 +4,9 @@
  * answer events of each turn, stored encrypted in numbered batches as the worker posts them and relayed to the GM as
  * server-sent events. Every table is a library table (owner column, Hibernate {@code @TenantId}, JPA and JPQL only,
  * content encrypted through {@code vault}); what a turn may read comes from {@code scope} only. Another owner's item is
- * "not found", exactly like an unknown one.
+ * "not found", exactly like an unknown one. From Story 3.1 part B, {@code service.SystemConversationsDeletion} is this
+ * module's part of a system's deletion ({@code library.service.SystemDeletionHandler}): the conversations of its
+ * campaigns, their answer jobs cancelled first.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Conversations",
         allowedDependencies = {"shared :: service", "jobs :: service", "scope :: service", "library :: service",

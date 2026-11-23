@@ -2,6 +2,8 @@ package io.github.gmshield.materials.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.materials.service.MaterialActions;
+import io.github.gmshield.materials.service.MaterialBelongings;
+import io.github.gmshield.materials.service.MaterialDeletions;
 import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.materials.service.PageProblems;
 import io.github.gmshield.shared.service.ApiException;
@@ -26,22 +28,34 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The owner's materials (Story 1.14): a list by the state of each material's newest version, and one material. The
+ * The owner's materials (Story 1.14): a list by the state of each material's current version, and one material. The
  * owner is the session's account, set by the request edge ({@code accounts.web}) before any of these runs; nothing
  * here takes an owner from the request. Another owner's id, an unknown id and a malformed id are the same
  * {@code request.not_found} (404). Every answer is {@code no-store}. From Story 1.19, one page of a material on a
  * ground ({@code ?ground=review}: the owner reviewing its current version), as JSON, and its picture, streamed as
  * WebP; a missing or unknown ground is {@code page.ground_unknown} (400). From Story 1.20, the quality report of a
- * material's newest version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
+ * material's current version, and the GM's four actions on it ({@code accept}, {@code reprocess}, {@code retry},
  * {@code discard}), each answering the material; an action its state does not allow is
- * {@code material.action_unavailable} (409).
+ * {@code material.action_unavailable} (409). From Story 3.1 the list takes {@code ?system=}: only the materials of that
+ * system, attached to it or to one of its campaigns; a system that is not the owner's is {@code request.not_found}.
+ * From Story 3.3 a material carries its version, size and where it belongs; the list takes every state when none is
+ * given; and {@code PATCH} changes where a material belongs ({@link MaterialBelongings}). From Story 3.4 a material
+ * has versions: everything here reads its current version (the newest one that is not discarded), a ready material may
+ * be reprocessed as a new version, and {@code serving} names the ready version that keeps serving meanwhile. From
+ * Story 3.4 part B a material names its superseded versions ({@code superseded}); {@code DELETE} deletes a material
+ * and {@code DELETE .../versions/{versionId}} removes a superseded version, each a recorded deletion that answers 202
+ * and runs in the background ({@link MaterialDeletions}); {@code GET .../deletion} counts what a material's deletion
+ * takes.
  */
 @RestController
 @Tag(name = "materials")
@@ -56,20 +70,29 @@ class MaterialController {
     static final String REPROCESS = "/api/v1/materials/{id}/reprocess";
     static final String RETRY = "/api/v1/materials/{id}/retry";
     static final String DISCARD = "/api/v1/materials/{id}/discard";
+    static final String DELETION = "/api/v1/materials/{id}/deletion";
+    static final String VERSION = "/api/v1/materials/{id}/versions/{versionId}";
     static final String WEBP = "image/webp";
     /** A page number as text: 1 to 9,999,999, never a sign or a leading zero; anything else is a page nowhere. */
     private static final Pattern PAGE_NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
+    /** A page's position: 0, or up to six digits with no leading zero. */
+    private static final Pattern OFFSET = Pattern.compile("0|[1-9][0-9]{0,5}");
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
 
     private final Materials materials;
     private final MaterialActions actions;
+    private final MaterialBelongings belongings;
+    private final MaterialDeletions deletions;
 
-    MaterialController(Materials materials, MaterialActions actions) {
+    MaterialController(Materials materials, MaterialActions actions, MaterialBelongings belongings,
+                       MaterialDeletions deletions) {
         this.materials = materials;
         this.actions = actions;
+        this.belongings = belongings;
+        this.deletions = deletions;
     }
 
     @Schema(name = "MaterialUpload", requiredProperties = {"id", "offset", "length", "expiresAt"})
@@ -163,13 +186,96 @@ class MaterialController {
         }
     }
 
+    @Schema(name = "MaterialPlace", requiredProperties = {"id", "name"})
+    record PlaceView(
+            @Schema(description = "The system's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000001")
+            String id,
+            @Schema(description = "The system's name", example = "D&D 5e") String name) {
+
+        static PlaceView of(Materials.Place place) {
+            return new PlaceView(place.id().toString(), place.name());
+        }
+
+        @Override
+        public String toString() {
+            return "PlaceView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "MaterialCampaign", requiredProperties = {"id", "name", "system"})
+    record CampaignPlaceView(
+            @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
+            String id,
+            @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
+            @Schema(description = "The campaign's system") PlaceView system) {
+
+        static CampaignPlaceView of(Materials.CampaignPlace campaign) {
+            return new CampaignPlaceView(campaign.id().toString(), campaign.name(), PlaceView.of(campaign.system()));
+        }
+
+        @Override
+        public String toString() {
+            return "CampaignPlaceView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "MaterialBelonging", requiredProperties = {"campaign", "systems"}, description = "Where the"
+            + " material belongs (contract 1.21.0): one campaign, or one or more systems; both empty for a material"
+            + " uploaded with no place. Only places that are not being deleted are named")
+    record BelongingView(
+            @Schema(description = "The campaign it belongs to; null when it belongs to systems or to nothing",
+                    types = {"object", "null"}, implementation = CampaignPlaceView.class) CampaignPlaceView campaign,
+            @ArraySchema(arraySchema = @Schema(description = "The systems it belongs to, oldest attachment first; empty"
+                    + " when it belongs to a campaign or to nothing"),
+                    schema = @Schema(implementation = PlaceView.class)) List<PlaceView> systems) {
+
+        static BelongingView of(Materials.Belonging belonging) {
+            return new BelongingView(belonging.campaign() == null ? null : CampaignPlaceView.of(belonging.campaign()),
+                    belonging.systems().stream().map(PlaceView::of).toList());
+        }
+    }
+
+    @Schema(name = "MaterialServing", requiredProperties = {"pages", "size"}, description = "The material's ready"
+            + " version, which keeps serving every scope while a newer version is processed (contract 1.23.0)")
+    record ServingView(
+            @Schema(description = "Its page total; null when not known", types = {"integer", "null"}, format = "int32",
+                    example = "320") Integer pages,
+            @Schema(description = "Its size in bytes; null when not known", types = {"integer", "null"},
+                    format = "int64", example = "134217728") Long size) {
+
+        static ServingView of(Materials.Serving serving) {
+            return serving == null ? null : new ServingView(serving.pages(), serving.size());
+        }
+    }
+
+    @Schema(name = "MaterialSuperseded", requiredProperties = {"id", "createdAt", "pages", "size"},
+            description = "A superseded version of the material, which the GM may remove (contract 1.24.0)")
+    record SupersededView(
+            @Schema(description = "The version's id: DELETE /api/v1/materials/{id}/versions/{versionId} removes it",
+                    format = "uuid", example = "0190a0b0-0000-7000-8000-00000000000a") String id,
+            @Schema(description = "When the version was uploaded", format = "date-time",
+                    example = "2026-11-10T14:00:00Z") String createdAt,
+            @Schema(description = "Its page total; null when not known", types = {"integer", "null"}, format = "int32",
+                    example = "320") Integer pages,
+            @Schema(description = "Its size in bytes; null when not known", types = {"integer", "null"},
+                    format = "int64", example = "134217728") Long size) {
+
+        static SupersededView of(Materials.Superseded version) {
+            return new SupersededView(version.id().toString(), version.createdAt().toString(), version.pages(),
+                    version.size());
+        }
+    }
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions"})
+    @Schema(name = "Material", requiredProperties = {"id", "name", "state", "actions", "version", "belonging",
+        "serving", "superseded"})
     record MaterialView(
             @Schema(description = "The material's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
             @Schema(description = "The material's name", example = "Livro do Jogador.pdf") String name,
-            @Schema(description = "The state of the material's newest version", example = "waiting",
+            @Schema(description = "The state of the material's current version: its newest version that is not"
+                    + " discarded, or its newest one when every version is discarded (contract 1.23.0)",
+                    example = "waiting",
                     allowableValues = {"uploading", "waiting", "processing", "needs_review", "ready", "superseded",
                         "failed", "discarded"}) String state,
             @Schema(description = "What the material is, when the GM said", example = "rulebook",
@@ -178,20 +284,36 @@ class MaterialController {
             @Schema(description = "Pages done of the total, once the total is known") PagesView pages,
             @Schema(description = "Why the version failed (category.reason), only when the state is failed",
                     example = "ingestion.password_required") String failure,
-            @ArraySchema(arraySchema = @Schema(description = "The actions the newest version allows now, in this"
+            @ArraySchema(arraySchema = @Schema(description = "The actions the current version allows now, in this"
                     + " order: accept and discard while it needs review, reprocess too when a page is unreadable;"
-                    + " retry (when it can start again) and discard while it is failed; none otherwise"),
+                    + " retry (when it can start again) and discard while it is failed; reprocess while it is ready"
+                    + " (contract 1.23.0: a new version, read from its cleaned original); none otherwise"),
                     schema = @Schema(type = "string", allowableValues = {"accept", "reprocess", "retry", "discard"}))
             List<String> actions,
             @Schema(description = "The image set still uploading (Story 1.21), only while the state is uploading;"
-                    + " upload is then absent") ImageSetView imageSet) {
+                    + " upload is then absent") ImageSetView imageSet,
+            @Schema(description = "The material's version: a change of where it belongs names it and raises it by one"
+                    + " (contract 1.21.0)", format = "int64", example = "0") long version,
+            @Schema(description = "The current version's size in bytes, once known (contract 1.21.0)", format = "int64",
+                    example = "134217728") Long size,
+            @JsonInclude(JsonInclude.Include.ALWAYS)
+            @Schema(description = "Where the material belongs (contract 1.21.0)") BelongingView belonging,
+            @JsonInclude(JsonInclude.Include.ALWAYS)
+            @Schema(description = "The ready version that keeps serving while the current version is another one"
+                    + " (a replacement or a reprocess on its way); null otherwise (contract 1.23.0)",
+                    types = {"object", "null"}, implementation = ServingView.class) ServingView serving,
+            @ArraySchema(arraySchema = @Schema(description = "The material's superseded versions, newest first; a"
+                    + " version whose removal is recorded is left out; empty when there is none (contract 1.24.0)"),
+                    schema = @Schema(implementation = SupersededView.class)) List<SupersededView> superseded) {
 
         static MaterialView of(Materials.Material material) {
             return new MaterialView(material.id().toString(), material.name(), material.state(), material.kind(),
                     material.upload() == null ? null : UploadView.of(material.upload()),
                     material.pages() == null ? null : PagesView.of(material.pages()),
                     material.failure(), material.actions(),
-                    material.imageSet() == null ? null : ImageSetView.of(material.imageSet()));
+                    material.imageSet() == null ? null : ImageSetView.of(material.imageSet()), material.version(),
+                    material.size(), BelongingView.of(material.belonging()), ServingView.of(material.serving()),
+                    material.superseded().stream().map(SupersededView::of).toList());
         }
 
         @Override
@@ -201,22 +323,31 @@ class MaterialController {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "MaterialPage", requiredProperties = "items")
+    @Schema(name = "MaterialPage", requiredProperties = {"items", "total"})
     record PageView(
             @ArraySchema(schema = @Schema(implementation = MaterialView.class)) List<MaterialView> items,
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
-                    example = "0190a0b0-0000-7000-8000-000000000003") String nextCursor) {
+                    example = "0190a0b0-0000-7000-8000-000000000003") String nextCursor,
+            @Schema(description = "How many materials the list has in all for the same states and system, whatever the"
+                    + " page; it counts a material whose every place is being deleted until that deletion is done",
+                    format = "int64", example = "61") long total) {
     }
 
     @GetMapping(path = MATERIALS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "listMaterials", summary = "The account's materials whose newest version is in one of the"
-            + " given states, newest first, with the upload's progress on those still uploading. request.invalid (400)"
-            + " without a state, for an unknown state, a limit outside 1 to 50 or a malformed cursor;" + SESSION_SUMMARY,
+    @Operation(operationId = "listMaterials", summary = "The account's materials whose current version is in one of the"
+            + " given states (every material without a state), newest first, with the upload's progress on those still"
+            + " uploading; with system, only those attached to that system or to one of its campaigns. A material whose"
+            + " every place is being deleted is left out, so a page may hold fewer than the limit. A page starts after a"
+            + " cursor or at an offset (a numbered page), and names the total of the list. request.invalid (400)"
+            + " for an unknown state, a limit outside 1 to 50, a malformed cursor, an offset outside 0 to 100000 or a"
+            + " cursor together with an offset above 0; request.not_found (404) for a system"
+            + " that is not the account's (unknown, another account's or malformed);" + SESSION_SUMMARY,
             parameters = {
                 @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
                         schema = @Schema(type = "string")),
-                @Parameter(name = "state", in = ParameterIn.QUERY, required = true,
-                        description = "A state of the newest version; repeat it for several",
+                @Parameter(name = "state", in = ParameterIn.QUERY,
+                        description = "A state of the current version; repeat it for several; absent: every state"
+                                + " (contract 1.21.0)",
                         array = @ArraySchema(minItems = 1, schema = @Schema(type = "string",
                                 allowableValues = {"uploading", "waiting", "processing", "needs_review", "ready",
                                     "superseded", "failed", "discarded"}))),
@@ -225,32 +356,43 @@ class MaterialController {
                                 defaultValue = "20")),
                 @Parameter(name = "cursor", in = ParameterIn.QUERY,
                         description = "The nextCursor of the previous page", schema = @Schema(type = "string",
-                                format = "uuid"))})
+                                format = "uuid")),
+                @Parameter(name = "system", in = ParameterIn.QUERY, description = "Only the materials of this system"
+                        + " (Story 3.1): attached to it or to one of its campaigns", schema = @Schema(type = "string",
+                                format = "uuid")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the newest to skip, 0 to"
+                        + " 100000, for a numbered page; not together with cursor",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
     ResponseEntity<PageView> list(@Parameter(hidden = true) @RequestParam(value = "state", required = false) List<String> states,
                                   @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
-                                  @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor) {
-        if (states == null || states.isEmpty() || !Materials.STATES.containsAll(states)) {
+                                  @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+                                  @Parameter(hidden = true) @RequestParam(value = "system", required = false) String system,
+                                  @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        if (states != null && (states.isEmpty() || !Materials.STATES.containsAll(states))) {
             throw invalid();
         }
-        int size = Materials.DEFAULT_LIMIT;
-        if (limit != null) {
-            if (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Materials.MAX_LIMIT) {
-                throw invalid();
-            }
-            size = Integer.parseInt(limit);
+        if (limit != null && (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Materials.MAX_LIMIT)) {
+            throw invalid();
         }
-        UUID after = null;
-        if (cursor != null) {
-            after = parse(cursor).orElseThrow(MaterialController::invalid);
+        int size = limit == null ? Materials.DEFAULT_LIMIT : Integer.parseInt(limit);
+        UUID after = cursor == null ? null : parse(cursor).orElseThrow(MaterialController::invalid);
+        // A page starts after a cursor or at a position, never both.
+        if (offset != null && (!OFFSET.matcher(offset).matches() || Integer.parseInt(offset) > Materials.MAX_OFFSET
+                || (after != null && Integer.parseInt(offset) > 0))) {
+            throw invalid();
         }
-        Materials.Page page = materials.list(states, after, size);
+        int from = offset == null ? 0 : Integer.parseInt(offset);
+        Materials.Page page = system == null ? materials.list(states, after, from, size)
+                : parse(system).flatMap(id -> materials.listOfSystem(states, id, after, from, size))
+                        .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(new PageView(page.items().stream().map(MaterialView::of).toList(),
-                        page.nextCursor() == null ? null : page.nextCursor().toString()));
+                        page.nextCursor() == null ? null : page.nextCursor().toString(), page.total()));
     }
 
     @GetMapping(path = MATERIAL, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "getMaterial", summary = "One of the account's materials, with the state of its newest"
+    @Operation(operationId = "getMaterial", summary = "One of the account's materials, with the state of its current"
             + " version. request.not_found (404) for any other id;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -258,6 +400,58 @@ class MaterialController {
             @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id) {
         return parse(id).flatMap(materials::find).map(MaterialView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    @Schema(name = "MaterialBelongingChange", description = "Exactly one of campaign and systems")
+    record BelongingBody(
+            @Schema(description = "One of the account's campaigns (archived or not)", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000002") String campaign,
+            @ArraySchema(minItems = 1, maxItems = 100, arraySchema = @Schema(description = "One to 100 of the account's"
+                    + " systems, at most 100 ids as sent; a repeated id is stored once"),
+                    schema = @Schema(type = "string", format = "uuid")) List<String> systems) {
+
+        @Override
+        public String toString() {
+            return "BelongingBody[]";
+        }
+    }
+
+    @Schema(name = "MaterialChange", requiredProperties = {"version", "belonging"})
+    record MaterialChangeBody(
+            @Schema(description = "The version the change was made on, as the material was read", format = "int64",
+                    minimum = "0", example = "0") Long version,
+            @Schema(description = "Where the material belongs from now on") BelongingBody belonging) {
+
+        @Override
+        public String toString() {
+            return "MaterialChangeBody[version=" + version + "]";
+        }
+    }
+
+    @PatchMapping(path = MATERIAL, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "changeMaterial", summary = "Changes where one of the account's materials belongs, on the"
+            + " version it names (contract 1.21.0): one campaign, or one to 100 systems. It applies from the next"
+            + " question; nothing is processed again. Answers the material as stored, its version raised by one."
+            + " request.stale_version (409) when the material has left that version; material.belonging_invalid (400)"
+            + " for both campaign and systems, neither, an empty or over-long list, or a campaign or system that is not"
+            + " the account's (unknown, another account's, malformed or being deleted); request.invalid (400) without a"
+            + " version or for a malformed body; request.not_found (404) for any other material id, one whose every"
+            + " place is being deleted included; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<MaterialView> change(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @RequestBody MaterialChangeBody body) {
+        UUID materialId = parse(id).orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+        if (body == null || body.version() == null || body.version() < 0) {
+            throw invalid();
+        }
+        BelongingBody belonging = body.belonging() == null ? new BelongingBody(null, null) : body.belonging();
+        return belongings.change(materialId, body.version(), belonging.campaign(), belonging.systems())
+                .map(MaterialView::of)
                 .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
                 .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
     }
@@ -450,7 +644,7 @@ class MaterialController {
 
     @GetMapping(path = REPORT, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getMaterialReport", summary = "The quality report of one of the account's materials:"
-            + " its newest version's outline, unreadable pages and warnings, while that version needs review or is"
+            + " its current version's outline, unreadable pages and warnings, while that version needs review or is"
             + " ready (the counts are the material's pages). request.not_found (404) for another owner's material,"
             + " an unknown or malformed id, or a version in any other state;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
@@ -464,13 +658,13 @@ class MaterialController {
     }
 
     private static final String ACTION_SUMMARY = " Takes no body and answers the material."
-            + " material.action_unavailable (409) when the newest version's state does not allow it now (see the"
+            + " material.action_unavailable (409) when the current version's state does not allow it now (see the"
             + " material's actions); request.not_found (404) for another owner's material or an unknown or malformed"
             + " id, and nothing changes;" + SESSION_SUMMARY;
     private static final String SESSION_HEADER = "X-Session-Token";
 
     @PostMapping(path = ACCEPT, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "acceptMaterial", summary = "Accepts the newest version of one of the account's materials:"
+    @Operation(operationId = "acceptMaterial", summary = "Accepts the current version of one of the account's materials:"
             + " needs_review becomes ready, and a ready version of it before becomes superseded." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -481,10 +675,13 @@ class MaterialController {
     }
 
     @PostMapping(path = REPROCESS, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "reprocessMaterial", summary = "Reads again the unreadable pages of the newest version of"
+    @Operation(operationId = "reprocessMaterial", summary = "Reads again the unreadable pages of the current version of"
             + " one of the account's materials, which needs review: it becomes processing, and needs review again"
             + " once they are read. ingestion.too_many_steps (409) when the new steps would pass the version's step"
-            + " cap." + ACTION_SUMMARY,
+            + " cap. From contract 1.23.0, on a ready material: a new version, waiting, read from a copy of the ready"
+            + " version's cleaned original, which keeps serving unchanged until the new one is accepted;"
+            + " material.version_in_progress (409) while another version is on its way; request.not_found (404) also"
+            + " for a material whose every place is being deleted." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<MaterialView> reprocess(
@@ -494,7 +691,7 @@ class MaterialController {
     }
 
     @PostMapping(path = RETRY, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "retryMaterial", summary = "Starts again the failed newest version of one of the account's"
+    @Operation(operationId = "retryMaterial", summary = "Starts again the failed current version of one of the account's"
             + " materials, from its cleaned original or its uploaded file: it becomes processing."
             + " ingestion.too_many_steps (409) when a new step would pass the version's step cap." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
@@ -506,15 +703,88 @@ class MaterialController {
     }
 
     @PostMapping(path = DISCARD, produces = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(operationId = "discardMaterial", summary = "Discards the newest version of one of the account's"
+    @Operation(operationId = "discardMaterial", summary = "Discards the current version of one of the account's"
             + " materials, which needs review or failed: it becomes discarded, and its pages, passages, outline and"
-            + " files are removed (a removal that resumes after a restart)." + ACTION_SUMMARY,
+            + " files are removed (a removal that resumes after a restart); a ready version of it before stays the"
+            + " material's (contract 1.23.0)." + ACTION_SUMMARY,
             parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<MaterialView> discard(
             @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id) {
         return act(id, Materials.DISCARD);
+    }
+
+    @Schema(name = "MaterialDeletion", requiredProperties = {"versions", "pages"}, description = "What goes with a"
+            + " material if it is deleted (contract 1.24.0)")
+    record DeletionView(
+            @Schema(description = "Its versions that are not discarded", format = "int64", example = "2") long versions,
+            @Schema(description = "The sum of those versions' page totals (a total not known counts 0)",
+                    format = "int64", example = "640") long pages) {
+
+        static DeletionView of(MaterialDeletions.Count count) {
+            return new DeletionView(count.versions(), count.pages());
+        }
+    }
+
+    @GetMapping(path = DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getMaterialDeletion", summary = "What goes with one of the account's materials if it is"
+            + " deleted (contract 1.24.0): how many of its versions are not discarded, and their pages."
+            + " request.not_found (404) for another owner's material, an unknown or malformed id, one whose every"
+            + " place is being deleted, or one whose deletion is recorded already;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<DeletionView> deletion(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        return parse(id).flatMap(deletions::count).map(DeletionView::of)
+                .map(view -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(view))
+                .orElseThrow(() -> new ApiException(ApiProblem.forStatus(404)));
+    }
+
+    @DeleteMapping(path = MATERIAL)
+    @Operation(operationId = "deleteMaterial", summary = "Deletes one of the account's materials with every version"
+            + " (contract 1.24.0; 202, no body): from now on it is gone from every list and count, and its passages from"
+            + " every scope; its pages, passages, files, index points and rows are removed in the background. A"
+            + " reference an answer stored reads as a removed source. A material already being deleted is answered the"
+            + " same, and nothing changes. Cannot be undone. request.not_found (404) for another owner's material, an"
+            + " unknown or malformed id, or one whose every place is being deleted;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion is recorded"))
+    ResponseEntity<Void> delete(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id) {
+        if (!parse(id).map(deletions::delete).orElse(false)) {
+            throw new ApiException(ApiProblem.forStatus(404));
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = VERSION)
+    @Operation(operationId = "removeMaterialVersion", summary = "Removes a superseded version of one of the account's"
+            + " materials (contract 1.24.0; 202, no body): from now on it is gone from the material's superseded"
+            + " versions, and its pages, passages, files, index points and row are removed in the background; the"
+            + " material and its other versions stay. A reference an answer stored to it reads as a removed source and"
+            + " its page is not found. A version whose removal is recorded already is answered the same."
+            + " material.version_not_removable (409) for a version in any other state (ready, in progress or"
+            + " discarded); request.not_found (404) for another owner's material or version, a version of another"
+            + " material, an unknown or malformed id, or a material whose every place is being deleted or whose deletion"
+            + " is recorded already; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION_HEADER, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The removal is recorded"))
+    ResponseEntity<Void> removeVersion(
+            @Parameter(description = "The material's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(description = "The version's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("versionId") String versionId) {
+        Optional<UUID> material = parse(id);
+        Optional<UUID> version = parse(versionId);
+        if (material.isEmpty() || version.isEmpty() || !deletions.removeVersion(material.get(), version.get())) {
+            throw new ApiException(ApiProblem.forStatus(404));
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 
     private ResponseEntity<MaterialView> act(String id, String action) {

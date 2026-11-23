@@ -191,9 +191,195 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     sem nome" / "Primeira campanha", or "Untitled system" / "First campaign". A failure leaves neither and
     keeps the attempt for a retry with the same account id. The vault's data-key insert commits in its own
     transaction (`REQUIRES_NEW`, on its own connection), because a stored key is cached at once.
-  - `GET /api/v1/campaigns/current` (the owner's oldest campaign, with its system), `GET
+  - `GET /api/v1/campaigns/current` (the owner's current campaign, with its system: Story 3.2, below), `GET
     /api/v1/campaigns/{id}` and `GET /api/v1/systems/{id}`: another owner's id, an unknown id and a
     malformed id all answer the same `request.not_found` (404). Every answer is `no-store`.
+  - **The cross-owner audit (Story 3.13 part C).** `CrossOwnerAuditFlowTest` (unit flow, in-memory stores, part of
+    `./gradlew check`) gives account A one item of every library kind (system, campaign and its scope settings, an
+    ingested and accepted material with a superseded version, pages and pictures, an image set and its open uploads,
+    conversations with a bookmarked, a dismissed and a waiting turn and a reference, a search). Account B then calls
+    every public route that names an item by id with A's ids: each answer is `request.not_found` (404) with the same
+    body as a random id (the trace id aside), also with B's own campaign or material beside A's version. Each body or
+    header field that names an item (`campaignId`, `systemId`, `conversationId`, a search's `materialId`,
+    `materialsOff`, a material's `belonging`, upload metadata and image-set `campaign`, `system`, `systems` and
+    `material`, the `?system=` filters) answers exactly what a random id gets. Afterwards no in-memory row, job or
+    offered message has changed, A reads every item back as it was, and B's lists hold none of A's ids.
+    `CrossOwnerRouteGuardTest` reads `/v3/api-docs/public`: an operation whose path has a `{…}` parameter that is
+    neither a row of the audit nor in its exemption list (with a reason) fails, naming its method and path, and so
+    does a path outside `LibraryOwnerFilter.LIBRARY_ROUTES` that is not in its short list of session and sign-in
+    paths; each covered operation is also refused with `session.required` without a session. A new route therefore
+    ships with its row in the audit. The audit runs on the in-memory twins of the stores; PostgreSQL's owner
+    filtering is covered by the integration tests of the library, uploads and materials.
+  - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
+    (deleting one is part B, below). A system is `{id, name, edition, description, version}`; `edition` and `description`
+    are null when none was given.
+    - Fields, counted in code points after trimming: name 1 to 120 (`request.system_name_invalid`, 400, params `min`
+      and `max`), edition at most 60 (`request.system_edition_invalid`, params `max`), description at most 2,000
+      (`request.system_description_invalid`, params `max`); a blank edition or description is none. Each is stored
+      only encrypted, under its own field: `Binding("system", "name"|"edition"|"description", id, owner)`. Logs carry
+      ids and the version only (`library.system_created`, `library.system_changed`).
+    - Two systems of one owner are the same when name and edition match (Dalton, 2026-11-20): `name_fingerprint` is
+      the fingerprint of the name's unique form alone when there is no edition (what every starter system already
+      stores, so no row is rewritten), else of `uniqueForm(name) + U+0000 + uniqueForm(edition)`, recomputed on every
+      edit. "D&D" 5.2.1 and "D&D" 2024 are two systems; "D&D" with no edition twice is not. A duplicate is
+      `request.system_name_taken` (409): the service checks the fingerprint first, and a write that the key
+      `system_owner_name_fingerprint_key` refuses anyway is the same 409 (the store turns it into a
+      `LibraryConflict`, never the database's message).
+    - `GET /api/v1/systems?cursor&limit`: `items` and `nextCursor`, newest first by id (encrypted names cannot be
+      sorted in SQL), `limit` 1 to 50 (default 20); a bad limit or cursor is `request.invalid` (400). `POST
+      /api/v1/systems` `{name, edition?, description?}` answers 201 with the system. `GET /api/v1/systems/{id}` answers
+      every field.
+    - `PATCH /api/v1/systems/{id}` `{version, name?, edition?, description?}`: an absent or null field is unchanged,
+      a blank edition or description removes it. `version` is the row's (`system.version`, Hibernate `@Version`,
+      starting at 0): one that is not the row's is `request.stale_version` (409) and changes nothing, as is an update
+      that a concurrent edit beats at the database. It answers the system with its version raised by one. A missing or
+      negative version is `request.invalid`.
+    - `GET /api/v1/campaigns?system=&cursor&limit`: the system's campaigns, newest first (from Story 3.2 `system` is
+      optional, below). `GET /api/v1/materials?state=...&system=` (`materials`) keeps only the materials
+      attached to the system (`material_system`) or whose campaign is one of its campaigns
+      (`Library.campaignIdsOf`). An unknown, foreign or malformed id answers `request.not_found` (404) on GET, PATCH
+      and in `?system=` alike.
+    - `V21__system_details.sql` adds `system.edition bytea`, `system.description bytea` and `system.version bigint not
+      null default 0`. Additive: the previous release neither reads nor writes them, so rolling back is safe. What
+      users see after a rollback: two editions of one game show as two systems with the same name, descriptions are
+      not shown. (The old release has no route that creates a system, so it cannot add a same-name system without an
+      edition; only a new account's starter system is created there.)
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.17.0). The worker does
+      not change.
+  - **Delete a system (Story 3.1 part B, public contract 1.18.0, migration V22, AD-22).** A recorded process that
+    resumes after a restart (`library.service.SystemDeletion`). What goes: the system, its campaigns, their
+    conversations, and every material attached to one of its campaigns or to this system and no other. A material also
+    attached to another system stays and only loses this attachment. Deleting the system that holds the GM's only
+    campaign is allowed: there is then no current campaign (`GET /api/v1/campaigns/current` is 404). No undo.
+    - `GET /api/v1/systems/{id}/deletion` answers `{campaigns, conversations, materials}`, what the confirmation
+      dialog names; each module counts its own part (materials: those that go whose newest version is not discarded).
+    - `DELETE /api/v1/systems/{id}` answers 202 with no body. In one transaction: `system.state` becomes `deleting`
+      (and `name_fingerprint` becomes the system's id, so the name and edition are free at once); each module's
+      `SystemDeletionHandler.prepare` cancels the jobs of what goes (ingestion steps and index changes of its
+      materials' versions, the `question.answer` jobs of its campaigns' turns), after locking them and reading when
+      their claims lapse (`Jobs.claimLapse`), and every version of a material that goes becomes `discarded`, so it
+      leaves every list and scope at once; a `deletion` row records owner, kind `system`, target and `not_before`
+      (the latest claim lapse, or now).
+    - From that commit the system and its campaigns are `request.not_found` everywhere: the system list, GET, PATCH,
+      DELETE and `/deletion`, `?system=`, `GET /api/v1/campaigns/{id}`, the current campaign and every question and
+      conversation read that goes through it. Another owner's system is the same 404 on both routes.
+    - Removal runs at `not_before` (an index change already running may write points until its claim lapses, at most
+      `GMSHIELD_JOB_CLAIM_LAPSE` after its last renewal): a one-shot pass scheduled after the commit, and
+      `SystemDeletion.sweep` at the start and every `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` (10 min) for whatever is
+      due, each pass as the owner (`OwnerContext.callAs`). A pass collects what goes again and prepares it again (an
+      upload that completed during the wait, a question asked as the system went); when that cancels a running job,
+      `not_before` moves and the pass stops. Then `materials` starts one `index.removal` per version unless it has one
+      (the version locked, so never two), runs the discard's `VersionRemoval`, removes the pieces of its files and
+      uploads, then every row of the version (page views, passages, outline, page ranges, `version_file`, `upload`,
+      `ingestion_step`, `index_change`) and the version, then the material with its `material_system` rows; and
+      detaches the materials that stay. `conversations` deletes each conversation's turns with their references and
+      event batches, then the conversation (`model_call_usage` stays: it names jobs only). Last, one transaction
+      deletes the campaigns and the system and sets `deletion.done_at`. Every step is safe to repeat; a pass that
+      fails (logged `library.deletion_deferred` with its error type) leaves the row for the next one.
+    - `deletion` is not a library table (AD-7): ids and times only, read and written with `JdbcClient` (joined to the
+      owner's transaction), without `@TenantId`; the sweep's list alone reads across owners. The handler interface
+      lives in `library.service`, so `library` still depends on `shared` and `vault` only.
+    - `V22__system_deletion.sql` adds `system.state text not null default 'ready'` (check `ready|deleting`) and the
+      `deletion` table. Additive: the previous release neither reads nor writes them. Rolling back while a deletion
+      is pending shows the system again, with whatever its removal has not removed yet, under its id as fingerprint
+      (its name can then be taken twice). Rolling forward again finishes every deletion left pending (system `deleting`,
+      `deletion.done_at` null) at the first sweep, with whatever the GM added to that system meanwhile. To keep such a
+      system, cancel its deletion before rolling back: `update deletion set done_at = now() where target_id = '<id>'`
+      and `update system set state = 'ready' where id = '<id>'` (its `name_fingerprint` stays the system's id, so the
+      same name and edition can be created again).
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.18.0). The worker does
+      not change: `index.removal` per version already exists.
+  - **Campaigns (Story 3.2 part A, public contract 1.19.0, migration V23).** The GM lists, creates, renames, archives,
+    restores and chooses campaigns (deleting one is part B). A campaign is `{id, name, system, archived, version}`;
+    a list item is `{id, name, system: {id, name, edition}, archived}`.
+    - Name: 1 to 120 code points after trimming (`request.campaign_name_invalid`, 400, params `min` and `max`), stored
+      only encrypted (`Binding("campaign", "name", id, owner)`). Its system is set at creation and never changes. A new
+      campaign starts with the starting scope (`ScopeSettings.STARTING`, which the resolver already reads for every
+      campaign; nothing is stored until Story 3.5).
+    - **Unique per system** (Dalton, 2026-11-20): `campaign.name_fingerprint` is the fingerprint of the name's unique
+      form (as a system's, under `campaign`/`name`), unique on `(owner_id, system_id, name_fingerprint)`
+      (`campaign_owner_system_name_fingerprint_key`). A duplicate on POST or PATCH is `request.campaign_name_taken`
+      (409); the service checks first and a write the key refuses anyway is the same 409. The same name in another
+      system is fine. An archived campaign keeps its name, so its name stays taken until it is renamed or deleted (part B). A first sign-in stores the starter campaign's fingerprint.
+    - **Rows from before V23** have no fingerprint (SQL cannot compute a keyed one, and the key ignores nulls). V23
+      lists their owners in `campaign_fingerprint_backfill` (owner ids only, not a library table); once the application
+      is ready, `library.service.CampaignFingerprints` fills each listed owner's rows as that owner (decrypt, then
+      fingerprint, through JPA), then removes the owner (`JdbcClient`). Repeatable: a start with nobody listed does
+      nothing, an owner whose fill fails stays for the next start (`library.campaign_fingerprints_failed`), and a row
+      whose name another campaign of its system already holds keeps none (`library.campaign_fingerprint_duplicate`).
+      Until then a create or a rename also compares the name with the system's campaigns that have no fingerprint.
+      Switched off by `gmshield.library.campaign-fingerprints.enabled=false` (the unit tests).
+    - `GET /api/v1/campaigns?system=&archived=&cursor&limit`: every campaign of the owner's ready systems, or the
+      system's only; `archived=false` (the default) leaves archived ones out, `archived=true` lists only them; newest
+      first by id; a bad `archived`, limit or cursor is `request.invalid` (400). An unknown, foreign or malformed
+      `system` is `request.not_found`. The system page's campaigns are this list with `system`.
+    - `POST /api/v1/campaigns` `{name, systemId}` answers 201 with the campaign, which becomes the current one. An
+      unknown, foreign, malformed or deleting system is 404; no `systemId` is `request.invalid`.
+    - `PATCH /api/v1/campaigns/{id}` `{version, name?, archived?}`: renames, archives (`archived: true`) or restores
+      (`false`) on the row's `version` (Hibernate `@Version`, from 0); a stale one is `request.stale_version` (409) and
+      changes nothing, and neither `name` nor `archived` is `request.invalid` (400). Without a name the stored name and
+      fingerprint stay as they are (no uniqueness check), so a row from before V23 is archived and restored as it is. Archiving keeps every row and sets `archived_at`: the campaign leaves the lists, the switcher and
+      the current position, still opens by id (`GET /api/v1/campaigns/{id}`, its conversation, stored references,
+      questions asked on it) and can be restored. Archive and restore are reversible, so the frontend asks no
+      confirmation. Logs: `library.campaign_created`, `library.campaign_changed` (ids, version, archived).
+    - **Current campaign:** `PUT /api/v1/campaigns/current` `{campaignId}` sets the campaign's `chosen_at` and answers
+      it (200); an archived, foreign, unknown or malformed id is 404 `request.not_found`, and nothing changes. It does
+      not raise the version (`@OptimisticLock(excluded = true)`), so a switch never makes an open rename stale. The
+      current campaign is the ready, not archived campaign with the latest `chosen_at`, else the oldest (created
+      first, then the smallest id); none when there is none (`GET .../current` and `GET /api/v1/conversations/current`
+      are then 404, which the frontend shows as the composer disabled). Archiving clears `chosen_at`, so archiving or
+      deleting the chosen campaign falls back by itself and a restored campaign does not come back as current. Nothing
+      about the current campaign is kept in the browser.
+    - `GET /api/v1/campaigns/{id}/conversation` (`conversations`) answers `{id, questions}`: the campaign's one
+      conversation and its turn count; 404 when it has none or the campaign is not the owner's.
+    - A system's deletion still counts and removes its archived campaigns (`campaignIdsOf` and the deletion's own reads
+      ignore the archive).
+    - `V23__campaign_management.sql` adds `campaign.version bigint not null default 0`, `archived_at`, `chosen_at`,
+      `name_fingerprint bytea`, the key, and `campaign_fingerprint_backfill`. Additive: the previous release neither
+      reads nor writes them. What users see after a rollback: archived campaigns show again, the current campaign is
+      the oldest again, and a starter made meanwhile has no fingerprint (filled at the next roll forward only when its
+      owner is listed; otherwise it is still compared by name on every create and rename).
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.19.0). The worker does
+      not change.
+  - **Delete a campaign (Story 3.2 part B, public contract 1.20.0, migration V24, AD-22).** The recorded, resumable
+    deletion of a system (above), extended to a `deletion` row of kind `campaign`: the same `SystemDeletion` process,
+    sweep and one-shot passes, the row's kind choosing what is collected and what `library` removes last. What goes:
+    the campaign, its conversation (turns, event batches, references) and every material attached to it
+    (`material.campaign_id`); nothing of its system or of the other campaigns. An archived campaign, the current one
+    and the GM's last one can all be deleted; the current campaign then falls back (part A's rule), or there is none
+    (the composer disabled). No undo.
+    - `GET /api/v1/campaigns/{id}/deletion` answers `{conversations, materials}` (materials whose newest version is
+      not discarded), what the confirmation dialog names.
+    - `DELETE /api/v1/campaigns/{id}` answers 202 with no body. In one transaction: `campaign.state` becomes
+      `deleting` (the row locked first; `name_fingerprint` becomes the campaign's id, so the name is free in its
+      system at once); each handler's `prepare` runs with `Going(null, [campaign])` (no system part: `materials` takes
+      the campaign's materials alone and detaches nothing; `conversations` cancels the campaign's answer jobs); a
+      `deletion` row records owner, kind `campaign`, target and `not_before` (the latest claim lapse, or now). Logs:
+      `library.campaign_deleting`, then `library.campaign_deleted` (ids and times only).
+    - From that commit the campaign is `request.not_found` to every read and write that goes through `library`: the
+      lists (and the switcher), GET, PATCH, DELETE and `/deletion`, `PUT .../current`, the current campaign, its
+      conversation, questions asked on it, uploads naming it. A system's preview no longer counts it. Reads by turn id
+      (a turn, its stop, events and references) still answer until the removal, as for a system (3.1 B, finding V4).
+    - Removal at `not_before`, per owner, as for a system: materials (one `index.removal` per version, never two,
+      `VersionRemoval`, files, rows), the conversation, then the campaign row and `deletion.done_at`. Each pass
+      collects again, so an upload that lands during the wait goes too.
+    - A system deleted while one of its campaigns is deleting takes that campaign too (a system's deletion takes all
+      its campaigns, deleting ones included); the campaign's own deletion then finds it gone and is marked done.
+    - `V24__campaign_deletion.sql` adds `campaign.state text not null default 'ready'` (check `ready|deleting`) and
+      lets `deletion.kind` be `campaign`. Additive: the previous release neither reads nor writes `campaign.state`.
+      Rolling back while a campaign deletion is pending shows the campaign again, with whatever its removal has not
+      removed yet, under its id as fingerprint; that release's sweep finds no system with the row's target and marks
+      the row done, so after rolling forward again the campaign stays hidden (`deleting`, no pending row) with its
+      remaining data. To finish it, reopen its row: `update deletion set done_at = null where kind = 'campaign' and
+      target_id = '<id>'`. To keep it instead, in one transaction: `delete from deletion where kind = 'campaign' and
+      target_id = '<id>'` (else a later delete of it is refused by `deletion_owner_target_key`), `update campaign set
+      state = 'ready', name_fingerprint = null where id = '<id>'` (its fingerprint is still its own id, which protects
+      no name), and `insert into campaign_fingerprint_backfill (owner_id) select owner_id from campaign where id =
+      '<id>' on conflict do nothing`; the next start fills its fingerprint. If another campaign of its system took its
+      name meanwhile, rename that one in the app first: otherwise the fill leaves this campaign without a fingerprint
+      (`library.campaign_fingerprint_duplicate`) and two campaigns share the name.
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.20.0). The worker does
+      not change.
   - JPA settings (`application.yaml`): the dialect is given and Hibernate never reads the database's
     metadata at start, `ddl-auto: none` (the schema is Flyway's), `open-in-view: false`. The unit tests
     start without a database and use in-memory stores (`@Primary`).
@@ -232,27 +418,146 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - `material` and `material_version` (`V6__materials.sql`) are library tables (`@TenantId`, JPA only);
     `upload` is a working table through `JdbcClient` with no content, no name and no hash. Another owner's
     id, an unknown id and a malformed id all answer `request.not_found` (404).
+  - **A replacement (Story 3.4, public contract 1.23.0).** `Upload-Metadata` may name `material` (the id of one of
+    the owner's materials) beside `filename` and nothing else: with `kind`, `language`, `campaign`, `system` or
+    `systems`, or an empty id, it is `upload.metadata_invalid` (400). It inserts only a `material_version` in
+    `uploading` and its upload; the material keeps its name, kind, language and place. `NewVersions.lockReady`
+    checks it in the same transaction, with the material locked (`MaterialStore.lockMaterial`, a `PESSIMISTIC_WRITE`
+    refresh as a change of where it belongs takes): another owner's, an unknown, a malformed or a deleting material is
+    `request.not_found` (404); a version in `uploading`, `waiting`, `processing`, `needs_review` or `failed` is
+    `material.version_in_progress` (409); no `ready` version (every one discarded) is `material.not_ready` (409).
+    `ImageSetRequest.material` does the same for an image set. The new version goes through ingestion and review; a
+    refused format deletes only it, and a mismatch, an expiry or a discard leaves the material `ready` on the old
+    one, which serves every scope meanwhile.
+  - **The current version (Story 3.4).** A material shows its current version: its newest version (latest
+    `created_at`, then greatest id) that is not `discarded`, or its newest one when every version is discarded
+    (`MaterialStore.current`, `currentIn`, `currentAttached`; one JPQL rule). It decides the material's state, size,
+    report, actions, review page and the list's `state` filter. `Material.serving` (`{pages, size}`) is the
+    material's `ready` version while that is not the current one, else null.
+  - Deploy order for public contract 1.23.0 (no migration): the backend first, then the frontend (its health check
+    fails against a 1.22.0 backend). The worker does not change. **A backend rollback below 1.23.0 is not safe once a
+    replacement exists**: a 1.22 backend reads a material's newest version as its state, so a discarded or expired
+    replacement makes a serving material read `discarded` (and offer no action), and its refused-format path deletes
+    the whole material, the serving version included. Nothing guards against it in code: before rolling back, check
+    that no material has more than one version (`select material_id from material_version group by material_id
+    having count(*) > 1`), or accept that loss.
+  - **Delete a material, remove a superseded version (Story 3.4 part B, public contract 1.24.0, migration V26,
+    AD-22).** The recorded, resumable deletion of a system (above), extended to `deletion` rows of kinds `material`
+    and `version`: the same `SystemDeletion` process, sweep, one-shot passes, claim wait and preparing again.
+    `library` knows neither: `materials.service.MaterialDeletions` checks the target, then `SystemDeletion
+    .deleteMaterial` or `.removeVersion` writes the row (once per owner, kind and target: `insert ... on conflict do
+    nothing`, so a second delete changes nothing) in one transaction with every handler's `prepare`, given
+    `Going.ofMaterial(id)` or `Going.ofVersion(id)`. There is no system or campaign to mark or delete: a pass is done
+    once the handlers' removal ends. `conversations` takes nothing (references are stored by value). No undo.
+    - `GET /api/v1/materials/{id}/deletion` answers `{versions, pages}`: the material's versions that are not
+      `discarded`, and the sum of their page totals.
+    - `DELETE /api/v1/materials/{id}` answers 202 with no body, and again for a material already being deleted.
+      `SystemMaterialsDeletion.prepare` discards every version of it (steps and index changes cancelled, the latest
+      claim lapse kept as `not_before`), so it leaves every list, count and scope at once and references to it read
+      `removed`. The removal runs `removeVersion` for each version (one `index.removal` per version, never two,
+      `VersionRemoval`, files, rows), then deletes the material with its attachments. A version that is no longer
+      `discarded` (an upload completed during the wait) fails the pass, and the next one prepares again.
+    - `DELETE /api/v1/materials/{id}/versions/{versionId}` answers 202 for a `superseded` version of that material,
+      and again once its removal is recorded; any other state is `material.version_not_removable` (409): a ready or
+      in-progress version is discarded instead. The same prepare and removal, for that version alone; the material
+      and its other versions stay. Its row goes, so a reference to it reads `removed` (`ScopeReads.removed`) and its
+      page is not found.
+    - All three answer `request.not_found` (404) for another owner's material or version, an unknown or malformed id,
+      a version of another material, or a material whose every place is being deleted.
+    - `Material.superseded` (`[{id, createdAt, pages, size}]`, newest first, one read for a whole page): the
+      material's `superseded` versions. One whose removal is recorded is `discarded` already, so it is left out.
+    - Failed removals: `IndexRemovalRetrySweep` (at the start and every `GMSHIELD_INDEX_RETRY_EVERY`, 10 min; off
+      with `gmshield.materials.index-retry-sweep.enabled=false`, the index retry sweep's own switch, so that setting
+      stops the retries of failed index changes too) visits each owner with a failed `index.removal` job
+      and gives each failed job that still has its `index_removal` row a new job with the same input (owner, source);
+      the row moves to it (`IndexStore.moveRemoval`), so the failed job, kept as history, is never retried twice.
+      Logs: `index.removal_retried`.
+    - Logs: `library.material_deleting`/`library.version_deleting`, then `library.material_deleted`/
+      `library.version_deleted`; `material.delete`, `material.version_remove` (ids and times only).
+    - `V26__material_deletion.sql` lets `deletion.kind` be `material` or `version`. Additive. Rolling back while one
+      is pending: that release's sweep finds no system with the row's target and marks it done; the versions the
+      delete discarded stay discarded (their content is removed by that release's version removal sweep, their rows
+      and points are not). For kind `material` the material row can also be left with no version (a pass that
+      stopped after its last version went, before the material did). After rolling forward, list the targets whose
+      row was marked done although something of them is left:
+      `select kind, target_id from deletion where done_at is not null and ((kind = 'material' and target_id in
+      (select id from material)) or (kind = 'version' and target_id in (select id from material_version)))`;
+      then reopen each (`update deletion set done_at = null where kind = '<kind>' and target_id = '<id>'`): the next
+      pass removes what is left, the versions, their points and, for `material`, the material row.
+    - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.24.0). The worker does
+      not change. The first start after the deploy runs the index removal retry sweep at once, for every owner: it
+      starts again every failed `index.removal` job left since Stories 1.20 (a discard) and 3.1 part B (a system's or
+      a campaign's deletion), one new job each on the ingestion lane.
 - **The guided upload's details and the materials list (`materials`, Story 1.14).** `Upload-Metadata` at creation
   may also carry `kind` (`rulebook`, `supplement`, `homebrew`, `campaign_notes`, `other`), `language` (`pt-BR`,
   `en`, or `detect`, stored as null for a later read stage), and `campaign` or `system` (the id of one of the
-  owner's, checked through `library.service.Library`). All are optional (an older frontend sends none). A bad
-  value, an unknown or another owner's id, or both `campaign` and `system` answer `upload.metadata_invalid` (400),
-  which never says which, and nothing is stored. Other keys are still ignored.
+  owner's, checked through `library.service.Library`); from Story 3.3 `systems` (below) names several systems. All
+  are optional (an older frontend sends none). A bad value, an unknown or another owner's id, or both `campaign` and
+  `system` answer `upload.metadata_invalid` (400), which never says which, and nothing is stored. Other keys are
+  still ignored.
   - `V7__material_details.sql`: `material.kind` and `material.language` (nullable, each with a CHECK of every
     value) and `material.campaign_id` (nullable, FK `(owner_id, campaign_id)` to `campaign`); the library table
     `material_system (id, owner_id, material_id, system_id)`, unique per `(owner_id, material_id, system_id)`, with
     owner-scoped FKs to `material` (on delete cascade, so a previous release that removes a refused upload's
-    material is not stopped) and `system`. One row per material in this release; several systems come with
-    Epic 3. Everything is written in creation's transaction; a refused format removes the row with the material.
+    material is not stopped) and `system`. One row per system the material belongs to (several from Story 3.3).
+    Everything is written in creation's transaction; a refused format removes the row with the material.
   - `GET /api/v1/materials?state=…&limit=&cursor=`: the owner's materials whose newest version (latest
     `created_at`, then greatest id) is in one of the given states, newest material first (descending id),
     `{items, nextCursor}`. `state` is repeatable and required, `limit` 1 to 50 (default 20), `cursor` the previous
-    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`).
+    `nextCursor`; anything else is `request.invalid` (400). JPQL only (`JpaMaterialStore.newestIn`, `currentIn` from Story 3.4). From Story 3.3
+    `state` is optional: without it, every material.
   - `GET /api/v1/materials/{id}`: one material. Another owner's id, an unknown id and a malformed id all answer
     `request.not_found` (404).
   - Each item is `{id, name, state, kind?, upload?}`; `upload` (`{id, offset, length, expiresAt}`, from the open
     `upload` row by its `(owner_id, version_id)` index) is there only while the newest version is `uploading`.
     Every answer is `no-store`. Nothing logs a name, a kind or where a material belongs.
+- **Where a material belongs (`materials`, Story 3.3, public contract 1.21.0, migration V25).** A material belongs
+  to exactly one of these: one campaign (`material.campaign_id`), or one to 100 systems (`material_system` rows). The
+  database cannot check that rule across two tables, so its one writer does: `Uploads.place` (the upload's check) and
+  `MaterialBelongings` (the change), both refusing a campaign with systems, more than 100 systems, or a target that is
+  not one of the owner's ready campaigns (archived ones included) and systems. A material uploaded with no place
+  (`none`) can be given one; no request takes a material back to no place.
+  - Uploads: tus metadata key `systems` (one to 100 ids, comma-separated inside the Base64 value) and
+    `ImageSetRequest.systems` (an array of one to 100; an empty one is refused). At most 100 ids as sent; a repeated
+    id is stored once. The single `system` key still names one; `system` with `systems`, or `campaign` with either, is
+    `upload.metadata_invalid`.
+  - `PATCH /api/v1/materials/{id}` `{version, belonging: {campaign} | {systems: [..]}}` answers 200 with the material,
+    its version raised by one. `material.version` (V25, `bigint not null default 0`, Hibernate `@Version`) is named by
+    the change; a stale one is `request.stale_version` (409). Both fields, neither, an empty list or one of more than
+    100 ids as sent (a repeated id is stored once), or an unknown, malformed, another owner's or deleting target is
+    `material.belonging_invalid` (400), which never says which; no version or a malformed body is `request.invalid`
+    (400); another owner's material, an unknown or malformed id, and a material whose every place is being deleted are
+    `request.not_found` (404). The material is locked (`select ... for update`) before its version is compared, so
+    two changes take turns and the second is stale. Systems change by difference: rows that stay are kept, the others
+    are deleted, new ones inserted (never a delete and insert of one key). The row's `updated_at` always moves, so the
+    version rises even when only its systems changed.
+  - A change writes only `material.campaign_id`, `material_system` rows and `material.version`: never a version, a
+    job, a passage or a Qdrant point. Every scope read resolves again (`AnswerJobs` resolves on each passages fetch),
+    so the change applies from the next question, and a question running while its material moves out gets
+    `scope.passage_refused` at its next fetch (`ConversationFlowTest`). References stored with a turn still open.
+  - The material view gains `version`, `size` (the newest version's bytes, absent until known) and `belonging:
+    {campaign: {id, name, system: {id, name}} | null, systems: [{id, name}]}`: only ready places, names decrypted.
+    The places of a page come from one read of its `material_system` rows and one `Library.places` call (one read
+    of the campaigns and one of the systems), never one read per row. A list leaves out a material that belongs
+    somewhere but whose every place is being deleted (a page may then hold fewer than the limit); `GET` by id still
+    answers it with an empty belonging.
+  - `V25__material_belonging.sql` adds `material.version`. Additive: the previous release neither reads nor writes
+    it (its inserts take the default). After a rollback, materials keep the place they were given last; a material
+    with several systems shows (and is resolved) in each of them, as the previous release's queries read every
+    `material_system` row.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.21.0). The worker does
+    not change.
+- **Numbered pages (`library`, `materials`, public contract 1.22.0).** The three lists (`GET /api/v1/materials`,
+  `/api/v1/systems`, `/api/v1/campaigns`) name `total`, how many items the list has in all for the same filters
+  (`state` and `system`; `system` and `archived`), and take `offset` (0 to 100000, default 0): how many of the newest to
+  skip, so a client shows page 3 with one call instead of reading two pages by cursor first.
+  - A page starts after a `cursor` or at an `offset`, never both: an `offset` above 0 with a `cursor`, or one outside
+    its range, is `request.invalid` (400). An offset past the end is an empty page that still names the total.
+  - The total is a `count` of the same query the list reads, in constant JPQL texts (`JpaLibraryStore.SYSTEM_COUNT` and
+    the four campaign counts; `JpaMaterialStore.NEWEST_COUNT` and the two attached counts). The materials total counts
+    a material whose every place is being deleted, which a page leaves out, until that deletion is done.
+  - No migration, and the worker does not change. Deploy order: the backend first, then a frontend whose minimum public
+    contract is 1.22.0. A frontend on 1.21.0 keeps working: it ignores `total` and never sends `offset`.
 - **Cleaning an upload and splitting it into pages (`materials` and `jobs`, Story 1.15, AD-17).** Completing a PDF
   upload creates, in the same transaction, the version's first ingestion step: a job of kind `ingestion` (ingestion
   lane) and an `ingestion_step` row (stage `clean`, the raw upload as its input). Text got its stage with Story 1.16
@@ -376,6 +681,13 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     - retry (`IngestionSteps.retry`): from the cleaned original as a pipeline restart does (the restart's job-free
       core, `startOver`), or without one from the complete raw upload as the first step does; the version becomes
       `processing`. Past the step cap of a known page total: `ingestion.too_many_steps` (409).
+    - reprocess of a `ready` version (Story 3.4, `IngestionSteps.reprocessAccepted`; `actions` lists `reprocess` for
+      `ready`): after the check of a replacement (`NewVersions.lockReady`, material locked), a new version of the
+      material, `waiting`, with the ready version's format, size and page total. Its `original` version file is a
+      copy of the ready version's cleaned original under a new file id (`version_file` file ids are unique per
+      owner; the copy goes if the transaction rolls back), and its first step is the format's start stage over that
+      copy, as a pipeline restart. The ready version, its files, passages and points are not touched, and it serves
+      until the new one is accepted. Any other state keeps the rules above (`needs_review`: in place).
     - discard: the version becomes `discarded` with `material_version.removal_pending` set, and its unended steps
       are cancelled. After the commit `VersionRemoval` runs once, as the owner, in three parts each safe to repeat:
       the page views, passages, outline, layers and outcomes (one transaction); the pieces of every version file;
@@ -506,17 +818,18 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     Their messages left in `gmshield:work:ingestion` are refused at the claim (`job.not_offered`) and acknowledged.
 - **What a campaign may use (`scope`, Story 2.2, AD-9, internal contract 1.8.0).** The one resolver: no other module
   reads library items for a campaign.
-  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge)`, a parameter of every resolve and stored
-    nowhere (Story 2.4 freezes it with a job, Story 3.5 stores it per campaign). `ScopeSettings.STARTING` is campaign
-    and system on, other and model knowledge off; `otherTier = true` is refused (`IllegalArgumentException`) until
-    Story 3.5.
+  - `ScopeSettings(campaignTier, systemTier, otherTier, modelKnowledge, materialsOff)`, a parameter of every resolve
+    (Story 2.4 freezes it with a job; Story 3.5 stores it per campaign, below). `ScopeSettings.STARTING` is campaign
+    and system on, other and model knowledge off, every material on.
   - `Scopes.resolve(campaignId, settings)`, as the bound owner in one read transaction, answers a `ResolvedScope`
     (made only by `Scopes`): the campaign tier is the `ready` version of each material whose `campaign_id` is the
     campaign; the system tier the `ready` version of each material attached through `material_system` to the
     campaign's system (one already in the campaign tier is left out); a tier switched off has none. A source is a
     version id, the `source` of the Qdrant payload. `pending` is the ids of the in-scope passages whose ordinal falls
     in the run of an `index.change` job that has not ended, kept by tier (`pending(tier)`). A campaign not found
-    (unknown, or another owner's) is 404 `request.not_found`.
+    (unknown, or another owner's) is 404 `request.not_found`. Where a material belongs is read afresh on every
+    resolve (Story 3.3): a material moved to another campaign or system leaves this scope at the next resolve, and a
+    material of several systems is in the system tier of each one's campaigns.
   - `Scopes.passages(scope, ids)` checks every id first: any id that is not a passage of an allowed source still
     `ready` (unknown, another owner's, a version no longer `ready`, out of every tier) refuses the whole request with
     403 `scope.passage_refused`, which names no id, before anything is decrypted. Otherwise it answers
@@ -525,6 +838,12 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     the pending passage ids of a set of versions, checked passage reads by id; JPQL, filtered by the owner, no
     migration). `ScopeReads` and its `Passage` are the only types of `materials`' named interface `service`, and
     `Materials.passage(UUID)` is package-private. Lines carry ids and counts, never a text or a title.
+  - **A replaced material (Story 3.4).** The tiers read every `ready` version, and a material has at most one: a new
+    version starts only while the material is `ready` with nothing else on its way, and accepting it supersedes the
+    old one. So the old version serves every scope while its replacement is processed, and the new one alone after
+    the accept; a reference stored with a turn still opens the superseded version (`CITED`). `scope.passage_refused`
+    stays non-retryable: an accept in the middle of a question fails that one answer clearly rather than quietly
+    changing the sources under it.
   - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`jobs`), with `X-Job-Grant`: body `{ids: [uuid]}`, 1
     to 100 non-null ids. A malformed body or an id that is not a UUID is 400 `request.invalid` before anything else;
     then the grant is checked (403 `job.grant_refused`), then the ids (400 `job.passages_invalid` for none, more than
@@ -535,20 +854,329 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     production kind `question.answer` implements it through `Scopes`; a test-only handler (`ScopedPassagesFlowTest`)
     proves the path too.
   - **The question input (Story 2.3).** `Scopes.questionInput(scope, question)` is the one builder of the input of a
-    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, tiers: [{tier,
-    sources, pending}], tokenKey}`. Both tiers are always listed, in order (campaign, then system), a tier without a
-    source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
+    job that carries a question, from a `ResolvedScope` only, as its owner: `{question, owner, modelKnowledge, tiers:
+    [{tier, sources, pending}], tokenKey}` (`modelKnowledge` from Story 3.8, below). Both tiers are always listed, in
+    order (campaign, then system), a tier without a source with empty lists; `pending` is that tier's pending passage ids, at most the first `Scopes.MAX_PENDING`
     (5,000 from indexing at worker start, 100 before; the worker reads them 100 at a time within a time budget) in
     order, so a re-index of a whole library never fills the claim reply (the total is logged as a count, `pending`,
     beside `pendingListed` and `pendingLeftOut`); `owner` is the scope's owner, for the worker's Qdrant
     filter; `tokenKey` is Base64 of `Vault.ownerTokenKey(owner)`, whose buffer is zeroed once encoded (so `scope` may
-    use `vault :: service`). The question is 1 to 4,000 characters (code points), else
+    use `vault :: service`). From internal contract 1.16.0 (Story 3.10) the answer job adds `history` after this builder
+    (below). The question is 1 to 4,000 characters (code points), else
     `IllegalArgumentException`; a scope of another owner is `IllegalStateException`. Provider, model and tier come
     with the claim (Story 2.10, `model`), never in this input. The handler's `input(JobRef)` returns it, so the claim reply carries it unchanged in `input`
     (no claim schema change). Lines (`scope.question_input`) carry counts, never the question or the key. No
     production kind carries a question until Story 2.4; the test-only kind `test.question` (`ScopedPassagesFlowTest`)
     proves that the claim reply carries the input and that the passages route serves the ids the worker found. The
     worker's search (`GMshield-worker`, `retrieval/search.py`) needs contract 1.8.0, unchanged here.
+- **A closed scope across three tiers (`scope`, Story 3.5, public contract 1.25.0, internal contract 1.13.0,
+  migration V27).** Each campaign's scope settings are stored in PostgreSQL only (never in a Qdrant point, and no
+  point is rewritten on a change, AD-10), and resolved by `Scopes` alone.
+  - **Storage.** `scope_setting` (owner, campaign with an owner-scoped key to `campaign`, `campaign_tier`,
+    `system_tier`, `other_tier`, `model_knowledge`, `version` as Hibernate `@Version`, created and updated times;
+    primary key (owner, campaign)) and `scope_material_off` (owner, campaign, material; primary key all three, no
+    reference to `material`), library tables through JPA only (`scope.data.JpaScopeStore`). A campaign with no row
+    reads as `STARTING` at version 0; the first change inserts the row at version 1 (a concurrent first insert hits
+    the key and is a stale version), so `library` writes nothing here when it creates a campaign. A material is on
+    unless it is listed as off, so a newly attached material starts on; an id whose material is gone is ignored when
+    resolving and dropped by the next change, which stores exactly the ids it lists.
+  - **Resolution.** The campaign tier is the `ready` versions of the campaign's materials; the system tier those of
+    its system's materials, minus the campaign tier's (while it is on); the other tier every other `ready` version of
+    the owner (the materials of the GM's other campaigns, archived ones included, and other systems; never one of the
+    campaign's or its system's, whatever the switches; read only while the tier is on). A tier switched off has no
+    source; a material switched off is left out of whichever tier it falls in. `Tier.OTHER` (`other`) follows
+    campaign and system everywhere, the question input's `tiers` included (three entries, always). `ScopeReads`
+    gains `readySourcesOfCampaign`, `readySourcesOfSystem`, `readySourcesOfOwner` (each version with its material)
+    and `materialLabels` (decrypted names).
+  - **Freezing.** `Conversations.ask` reads the stored settings (`CampaignScopes.settings`) and freezes them on the
+    turn: `turn.other_tier` (default false) beside the V17 switches, and one `turn_material_off` row (owner, turn,
+    material) per material off. `AnswerJobs` rebuilds the `ScopeSettings` from the turn on every passage fetch and
+    reference read, so a change made while a turn is answered applies from the next question and never turns into
+    `scope.passage_refused` mid-answer. `GET /api/v1/conversations/current` uses the stored settings.
+    `modelKnowledge = true` is stored and frozen; from Story 3.8 it lets the model add its own knowledge (below).
+  - `GET /api/v1/campaigns/{id}/scope` answers `{version, campaignTier, systemTier, otherTier, modelKnowledge,
+    materials: [{id, name, tier, on}]}`: the materials of every tier whatever the tier's switch, each with a `ready`
+    version, in tier order, then newest first (`Scopes.members`).
+  - `PUT /api/v1/campaigns/{id}/scope` takes `{version, campaignTier, systemTier, otherTier, modelKnowledge,
+    materialsOff: [ids]}` and answers the new view, its version raised by one. A version the settings have left is
+    409 `request.stale_version`; a missing field, a negative version, a null or malformed id, more than 1,000 ids or
+    a malformed body is 400 `request.invalid`; an id that is not the owner's material, or in none of the campaign's
+    tiers, is 400 `scope.material_unknown`; nothing changes then. Both routes answer 404 `request.not_found` for
+    another owner's, an unknown, a malformed or a deleting campaign, and send `Cache-Control: no-store`. Logs:
+    `scope.settings_changed` (ids, switches and counts).
+  - **The ground "the current scope".** `GET /api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}` and
+    `.../picture` (`conversations`, beside the reference routes, through `CampaignScopes.sourcePage`) serve a page of
+    a version that is an allowed source of the campaign's current stored scope (`Scopes.resolveSources`), with the
+    reference page's shape and headers; anything else is 404 `request.not_found`, never telling whether the version
+    exists. A reference stored with a turn keeps its own ground and ignores the current settings: a source that has
+    left the scope still opens there, and nothing new is drawn from it.
+  - **Deletion.** `scope.service.ScopeDeletion` is a `SystemDeletionHandler` (part `scope`, counting 0): a system's or
+    a campaign's removal deletes the settings and switch rows of the campaigns going (before their rows go), a
+    material's removal its switch rows in every campaign; a version's removal takes nothing.
+  - **Internal contract 1.13.0.** `JobPassage.tier` allows `other`. The worker (`retrieval.search.TIERS`) takes turns
+    across the three tiers and requires 1.13.0.
+  - Deploy order: the backend first (V27 is additive; until a GM changes a campaign's scope every campaign resolves as
+    before), then the worker (its minimum backend contract becomes 1.13.0) and the frontend (contract copy only; its
+    minimum stays 1.24.0). **Between the backend and the worker deploys questions fail**: the question input now always
+    lists the `other` tier, which a 1.12 worker refuses as `retrieval.input_invalid` (not retried), so deploy the
+    worker right after the backend. Rolling the backend back below 1.25.0: the scope tables and `turn.other_tier` are
+    ignored (every campaign resolves as `STARTING`, a frozen turn by its V17 switches alone), and the worker must go
+    back first, since it refuses a 1.24 backend.
+- **The campaign's version leads (`conversations`, Story 3.7, public contract 1.26.0, internal contract 1.14.0,
+  migration V28).** The tier shown with an answer is always the backend's: the worker copies `JobPassage.tier` onto
+  each passage it hands the model and never works one out.
+  - **The tier marker.** `JobStreamEvent` gains type `tier` with a field `tier` (`campaign`, `system` or `other`) and
+    `offset`: the model opened a tier's version of the answer there (the campaign's first, then each other tier's as
+    an alternative, when the sources disagree). A `tier` event with any other field, no offset, a negative one, or
+    another word is `job.events_invalid` (400, nothing stored). `AnswerJobs.events` drops a marker whose tier has no
+    source in the turn's frozen scope (`conversation.tiers_dropped`, a count) and stores the rest encrypted with the
+    batch's events, like a citation (`{"type": "tier", "tier", "offset"}`). The stream relays it as the public event
+    `tier` (`TurnTierEvent` `{tier, offset}`) and replays it after `Last-Event-ID`.
+  - **The reference's tier.** `turn_reference.tier` (V28, nullable, checked to the three words) is written once with
+    the reference, from `ResolvedScope.tierOf(versionId)` on the turn's frozen scope (`CitedPlace.tier`): a source that
+    leaves the scope, or is removed, keeps the tier it had. `TurnSourceReference` gains an optional `tier`; a row
+    written before V28 has none, shows no tier and still opens. No backfill.
+  - Deploy order: backend → frontend → worker. The backend first (V28 is additive; a 1.13 worker never sends a
+    `tier` event), then the frontend (its minimum becomes 1.26.0), then the worker (its minimum becomes 1.14.0).
+    Rolling the backend back below 1.26.0: the column is ignored, and the worker and the frontend must go back first.
+- **Model knowledge only when the GM turns it on (`conversations`, `scope`, Story 3.8, public contract 1.27.0,
+  internal contract 1.15.0, no migration).** The campaign's `modelKnowledge` switch (stored since V27, frozen on each
+  turn since V17) now reaches the worker and decides whether an answer may hold a part from the model's own knowledge.
+  - **The question input.** `Scopes.questionInput` adds `modelKnowledge` (boolean, always present): the switch of the
+    scope's settings, which for an answer job are the turn's frozen settings, so a change applies from the next
+    question. It changes no source, no pending passage and nothing the passages route hands over. The worker gives the
+    model a fixed extra rule only when it is true, and reads an absent field as false.
+  - **The model tier word.** `JobStreamEvent.tier` (internal 1.15.0) and `TurnTierEvent.tier` (public 1.27.0) allow
+    `model`: the model's own knowledge starts at that offset. It is a turn-event tier word only (`JobEvent.MODEL`,
+    `TurnEvent.MODEL`): `Tier`, `JobPassage.tier`, `turn_reference.tier` and `TurnSourceReference.tier` keep their
+    three words, so a reference never carries it. The batch check accepts it with the same fields as any tier marker.
+    `AnswerJobs.events` stores a `model` marker only when the turn's frozen `modelKnowledge` is on; otherwise it is
+    dropped (`conversation.tiers_dropped`) and never relayed. A kept one is stored, relayed and replayed like any tier
+    marker.
+  - **The done event.** `TurnDoneEvent` gains the required `modelKnowledge` (the turn's frozen switch, read from the
+    turn row, so a turn asked before 3.8 answers its stored value), and `silent` becomes "not stopped, no reference
+    and no `model` tier event". `Conversations.ending(turnId)` reads the references, the switch and whether a `model`
+    marker was stored (it reads the turn's events only when the switch is on) in one transaction, when `done` is sent.
+    The frontend uses `modelKnowledge` to offer the scope under a silent answer only when the switch was off.
+  - Deploy order: backend → worker → frontend. The backend first (a 1.14 worker ignores the new input field and never
+    sends a `model` marker), then the worker (its minimum becomes 1.15.0; the old frontend cannot turn the switch on,
+    so nothing it can set is ignored), then the frontend (its minimum becomes 1.27.0), last so the switch only turns
+    on once the worker honours it. Rolling the backend back below 1.27.0: the frontend and the worker must go back
+    first.
+- **Search the library (`conversations`, `scope`, Story 3.9, public contract 1.28.0, internal contract unchanged
+  1.15.0, migration V29).** A GM finds a passage by meaning or exact words without asking a question. Search is a job
+  on the interactive lane, like a question, and its text is never matched in SQL.
+  - `POST /api/v1/campaigns/{campaignId}/searches` with `{query, tier?, materialId?}` answers 202 `{id}`
+    (`createSearch`). The query is 1 to 500 code points, not blank; `tier` is `campaign`, `system` or `other`;
+    `materialId` a material's id; each filter may be absent or null. Anything else is 400 `request.invalid`, a campaign
+    that is not the account's 404 `request.not_found`, with nothing recorded. In one transaction (`Searches.create`):
+    the `search` row with the query encrypted (binding `search`/`query`), its filters and state `pending`, and its job
+    of kind `library.search`; then the owner's searches past the newest 20 are pruned (their unended jobs cancelled,
+    then their results and rows).
+  - `GET /api/v1/searches/{searchId}` answers `{id, campaignId, query, tier, materialId, state, code?, results}`
+    (`getSearch`, schema `Search`): `state` is `pending`, `done` or `failed`; `code` only when failed; `results` (empty
+    unless done) up to 20 `{passageId, versionId, materialName, sectionPath, page, firstWords, tier}` in rank order.
+    Each stored result is re-read on every `GET` within the campaign's **current** scope narrowed by the search's
+    filters (`Scopes.results`): one whose source left the scope since (a tier or material switched off, a version no
+    longer `ready`) is dropped, never refused, and the tier is the one the scope gives now. `firstWords` is the
+    passage's text with its runs of white space made one space, cut to its first 160 code points at a word boundary.
+    Another owner's search, an unknown or malformed id, a pruned one, and one whose campaign was deleted since are the
+    same 404. `/api/v1/searches/**` joins the library routes (`LibraryOwnerFilter`). The result's page opens on the
+    ground of the current scope (`getScopeSourcePage`, Story 3.5); there is no new ground.
+  - **The scope narrowed (`ScopeFilter`).** `Scopes.resolve(campaign, settings, filter)` and `resolveSources(…)` keep
+    only the allowed sources the filter keeps, before the pending passages are read: a tier filter empties the other
+    tiers' `sources` and `pending`, a material filter keeps only that material's version (and its pending passages).
+    A filter only narrows: a tier or material switched off, or a material in no tier, leaves nothing.
+  - **The job (`SearchJobs`, `library.search`, interactive, `callsModel()` false).** Its input is
+    `Scopes.searchInput`: the question input's shape (`{query, owner, modelKnowledge, tiers: [{tier, sources,
+    pending}], tokenKey}`) with `query` in place of `question`, within the search's campaign's current stored settings
+    narrowed by its filters. Its passages route (the worker reads the candidates' text to put the exact query first)
+    serves that same narrowed scope through `Scopes.passages`, so an id outside it is 403 `scope.passage_refused`.
+    `completed` takes `result.ids`: 0 to 20 distinct passage ids in rank order (anything else is 400
+    `job.result_invalid` and the search stays pending). Every id is checked against the narrowed scope first
+    (`Scopes.references`, which decrypts no text): when any is not a passage of an allowed source still `ready`, the
+    whole result is refused and the search ends `failed` with `scope.passage_refused` (the job itself is done).
+    Otherwise `search_result` stores each id with its rank, version and tier, and the search ends `done`. The job's end
+    in `failed` (a reported failure or a lapsed claim after the last attempt) ends the search `failed` with its code.
+  - The worker's side: `GMshield-worker` `lanes/search.py` (README there). Its result is ids only.
+  - `V29__search.sql`: `search` (owner `@TenantId`, campaign with a reference to it, job, encrypted query, tier,
+    material by value, state, code: a failed search has one and only it) and `search_result` (search, rank 1 to 20,
+    passage, version and tier by value; a (search, rank) and a (search, passage) once). Library tables: every key
+    with the owner, JPA and JPQL only. The campaign's and the system's deletion (`SystemConversationsDeletion`)
+    cancel the searches' jobs with the answers' and remove the searches with their results; a material's deletion takes
+    none (the next read drops its results).
+  - Lines (`search.created`, `search.done`, `search.failed`, `search.result_refused`, `search.read`,
+    `search.results_dropped`, `scope.search_input`, `scope.results_read`) carry ids, counts and codes, never the query
+    or a passage's text.
+  - Deploy order: backend → worker → frontend. The backend first (V29 is additive; nothing creates a search until the
+    frontend does), then the worker (it adds the `library.search` handler), then the frontend (its minimum becomes
+    1.28.0). **A backend rolled back below this release must first cancel every unended `library.search` job**, with
+    the backend stopped, as `gmshield_backend`; the two tables are then left unread:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind = 'library.search' and state in ('waiting', 'offered', 'running');
+    ```
+
+- **Conversations by area (`conversations`, Story 3.10 part A, public contract 1.29.0, internal contract 1.16.0,
+  migration V30).** A campaign has many conversations, each in one area of the sidebar: `questions` (Consultas) or
+  `rules` (Criação de Regras). A conversation is made by its first question, never by "Nova conversa", so none is
+  empty. Deleting a conversation is part B (below).
+  - `V30__conversation_areas.sql`: `conversation` gains `area` (checked to the two words; existing rows `questions`),
+    `name` (bytea, null until the GM renames it; vault binding `conversation`/`name`), `version` (Hibernate `@Version`,
+    raised by a rename only) and `last_asked_at` (an existing row takes its newest turn's time; asking moves it forward
+    by one JPQL bulk update that never moves it back and never raises the version, so an open rename stays valid). The unique key
+    `conversation_owner_campaign_key` is dropped, and `conversation_owner_campaign_area (owner_id, campaign_id, area,
+    last_asked_at)` serves the lists.
+  - `GET /api/v1/campaigns/{campaignId}/conversations?area=&limit=&offset=` (`listConversations`) answers `{items:
+    [{id, area, name, questions, createdAt, lastAskedAt, version}], nextCursor?, total}`: the area's conversations,
+    the most recently asked first (then by id), `limit` 1 to 50 (20 by default), `offset` 0 to 100,000; `nextCursor`
+    is the next page's offset as text, absent on the last. A missing or unknown area, a limit or an offset outside its
+    range is 400 `request.invalid`; a campaign that is not the account's is 404.
+  - `GET /api/v1/conversations/{id}` (`getConversation`) answers `{id, campaignId, area, name, version}`;
+    `GET /api/v1/conversations/{id}/turns` (`listConversationTurns`) answers `{items: [{id, question, language,
+    createdAt, events: [{sequence, type, data}]}]}`: the newest 200 turns, oldest first, each event's `data` as the
+    stream sends it (a `done`'s built when read, as on the stream). A turn still being answered has no final event
+    yet; its stream continues after its last sequence.
+  - `PATCH /api/v1/conversations/{id}` (`renameConversation`) with `{version, name}`: the name trimmed, 1 to 120
+    code points (else 400 `request.conversation_name_invalid`, params `min` and `max`; a missing or null `name` too),
+    stored encrypted; a version the row has left is 409 `request.stale_version`; no version or a malformed body is 400
+    `request.invalid`.
+  - `name`, in every view, is the stored name, or else the first question's first 60 code points cut at a word
+    boundary (`Searches.firstWords`).
+  - `POST /api/v1/campaigns/{campaignId}/turns` gains optional `conversationId` (continue it: it must be one of this
+    campaign's conversations, else 404 with nothing recorded) and `area` (start a new conversation of it; with
+    `conversationId` it must be that conversation's, else 400). With neither, the campaign's latest `questions`
+    conversation is continued (made when it has none), as before, so the previous frontend keeps working during the
+    deploy. `GET /api/v1/campaigns/{campaignId}/conversation` answers that same latest `questions` conversation.
+  - Every one of these routes answers `no-store`, and another account's conversation, an unknown or malformed id and
+    one of a campaign being deleted (from part B, a conversation being deleted too) are the same 404
+    `request.not_found`.
+  - **History (internal 1.16.0).** `AnswerJobs.input` adds `history: [{question, answer}]` after
+    `Scopes.questionInput` (whose `textInput`, shared with the search input, is unchanged): the last 6 turns before
+    this one in its conversation that ended `done` and were neither stopped nor (Story 3.11) dismissed
+    (`Conversations.history`), built for each claim (so a claim already made keeps what it was given), oldest first,
+    each answer its joined `delta` texts (they hold no citation marker) cut at 4,000 code points; `[]` for a first
+    question.
+    Retrieval still reads the question alone, and the history is never a source: the worker puts it inside the
+    document delimiter as escaped data and never gives its ids. The line `conversation.history_read` carries the count
+    only.
+  - Lines (`conversation.created`, `conversation.renamed`, `conversation.history_read`, `conversation.turn_recorded`
+    with its area) carry ids, counts and words, never a name, a question or an answer.
+  - Deploy order: backend → worker → frontend. The backend first (V30 is additive for the previous release, whose
+    inserts take the defaults; a 1.15 worker ignores the unknown `history` field), then the worker (its minimum
+    becomes 1.16.0), then the frontend (its minimum becomes 1.29.0). Rolling the backend back below 1.29.0: the
+    frontend and the worker go back first; the old backend continues the oldest conversation of a campaign whatever
+    its area, and ignores the names.
+
+- **Delete a conversation (`conversations`, Story 3.10 part B, public contract 1.30.0, migration V31, AD-22).** The
+  recorded, resumable deletion of a system (3.1 part B), extended to a `deletion` row of kind `conversation`, recorded
+  as a material's is (3.4 part B). What goes: the conversation, its turns, their event batches, `turn_material_off`
+  rows and source references. Nothing of the other conversations, its campaign, the searches or the materials changes;
+  `model_call_usage` stays (it names a job, never a turn). No undo, no bulk delete.
+  - `V31__conversation_deletion.sql`: `conversation.state` (`ready` | `deleting`, default `ready`, checked), and
+    `deletion_kind_check` widened with `conversation`. Additive: the previous release neither reads nor writes the
+    state (its inserts take the default).
+  - `GET /api/v1/conversations/{id}/deletion` (`getConversationDeletion`) answers `{questions}` (its turn count), what
+    the confirmation dialog names.
+  - `DELETE /api/v1/conversations/{id}` (`deleteConversation`) answers 202 with no body. `Conversations.delete` checks
+    the conversation (the account's, `ready`, its campaign the account's), then `SystemDeletion.deleteConversation`
+    writes, in one transaction, the `deletion` row (once per target) and each handler's `prepare` with
+    `Going.ofConversation(id)`: `conversations` sets `state = 'deleting'` (a JPQL bulk update after the owner's row was
+    read: it never raises the version) and locks and cancels the conversation's unended answer jobs; `not_before` is
+    the latest lapse of those claims, or now. `materials` and `scope` ignore it. `library` keeps the id opaque. Logs:
+    `conversation.delete`, `library.conversation_deleting`, `conversation.deletion_prepared`, then
+    `conversation.deletion_removed` and `library.conversation_deleted` (ids, counts and times only).
+  - From that commit the conversation is `request.not_found` everywhere: its campaign's list and `total`, GET, `/turns`,
+    PATCH, DELETE and `/deletion`, a question naming it, the area-less question's latest `questions` conversation (the
+    question continues the next latest one, or makes one), `GET /campaigns/{id}/conversation`, a campaign's or a
+    system's deletion counts; and its turns' events, stop and reference pages and pictures. The cancel ends the answer
+    jobs' claims (a later worker call is refused, `job.grant_refused`); a job call already under way when the
+    conversation turned deleting still reads it (`Conversations.storedEvents`,
+    `ConversationStore.findConversationAnyState`) and ends normally.
+  - Removal at `not_before`, as a one-shot after the commit and through the sweep (which resumes it after a restart):
+    in one transaction the references, then each turn with its batches and materials-off rows, then the conversation;
+    then `deletion.done_at`. Every step is safe to repeat.
+  - A campaign or a system deleted meanwhile takes the conversation too (`conversationsOfCampaigns` reads every state);
+    the conversation's own deletion then finds nothing left and is marked done.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.30.0). The worker does
+    not change. After a rollback a deleting conversation shows again, with whatever its removal has not removed yet;
+    that release's sweep takes a pending `conversation` row as a system it cannot find and marks it done. **Before
+    rolling forward again**, make such conversations ready, or they stay `deleting` (hidden) forever with no pending
+    deletion to remove them, so the GM can delete them again:
+    ```sql
+    update conversation c set state = 'ready'
+     where c.state = 'deleting'
+       and not exists (select 1 from deletion d where d.kind = 'conversation' and d.target_id = c.id
+                                                 and d.done_at is null);
+    delete from deletion d
+     where d.kind = 'conversation' and d.done_at is not null
+       and exists (select 1 from conversation c where c.id = d.target_id);
+    ```
+    The second statement drops the record the old sweep ended without removing anything: a deletion is recorded once
+    per target, so it would otherwise answer a new delete of the conversation as not found.
+
+- **Dismiss an answer (`conversations`, Story 3.11, public contract 1.31.0, migration V32, FR-31).** The GM removes an
+  answer they do not want from the conversation, with an undo. No list of dismissed answers.
+  - `V32__turn_dismissal.sql`: `turn.dismissed_at timestamptz` (null: shown). Additive: the previous release neither
+    reads nor writes it.
+  - `PUT /api/v1/turns/{id}/dismissal` (`dismissTurn`) answers 204 and sets `dismissed_at` when it is null;
+    `DELETE /api/v1/turns/{id}/dismissal` (`restoreTurn`) answers 204 and clears it. Both are safe to repeat, and
+    neither moves the conversation's version or `last_asked_at`. Only an ended turn is dismissed (`stopped_at` set, or
+    its last stored event `done` or `error`): otherwise 409 `conversation.turn_running` and nothing changes. Another
+    account's turn, an unknown or malformed id and a turn of a deleting conversation are 404 `request.not_found` on
+    both routes (`Conversations.shown`).
+  - `TurnEntity.dismissedAt` is mapped `updatable = false`: only the store's JPQL bulk updates
+    (`JpaConversationStore.markDismissed`, `clearDismissed`, each after the owner's row was read) write it, so a stop's
+    full-row flush of a turn loaded before a dismissal committed never undoes it (`ConversationStateIntegrationTest`).
+  - From the dismissal's commit: `newestTurns` (so `/turns` and `Conversations.history`), `turnCount` and `turnCounts`
+    (the list's `questions`, `GET /campaigns/{id}/conversation` and `/deletion`) take shown turns only. The history is
+    built for each claim of a question's job (a lapsed claim re-offered builds it again), so a claim already made keeps
+    the history it was given. Unchanged: the default name (`firstTurns` still takes the first
+    question, dismissed or not, so a name never changes on its own), the turn's own routes (events, stop, references
+    and their pages), and the conversation's deletion (`turnsOf` takes every turn).
+  - Lines `conversation.turn_dismissed` and `conversation.turn_restored` carry the owner, the turn and whether it
+    changed.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.31.0). The worker and
+    the internal contract (1.16.0) do not change. After a rollback every dismissed turn shows again and is sent as
+    history again; rolling forward hides them again.
+
+- **Bookmark an answer (`conversations`, Story 3.12, public contract 1.32.0, migration V33, FR-34, FR-36).** The GM
+  saves a useful answer and finds it again from a list across all their campaigns. No notes or folders.
+  - `V33__turn_bookmark.sql`: `turn.bookmarked_at timestamptz` (null: not saved) and the partial index
+    `turn_owner_bookmarked` on `(owner_id, bookmarked_at)` where it is not null. Additive: the previous release
+    neither reads nor writes it.
+  - `PUT /api/v1/turns/{id}/bookmark` (`bookmarkTurn`) answers 204 and sets `bookmarked_at` when it is null;
+    `DELETE /api/v1/turns/{id}/bookmark` (`unbookmarkTurn`) answers 204 and clears it, whatever the turn's state. Both
+    are safe to repeat (a second save keeps the first time), and neither moves the conversation's version or
+    `last_asked_at`. Only a done turn is saved (not stopped, its last stored event a `done` not marked stopped, and
+    not silent: it has a source reference, or a model-knowledge part on a turn whose model knowledge was on, as the
+    `done` event's `silent` says): a running, stopped, failed or silent one is 409 `conversation.turn_not_done` and
+    nothing changes. Another account's
+    turn, an unknown or malformed id and a turn of a deleting conversation are 404 `request.not_found` on both routes.
+  - `TurnEntity.bookmarkedAt` is mapped `updatable = false`, as `dismissedAt`: only the store's JPQL bulk updates
+    (`JpaConversationStore.markBookmarked`, `clearBookmarked`) write it (`ConversationStateIntegrationTest`). Deleting
+    a turn by any route (its conversation, campaign or system) deletes the row, so the bookmark goes with it.
+  - `GET /api/v1/conversations/{id}/turns`: each turn gains `bookmarked`.
+  - `GET /api/v1/saved-answers?limit&offset` (`listSavedAnswers`, under the library routes' session edge) answers
+    `{items, nextCursor, total}` as the conversations list does: ordered `bookmarked_at desc, id desc`, `limit` 1 to
+    50 (default 20), `offset` 0 to 100000, else 400 `request.invalid`. Each item: `turnId`, `conversationId`,
+    `campaignId`, `campaignName`, `area`, `conversationName` (the list's name rule), `savedAt` and `excerpt` (the
+    answer's joined `delta` texts with Markdown stripped by `conversations.service.Markdown`, white space flattened,
+    cut at a word boundary to at most 280 code points by `Searches.firstWords`). `Conversations.saved` reads the
+    campaigns of the owner's listed saved turns (`savedCampaigns`), keeps those `Library.places` holds and that are
+    not archived (so a campaign being deleted or archived drops out, and an archived one comes back on its restore),
+    then pages `savedTurns` and counts `savedCount` within them: both join each saved turn to its `ready`
+    conversation on owner and id and leave out a dismissed turn (its bookmark is kept, so the undo lists it again).
+  - No standing as a source: neither the scope, retrieval nor `Conversations.history` reads the column
+    (`ConversationFlowTest` asserts the history and the passages handed over are the same with and without it).
+  - Lines `conversation.turn_bookmarked` and `conversation.turn_unbookmarked` carry the owner, the turn and whether
+    it changed.
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.32.0). The worker and
+    the internal contract (1.16.0) do not change. After a rollback the bookmarks are kept but not shown; rolling
+    forward shows them again.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
@@ -570,7 +1198,8 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     `ScopeSettings.STARTING` frozen on it and its language, and its job of kind `question.answer` on the interactive
     lane. Another owner's campaign, an unknown one or a malformed id is 404, with nothing recorded. The language is
     `pt-BR`, `en` or null when unsure (`Languages`: a count of each language's short words, no library, no model).
-    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10.
+    Only the turns asked since the page opened are shown (Dalton, 2026-11-18): there is no turns list until Story 3.10
+    (below: a campaign has many conversations by area, each with its turns).
   - `GET /api/v1/turns/{turnId}/events` is `text/event-stream` (`TurnStreams`): the stored events after
     `Last-Event-ID` (0 when absent or not a number), then new ones, each `id:` its sequence (1, 2, … per turn) and
     named `delta {text}`, `citation {passageId, offset}`, `done {silent, references}` (Story 2.5, below) or
@@ -782,6 +1411,7 @@ that names the settings, never a value, and exits with status 78.
 | `GMSHIELD_UPLOAD_SWEEP_EVERY` | how often unfinished uploads past their 6 hours are discarded (default `10m`) |
 | `GMSHIELD_VERSION_REMOVAL_SWEEP_EVERY` | how often the removals of discarded versions that stopped half way are finished (default `10m`) |
 | `GMSHIELD_INDEX_RETRY_EVERY` | how often the index changes whose job failed get a new job, each run at most 3 times (default `10m`) |
+| `GMSHIELD_SYSTEM_DELETION_SWEEP_EVERY` | how often the deletions of systems and campaigns that are due are run again, the first right after the start (default `10m`) |
 | `GMSHIELD_JOB_OUTPUT_MAX_BYTES` | the largest file a worker may send back for a job (default `3GB`, a Spring data size in binary units) |
 | `GMSHIELD_JOB_OUTPUT_CLAIM_MAX_BYTES` | all the files one claim may send back together (default `8GB`; at least the output limit) |
 | `GMSHIELD_INGESTION_STEPS_PER_PAGE` | a version may have at most this many steps per page, plus one (default `4`, 1 to 100) |

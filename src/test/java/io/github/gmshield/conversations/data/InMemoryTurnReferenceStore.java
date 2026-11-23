@@ -47,4 +47,20 @@ public class InMemoryTurnReferenceStore implements TurnReferenceStore {
         return rows.values().stream().filter(row -> row.turnId().equals(turnId))
                 .sorted(Comparator.comparingInt(TurnReferenceRow::number)).toList();
     }
+
+    @Override
+    public synchronized int deleteReferences(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("no transaction");
+        }
+        List<TurnReferenceRow> found = references(turnId);
+        for (TurnReferenceRow row : found) {
+            if (owner.equals(row.ownerId())) {
+                rows.remove(row.id());
+                RollbackUndo.onRollback(() -> rows.put(row.id(), row));
+            }
+        }
+        return found.size();
+    }
 }

@@ -5,11 +5,13 @@ import java.util.UUID;
 
 /**
  * A source reference of a completed turn as the GM's stream sends it (Story 2.5): its number (1..n, by first citation),
- * the material's name, the section path (outermost first), the page, the ids of the cited passages at that place, and
- * whether its source has been removed since. {@code toString} names the number and the page only.
+ * the material's name, the section path (outermost first), the page, the ids of the cited passages at that place,
+ * whether its source has been removed since, and (Story 3.7) the tier its source had in the turn's scope when the
+ * answer was written ({@code null} for a reference stored before then). {@code toString} names the number and the page
+ * only.
  */
 public record TurnReference(int number, String materialName, List<String> sectionPath, int page,
-                            List<UUID> passageIds, boolean removed) {
+                            List<UUID> passageIds, boolean removed, String tier) {
 
     public TurnReference {
         sectionPath = List.copyOf(sectionPath);

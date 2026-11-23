@@ -4,16 +4,21 @@ import java.util.UUID;
 
 /**
  * One event of a turn's answer as the GM's stream sends it (Story 2.4): its sequence (1, 2, … per turn) and its kind,
- * {@code delta} with its text, {@code citation} with a passage id and an offset, {@code done} ({@code stopped} when the
- * GM stopped the answer, Story 2.6), or {@code error} with a code. {@code toString} never names the text.
+ * {@code delta} with its text, {@code citation} with a passage id and an offset, {@code tier} with a tier word and an
+ * offset (Story 3.7: that tier's version of the answer starts there; Story 3.8: {@value #MODEL} starts a part from the
+ * model's own knowledge), {@code done} ({@code stopped} when the GM stopped the answer, Story 2.6), or {@code error}
+ * with a code. {@code toString} never names the text.
  */
 public record TurnEvent(long sequence, String type, String text, UUID passageId, Integer offset, String code,
-                        boolean stopped) {
+                        boolean stopped, String tier) {
 
     public static final String DELTA = "delta";
     public static final String CITATION = "citation";
+    public static final String TIER = "tier";
     public static final String DONE = "done";
     public static final String ERROR = "error";
+    /** The tier word of a part from the model's own knowledge (Story 3.8): a turn-event tier, never a source's. */
+    public static final String MODEL = "model";
 
     /** Whether the answer ends with this event. */
     public boolean last() {
@@ -21,7 +26,7 @@ public record TurnEvent(long sequence, String type, String text, UUID passageId,
     }
 
     TurnEvent at(long newSequence) {
-        return new TurnEvent(newSequence, type, text, passageId, offset, code, stopped);
+        return new TurnEvent(newSequence, type, text, passageId, offset, code, stopped, tier);
     }
 
     @Override

@@ -18,6 +18,10 @@
  * {@code findPassages}; from Story 2.7, a page and picture of a given cited version, through the review ground's
  * read. It is this module's only named interface, and only the {@code scope} module may use it
  * ({@code ModuleBoundaryTest}).
+ *
+ * <p>From Story 3.1 part B, {@code service.SystemMaterialsDeletion} is this module's part of a system's deletion
+ * ({@code library.service.SystemDeletionHandler}): it cancels and discards the versions of the materials that go, and
+ * later removes them, their rows and files, after one {@code index.removal} per version.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
         allowedDependencies = {"shared :: service", "vault :: service", "jobs :: service", "library :: service"})

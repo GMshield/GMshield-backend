@@ -46,7 +46,10 @@ FROM eclipse-temurin:27.0.1.0-jre-alpine@sha256:a0f3b523fd89e242ce302715ce367f68
 ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="gmshield-backend" \
       org.opencontainers.image.revision="${GIT_SHA}"
-RUN addgroup -S -g 10001 gmshield \
+# libfontenc's current Alpine security update (unpinned: on 2026-11-21 the pinned base still carried
+# 1.1.9-r0, and 1.1.10-r0 fixes CVE-2026-109908).
+RUN apk upgrade --no-cache libfontenc \
+    && addgroup -S -g 10001 gmshield \
     && adduser -S -D -H -u 10001 -G gmshield -s /sbin/nologin gmshield \
     && install -d -o 10001 -g 10001 -m 700 /var/lib/gmshield/files
 WORKDIR /app
