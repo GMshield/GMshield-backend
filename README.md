@@ -202,14 +202,22 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
     body as a random id (the trace id aside), also with B's own campaign or material beside A's version. Each body or
     header field that names an item (`campaignId`, `systemId`, `conversationId`, a search's `materialId`,
     `materialsOff`, a material's `belonging`, upload metadata and image-set `campaign`, `system`, `systems` and
-    `material`, the `?system=` filters) answers exactly what a random id gets. Afterwards no in-memory row, job or
+    `material`, the `?system=` filters) answers exactly what a random id gets. Afterwards no compared row, job or
     offered message has changed, A reads every item back as it was, and B's lists hold none of A's ids.
     `CrossOwnerRouteGuardTest` reads `/v3/api-docs/public`: an operation whose path has a `{…}` parameter that is
     neither a row of the audit nor in its exemption list (with a reason) fails, naming its method and path, and so
     does a path outside `LibraryOwnerFilter.LIBRARY_ROUTES` that is not in its short list of session and sign-in
     paths; each covered operation is also refused with `session.required` without a session. A new route therefore
-    ships with its row in the audit. The audit runs on the in-memory twins of the stores; PostgreSQL's owner
-    filtering is covered by the integration tests of the library, uploads and materials.
+    ships with its row in the audit. The audit runs twice: on the in-memory twins of the stores in `./gradlew check`,
+    and on PostgreSQL and Redis in `CrossOwnerAuditIntegrationTest` (`./gradlew integrationTest`), which shares the
+    unit test's routes, probes and worlds through the test classes on the integration classpath. There, "nothing
+    changed" is a dump of A's and B's rows in the tables with an `owner_id` column (a new one is covered without
+    editing the test; `account` and `audit_entry` have no such column and are not dumped) and each lane's whole work
+    stream (`XRANGE`), compared before and after; a test changes one of A's rows through JDBC between two dumps to
+    prove the comparison names it. A store that drops its `@TenantId` filter fails the audit; a JDBC store's
+    `owner_id = :owner` filter is proved only where an audited route reaches that store before a `@TenantId` lookup
+    refuses the id, which is not the case for `JdbcDeletionStore`'s reads. In memory, the compared tables are a
+    hand-kept list in `InMemoryCrossOwnerAuditStores`.
   - **Systems (Story 3.1 part A, public contract 1.17.0, migration V21).** The GM lists, creates and edits systems
     (deleting one is part B, below). A system is `{id, name, edition, description, version}`; `edition` and `description`
     are null when none was given.
