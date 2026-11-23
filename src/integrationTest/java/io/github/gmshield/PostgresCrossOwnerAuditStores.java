@@ -136,11 +136,13 @@ final class PostgresCrossOwnerAuditStores implements CrossOwnerAuditStores {
 
     @Override
     public Map<String, List<String>> held() {
-        return Map.of("system", List.of("system"), "record_type", List.of("recordType"), "campaign", List.of("campaign"),
-                "material", List.of("material", "imageSetMaterial"), "material_version", List.of("version",
-                        "superseded", "imageSet"), "passage", List.of("passage"), "upload", List.of("upload"),
-                "conversation", List.of("conversation", "rulesConversation"), "turn", List.of("turn",
-                        "dismissedTurn", "waitingTurn"), "search", List.of("search"));
+        return Map.ofEntries(Map.entry("system", List.of("system")), Map.entry("record_type", List.of("recordType")),
+                Map.entry("record", List.of("record")), Map.entry("campaign", List.of("campaign")),
+                Map.entry("material", List.of("material", "imageSetMaterial")),
+                Map.entry("material_version", List.of("version", "superseded", "imageSet")),
+                Map.entry("passage", List.of("passage")), Map.entry("upload", List.of("upload")),
+                Map.entry("conversation", List.of("conversation", "rulesConversation")),
+                Map.entry("turn", List.of("turn", "dismissedTurn", "waitingTurn")), Map.entry("search", List.of("search")));
     }
 
     /** Each lane's whole stream, its messages' job ids in order; a message without a job id is left out. */

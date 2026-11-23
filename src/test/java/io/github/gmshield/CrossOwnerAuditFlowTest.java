@@ -76,8 +76,9 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Story 3.13 part C: the cross-owner audit. Account A owns one item of every library kind of Epic 3 and before: a
- * system (from Story 4.1 with its core record types) and a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second
- * version that is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
+ * system (from Story 4.1 with its core record types, and from Story 4.3 the spell record of its accepted version) and
+ * a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second version that
+ * is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
  * open uploads; a conversation with a done, bookmarked turn whose reference opens a page, a done, dismissed turn, a
  * search, and a turn still waiting in a second conversation. Account B then walks {@link #ROUTES}, every public route
  * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
@@ -181,6 +182,14 @@ class CrossOwnerAuditFlowTest {
             route("PATCH", "/api/v1/record-types/{id}", "id", "recordType")
                     .json("{\"version\":{recordTypeVersion},\"name\":\"Tomado\"}"),
             route("DELETE", "/api/v1/record-types/{id}", "id", "recordType"),
+            // a record type's records, and a record as its system shows it with its version's pages (Story 4.3)
+            route("GET", "/api/v1/record-types/{id}/records", "id", "recordType"),
+            route("GET", "/api/v1/systems/{systemId}/records/{recordId}", "systemId", "system", "recordId", "record")
+                    .own("systemId"),
+            route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}", "systemId", "system",
+                    "recordId", "record", "page", "1").own("systemId"),
+            route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}/picture", "systemId", "system",
+                    "recordId", "record", "page", "1").headers("Accept", "image/webp").own("systemId"),
             // campaigns
             route("GET", "/api/v1/campaigns/{id}", "id", "campaign"),
             route("PATCH", "/api/v1/campaigns/{id}", "id", "campaign")
@@ -593,6 +602,12 @@ class CrossOwnerAuditFlowTest {
         items.put("version", second.versionId().toString());
         UUID passage = stores.passage(second.versionId());
         items.put("passage", passage.toString());
+        // Story 4.3: the spell record of the ready version, as A's records list names it (the superseded version's
+        // record is not listed).
+        JsonNode records = json(get(gm, "/api/v1/record-types/" + items.get("recordType") + "/records"));
+        assertThat(records.path("total").asLong()).as(records.toString()).isEqualTo(1);
+        assertThat(records.path("items").get(0).path("name").asString()).isEqualTo("Fire Bolt");
+        items.put("record", records.path("items").get(0).path("id").asString());
 
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"

@@ -12,6 +12,7 @@ import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialStore;
@@ -1775,6 +1776,133 @@ class IngestionIntegrationTest {
     private long spellCount(UUID owner, UUID system) throws Exception {
         return as(owner, () -> ontology.recordTypes(system, 0, 8)).orElseThrow().items().stream()
                 .filter(type -> "spell".equals(type.core())).findFirst().orElseThrow().records();
+    }
+
+    // --- Story 4.3: a system's records on Postgres
+
+    @Autowired
+    private Records systemRecords;
+
+    @Test
+    void aSystemsRecordsAreListedByNameFromItsReadyVersionsOnlyAndOneOpensWithItsReferencesGroupedOnPostgres()
+            throws Exception {
+        UUID owner = Ids.newId();
+        write(owner, () -> library.createStarter(Language.EN));
+        UUID system = jdbc.sql("select id from system where owner_id = ?").param(owner).query(UUID.class).single();
+        UUID campaign = jdbc.sql("select id from campaign where owner_id = ?").param(owner).query(UUID.class).single();
+        Uploads.Details toSystem = new Uploads.Details(null, null, null, List.of(system.toString()));
+
+        // A material of the system, with two more passages on page 2 under one section path.
+        Chain book = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        UUID p1 = passageOn(book, 1);
+        UUID p3 = passageOn(book, 3);
+        UUID twoA = Ids.newId();
+        UUID twoB = Ids.newId();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        write(owner, () -> store.insertPassages(List.of(passageRow(book, twoA, 2, 2, now),
+                passageRow(book, twoB, 3, 2, now))));
+        write(owner, () -> extracted.replaceRange(book.versionId(), 1, 4, List.of(
+                new ExtractedRecords.Extracted("spell", "bola de fogo", List.of(new ExtractedRecords.Field("Nível",
+                        "3"), new ExtractedRecords.Field("Alcance", "45 m")), List.of(p3, twoA, p1, twoB), 1),
+                new ExtractedRecords.Extracted("spell", "Ácido", List.of(), List.of(p1), 1),
+                new ExtractedRecords.Extracted("spell", "Bola de Fogo", List.of(), List.of(p3), 3),
+                new ExtractedRecords.Extracted("item", "Corda", List.of(), List.of(p1), 1))));
+        accepted(book);
+        // A material of the system's campaign: the type filter spans both versions.
+        Chain campaignBook = reviewed(completed(owner, pdf(MIB), new Uploads.Details(null, null, campaign.toString(),
+                (List<String>) null)), 4, List.of());
+        write(owner, () -> extracted.replaceRange(campaignBook.versionId(), 1, 4, List.of(
+                new ExtractedRecords.Extracted("spell", "Zarabatana", List.of(), List.of(passageOn(campaignBook, 3)),
+                        3),
+                new ExtractedRecords.Extracted("spell", "abelha", List.of(), List.of(passageOn(campaignBook, 1)),
+                        1))));
+        accepted(campaignBook);
+        // A material accepted, then replaced by a version accepted too: the first is superseded.
+        Chain old = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        write(owner, () -> extracted.replaceRange(old.versionId(), 1, 4, List.of(new ExtractedRecords.Extracted(
+                "spell", "Antiga", List.of(), List.of(passageOn(old, 1)), 1))));
+        accepted(old);
+        Chain renewed = reviewed(completed(owner, pdf(MIB), new Uploads.Details(null, null, null, null,
+                old.materialId().toString())), 4, List.of());
+        write(owner, () -> extracted.replaceRange(renewed.versionId(), 1, 4, List.of(new ExtractedRecords.Extracted(
+                "spell", "Renovada", List.of(), List.of(passageOn(renewed, 1)), 1))));
+        accepted(renewed);
+        assertThat(state(old.versionId())).isEqualTo("superseded");
+        // A version that still needs review.
+        Chain pending = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        write(owner, () -> extracted.replaceRange(pending.versionId(), 1, 4, List.of(new ExtractedRecords.Extracted(
+                "spell", "Pendente", List.of(), List.of(passageOn(pending, 1)), 1))));
+        UUID spell = as(owner, () -> ontology.recordTypes(system, 0, 8)).orElseThrow().items().stream()
+                .filter(type -> "spell".equals(type.core())).findFirst().orElseThrow().id();
+
+        Records.SummaryPage all = as(owner, () -> systemRecords.records(spell, 0, 50)).orElseThrow();
+
+        assertThat(all.total()).isEqualTo(6);
+        assertThat(all.items()).extracting(Records.Summary::name).containsExactly("abelha", "Ácido",
+                all.items().get(2).name(), all.items().get(3).name(), "Renovada", "Zarabatana");
+        assertThat(all.items().subList(2, 4)).extracting(Records.Summary::name)
+                .containsExactlyInAnyOrder("bola de fogo", "Bola de Fogo");
+        assertThat(all.items().subList(2, 4)).extracting(Records.Summary::id).isSorted();
+        assertThat(all.items()).allSatisfy(item -> assertThat(item.materialName()).isEqualTo("Livro.pdf"));
+        assertThat(all.items()).extracting(Records.Summary::page).containsExactly(1, 1,
+                all.items().get(2).page(), all.items().get(3).page(), 1, 3);
+        Records.SummaryPage paged = as(owner, () -> systemRecords.records(spell, 2, 2)).orElseThrow();
+        assertThat(paged.total()).isEqualTo(6);
+        assertThat(paged.items()).isEqualTo(all.items().subList(2, 4));
+        assertThat(as(owner, () -> systemRecords.records(spell, 5, 2)).orElseThrow().items())
+                .extracting(Records.Summary::name).containsExactly("Zarabatana");
+        // Another owner reads none of it.
+        assertThat(as(Ids.newId(), () -> systemRecords.records(spell, 0, 50))).isEmpty();
+
+        // One record: its fields in stored order, one reference per (version, section path, page), in page order.
+        UUID bola = jdbc.sql("select id from record where version_id = ? and ordinal = 0").param(book.versionId())
+                .query(UUID.class).single();
+        Records.Detail detail = as(owner, () -> systemRecords.record(system, bola)).orElseThrow();
+        assertThat(detail.name()).isEqualTo("bola de fogo");
+        assertThat(detail.recordType().id()).isEqualTo(spell);
+        assertThat(detail.recordType().core()).isEqualTo("spell");
+        assertThat(detail.fields()).extracting(Records.Field::name, Records.Field::value)
+                .containsExactly(tuple("Nível", "3"), tuple("Alcance", "45 m"));
+        assertThat(detail.references()).extracting(Records.Reference::page, Records.Reference::sectionPath)
+                .containsExactly(tuple(1, List.of("Capítulo")), tuple(2, List.of("A")),
+                        tuple(3, List.of("Capítulo", "Seção")));
+        // Each carries the record's passages at its place: both of page 2's under one reference, ordered by id.
+        assertThat(detail.references()).extracting(Records.Reference::passageIds).containsExactly(List.of(p1),
+                Stream.of(twoA, twoB).sorted().toList(), List.of(p3));
+        assertThat(detail.references()).allSatisfy(reference -> {
+            assertThat(reference.versionId()).isEqualTo(book.versionId());
+            assertThat(reference.materialName()).isEqualTo("Livro.pdf");
+        });
+        // Its version's pages, every one of them, with their pictures.
+        assertThat(as(owner, () -> systemRecords.page(system, bola, 4)).orElseThrow().pageTotal()).isEqualTo(4);
+        assertThat(as(owner, () -> systemRecords.picture(system, bola, 2))).isPresent();
+        assertThat(as(owner, () -> systemRecords.page(system, bola, 5))).isEmpty();
+
+        // Hidden: a superseded version's record, a pending one's, another system's view, another owner.
+        UUID antiga = jdbc.sql("select id from record where version_id = ?").param(old.versionId()).query(UUID.class)
+                .single();
+        UUID pendente = jdbc.sql("select id from record where version_id = ?").param(pending.versionId())
+                .query(UUID.class).single();
+        UUID otherSystem = as(owner, () -> library.createSystem(new Library.SystemFields("Outro", null, null))).id();
+        assertThat(as(owner, () -> systemRecords.record(system, antiga))).isEmpty();
+        assertThat(as(owner, () -> systemRecords.page(system, antiga, 1))).isEmpty();
+        assertThat(as(owner, () -> systemRecords.record(system, pendente))).isEmpty();
+        assertThat(as(owner, () -> systemRecords.record(otherSystem, bola))).isEmpty();
+        assertThat(as(Ids.newId(), () -> systemRecords.record(system, bola))).isEmpty();
+        assertThat(as(owner, () -> systemRecords.record(system, Ids.newId()))).isEmpty();
+        freeTheIngestionLane();
+    }
+
+    /** The chain's version accepted; its index changes would hold the ingestion lane. */
+    private void accepted(Chain chain) throws Exception {
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+        assertThat(state(chain.versionId())).isEqualTo("ready");
+        freeTheIngestionLane();
+    }
+
+    private UUID passageOn(Chain chain, int page) {
+        return jdbc.sql("select id from passage where version_id = ? and page = ? order by ordinal limit 1")
+                .params(chain.versionId(), page).query(UUID.class).single();
     }
 
     // --- helpers

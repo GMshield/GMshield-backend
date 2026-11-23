@@ -6,6 +6,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -66,6 +67,32 @@ public class InMemoryRecordStore implements RecordStore {
         records.values().stream().filter(row -> row.ownerId().equals(owner) && versionIds.contains(row.versionId()))
                 .forEach(row -> counts.merge(row.type(), 1L, Long::sum));
         return counts;
+    }
+
+    @Override
+    public Optional<RecordRow> find(UUID id) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(records.get(id)).filter(row -> row.ownerId().equals(owner))
+                .map(row -> withLinks(row, row.passageIds().stream().sorted().toList()));
+    }
+
+    @Override
+    public List<RecordRow> ofTypeIn(Collection<UUID> versionIds, String type) {
+        UUID owner = OwnerContext.require();
+        return records.values().stream().filter(row -> row.ownerId().equals(owner)
+                && versionIds.contains(row.versionId()) && row.type().equals(type))
+                .map(row -> withLinks(row, List.of())).toList();
+    }
+
+    @Override
+    public List<UUID> passagesOf(UUID recordId) {
+        return find(recordId).map(RecordRow::passageIds).orElse(List.of());
+    }
+
+    /** The row as the JPA store reads it: its links by passage id, or none for a list. */
+    private static RecordRow withLinks(RecordRow row, List<UUID> passageIds) {
+        return new RecordRow(row.id(), row.ownerId(), row.versionId(), row.ordinal(), row.firstPage(), row.type(),
+                row.name(), row.fields(), passageIds, row.createdAt());
     }
 
     private int delete(List<RecordRow> found) {

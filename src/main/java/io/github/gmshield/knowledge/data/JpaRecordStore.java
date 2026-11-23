@@ -7,6 +7,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
@@ -27,6 +28,11 @@ class JpaRecordStore implements RecordStore {
             + " and r.firstPage between :first and :last";
     private static final String LINKS = "select l from RecordPassage l where l.recordId in :records"
             + " order by l.recordId, l.passageId";
+    private static final String BY_ID = "select r from Record r where r.id = :id";
+    private static final String OF_TYPE = "select r from Record r where r.versionId in :versions"
+            + " and r.recordType = :type";
+    private static final String LINKS_OF = "select l.passageId from RecordPassage l where l.recordId = :record"
+            + " order by l.passageId";
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
             + " group by r.recordType order by r.recordType";
 
@@ -80,6 +86,29 @@ class JpaRecordStore implements RecordStore {
         em().createQuery(COUNTS, Object[].class).setParameter("versions", versionIds).getResultList()
                 .forEach(row -> counts.put((String) row[0], (Long) row[1]));
         return counts;
+    }
+
+    @Override
+    public Optional<RecordRow> find(UUID id) {
+        List<RecordEntity> found = em().createQuery(BY_ID, RecordEntity.class).setParameter("id", id).getResultList();
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(found.getFirst().row(passagesOf(id)));
+    }
+
+    @Override
+    public List<RecordRow> ofTypeIn(Collection<UUID> versionIds, String type) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(OF_TYPE, RecordEntity.class).setParameter("versions", versionIds)
+                .setParameter("type", type).getResultList().stream().map(entity -> entity.row(List.of())).toList();
+    }
+
+    @Override
+    public List<UUID> passagesOf(UUID recordId) {
+        return em().createQuery(LINKS_OF, UUID.class).setParameter("record", recordId).getResultList();
     }
 
     /** Removes the records' links, then the records themselves; answers how many records went. */
