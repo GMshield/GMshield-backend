@@ -108,6 +108,11 @@ import tools.jackson.databind.json.JsonMapper;
  * value (so it keeps its fields when its material is reprocessed, and reads as removed once the material is deleted);
  * a record citation out of scope is dropped; a stopped answer keeps its cited records; the record reference's page
  * opens on the turn's ground; and no line names a record or a field.
+ *
+ * <p>Story 4.4 part B, records of a type the GM approved: they are listed, counted and opened in a system that has a
+ * type of their key, and stay passages in a system that has none (not listed, not opened, not found by a search or an
+ * answer of its campaigns, and a worker returning one is refused); a search and a question carry the campaign's
+ * system's keys; a type with records cannot be deleted.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -1062,6 +1067,99 @@ class RecordsFlowTest {
                 reference -> reference.path("recordId").asString()).containsExactly(tuple("record", light));
     }
 
+    // --- Story 4.4 part B: records of an approved type
+
+    @Test
+    void anApprovedTypesRecordsAreListedCountedAndOpenedOnlyInTheSystemThatHasItsKey() throws Exception {
+        Gm gm = signUp();
+        UUID other = createSystem(gm, "Outro");
+        UUID talent = approvedType(gm, gm.system(), "Talento", "talento");
+        // Matrix row "Two systems": the material counts under both, and only the GM's system approved the key.
+        Ingested book = accepted(gm, metadata("Livro.pdf", "systems", gm.system() + "," + other), List.of(
+                record("talento", "Ataque Poderoso", 1, List.of(new Field("Custo", "1 PM"))),
+                record("spell", "Luz", 1, List.of())));
+        String power = recordOf(book.versionId(), "Ataque Poderoso");
+
+        JsonNode page = ok(get("/api/v1/record-types/" + talent + "/records", gm.session()));
+        assertThat(page.path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Ataque Poderoso");
+        assertThat(ok(get("/api/v1/record-types/" + talent, gm.session())).path("records").asLong()).isEqualTo(1);
+        JsonNode read = ok(get("/api/v1/systems/" + gm.system() + "/records/" + power, gm.session()));
+        assertThat(read.path("recordType").path("id").asString()).isEqualTo(talent.toString());
+        assertThat(read.path("recordType").path("key").asString()).isEqualTo("talento");
+        assertThat(read.path("recordType").path("core").isNull()).isTrue();
+        assertThat(read.path("recordType").path("name").asString()).isEqualTo("Talento");
+        assertThat(ok(get("/api/v1/systems/" + gm.system() + "/records/" + recordOf(book.versionId(), "Luz"),
+                gm.session())).path("recordType").path("key").asString()).isEqualTo("spell");
+
+        // In the other system it stays passages: not counted, not listed, not opened; its spell is.
+        JsonNode types = ok(get("/api/v1/systems/" + other + "/record-types", gm.session()));
+        assertThat(types.path("items")).extracting(item -> item.path("key").asString()).doesNotContain("talento");
+        assertThat(types.path("items")).filteredOn(item -> item.path("key").asString().equals("spell"))
+                .extracting(item -> item.path("records").asLong()).containsExactly(1L);
+        assertProblem(get("/api/v1/systems/" + other + "/records/" + power, gm.session()), 404, "request.not_found");
+
+        // Matrix row "Delete in use".
+        assertProblem(send("DELETE", "/api/v1/record-types/" + talent, gm.session(), null), 409,
+                "ontology.record_type_in_use");
+        assertNoLineNames("Ataque Poderoso", "1 PM");
+    }
+
+    @Test
+    void aSearchAndAnAnswerOfTheCampaignReadOnlyTheKeysOfItsSystemAndAForgedOneIsRefused() throws Exception {
+        Gm gm = signUp();
+        UUID other = createSystem(gm, "Outro");
+        approvedType(gm, gm.system(), "Talento", "talento");
+        approvedType(gm, other, "Vantagem", "vantagem");
+        Ingested book = accepted(gm, metadata("Livro.pdf", "systems", gm.system() + "," + other), List.of(
+                record("talento", "Ataque Poderoso", 1, List.of(new Field("Custo", "1 PM"))),
+                record("vantagem", "Sortudo", 1, List.of())));
+        String power = recordOf(book.versionId(), "Ataque Poderoso");
+        String lucky = recordOf(book.versionId(), "Sortudo");
+
+        // Matrix row "Search filter": the campaign's system's keys go to the worker, and a filter takes any key.
+        Search search = search(gm, Map.of("query", "Golpe", "recordType", "talento"));
+        assertThat(search.claim().path("input").path("recordType").asString()).isEqualTo("talento");
+        assertThat(strings(search.claim().path("input").path("recordTypes"))).contains("talento", "spell", "note")
+                .doesNotContain("vantagem").isSorted();
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + power + "\"]}");
+        JsonNode found = ok(get("/api/v1/searches/" + search.id(), gm.session()));
+        assertThat(found.path("recordType").asString()).isEqualTo("talento");
+        assertThat(found.path("results")).extracting(result -> result.path("recordId").asString(),
+                result -> result.path("recordType").asString()).containsExactly(tuple(power, "talento"));
+        // A record whose key the campaign's system lacks is not found by name, and a worker returning it is refused.
+        Search byName = search(gm, Map.of("query", "Sortudo"));
+        report(byName.jobId(), byName.claim(), "{\"ids\":[]}");
+        assertThat(ok(get("/api/v1/searches/" + byName.id(), gm.session())).path("results")).isEmpty();
+        Search forged = search(gm, Map.of("query", "Sortudo"));
+        report(forged.jobId(), forged.claim(), "{\"ids\":[\"" + lucky + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + forged.id(), gm.session())).path("code").asString())
+                .isEqualTo("scope.passage_refused");
+        // A filter that is not a key's text is refused.
+        for (String bad : List.of("Talento", "3d6", "a-b", "x".repeat(33))) {
+            HttpResponse<String> refused = send("POST", "/api/v1/campaigns/" + gm.campaign() + "/searches",
+                    gm.session(), Map.of("query", "Golpe", "recordType", bad));
+            assertThat(refused.statusCode()).as(bad).isEqualTo(400);
+        }
+        assertProblem(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + lucky, gm.session()), 404,
+                "request.not_found");
+
+        // Matrix row "Answer cites one": the question's input names the keys; the record reads and is cited with its
+        // key, and a record of another system's key refuses the whole read.
+        Answer answer = asked(gm, "Quanto custa Ataque Poderoso?");
+        assertThat(strings(answer.claim().path("input").path("recordTypes"))).contains("talento")
+                .doesNotContain("vantagem");
+        assertProblem(readRecords(answer, List.of(power, lucky)), 403, "scope.passage_refused");
+        JsonNode read = ok(readRecords(answer, List.of(power)));
+        assertThat(read.path("records").get(0).path("type").asString()).isEqualTo("talento");
+        events(answer, List.of(delta("Custa 1 PM."), recordCitation(lucky, 9), recordCitation(power, 10)));
+        done(answer);
+        JsonNode references = references(gm, answer);
+        assertThat(references).extracting(reference -> reference.path("recordId").asString(),
+                reference -> reference.path("recordType").asString()).containsExactly(tuple(power, "talento"));
+        assertNoLineNames("Ataque Poderoso", "Sortudo", "1 PM", "talento", "vantagem");
+    }
+
     // --- helpers: answers
 
     /** A question of the GM's current campaign, its turn's conversation, and its answer job claimed as the worker. */
@@ -1267,6 +1365,15 @@ class RecordsFlowTest {
         OwnerContext.runAs(gm.id(), () -> knowledge.insertRecordTypes(List.of(new RecordTypeRow(id, gm.id(), system,
                 null, "t" + id.toString().substring(0, 8), Ids.newId(),
                 vault.encryptText(new Binding("record_type", "name", id, gm.id()), name),
+                vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0, Instant.now()))));
+        return id;
+    }
+
+    /** A record type the GM approved in {@code system} with this name and key (Story 4.4), stored directly: its id. */
+    private UUID approvedType(Gm gm, UUID system, String name, String key) {
+        UUID id = Ids.newId();
+        OwnerContext.runAs(gm.id(), () -> knowledge.insertRecordTypes(List.of(new RecordTypeRow(id, gm.id(), system,
+                null, key, Ids.newId(), vault.encryptText(new Binding("record_type", "name", id, gm.id()), name),
                 vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0, Instant.now()))));
         return id;
     }

@@ -53,10 +53,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       Empty for an unknown search, another owner's, or one whose campaign is not found (deleted since).</li>
  * </ul>
  *
- * <p>Story 4.3 part B: a search may also have a record-type filter (a core key of {@link #RECORD_TYPES}, else
- * {@code request.invalid}), which leaves only records of that type, and its results may be records: a record result is
- * re-read within the same narrowed scope ({@link Scopes#records}) and carries its name (decrypted only for the answer),
- * its core type, its first page's place and the ids of its passages there, instead of first words.
+ * <p>Story 4.3 part B: a search may also have a record-type filter (a core key; from Story 4.4 part B any record
+ * type key, {@link Scopes#recordTypeKey}, else {@code request.invalid}), which leaves only records of that type, and
+ * its results may be records: a record result is re-read within the same narrowed scope ({@link Scopes#records}) and
+ * carries its name (decrypted only for the answer), its type's key, its first page's place and the ids of its passages
+ * there, instead of first words.
  *
  * <p>The query is never matched in SQL. Lines carry ids, counts and codes, never a query or a passage's text.
  */
@@ -69,12 +70,6 @@ public class Searches {
     public static final int KEPT = 20;
     /** The most results a search stores. */
     public static final int MAX_RESULTS = 20;
-    /**
-     * The core keys a record-type filter may name: records store core keys (Story 4.2), so a filter never names a type
-     * the GM approved. The same eight keys as {@code record_type.core} and {@code record.type} (V34, V35).
-     */
-    public static final List<String> RECORD_TYPES = List.of("rule", "spell", "item", "creature", "character_sheet",
-            "encounter", "dungeon", "note");
     /** A passage result's kind. */
     public static final String PASSAGE = "passage";
     /** A record result's kind (Story 4.3 part B). */
@@ -107,7 +102,7 @@ public class Searches {
 
     /**
      * A search's result as the GM reads it: a passage ({@code kind} {@value #PASSAGE}: its id and first words) or, from
-     * Story 4.3 part B, a record ({@code kind} {@value #RECORD}: its id, name, core type and the ids of its passages on
+     * Story 4.3 part B, a record ({@code kind} {@value #RECORD}: its id, name, type key and the ids of its passages on
      * its first page); both with their version, material name, section path, page and tier. The fields of the other
      * kind are null (empty for {@code passageIds}). {@code toString} names ids, the kind, the page and the tier only.
      */
@@ -171,7 +166,7 @@ public class Searches {
     /** Records a search of the owner's campaign, as the class says; answers its id. */
     public UUID create(UUID campaignId, String query, Tier tier, UUID materialId, String recordType) {
         if (query == null || query.isBlank() || query.codePointCount(0, query.length()) > Scopes.MAX_QUERY
-                || recordType != null && !RECORD_TYPES.contains(recordType)) {
+                || recordType != null && !Scopes.recordTypeKey(recordType)) {
             throw ConversationProblems.invalid();
         }
         UUID owner = OwnerContext.require();
@@ -189,7 +184,7 @@ public class Searches {
                     .addKeyValue("searchId", searchId).addKeyValue("jobId", job.id())
                     .addKeyValue("tier", tier == null ? "none" : tier.word())
                     .addKeyValue("material", materialId != null)
-                    .addKeyValue("recordType", recordType == null ? "none" : recordType).addKeyValue("pruned", pruned)
+                    .addKeyValue("recordType", Scopes.loggedType(recordType)).addKeyValue("pruned", pruned)
                     .addKeyValue("queryLength", query.codePointCount(0, query.length())).log("search.created");
             return searchId;
         });

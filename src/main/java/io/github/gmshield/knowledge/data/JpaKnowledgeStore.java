@@ -44,6 +44,12 @@ class JpaKnowledgeStore implements KnowledgeStore {
     private static final String CORE_ROWS_OF_SYSTEM = "select r from RecordType r where r.systemId = :system"
             + " and r.core is not null order by r.id";
     private static final String KEY_TAKEN = "select r.id from RecordType r where r.systemId = :system and r.typeKey = :key";
+    private static final String KEYS_OF_SYSTEM = "select coalesce(r.typeKey, r.core) from RecordType r"
+            + " where r.systemId = :system";
+    private static final String BY_KEY = "select r from RecordType r where r.systemId = :system"
+            + " and (r.typeKey = :key or (r.typeKey is null and r.core = :key))";
+    private static final String APPROVED_OF_SYSTEM = "select r from RecordType r where r.systemId = :system"
+            + " and r.core is null order by r.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -143,6 +149,25 @@ class JpaKnowledgeStore implements KnowledgeStore {
     public boolean keyTaken(UUID systemId, String key) {
         return !em().createQuery(KEY_TAKEN, UUID.class).setParameter("system", systemId).setParameter("key", key)
                 .setMaxResults(1).getResultList().isEmpty();
+    }
+
+    @Override
+    public Set<String> keys(UUID systemId) {
+        return new HashSet<>(em().createQuery(KEYS_OF_SYSTEM, String.class).setParameter("system", systemId)
+                .getResultList());
+    }
+
+    @Override
+    public Optional<RecordTypeRow> findByKey(UUID systemId, String key) {
+        return em().createQuery(BY_KEY, RecordTypeEntity.class).setParameter("system", systemId)
+                .setParameter("key", key).setMaxResults(1).getResultList().stream().findFirst()
+                .map(RecordTypeEntity::row);
+    }
+
+    @Override
+    public List<RecordTypeRow> approvedRecordTypes(UUID systemId) {
+        return em().createQuery(APPROVED_OF_SYSTEM, RecordTypeEntity.class).setParameter("system", systemId)
+                .getResultList().stream().map(RecordTypeEntity::row).toList();
     }
 
     private Optional<RecordTypeEntity> entity(UUID id, LockModeType lock) {

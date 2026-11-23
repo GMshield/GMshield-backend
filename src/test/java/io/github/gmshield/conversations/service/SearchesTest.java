@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.gmshield.knowledge.service.CoreRecordTypes;
 import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
 import java.util.ArrayList;
@@ -18,8 +19,16 @@ import org.junit.jupiter.api.Test;
 class SearchesTest {
 
     @Test
-    void aRecordTypeFilterTakesExactlyTheCoreKeys() {
-        assertThat(Searches.RECORD_TYPES).isEqualTo(CoreRecordTypes.KEYS);
+    void aRecordTypeFilterTakesAnyRecordTypeKeyFromStory44PartB() {
+        assertThat(CoreRecordTypes.KEYS).allMatch(Scopes::recordTypeKey);
+        assertThat(List.of("talento", "t_3d6_tabela", "a", "a" + "b".repeat(31))).allMatch(Scopes::recordTypeKey);
+        assertThat(List.of("", "Talento", "3d6", "_x", "a-b", "a" + "b".repeat(32), "talento ")).noneMatch(
+                Scopes::recordTypeKey);
+        assertThat(Scopes.recordTypeKey(null)).isFalse();
+        // A log line names a core key, never an approved one (a slug of a name the GM approved).
+        assertThat(Scopes.loggedType("spell")).isEqualTo("spell");
+        assertThat(Scopes.loggedType("talento")).isEqualTo("approved");
+        assertThat(Scopes.loggedType(null)).isEqualTo("none");
     }
 
     @Test

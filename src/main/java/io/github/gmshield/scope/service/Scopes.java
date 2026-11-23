@@ -2,6 +2,7 @@ package io.github.gmshield.scope.service;
 
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.RecordTypeKeys;
 import io.github.gmshield.materials.service.ScopeReads;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
@@ -98,22 +99,29 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@code ready} is dropped, never refused (a result stored earlier may have left the scope since); each carries
  *       its place, its material's name, its text and its tier.</li>
  *   <li>Story 4.3 part B (records in search): {@link #searchInput(ResolvedScope, String, String)} adds a record-type
- *       filter ({@code recordType}, a core key) when the search has one. {@link #records} reads records by id within a
- *       resolved scope, in the order given, each once: a record whose version is not an allowed source still
- *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; each carries its first
- *       page's place (the section path of its first passage there), the ids of its passages on that page, its core
- *       type, its name and its tier; its line {@code scope.records_read} counts the ids asked, the records kept and
- *       the ids that are no allowed record ({@code notRecords}: a search's passage ids among them, or a record out of
- *       the scope). {@link #namedRecords} finds the records of a resolved scope whose name equals a
- *       query (an equality on a keyed fingerprint, {@link ExtractedRecords#named}), of one core type when one is given,
- *       leaving out those of a records run not indexed yet ({@link ScopeReads#unindexedRecordRuns}), so a record is
- *       found by name only once the index can find it too; a record the worker returned (it is in the index, whatever
- *       its run says, for instance a run cut again by a reconcile) is never left out.</li>
+ *       filter ({@code recordType}, a record type key) when the search has one. {@link #records} reads records by id
+ *       within a resolved scope, in the order given, each once: a record whose version is not an allowed source still
+ *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; each carries its first page's
+ *       place (the section path of its first passage there), the ids of its passages on that page, its type's key, its
+ *       name and its tier; its line {@code scope.records_read} counts the ids asked, the records kept and the ids that
+ *       are no allowed record ({@code notRecords}: a search's passage ids among them, or a record out of the scope).
+ *       {@link #namedRecords} finds the records of a resolved scope whose name equals a query (an equality on a keyed
+ *       fingerprint, {@link ExtractedRecords#named}), of one type when one is given, leaving out those of a records run
+ *       not indexed yet ({@link ScopeReads#unindexedRecordRuns}), so a record is found by name only once the index can
+ *       find it too; a record the worker returned (it is in the index, whatever its run says, for instance a run cut
+ *       again by a reconcile) is never left out.</li>
  *   <li>Story 4.3 part C (records in answers): {@link #recordContents} reads records by id within a resolved scope with
  *       their names and fields, as {@link #passages} reads passages: in the order asked, each once, and the whole
  *       request refused with {@value #REFUSED_CODE} (403), before anything is decrypted, when any id is not a record of
  *       an allowed source still {@code ready}. {@link #citedRecords} reads an answer's cited records the same way, in
  *       one read, but drops (never refuses) an id that is not one, as {@link #references} drops a cited passage.</li>
+ *   <li>Story 4.4 part B (approved record types): a record stores its type's key, and every read of records here
+ *       ({@link #records}, {@link #namedRecords}, {@link #recordContents}, {@link #citedRecords}) keeps only those
+ *       whose key is a record type of the campaign's system ({@link ResolvedScope#recordTypes}, read through
+ *       {@link RecordTypeKeys} when the scope is resolved): in a system that never approved a type, its records stay
+ *       passages, so a record id of another key is not a record of the scope ({@link #recordContents} refuses it).
+ *       {@link #questionInput} and {@link #searchInput} carry those keys as {@code recordTypes}, and the worker filters
+ *       the index's record points to them. A record-type filter may name any key ({@link #recordTypeKey}).</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -139,14 +147,16 @@ public class Scopes {
     private final Library library;
     private final ScopeReads reads;
     private final ExtractedRecords records;
+    private final RecordTypeKeys recordTypeKeys;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    Scopes(Library library, ScopeReads reads, ExtractedRecords records, Vault vault,
+    Scopes(Library library, ScopeReads reads, ExtractedRecords records, RecordTypeKeys recordTypeKeys, Vault vault,
            ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
         this.reads = reads;
         this.records = records;
+        this.recordTypeKeys = recordTypeKeys;
         this.vault = vault;
         this.transactions = transactions;
     }
@@ -199,7 +209,8 @@ public class Scopes {
                 sources.put(tier, ids);
                 pending.put(tier, withPending ? pendingOf(ids) : List.of());
             }
-            ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, sources, pending, materialOf);
+            ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, sources, pending, materialOf,
+                    recordTypeKeys.keysOf(campaign.system().id()));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("campaignSources", sources.get(Tier.CAMPAIGN).size())
                     .addKeyValue("systemSources", sources.get(Tier.SYSTEM).size())
@@ -437,7 +448,7 @@ public class Scopes {
     }
 
     /**
-     * The records of {@code scope} whose name equals {@code name}, of the core type {@code recordType} when it is not
+     * The records of {@code scope} whose name equals {@code name}, of the type key {@code recordType} when it is not
      * null, as the class says (Story 4.3 part B); by id. A record among {@code returned} (the ids the worker found) is
      * kept even when its records run is not indexed.
      */
@@ -462,8 +473,8 @@ public class Scopes {
             return placed(scope, indexed);
         });
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("found", found.size())
-                .addKeyValue("unindexed", unindexed[0]).addKeyValue("recordType", recordType == null ? "none"
-                        : recordType).log("scope.named_records_read");
+                .addKeyValue("unindexed", unindexed[0]).addKeyValue("recordType", loggedType(recordType))
+                .log("scope.named_records_read");
         return found;
     }
 
@@ -559,11 +570,16 @@ public class Scopes {
         }
     }
 
-    /** {@link #placed} without the names: nothing is decrypted but the places. */
+    /**
+     * {@link #placed} without the names: nothing is decrypted but the places. From Story 4.4 part B a record whose key
+     * is not a record type of the campaign's system ({@link ResolvedScope#recordTypes}) is not in the scope: in a
+     * system that never approved its type, it stays passages.
+     */
     private List<Placed> located(ResolvedScope scope, Collection<ExtractedRecords.Located> located) {
         Set<UUID> allowed = scope.allowedSources();
+        Set<String> keys = scope.recordTypes();
         List<ExtractedRecords.Located> inScope = located.stream()
-                .filter(record -> allowed.contains(record.versionId())).toList();
+                .filter(record -> allowed.contains(record.versionId()) && keys.contains(record.type())).toList();
         if (inScope.isEmpty()) {
             return List.of();
         }
@@ -649,7 +665,30 @@ public class Scopes {
         if (question == null || question.isEmpty() || question.codePointCount(0, question.length()) > MAX_QUESTION) {
             throw new IllegalArgumentException("scope.question_invalid");
         }
-        return textInput(scope, "question", question, "scope.question_input");
+        return withRecordTypes(textInput(scope, "question", question, "scope.question_input"), scope);
+    }
+
+    /**
+     * Whether {@code key} is a record type key's text (Story 4.4 part B, V40): a lower-case letter, then up to 31
+     * lower-case letters, digits or underscores; false for null.
+     */
+    public static boolean recordTypeKey(String key) {
+        return RecordTypeKeys.valid(key);
+    }
+
+    /** A record type key as a log line may carry it: a core key as it is, any other as {@code approved}. */
+    public static String loggedType(String key) {
+        return RecordTypeKeys.logged(key);
+    }
+
+    /**
+     * {@code recordTypes} (Story 4.4 part B, internal contract 1.21.0): the record type keys of the campaign's system,
+     * sorted, to which the worker limits the records it reads; the records of another key stay out of the scope.
+     */
+    private static ObjectNode withRecordTypes(ObjectNode input, ResolvedScope scope) {
+        ArrayNode types = input.putArray("recordTypes");
+        scope.recordTypes().stream().sorted().forEach(types::add);
+        return input;
     }
 
     /**
@@ -663,15 +702,15 @@ public class Scopes {
 
     /**
      * {@link #searchInput(ResolvedScope, String)} with a record-type filter (Story 4.3 part B, internal contract
-     * 1.18.0): when {@code recordType} (a core key) is not null, the input also carries {@code recordType}, and the
-     * worker returns only records of that type.
+     * 1.18.0): when {@code recordType} (a record type key) is not null, the input also carries {@code recordType}, and
+     * the worker returns only records of that type.
      */
     public ObjectNode searchInput(ResolvedScope scope, String query, String recordType) {
         Objects.requireNonNull(scope, "scope");
         if (query == null || query.isEmpty() || query.codePointCount(0, query.length()) > MAX_QUERY) {
             throw new IllegalArgumentException("scope.query_invalid");
         }
-        ObjectNode input = textInput(scope, "query", query, "scope.search_input");
+        ObjectNode input = withRecordTypes(textInput(scope, "query", query, "scope.search_input"), scope);
         if (recordType != null) {
             input.put("recordType", recordType);
         }

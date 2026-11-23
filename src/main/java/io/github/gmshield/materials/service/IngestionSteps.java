@@ -102,14 +102,15 @@ import tools.jackson.databind.node.ObjectNode;
  *       version of its material starts from a copy of its cleaned original, as a restart does.</li>
  *   <li>From Story 4.2, a report carrying passages may name next steps of stage {@value #RECORDS} over a run of pages
  *       with the input {@value #PASSAGES_INPUT}: each gets its job at once. Its claim input names that input and
- *       {@code recordTypes} (the core types {@link #RECORD_TYPES}); {@link #openInput} streams the passages of its
- *       pages as JSON Lines ({@code {id, page, sectionPath, text}}, decrypted); and only such a step calls a model
- *       ({@link #callsModel}). Its report carries {@code records} ({@code type}, {@code name}, {@code fields} of
- *       {@code {name, value}}, {@code passageIds}), each checked against the passages of its pages and handed to
- *       {@link ExtractedRecords}, which replaces that run's records. A records step that ends failed (a refusal, a
- *       truncation, an outage after its last attempt) never fails the version: its pages are marked unread, and the
- *       chain still ends. Whatever replaces or removes the version's passages (a passages report, a restart, a
- *       reprocess) removes its records first and clears those marks.</li>
+ *       {@code recordTypes} (from Story 4.4 part B, {@link RecordTypeKeys#extraction}: rule, spell and item, then the
+ *       keys approved in the systems its material counts under, each named in {@code recordTypeNames});
+ *       {@link #openInput} streams the passages of its pages as JSON Lines ({@code {id, page, sectionPath, text}},
+ *       decrypted); and only such a step calls a model ({@link #callsModel}). Its report carries {@code records}
+ *       ({@code type}, {@code name}, {@code fields} of {@code {name, value}}, {@code passageIds}), each checked against
+ *       the passages of its pages and handed to {@link ExtractedRecords}, which replaces that run's records. A records
+ *       step that ends failed (a refusal, a truncation, an outage after its last attempt) never fails the version: its
+ *       pages are marked unread, and the chain still ends. Whatever replaces or removes the version's passages (a
+ *       passages report, a restart, a reprocess) removes its records first and clears those marks.</li>
  *   <li>From Story 4.4, a records step's report may carry {@code proposals}: record types and terms its passages name,
  *       at most {@value #MAX_PROPOSALS}, each with up to {@value #MAX_EXAMPLES} examples quoted from a passage it cites
  *       (and a term with its quoted definition). Each quote is checked against the decrypted text of the passage it
@@ -149,10 +150,10 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     public static final String RECORDS = "records";
     /** A records step's input (Story 4.2): the passages of its pages, as JSON Lines. */
     public static final String PASSAGES_INPUT = "passages";
-    /** The record types a records step extracts (Story 4.2): the core types rule, spell and item, by their keys. */
-    static final List<String> RECORD_TYPES = List.of("rule", "spell", "item");
     /** A records report's limits (Story 4.2): its records, and each one's name, fields and passages, in code points. */
     static final int MAX_RECORDS = 1_000;
+    /** The core types a records step extracts (Story 4.2), as the records line counts them by name. */
+    static final List<String> EXTRACTED_CORE = List.of("rule", "spell", "item");
     static final int MAX_RECORD_NAME = 200;
     static final int MAX_FIELDS = 64;
     static final int MAX_FIELD_NAME = 200;
@@ -215,15 +216,17 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     private final Vault vault;
     private final ExtractedRecords records;
     private final OntologyProposals proposals;
+    private final RecordTypeKeys recordTypes;
     private final Library library;
     private final ObjectProvider<Clock> clock;
 
     IngestionSteps(Jobs jobs, MaterialStore materials, UploadStorage uploads, FileStore files, IngestionSettings settings,
-                   Vault vault, ExtractedRecords records, OntologyProposals proposals, Library library,
-                   ObjectProvider<Clock> clock) {
+                   Vault vault, ExtractedRecords records, OntologyProposals proposals, RecordTypeKeys recordTypes,
+                   Library library, ObjectProvider<Clock> clock) {
         this.jobs = jobs;
         this.records = records;
         this.proposals = proposals;
+        this.recordTypes = recordTypes;
         this.library = library;
         this.materials = materials;
         this.uploads = uploads;
@@ -293,8 +296,14 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             }
         } else if (step.inputPassages()) {
             input.put("input", PASSAGES_INPUT);
+            // Story 4.4 part B: rule, spell and item, then every key approved in the systems the material counts under,
+            // each with its name (internal contract 1.21.0); the worker shows the model the names, as data.
             ArrayNode types = input.putArray("recordTypes");
-            RECORD_TYPES.forEach(types::add);
+            ObjectNode names = input.putObject("recordTypeNames");
+            recordTypes.extraction(systemsOf(version.materialId())).forEach(type -> {
+                types.add(type.key());
+                names.put(type.key(), type.name());
+            });
         } else if (readsImages(step, version)) {
             input.put("input", IMAGES_INPUT);
             ArrayNode images = input.putArray("inputs");
@@ -535,7 +544,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             replacePassages(job, version.id(), report, now);
         }
         if (report.carriesRecords()) {
-            replaceRecords(job, step, report);
+            replaceRecords(job, step, version, report);
         }
         if (report.carriesProposals()) {
             storeProposals(job, step, version, report);
@@ -1102,15 +1111,20 @@ public class IngestionSteps implements JobHandler, IngestionStart {
 
     /**
      * A records step's report (Story 4.2): each record must cite only passages of the version on the step's pages
-     * ({@value #RECORD_INVALID} otherwise, and nothing is kept); its first page is the lowest of theirs. The step's run of
-     * records becomes the report's, so the same step reported again replaces its records.
+     * ({@value #RECORD_INVALID} otherwise, and nothing is kept); its first page is the lowest of theirs. The step's run
+     * of records becomes the report's, so the same step reported again replaces its records. From Story 4.4 part B the
+     * keys the material may extract are worked out again here, with the version locked: a record whose key is no longer
+     * among them (its type was deleted since the claim, or the material left its system) is dropped and counted, never
+     * refused.
      */
-    private void replaceRecords(JobRef job, StepRow step, Report report) {
+    private void replaceRecords(JobRef job, StepRow step, VersionRow version, Report report) {
         Map<UUID, Integer> pages = new HashMap<>();
         materials.passagesOnPages(step.versionId(), step.firstPage(), step.lastPage())
                 .forEach(passage -> pages.put(passage.id(), passage.page()));
+        Set<String> keys = new HashSet<>(recordTypes.extractionKeys(systemsOf(version.materialId())));
         List<ExtractedRecords.Extracted> extracted = new ArrayList<>(report.records().size());
-        Map<String, Integer> byType = new java.util.TreeMap<>();
+        Map<String, Integer> byType = new HashMap<>();
+        int dropped = 0;
         for (Report.ReportedRecord record : report.records()) {
             int first = Integer.MAX_VALUE;
             for (UUID passageId : record.passageIds()) {
@@ -1120,6 +1134,10 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 }
                 first = Math.min(first, page);
             }
+            if (!keys.contains(record.type())) {
+                dropped++;
+                continue;
+            }
             extracted.add(new ExtractedRecords.Extracted(record.type(), record.name(), record.fields(),
                     record.passageIds(), first));
             byType.merge(record.type(), 1, Integer::sum);
@@ -1128,9 +1146,16 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         org.slf4j.spi.LoggingEventBuilder line = log.atInfo().addKeyValue("versionId", step.versionId())
                 .addKeyValue("jobId", job.id()).addKeyValue("firstPage", step.firstPage())
                 .addKeyValue("lastPage", step.lastPage()).addKeyValue("records", extracted.size())
-                .addKeyValue("replaced", replaced);
-        RECORD_TYPES.forEach(type -> line.addKeyValue(type, byType.getOrDefault(type, 0)));
-        line.log("ingestion.records_recorded");
+                .addKeyValue("replaced", replaced).addKeyValue("dropped", dropped);
+        // Counts by key: the core keys by name, the approved ones (slugs of names the GM approved) as one count, since
+        // a log line names no library content.
+        int approved = extracted.size();
+        for (String core : EXTRACTED_CORE) {
+            int count = byType.getOrDefault(core, 0);
+            line.addKeyValue(core, count);
+            approved -= count;
+        }
+        line.addKeyValue("approved", approved).log("ingestion.records_recorded");
     }
 
     /**
@@ -1317,7 +1342,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * {@code width}, {@code height}) and {@code lines} ({@code text}, {@code box}), or a text page's {@code text}.
      * From Story 4.2, a next step of stage {@value #RECORDS} has the input {@value #PASSAGES_INPUT} and a page range
      * (and that input belongs to no other stage), and {@code records} (null when absent): at most
-     * {@value #MAX_RECORDS}, each a {@code type} of {@link #RECORD_TYPES}, a non-blank {@code name} of at most
+     * {@value #MAX_RECORDS}, each a {@code type} that is a record type key ({@link RecordTypeKeys#KEY}; whether the
+     * material may extract it is checked when the report is recorded), a non-blank {@code name} of at most
      * {@value #MAX_RECORD_NAME} code points, {@code fields} (at most {@value #MAX_FIELDS}, each a non-blank
      * {@code name} and {@code value}) and 1 to {@value #MAX_RECORD_PASSAGES} distinct {@code passageIds}.
      */
@@ -1484,7 +1510,7 @@ public class IngestionSteps implements JobHandler, IngestionStart {
             List<ReportedRecord> found = new ArrayList<>(node.size());
             for (JsonNode item : node) {
                 JsonNode type = item.path("type");
-                if (!item.isObject() || !type.isString() || !RECORD_TYPES.contains(type.asString())) {
+                if (!item.isObject() || !type.isString() || !RecordTypeKeys.valid(type.asString())) {
                     throw new JobResultInvalid(RECORD_INVALID);
                 }
                 found.add(new ReportedRecord(type.asString(), text(item.path("name"), MAX_RECORD_NAME),
