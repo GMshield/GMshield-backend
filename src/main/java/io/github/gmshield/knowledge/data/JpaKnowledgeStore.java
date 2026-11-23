@@ -28,6 +28,7 @@ class JpaKnowledgeStore implements KnowledgeStore {
 
     static final String CORE_KEY = "record_type_owner_system_core_key";
     static final String NAME_KEY = "record_type_owner_system_name_fingerprint_key";
+    static final String KEY_KEY = "record_type_owner_system_key_key";
     /** The core types first, in their fixed order (CoreRecordTypes), then the others oldest first. */
     private static final String OF_SYSTEM = "select r from RecordType r where r.systemId = :system order by case"
             + " when r.core = 'rule' then 0 when r.core = 'spell' then 1 when r.core = 'item' then 2"
@@ -40,6 +41,9 @@ class JpaKnowledgeStore implements KnowledgeStore {
     private static final String NAME_TAKEN = "select r.id from RecordType r where r.systemId = :system"
             + " and r.nameFingerprint = :fingerprint and r.id <> :except";
     private static final String ALL_OF_SYSTEM = "select r from RecordType r where r.systemId = :system";
+    private static final String CORE_ROWS_OF_SYSTEM = "select r from RecordType r where r.systemId = :system"
+            + " and r.core is not null order by r.id";
+    private static final String KEY_TAKEN = "select r.id from RecordType r where r.systemId = :system and r.typeKey = :key";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -129,6 +133,18 @@ class JpaKnowledgeStore implements KnowledgeStore {
         em.flush();
     }
 
+    @Override
+    public void lockOntology(UUID systemId) {
+        em().createQuery(CORE_ROWS_OF_SYSTEM, RecordTypeEntity.class).setParameter("system", systemId)
+                .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList();
+    }
+
+    @Override
+    public boolean keyTaken(UUID systemId, String key) {
+        return !em().createQuery(KEY_TAKEN, UUID.class).setParameter("system", systemId).setParameter("key", key)
+                .setMaxResults(1).getResultList().isEmpty();
+    }
+
     private Optional<RecordTypeEntity> entity(UUID id, LockModeType lock) {
         return em().createQuery(BY_ID, RecordTypeEntity.class).setParameter("id", id).setLockMode(lock)
                 .getResultList().stream().findFirst();
@@ -155,7 +171,9 @@ class JpaKnowledgeStore implements KnowledgeStore {
             if (cause instanceof ConstraintViolationException violation && CORE_KEY.equalsIgnoreCase(violation.getConstraintName())) {
                 return Optional.of(new KnowledgeConflict(KnowledgeConflict.Reason.CORE_TAKEN));
             }
-            if (cause instanceof ConstraintViolationException violation && NAME_KEY.equalsIgnoreCase(violation.getConstraintName())) {
+            if (cause instanceof ConstraintViolationException violation
+                    && (NAME_KEY.equalsIgnoreCase(violation.getConstraintName())
+                    || KEY_KEY.equalsIgnoreCase(violation.getConstraintName()))) {
                 return Optional.of(new KnowledgeConflict(KnowledgeConflict.Reason.NAME_TAKEN));
             }
         }

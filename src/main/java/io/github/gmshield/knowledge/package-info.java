@@ -14,7 +14,11 @@
  * version's pages) through {@code materials.service.RecordSources}, never {@code ScopeReads}. From Story 4.3 part B it
  * also reads one record as a campaign shows it, within the campaign's current scope as {@code scope.service.Scopes}
  * resolves it ({@code scope} depends on nothing here: it reads records through the port {@code ExtractedRecords}), and
- * stores each record's name fingerprint for a search's exact-name match. Terms and proposals (4.4) come later.
+ * stores each record's name fingerprint for a search's exact-name match. From Story 4.4 ({@code proposal}, {@code term},
+ * {@code term_alias}) it keeps the record types and terms a records step proposes, per system, through the port
+ * {@code materials.service.OntologyProposals} that {@code service.Proposals} implements, and the GM's decisions on them
+ * ({@code service.Proposals}, {@code service.Terms}); an origin names its material through
+ * {@code materials.service.MaterialNames}.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service",

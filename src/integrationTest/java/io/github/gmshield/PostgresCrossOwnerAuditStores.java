@@ -138,6 +138,7 @@ final class PostgresCrossOwnerAuditStores implements CrossOwnerAuditStores {
     public Map<String, List<String>> held() {
         return Map.ofEntries(Map.entry("system", List.of("system")), Map.entry("record_type", List.of("recordType")),
                 Map.entry("record", List.of("record")), Map.entry("campaign", List.of("campaign")),
+                Map.entry("proposal", List.of("proposal", "termProposal")), Map.entry("term", List.of("term")),
                 Map.entry("material", List.of("material", "imageSetMaterial")),
                 Map.entry("material_version", List.of("version", "superseded", "imageSet")),
                 Map.entry("passage", List.of("passage")), Map.entry("upload", List.of("upload")),

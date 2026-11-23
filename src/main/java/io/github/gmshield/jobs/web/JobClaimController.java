@@ -115,7 +115,10 @@ class JobClaimController {
             @Schema(description = "For failed only: false ends the job at once, without another attempt (an input no"
                     + " attempt can change); absent or true lets the backend retry while attempts remain") Boolean retry,
             @Schema(description = "For done only: the result for the job's handler. From contract 1.18.0 a"
-                    + " library.search result's ids may name records of the scope next to passages")
+                    + " library.search result's ids may name records of the scope next to passages. From contract"
+                    + " 1.20.0 an ingestion records step's result may carry proposals (at most 20, each a kind"
+                    + " record_type or term, a name of at most 120 code points, a definition of at most 500 and at most"
+                    + " 3 examples, each a passageId and a quote of at most 200), checked against the cited passages")
             Map<String, Object> result,
             @ArraySchema(maxItems = JobClaims.MAX_USAGE, arraySchema = @Schema(description = "The usage of the"
                     + " attempt's model calls not posted with events (contract 1.17.0), done or failed, recorded once"

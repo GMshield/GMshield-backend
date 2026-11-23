@@ -79,7 +79,7 @@ class MaterialsTest {
                 beans.getBeanProvider(Clock.class));
         service = new Uploads(materials, uploads, vault, files, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
-                (version, upload) -> started.add(version), TestMaterials.NO_RECORDS);
+                (version, upload) -> started.add(version), TestMaterials.NO_RECORDS, TestMaterials.NO_PROPOSALS);
         reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
                 .collect(java.util.stream.Collectors.toSet()), library, new IngestionSettings(4),
                 TestMaterials.NO_RECORDS, beans.getBeanProvider(PlatformTransactionManager.class));

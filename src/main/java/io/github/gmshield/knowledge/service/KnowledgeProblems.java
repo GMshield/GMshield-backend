@@ -22,6 +22,19 @@ final class KnowledgeProblems {
     /** A record type that types records is removed (Story 4.2): its records would have no type. */
     static final ApiProblem RECORD_TYPE_IN_USE =
             ApiProblem.of(409, "ontology", "record_type_in_use", "Record type in use");
+    /** A proposal approved under a name outside its limits (Story 4.4). */
+    static final ApiProblem NAME_INVALID =
+            ApiProblem.of(400, "ontology", "name_invalid", "Name invalid")
+                    .withParams(Map.<String, Object>of("min", 1, "max", Ontology.NAME_MAX));
+    /**
+     * A proposal approved or merged under a name the system already has (Story 4.4): a record type, a term, an alias or
+     * a core type's name in pt-BR or en.
+     */
+    static final ApiProblem NAME_TAKEN =
+            ApiProblem.of(409, "ontology", "name_taken", "Name taken");
+    /** A merge into an item that is not of the proposal's kind, or not of its system, or unknown (Story 4.4). */
+    static final ApiProblem MERGE_TARGET_INVALID =
+            ApiProblem.of(400, "ontology", "merge_target_invalid", "Merge target invalid");
     /** The change names a version the item has left: someone changed it elsewhere. */
     static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");

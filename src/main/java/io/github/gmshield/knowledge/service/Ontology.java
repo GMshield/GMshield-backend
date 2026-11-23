@@ -49,6 +49,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * its core type in the system's {@code ready} versions ({@link ReadyVersions#ofSystem}: the materials attached
  * to the system and those of its campaigns), so a version that needs review counts nowhere; a type that is not core has
  * none yet (records store a core key, and approved types come with Story 4.4). Logs carry ids, counts and versions only.
+ *
+ * <p>From Story 4.4 a record type also has its {@code key} (a core type's core key, or the stable slug of an approved
+ * type's name, which never changes) and its origin: {@code core}, or the proposal that approved it and that proposal's
+ * material ({@link Origin}). A rename checks the system's one name space ({@link NameSpace}: types, terms, aliases and
+ * the core names in pt-BR and en) under the system's ontology lock. A type that is not core has no records until Story
+ * 4.4 part B extracts approved types.
  */
 @Service
 public class Ontology {
@@ -72,11 +78,16 @@ public class Ontology {
     private final ReadyVersions ready;
     private final ExtractedRecords records;
     private final ObjectProvider<PlatformTransactionManager> transactions;
+    private final NameSpace names;
+    private final Origins origins;
     private final Clock clock;
 
     Ontology(KnowledgeStore store, Vault vault, Library library, ReadyVersions ready, ExtractedRecords records,
-             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+             ObjectProvider<PlatformTransactionManager> transactions, NameSpace names, Origins origins,
+             ObjectProvider<Clock> clock) {
         this.store = store;
+        this.names = names;
+        this.origins = origins;
         this.vault = vault;
         this.library = library;
         this.ready = ready;
@@ -87,12 +98,25 @@ public class Ontology {
 
     /**
      * A record type: its name (for a core type, the stored English name, which the frontend replaces by its own
-     * translation of {@code core}), its core key (null when it is not core), how many records it types, and its version.
+     * translation of {@code core}), its core key (null when it is not core), its stable key (Story 4.4), its origin (null
+     * for a core type, whose origin is {@code core}), how many records it types, and its version.
      */
-    public record RecordType(UUID id, String name, String core, long records, long version) {
+    public record RecordType(UUID id, String name, String core, String key, Origin origin, long records, long version) {
         @Override
         public String toString() {
-            return "RecordType[id=" + id + ", core=" + core + ", records=" + records + ", version=" + version + "]";
+            return "RecordType[id=" + id + ", core=" + core + ", key=" + key + ", records=" + records + ", version="
+                    + version + "]";
+        }
+    }
+
+    /**
+     * Where an approved record type or term came from (Story 4.4): the approving proposal, its material, and that
+     * material's name; the material and its name are null once the material was deleted. {@code toString} names ids.
+     */
+    public record Origin(UUID proposalId, UUID materialId, String materialName) {
+        @Override
+        public String toString() {
+            return "Origin[proposalId=" + proposalId + ", materialId=" + materialId + "]";
         }
     }
 
@@ -143,22 +167,29 @@ public class Ontology {
      * being deleted.
      */
     public Optional<RecordTypePage> recordTypes(UUID systemId, int offset, int limit) {
+        checkPage(offset, limit);
+        return reading(() -> library.system(systemId).map(system -> {
+            Map<String, Long> counts = counts(system.id());
+            List<RecordTypeRow> rows = store.recordTypes(system.id(), offset, limit);
+            Map<UUID, Origin> from = origins.of(rows.stream().map(RecordTypeRow::proposalId).toList());
+            return new RecordTypePage(rows.stream().map(row -> open(row, counts, from)).toList(),
+                    store.recordTypeCount(system.id()));
+        }));
+    }
+
+    /** A list page's limits: {@code offset} 0 to {@value #MAX_OFFSET}, {@code limit} 1 to {@value #MAX_LIMIT}. */
+    static void checkPage(int offset, int limit) {
         if (limit < 1 || limit > MAX_LIMIT) {
             throw new IllegalArgumentException("knowledge.limit_invalid");
         }
         if (offset < 0 || offset > MAX_OFFSET) {
             throw new IllegalArgumentException("knowledge.offset_invalid");
         }
-        return reading(() -> library.system(systemId).map(system -> {
-            Map<String, Long> counts = counts(system.id());
-            return new RecordTypePage(store.recordTypes(system.id(), offset, limit).stream()
-                    .map(row -> open(row, counts)).toList(), store.recordTypeCount(system.id()));
-        }));
     }
 
     /** The owner's record type {@code id}; empty for an unknown id, another owner's or one of a system being deleted. */
     public Optional<RecordType> recordType(UUID id) {
-        return reading(() -> visible(id).map(row -> open(row, counts(row.systemId()))));
+        return reading(() -> visible(id).map(row -> open(row, counts(row.systemId()), origins.of(proposals(row)))));
     }
 
     /**
@@ -175,13 +206,15 @@ public class Ontology {
             }
             String name = name(typedName);
             byte[] fingerprint = fingerprint(name);
-            if (store.nameTaken(row.systemId(), fingerprint, id)) {
+            // Story 4.4: the one name space of the system, terms, aliases and the core names in both languages included.
+            store.lockOntology(row.systemId());
+            if (names.taken(row.systemId(), name, id)) {
                 throw new ApiException(KnowledgeProblems.RECORD_TYPE_NAME_TAKEN);
             }
             RecordTypeRow stored = conflicts(() -> store.rename(id, version,
                     vault.encryptText(binding(id, row.ownerId()), name), fingerprint))
                     .orElseThrow(() -> new IllegalStateException("knowledge.record_type_vanished"));
-            return new RecordType(id, name, null, NO_RECORDS, stored.version());
+            return open(stored, Map.of(), origins.of(proposals(stored)));
         }));
         renamed.ifPresent(type -> log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("recordTypeId", id)
                 .addKeyValue("version", type.version()).log("knowledge.record_type_renamed"));
@@ -234,9 +267,15 @@ public class Ontology {
         return store.findRecordType(id).filter(row -> library.system(row.systemId()).isPresent());
     }
 
-    private RecordType open(RecordTypeRow row, Map<String, Long> counts) {
+    private RecordType open(RecordTypeRow row, Map<String, Long> counts, Map<UUID, Origin> from) {
         return new RecordType(row.id(), vault.decryptText(binding(row.id(), row.ownerId()), row.name()), row.core(),
-                records(row, counts), row.version());
+                row.key(), row.proposalId() == null ? null : from.get(row.proposalId()), records(row, counts),
+                row.version());
+    }
+
+    /** The approving proposal of a record type, as a list: none for a core type. */
+    private static List<UUID> proposals(RecordTypeRow row) {
+        return row.proposalId() == null ? List.of() : List.of(row.proposalId());
     }
 
     /**

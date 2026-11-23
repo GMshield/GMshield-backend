@@ -33,6 +33,18 @@ class RecordTypeEntity {
     @Column(name = "core", updatable = false)
     private String core;
 
+    /**
+     * The stable key (Story 4.4): the core key (null in a core row the release before V39 wrote), or the slug of an
+     * approved type's name; it never changes. A JPQL path
+     * names it {@code typeKey}, never the function name {@code key}.
+     */
+    @Column(name = "key", updatable = false)
+    private String typeKey;
+
+    /** The approving proposal (Story 4.4), null for a core type; it never changes. */
+    @Column(name = "proposal_id", updatable = false)
+    private UUID proposalId;
+
     @Column(name = "name", nullable = false)
     private byte[] name;
 
@@ -55,6 +67,8 @@ class RecordTypeEntity {
         this.ownerId = row.ownerId();
         this.systemId = row.systemId();
         this.core = row.core();
+        this.typeKey = row.key();
+        this.proposalId = row.proposalId();
         this.name = row.name();
         this.nameFingerprint = row.nameFingerprint();
         this.createdAt = row.createdAt();
@@ -71,6 +85,8 @@ class RecordTypeEntity {
     }
 
     RecordTypeRow row() {
-        return new RecordTypeRow(id, ownerId, systemId, core, name, nameFingerprint, version, createdAt);
+        // A core type written by the release before V39 has no key: its key is its core key.
+        return new RecordTypeRow(id, ownerId, systemId, core, typeKey == null ? core : typeKey, proposalId, name, nameFingerprint, version,
+                createdAt);
     }
 }

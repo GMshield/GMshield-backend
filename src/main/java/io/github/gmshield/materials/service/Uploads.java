@@ -106,12 +106,14 @@ public class Uploads {
     private final ObjectProvider<Clock> clock;
     private final IngestionStart ingestion;
     private final ExtractedRecords records;
+    private final OntologyProposals proposals;
 
     Uploads(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Library library,
             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock,
-            IngestionStart ingestion, ExtractedRecords records) {
+            IngestionStart ingestion, ExtractedRecords records, OntologyProposals proposals) {
         this.ingestion = ingestion;
         this.records = records;
+        this.proposals = proposals;
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
@@ -526,8 +528,11 @@ public class Uploads {
             uploads.joined().delete(row.id());
             // Story 4.2: a version's records go before it (a refused upload has none; the order holds anyway).
             records.removeVersion(version.id());
+            // Story 4.4: and its proposals (a refused upload has none either).
+            proposals.clearPending(version.id());
             materials.deleteVersion(version.id());
             if (materials.versionsOf(version.materialId()).isEmpty()) {
+                proposals.removeMaterial(version.materialId());
                 materials.deleteMaterial(version.materialId());
             }
             return null;

@@ -22,6 +22,11 @@ import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
+import io.github.gmshield.knowledge.data.TermAliasRow;
+import io.github.gmshield.knowledge.data.TermRow;
+import io.github.gmshield.knowledge.data.ProposalRow;
+import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
+import io.github.gmshield.knowledge.data.InMemoryOntologyStore;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.limits.data.InMemoryUsageStore;
 import io.github.gmshield.materials.service.ExtractedRecords;
@@ -46,6 +51,7 @@ import io.github.gmshield.materials.service.IndexRetrySweep;
 import io.github.gmshield.materials.service.Materials;
 import io.github.gmshield.materials.service.ScopeReads;
 import io.github.gmshield.materials.service.TestMaterials;
+import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
 import io.github.gmshield.vault.data.DataKeyStore;
@@ -3209,6 +3215,571 @@ class IngestionFlowTest {
         json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("items")
                 .forEach(item -> counts.put(item.path("core").asString(), item.path("records").asLong()));
         return counts;
+    }
+
+    // --- Story 4.4 (part A): ontology proposals
+
+    @Autowired
+    private InMemoryOntologyStore ontology;
+    @Autowired
+    private InMemoryKnowledgeStore knowledge;
+    @Autowired
+    private io.github.gmshield.library.service.SystemDeletion systemDeletion;
+    @Autowired
+    private io.github.gmshield.library.data.InMemoryDeletionStore deletionRows;
+
+    private static final String TALENTS = "Talentos são habilidades especiais que um personagem aprende.\n"
+            + "Pontos de Vida (PV): medem a saúde do personagem.\n"
+            + "Truque, Magia, Spell, Feitiço, Perícia e Ofício são palavras deste livro.";
+
+    @Test
+    void aRecordsStepProposesATypeAndATermQuotedFromItsPassagesStoredEncryptedOnTheTabAndTheMaterialPage()
+            throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        // Matrix rows "Type found" and "Term found": the quotes are found across the passage's line break.
+        withProposals(gm, uploaded, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são habilidades"), example(passage, "um   personagem aprende. Pontos")) + ","
+                + proposal("term", "Pontos de Vida", "Pontos de Vida (PV): medem a saúde do personagem.",
+                example(passage, "Pontos de Vida (PV)")));
+
+        JsonNode tab = json(get(gm, "/api/v1/systems/" + system + "/proposals"));
+        assertThat(tab.path("total").asLong()).isEqualTo(2);
+        JsonNode type = tab.path("items").get(0);
+        assertThat(type.path("kind").asString()).isEqualTo("record_type");
+        assertThat(type.path("name").asString()).isEqualTo("Talento");
+        assertThat(type.path("definition").isNull()).isTrue();
+        assertThat(type.path("state").asString()).isEqualTo("pending");
+        assertThat(type.path("systemId").asString()).isEqualTo(system.toString());
+        assertThat(type.path("materialId").asString()).isEqualTo(uploaded.materialId());
+        assertThat(type.path("materialName").asString()).isEqualTo("Livro.pdf");
+        assertThat(type.path("examples").toString()).isEqualTo("[{\"page\":1,\"quote\":\"Talentos são habilidades\"},"
+                + "{\"page\":1,\"quote\":\"um   personagem aprende. Pontos\"}]");
+        JsonNode term = tab.path("items").get(1);
+        assertThat(term.path("kind").asString()).isEqualTo("term");
+        assertThat(term.path("definition").asString()).isEqualTo("Pontos de Vida (PV): medem a saúde do personagem.");
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/proposals"))).isEqualTo(tab);
+        // A proposal joins nothing by itself: no type and no term yet.
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("total").asLong()).isEqualTo(8);
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/terms")).path("total").asLong()).isZero();
+
+        // Stored encrypted: no name, definition or example in plaintext.
+        for (ProposalRow row : proposalsOf(uploaded.materialId())) {
+            String stored = new String(row.name(), StandardCharsets.ISO_8859_1) + new String(row.examples(),
+                    StandardCharsets.ISO_8859_1) + (row.definition() == null ? ""
+                    : new String(row.definition(), StandardCharsets.ISO_8859_1));
+            assertThat(stored).doesNotContain("Talento").doesNotContain("Pontos").doesNotContain("habilidades");
+        }
+        // Another owner: not found, as an unknown id.
+        assertThat(get(other, "/api/v1/systems/" + system + "/proposals").statusCode()).isEqualTo(404);
+        assertThat(get(other, "/api/v1/materials/" + uploaded.materialId() + "/proposals").statusCode()).isEqualTo(404);
+        assertThat(get(other, "/api/v1/systems/" + system + "/terms").statusCode()).isEqualTo(404);
+        assertThat(decide(other, "approval", type.path("id").asString(), "{\"version\":0}").statusCode())
+                .isEqualTo(404);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.proposals_recorded"));
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Talento")
+                || String.valueOf(event.getKeyValuePairs()).contains("Talento"));
+    }
+
+    @Test
+    void aKnownARepeatedOrAnUnverifiedProposalIsDroppedAndARepeatWithinTheVersionAddsExamples() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded first = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, first, TALENTS, passage -> proposal("term", "Pontos de Vida", "medem a saúde",
+                example(passage, "Pontos de Vida")) + "," + proposal("record_type", "Truque", "",
+                example(passage, "Truque")));
+        approve(gm, pending(gm, system, "Pontos de Vida"), "{\"version\":0}");
+
+        Uploaded second = uploadTo(gm, "Bestiario.pdf", system);
+        withProposals(gm, second, TALENTS, passage -> String.join(",",
+                // Matrix row "Known": a core name in pt-BR and in en, and the approved term (case and space aside).
+                proposal("record_type", "Magia", "", example(passage, "Magia")),
+                proposal("record_type", " SPELL ", "", example(passage, "Spell")),
+                proposal("term", "pontos de vida", "medem a saúde", example(passage, "Pontos de Vida")),
+                // A name the passage never writes, beside a real quote, is dropped too.
+                proposal("record_type", "Admin", "", example(passage, "Talentos são")),
+                // Matrix row "Unverified quote": a quote not in the passage, a passage of no page of the step, and a
+                // term whose definition is not in the passage are dropped; a proposal left with one example stays.
+                proposal("record_type", "Perícia", "", example(passage, "Perícias são testes")),
+                proposal("record_type", "Ofício", "", example(UUID.randomUUID(), "Talentos")),
+                proposal("term", "Mana", "Mana é a energia mágica", example(passage, "personagem")),
+                proposal("record_type", "Talento", "", example(passage, "Talentos são"),
+                        example(passage, "nunca escrito")),
+                // A repeat within the report adds its examples to the first, up to three.
+                proposal("record_type", "talento", "", example(passage, "Talentos são habilidades especiais"),
+                        example(passage, "aprende"), example(passage, "personagem"))));
+        JsonNode listed = json(get(gm, "/api/v1/materials/" + second.materialId() + "/proposals"));
+        assertThat(listed.path("items")).extracting(item -> item.path("name").asString()).containsExactly("Talento");
+        assertThat(listed.path("items").get(0).path("examples")).extracting(item -> item.path("quote").asString())
+                .containsExactly("Talentos são", "Talentos são habilidades especiais", "aprende");
+        // The first material's type proposal is its own: the same name from another material is another proposal.
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/proposals")).path("total").asLong()).isEqualTo(2);
+
+        // Matrix row "Repeated": the same material proposes it again in the same version (another records step): its
+        // new example joins the pending proposal's.
+        UUID passage = passages(first.versionId()).getFirst().id();
+        StepRow again = repeatRecordsStep(first);
+        report(again, claimWithModel(again.jobId()), proposalsReport(proposal("record_type", "Truque", "",
+                example(passage, "Truque, Magia"))));
+        assertThat(pendingNamed(gm, system, "Truque").path("examples")).extracting(item -> item.path("quote")
+                .asString()).containsExactly("Truque", "Truque, Magia");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.proposals_recorded")
+                && hasPair(event, "dropped", 8) && hasPair(event, "examplesDropped", 3));
+    }
+
+    @Test
+    void approvingMakesATypeWithAStableKeyOrATermWithItsOriginAndRefusesATakenOrInvalidName() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, uploaded, TALENTS, passage -> String.join(",",
+                proposal("record_type", "Talento", "", example(passage, "Talentos")),
+                proposal("record_type", "Habilidade", "", example(passage, "habilidades")),
+                proposal("term", "Pontos de Vida", "Pontos de Vida (PV): medem a saúde", example(passage, "PV")),
+                proposal("term", "Saúde", "medem a saúde", example(passage, "saúde"))));
+
+        // Matrix row "Approve": renamed to "Feat", the key is its slug.
+        String talent = pending(gm, system, "Talento");
+        assertThat(decide(gm, "approval", talent, "{\"version\":0,\"name\":\"  \"}").statusCode()).isEqualTo(400);
+        assertThat(code(decide(gm, "approval", talent, "{\"version\":0,\"name\":\"Magia\"}")))
+                .isEqualTo("ontology.name_taken");
+        assertThat(code(decide(gm, "approval", talent, "{\"version\":0,\"name\":\"" + "x".repeat(121) + "\"}")))
+                .isEqualTo("ontology.name_invalid");
+        JsonNode approved = approve(gm, talent, "{\"version\":0,\"name\":\"Feat\"}");
+        assertThat(approved.path("proposal").path("state").asString()).isEqualTo("approved");
+        assertThat(approved.path("proposal").path("version").asLong()).isEqualTo(1);
+        JsonNode type = json(get(gm, "/api/v1/record-types/" + approved.path("resultId").asString()));
+        assertThat(type.path("name").asString()).isEqualTo("Feat");
+        assertThat(type.path("key").asString()).isEqualTo("feat");
+        assertThat(type.path("core").isNull()).isTrue();
+        assertThat(type.path("origin").toString()).isEqualTo("{\"kind\":\"proposal\",\"proposalId\":\"" + talent
+                + "\",\"materialId\":\"" + uploaded.materialId() + "\",\"materialName\":\"Livro.pdf\"}");
+        // A rename keeps the key; the core types' origin is core.
+        HttpResponse<String> renamed = send("PATCH", "/api/v1/record-types/" + type.path("id").asString(),
+                "{\"version\":0,\"name\":\"Façanha\"}".getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type",
+                "application/json");
+        assertThat(renamed.statusCode()).as(renamed.body()).isEqualTo(200);
+        assertThat(json(renamed).path("key").asString()).isEqualTo("feat");
+        JsonNode types = json(get(gm, "/api/v1/systems/" + system + "/record-types"));
+        assertThat(types.path("total").asLong()).isEqualTo(9);
+        assertThat(types.path("items").get(0).path("origin").toString()).isEqualTo("{\"kind\":\"core\","
+                + "\"proposalId\":null,\"materialId\":null,\"materialName\":null}");
+        assertThat(types.path("items").get(0).path("key").asString()).isEqualTo("rule");
+        // The approved type's name is taken for another proposal now, and a type's name refuses a term.
+        assertThat(code(decide(gm, "approval", pending(gm, system, "Habilidade"), "{\"version\":0,\"name\":\"FAÇANHA \"}")))
+                .isEqualTo("ontology.name_taken");
+        String hp = pending(gm, system, "Pontos de Vida");
+        assertThat(code(decide(gm, "approval", hp, "{\"version\":0,\"name\":\"Façanha\"}")))
+                .isEqualTo("ontology.name_taken");
+
+        // A term, as proposed, with its quoted definition and origin.
+        JsonNode term = approve(gm, hp, "{\"version\":0}");
+        JsonNode terms = json(get(gm, "/api/v1/systems/" + system + "/terms"));
+        assertThat(terms.path("total").asLong()).isEqualTo(1);
+        assertThat(terms.path("items").get(0).path("id").asString()).isEqualTo(term.path("resultId").asString());
+        assertThat(terms.path("items").get(0).path("name").asString()).isEqualTo("Pontos de Vida");
+        assertThat(terms.path("items").get(0).path("definition").asString())
+                .isEqualTo("Pontos de Vida (PV): medem a saúde");
+        assertThat(terms.path("items").get(0).path("aliases").toString()).isEqualTo("[]");
+        assertThat(terms.path("items").get(0).path("origin").path("proposalId").asString()).isEqualTo(hp);
+        // A type's name cannot become a term, nor a term's a type's.
+        assertThat(code(decide(gm, "approval", pending(gm, system, "Saúde"), "{\"version\":0,\"name\":\"Façanha\"}")))
+                .isEqualTo("ontology.name_taken");
+        assertThat(code(decide(gm, "approval", pending(gm, system, "Habilidade"),
+                "{\"version\":0,\"name\":\"pontos de vida\"}"))).isEqualTo("ontology.name_taken");
+        // Stored encrypted: a term's name and definition.
+        TermRow row = ontology.terms.values().stream().filter(found -> found.proposalId().equals(UUID.fromString(hp)))
+                .findFirst().orElseThrow();
+        assertThat(new String(row.name(), StandardCharsets.ISO_8859_1) + new String(row.definition(),
+                StandardCharsets.ISO_8859_1)).doesNotContain("Pontos").doesNotContain("saúde");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.proposal_approved"));
+
+        // A rename of a type that is not core checks the whole name space: a term, an alias, a core name in pt-BR.
+        approve(gm, "merge", pending(gm, system, "Saúde"), "{\"version\":0,\"targetId\":\"" + term.path("resultId")
+                .asString() + "\"}");
+        for (String taken : List.of("Pontos de Vida", " saúde ", "Magia")) {
+            HttpResponse<String> refused = send("PATCH", "/api/v1/record-types/" + type.path("id").asString(),
+                    ("{\"version\":1,\"name\":\"" + taken + "\"}").getBytes(StandardCharsets.UTF_8), session(gm),
+                    "Content-Type", "application/json");
+            assertThat(refused.statusCode()).as(taken).isEqualTo(409);
+            assertThat(code(refused)).as(taken).isEqualTo("ontology.record_type_name_taken");
+        }
+        // A name whose slug is a core key gets a suffix: a core key is never an approved type's.
+        JsonNode spellLike = approve(gm, pending(gm, system, "Habilidade"), "{\"version\":0,\"name\":\"Spell!\"}");
+        assertThat(json(get(gm, "/api/v1/record-types/" + spellLike.path("resultId").asString())).path("key")
+                .asString()).isEqualTo("spell_2");
+    }
+
+    @Test
+    void mergingATermProposalAddsAnAliasAndATypeProposalOnlyClosesWhileAWrongTargetIsRefused() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        UUID otherSystem = UUID.fromString(json(send("POST", "/api/v1/systems", "{\"name\":\"Outro\"}"
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json")).path("id")
+                .asString());
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, uploaded, TALENTS, passage -> String.join(",",
+                proposal("term", "Pontos de Vida", "Pontos de Vida (PV): medem a saúde", example(passage, "PV")),
+                proposal("term", "PV", "Pontos de Vida (PV)", example(passage, "(PV)")),
+                proposal("record_type", "Feitiço", "", example(passage, "Feitiço"))));
+        String term = approve(gm, pending(gm, system, "Pontos de Vida"), "{\"version\":0}").path("resultId").asString();
+        String spell = json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("items").get(1).path("id")
+                .asString();
+        String otherSpell = json(get(gm, "/api/v1/systems/" + otherSystem + "/record-types")).path("items").get(1)
+                .path("id").asString();
+        String pv = pending(gm, system, "PV");
+        String feitico = pending(gm, system, "Feitiço");
+
+        // Matrix row "Merge", refused: a target of the other kind, of another system, unknown or malformed.
+        for (String target : List.of(spell, UUID.randomUUID().toString(), "nada")) {
+            assertThat(code(decide(gm, "merge", pv, "{\"version\":0,\"targetId\":\"" + target + "\"}")))
+                    .isEqualTo("ontology.merge_target_invalid");
+        }
+        for (String target : List.of(term, otherSpell)) {
+            assertThat(code(decide(gm, "merge", feitico, "{\"version\":0,\"targetId\":\"" + target + "\"}")))
+                    .isEqualTo("ontology.merge_target_invalid");
+        }
+        assertThat(decide(gm, "merge", pv, "{\"version\":0}").statusCode()).isEqualTo(400);
+
+        JsonNode merged = approve(gm, "merge", pv, "{\"version\":0,\"targetId\":\"" + term + "\"}");
+        assertThat(merged.path("proposal").path("state").asString()).isEqualTo("merged");
+        assertThat(merged.path("resultId").asString()).isEqualTo(term);
+        JsonNode terms = json(get(gm, "/api/v1/systems/" + system + "/terms"));
+        assertThat(terms.path("total").asLong()).isEqualTo(1);
+        assertThat(terms.path("items").get(0).path("aliases").toString()).isEqualTo("[\"PV\"]");
+        TermAliasRow alias = ontology.aliases.values().stream().findFirst().orElseThrow();
+        assertThat(new String(alias.name(), StandardCharsets.ISO_8859_1)).doesNotContain("PV");
+        // A type proposal merged into a type (a core one here) only closes: no type is added.
+        approve(gm, "merge", feitico, "{\"version\":0,\"targetId\":\"" + spell + "\"}");
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("total").asLong()).isEqualTo(8);
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/proposals")).path("total").asLong()).isZero();
+    }
+
+    @Test
+    void aRejectedProposalIsNotRaisedAgainOnReprocessAndAStaleDecisionIsRefused() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, uploaded, TALENTS, List.of(2), passage -> String.join(",",
+                proposal("record_type", "Talento", "", example(passage, "Talentos")),
+                proposal("record_type", "Perícia", "", example(passage, "Perícia"))));
+        String talent = pending(gm, system, "Talento");
+        String skill = pending(gm, system, "Perícia");
+
+        // Matrix row "Stale": a decision on an older version, or a second decision, is refused and changes nothing.
+        assertThat(code(decide(gm, "rejection", talent, "{\"version\":3}"))).isEqualTo("request.stale_version");
+        JsonNode rejected = approve(gm, "rejection", talent, "{\"version\":0}");
+        assertThat(rejected.path("proposal").path("state").asString()).isEqualTo("rejected");
+        assertThat(rejected.path("resultId").isNull()).isTrue();
+        assertThat(code(decide(gm, "approval", talent, "{\"version\":0}"))).isEqualTo("request.stale_version");
+        assertThat(code(decide(gm, "approval", talent, "{\"version\":1}"))).isEqualTo("request.stale_version");
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("total").asLong()).isEqualTo(8);
+
+        // Matrix rows "Reject, then reprocess" and "Version cleared": the pending one goes, the rejected one stays
+        // and is not raised again when the reprocessed version proposes both again.
+        HttpResponse<String> reprocessed = act(gm, uploaded, "reprocess");
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(200);
+        assertThat(ontology.proposals).doesNotContainKey(UUID.fromString(skill));
+        assertThat(ontology.proposals.get(UUID.fromString(talent)).state()).isEqualTo("rejected");
+        assertThat(ontology.proposals.get(UUID.fromString(talent)).versionId()).isNull();
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 2, 2, List.of()));
+        StepRow passages = offeredStep(uploaded.versionId());
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, TALENTS, "A"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 2) + "]"));
+        UUID passage = passages(uploaded.versionId()).getFirst().id();
+        StepRow records = offeredStep(uploaded.versionId());
+        report(records, claimWithModel(records.jobId()), proposalsReport(String.join(",",
+                proposal("record_type", "Talento", "", example(passage, "Talentos")),
+                proposal("record_type", "Perícia", "", example(passage, "Perícia")))));
+        assertThat(json(get(gm, "/api/v1/systems/" + system + "/proposals")).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("Perícia");
+    }
+
+    @Test
+    void aRestartOrADiscardClearsPendingProposalsAndADeletedMaterialKeepsOnlyApprovedOnesWithoutIt()
+            throws Exception {
+        Gm gm = signUp();
+        UUID system = UUID.fromString(json(send("POST", "/api/v1/systems", "{\"name\":\"Passageiro\"}"
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json")).path("id")
+                .asString());
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, uploaded, TALENTS, passage -> String.join(",",
+                proposal("record_type", "Talento", "", example(passage, "Talentos")),
+                proposal("term", "Pontos de Vida", "Pontos de Vida (PV): medem a saúde", example(passage, "PV")),
+                proposal("term", "PV", "Pontos de Vida (PV)", example(passage, "(PV)")),
+                proposal("record_type", "Perícia", "", example(passage, "Perícia"))));
+        String type = approve(gm, pending(gm, system, "Talento"), "{\"version\":0}").path("resultId").asString();
+        String term = approve(gm, pending(gm, system, "Pontos de Vida"), "{\"version\":0}").path("resultId").asString();
+        approve(gm, "merge", pending(gm, system, "PV"), "{\"version\":0,\"targetId\":\"" + term + "\"}");
+
+        // A discard clears the version's pending proposal; the decided ones stay.
+        HttpResponse<String> discarded = act(gm, uploaded, "discard");
+        assertThat(discarded.statusCode()).as(discarded.body()).isEqualTo(200);
+        assertThat(proposalsOf(uploaded.materialId())).extracting(ProposalRow::state)
+                .containsExactlyInAnyOrder("approved", "approved", "merged");
+        assertThat(proposalsOf(uploaded.materialId())).allMatch(row -> row.versionId() == null);
+
+        // Matrix row "Material deleted": only the approved ones stay, without their material; the alias stays too.
+        HttpResponse<String> deleted = send("DELETE", "/api/v1/materials/" + uploaded.materialId(), null, session(gm));
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        UUID deletion = deletionRows.rows.values().stream()
+                .filter(row -> row.targetId().equals(UUID.fromString(uploaded.materialId()))).findFirst().orElseThrow()
+                .id();
+        assertThat(systemDeletion.run(gm.id(), deletion)).isTrue();
+        assertThat(ontology.proposals.values()).filteredOn(row -> row.systemId().equals(system))
+                .extracting(ProposalRow::state).containsExactlyInAnyOrder("approved", "approved");
+        assertThat(ontology.proposals.values()).filteredOn(row -> row.systemId().equals(system))
+                .allMatch(row -> row.materialId() == null);
+        assertThat(json(get(gm, "/api/v1/record-types/" + type)).path("origin").toString()).isEqualTo("{\"kind\":"
+                + "\"proposal\",\"proposalId\":\"" + knowledge.recordTypes.get(UUID.fromString(type)).proposalId()
+                + "\",\"materialId\":null,\"materialName\":null}");
+        JsonNode terms = json(get(gm, "/api/v1/systems/" + system + "/terms"));
+        assertThat(terms.path("items").get(0).path("aliases").toString()).isEqualTo("[\"PV\"]");
+        assertThat(terms.path("items").get(0).path("origin").path("materialId").isNull()).isTrue();
+
+        // A system's deletion takes its aliases, terms, approved types and proposals.
+        assertThat(OwnerContext.callAs(gm.id(), () -> systemDeletion.delete(system))).isTrue();
+        UUID ofSystem = deletionRows.rows.values().stream().filter(row -> row.targetId().equals(system)).findFirst()
+                .orElseThrow().id();
+        assertThat(systemDeletion.run(gm.id(), ofSystem)).isTrue();
+        assertThat(ontology.proposals.values()).noneMatch(row -> row.systemId().equals(system));
+        assertThat(ontology.terms.values()).noneMatch(row -> row.systemId().equals(system));
+        assertThat(ontology.aliases.values()).noneMatch(row -> row.systemId().equals(system));
+        assertThat(knowledge.recordTypes.values()).noneMatch(row -> row.systemId().equals(system));
+
+        // A restart (a report under another pipeline) clears the pending ones of the restarted version. The deletions'
+        // index removals would hold the ingestion lane.
+        endEveryUnendedJob();
+        Uploaded restarted = uploadTo(gm, "Outro.pdf", starterSystem(gm));
+        withProposals(gm, restarted, TALENTS, passage -> proposal("record_type", "Ofício", "",
+                example(passage, "Ofício")));
+        assertThat(proposalsOf(restarted.materialId())).hasSize(1);
+        StepRow again = repeatRecordsStep(restarted);
+        report(again, claimWithModel(again.jobId()), "{\"pipelineVersion\":\"3\",\"records\":[],\"next\":[]}");
+        assertThat(proposalsOf(restarted.materialId())).isEmpty();
+    }
+
+    @Test
+    void proposalsComeFromARecordsStepOnlyAndAReportWithMalformedProposalsIsRefusedAndKeepsNothing()
+            throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        StepRow passages = passagesStepAfterReading(uploaded, 2);
+        // A passages report carrying proposals is refused.
+        HttpResponse<String> refused = outcome(passages.jobId(), claim(passages.jobId()), "{\"outcome\":\"done\","
+                + "\"result\":" + passagesReport(passage(1, TALENTS, "A")).replace("\"next\":[]",
+                "\"proposals\":[],\"next\":[" + recordsStep(1, 2) + "]") + "}");
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
+        assertThat(refused.body()).contains("job.result_invalid");
+        endEveryUnendedJob();
+
+        Uploaded other = uploadTo(gm, "Outro.pdf", system);
+        StepRow step = recordsStepOf(gm, other);
+        UUID passage = passages(other.versionId()).getFirst().id();
+        String fine = proposal("record_type", "Talento", "", example(passage, "Talentos"));
+        JsonNode claim = claimWithModel(step.jobId());
+        for (String bad : List.of(
+                String.join(",", java.util.Collections.nCopies(21, fine)),
+                proposal("verb", "Talento", "", example(passage, "Talentos")),
+                proposal("record_type", " ", "", example(passage, "Talentos")),
+                proposal("record_type", "x".repeat(121), "", example(passage, "Talentos")),
+                proposal("term", "Talento", "x".repeat(501), example(passage, "Talentos")),
+                proposal("record_type", "Talento", "", example(passage, "a"), example(passage, "b"),
+                        example(passage, "c"), example(passage, "d")),
+                proposal("record_type", "Talento", "", example(passage, "x".repeat(201))),
+                "{\"kind\":\"record_type\",\"name\":\"Talento\",\"examples\":[{\"passageId\":\"nada\",\"quote\":\"T\"}]}",
+                "{\"kind\":\"record_type\",\"name\":\"Talento\"}")) {
+            HttpResponse<String> answered = outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":"
+                    + proposalsReport(bad) + "}");
+            assertThat(answered.statusCode()).as(bad + ": " + answered.body()).isEqualTo(400);
+        }
+        assertThat(proposalsOf(other.materialId())).isEmpty();
+        // A well-formed report is then taken.
+        report(step, claim, proposalsReport(fine));
+        assertThat(proposalsOf(other.materialId())).hasSize(1);
+    }
+
+    @Autowired
+    private io.github.gmshield.materials.service.OntologyProposals proposalPort;
+
+    @Test
+    void aMaterialInTwoSystemsProposesToEachAndEachSystemDecidesOnItsOwn() throws Exception {
+        Gm gm = signUp();
+        UUID first = starterSystem(gm);
+        UUID second = UUID.fromString(json(send("POST", "/api/v1/systems", "{\"name\":\"Pathfinder\"}"
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json")).path("id")
+                .asString());
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null, "filename " + Base64.getEncoder().encodeToString(
+                "Livro.pdf".getBytes(StandardCharsets.UTF_8)) + ",systems " + Base64.getEncoder().encodeToString(
+                (first + "," + second).getBytes(StandardCharsets.UTF_8)));
+        withProposals(gm, uploaded, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")));
+
+        for (UUID system : List.of(first, second)) {
+            JsonNode listed = json(get(gm, "/api/v1/systems/" + system + "/proposals"));
+            assertThat(listed.path("items")).extracting(item -> item.path("name").asString()).containsExactly("Talento");
+            assertThat(listed.path("items").get(0).path("systemId").asString()).isEqualTo(system.toString());
+        }
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/proposals")).path("total").asLong())
+                .isEqualTo(2);
+        // Deciding in one system leaves the other's pending.
+        approve(gm, pending(gm, first, "Talento"), "{\"version\":0}");
+        assertThat(json(get(gm, "/api/v1/systems/" + first + "/proposals")).path("total").asLong()).isZero();
+        assertThat(json(get(gm, "/api/v1/systems/" + second + "/proposals")).path("total").asLong()).isEqualTo(1);
+        assertThat(json(get(gm, "/api/v1/systems/" + second + "/record-types")).path("total").asLong()).isEqualTo(8);
+    }
+
+    @Test
+    void aPendingProposalOfASupersededVersionMovesToTheNewVersionThatProposesItAgain() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded old = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, old, TALENTS, passage -> proposal("record_type", "Talento", "", example(passage, "Talentos")));
+        accept(gm, old);
+        // The accept's index changes would hold the ingestion lane.
+        endEveryUnendedJob();
+        Uploaded replacement = replace(gm, old.materialId(), pdf(MIB), "Livro 2a impressao.pdf");
+        withProposals(gm, replacement, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")));
+        ProposalRow moved = proposalsOf(old.materialId()).getFirst();
+        assertThat(proposalsOf(old.materialId())).hasSize(1);
+        assertThat(moved.versionId()).isEqualTo(replacement.versionId());
+
+        // The old version's removal no longer takes it.
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                proposalPort.clearPending(old.versionId())));
+        assertThat(pendingNamed(gm, system, "Talento").path("examples")).extracting(item -> item.path("quote")
+                .asString()).containsExactly("Talentos são");
+        assertThat(ontology.proposals.get(moved.id()).versionId()).isEqualTo(replacement.versionId());
+    }
+
+    /** A PDF upload attached to {@code system}. */
+    private Uploaded uploadTo(Gm gm, String name, UUID system) throws Exception {
+        return upload(gm, pdf(MIB), name, null, "filename " + Base64.getEncoder().encodeToString(
+                name.getBytes(StandardCharsets.UTF_8)) + ",system " + Base64.getEncoder().encodeToString(
+                system.toString().getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private void withProposals(Gm gm, Uploaded uploaded, String text,
+                               java.util.function.Function<UUID, String> proposals) throws Exception {
+        withProposals(gm, uploaded, text, List.of(), proposals);
+    }
+
+    /**
+     * A PDF of two pages read to review ({@code unreadable} pages unreadable), with one passage of {@code text} on page 1
+     * and one records step over both pages, whose report carries no record and the proposals {@code proposals} gives
+     * for that passage's id.
+     */
+    private void withProposals(Gm gm, Uploaded uploaded, String text, List<Integer> unreadable,
+                               java.util.function.Function<UUID, String> proposals) throws Exception {
+        StepRow step = recordsStepOf(gm, uploaded, text, unreadable);
+        report(step, claimWithModel(step.jobId()), proposalsReport(proposals.apply(
+                passages(uploaded.versionId()).getFirst().id())));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    private StepRow recordsStepOf(Gm gm, Uploaded uploaded) throws Exception {
+        return recordsStepOf(gm, uploaded, TALENTS, List.of());
+    }
+
+    /** As {@link #withProposals}, up to the records step, which is answered here. */
+    private StepRow recordsStepOf(Gm gm, Uploaded uploaded, String text, List<Integer> unreadable) throws Exception {
+        JsonNode cleanClaim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), cleanClaim, pdf(4000));
+        UUID batch = output(uploaded.jobId(), cleanClaim, pdf(3000));
+        report(steps(uploaded.versionId()).getFirst(), cleanClaim, "{\"pipelineVersion\":\"2\",\"pageTotal\":2,"
+                + "\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[{\"fileId\":\"" + batch
+                + "\",\"firstPage\":1,\"lastPage\":2}],\"next\":[{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":2,"
+                + "\"input\":\"" + batch + "\"}," + passagesStep(2) + "]}");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 2, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 1, 2, unreadable));
+        StepRow passages = offeredStep(uploaded.versionId());
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, text, "A"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 1) + "]")
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 2) + "]"));
+        return offeredStep(uploaded.versionId());
+    }
+
+    /**
+     * A second records step of the version over its two pages, as a repeated report of the passages step would name
+     * it: the version back to processing, its passages kept.
+     */
+    private StepRow repeatRecordsStep(Uploaded uploaded) {
+        UUID owner = materials.versions.get(uploaded.versionId()).ownerId();
+        OwnerContext.runAs(owner, () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            materials.changeVersionState(uploaded.versionId(), "processing", Instant.now());
+            jobService.create("ingestion", created -> materials.insertStep(StepRow.records(Ids.newId(), owner,
+                    uploaded.versionId(), created.id(), "records", 1, 2, Instant.now())));
+        }));
+        return offeredStep(uploaded.versionId());
+    }
+
+    private static String proposalsReport(String proposals) {
+        return "{\"pipelineVersion\":\"2\",\"records\":[],\"proposals\":[" + proposals + "],\"next\":[]}";
+    }
+
+    private static String proposal(String kind, String name, String definition, String... examples) {
+        return "{\"kind\":\"" + kind + "\",\"name\":\"" + name + "\",\"definition\":\"" + definition
+                + "\",\"examples\":[" + String.join(",", examples) + "]}";
+    }
+
+    private static String example(UUID passageId, String quote) {
+        return "{\"passageId\":\"" + passageId + "\",\"quote\":\"" + quote + "\"}";
+    }
+
+    private List<ProposalRow> proposalsOf(String materialId) {
+        return ontology.proposals.values().stream()
+                .filter(row -> UUID.fromString(materialId).equals(row.materialId())).toList();
+    }
+
+    /** The id of the system's pending proposal named {@code name}. */
+    private String pending(Gm gm, UUID system, String name) throws Exception {
+        return pendingNamed(gm, system, name).path("id").asString();
+    }
+
+    private JsonNode pendingNamed(Gm gm, UUID system, String name) throws Exception {
+        for (JsonNode item : json(get(gm, "/api/v1/systems/" + system + "/proposals?limit=50")).path("items")) {
+            if (item.path("name").asString().equals(name)) {
+                return item;
+            }
+        }
+        throw new AssertionError("no pending proposal " + name);
+    }
+
+    private HttpResponse<String> decide(Gm gm, String decision, String proposalId, String body) throws Exception {
+        return send("POST", "/api/v1/proposals/" + proposalId + "/" + decision, body.getBytes(StandardCharsets.UTF_8),
+                session(gm), "Content-Type", "application/json");
+    }
+
+    private JsonNode approve(Gm gm, String proposalId, String body) throws Exception {
+        return approve(gm, "approval", proposalId, body);
+    }
+
+    private JsonNode approve(Gm gm, String decision, String proposalId, String body) throws Exception {
+        HttpResponse<String> decided = decide(gm, decision, proposalId, body);
+        assertThat(decided.statusCode()).as(decided.body()).isEqualTo(200);
+        assertThat(decided.headers().firstValue("Cache-Control")).hasValue("no-store");
+        return json(decided);
+    }
+
+    private static String code(HttpResponse<String> answer) {
+        return json(answer).path("code").asString();
+    }
+
+    /** Whether a log event carries this key with this value (no pattern over the pairs' text, Sonar S8786). */
+    private static boolean hasPair(ILoggingEvent event, String key, Object value) {
+        List<org.slf4j.event.KeyValuePair> pairs = event.getKeyValuePairs();
+        return pairs != null && pairs.stream().anyMatch(pair -> pair.key.equals(key)
+                && String.valueOf(pair.value).equals(String.valueOf(value)));
     }
 
     // --- Story 2.1: the index

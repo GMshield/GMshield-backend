@@ -82,6 +82,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     private final UploadStorage uploads;
     private final IngestionSteps ingestion;
     private final ExtractedRecords records;
+    private final OntologyProposals proposals;
     private final IndexChanges indexChanges;
     private final IndexRemovals indexRemovals;
     private final VersionRemoval removal;
@@ -92,10 +93,11 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     SystemMaterialsDeletion(MaterialStore materials, IndexStore index, UploadStorage uploads, IngestionSteps ingestion,
                             IndexChanges indexChanges, IndexRemovals indexRemovals, VersionRemoval removal,
-                            FileStore files, Jobs jobs, ExtractedRecords records,
+                            FileStore files, Jobs jobs, ExtractedRecords records, OntologyProposals proposals,
                             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.materials = materials;
         this.records = records;
+        this.proposals = proposals;
         this.index = index;
         this.uploads = uploads;
         this.ingestion = ingestion;
@@ -181,8 +183,14 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
             for (VersionRow version : reading(() -> materials.versionsOf(material.id()))) {
                 left += removeVersion(owner, version.id()) ? 0 : 1;
             }
-            removed += Boolean.TRUE.equals(writing(() -> materials.versionsOf(material.id()).isEmpty()
-                    && materials.deleteMaterial(material.id()))) ? 1 : 0;
+            // Story 4.4: its proposals that were not approved go first; the approved ones keep their origin.
+            removed += Boolean.TRUE.equals(writing(() -> {
+                if (!materials.versionsOf(material.id()).isEmpty()) {
+                    return false;
+                }
+                proposals.removeMaterial(material.id());
+                return materials.deleteMaterial(material.id());
+            })) ? 1 : 0;
         }
         List<UUID> goneIds = gone.stream().map(MaterialRow::id).toList();
         int detached = 0;
@@ -257,6 +265,8 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
             materials.deletePageViews(versionId);
             // Story 4.2: the records first, since they link to the passages.
             records.removeVersion(versionId);
+            // Story 4.4: the version's proposals no longer name it before it goes.
+            proposals.clearPending(versionId);
             materials.deletePassages(versionId);
             materials.deleteOutline(versionId);
             materials.deletePageRanges(versionId);
