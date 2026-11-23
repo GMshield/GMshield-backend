@@ -1302,6 +1302,31 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     records by type, how many it replaced) and `ingestion.records_unread` (the failed step's code and page count).
   - Deploy order: the backend (internal 1.17.0, public 1.34.0), then the worker (its minimum backend contract becomes
     1.17.0; a records step under an older worker's pipeline restarts the chain), then the frontend.
+- **Browse records (`knowledge`, Story 4.3 part A, public contract 1.35.0).** Read-only; no migration.
+  `knowledge.service.Records` reads a system's records from its `ready` versions only (`ReadyVersions.ofSystem`, the
+  records tab's rule); everything else (another owner's record, one of a version that needs review or is superseded,
+  one of another system, a system being deleted, an unknown or malformed id) is 404 `request.not_found`, with no name
+  or field in the answer.
+  - `GET /api/v1/record-types/{id}/records?limit&offset` (`listRecords`) answers `{items: [{id, name, materialName,
+    page}], total}`, alphabetical by name: the type's records are read (`RecordStore.ofTypeIn`), their names decrypted
+    and sorted with a root-locale `java.text.Collator` at secondary strength (case ignored; accents order only names
+    that are otherwise equal, the unaccented first), the record id breaking ties, then paged in memory (limit 1 to
+    50, default 20; offset 0 to 100000). Two records with one name are two rows. A type that is not core has none yet.
+  - `GET /api/v1/systems/{systemId}/records/{recordId}` (`getRecord`) answers `{id, name, recordType: {id, core,
+    name}, fields: [{name, value}], references: [{versionId, materialName, sectionPath, page, passageIds}]}`: the
+    system's record type of the record's core key (`core` is never null), the fields in stored order, and one
+    reference per distinct (version, section path, page) of its passages, in page order. `passageIds` lists the
+    record's passages at that place, in the order `RecordSources.places` gives them, so the source view marks them as
+    it marks an answer's cited passages.
+  - `.../records/{recordId}/pages/{page}` (`getRecordSourcePage`, the `MaterialPageView` shape) and `.../picture`
+    (`getRecordSourcePagePicture`, WebP, `nosniff`) serve any page of the record's version: the source view's ground
+    "a record as its system shows it".
+  - `knowledge` may not use `ScopeReads` (AD-9): the new `materials.service.RecordSources` (named interface) wraps
+    `ScopeReads.places`, the material names of ready versions and `versionPage`/`versionPicture` for it.
+  - Log lines (ids and counts only): `knowledge.records_listed`, `knowledge.record_read`, `knowledge.record_page`,
+    `knowledge.record_picture`; each says `found` or `served`, a miss included. The four routes are in the
+    cross-owner audit.
+  - Deploy order: backend → frontend.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

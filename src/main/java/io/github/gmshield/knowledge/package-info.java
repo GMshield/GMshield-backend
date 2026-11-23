@@ -10,7 +10,9 @@
  * ({@code record}, {@code record_passage}) for the {@code materials} module, through the port
  * {@code materials.service.ExtractedRecords} that {@code service.ExtractedRecordStore} implements, so {@code materials}
  * depends on nothing here either; and each record type's count is the records of the system's {@code ready} versions
- * of that core type. Terms and proposals (4.4) come later.
+ * of that core type. From Story 4.3 {@code service.Records} reads a system's records (a type's list, one record, its
+ * version's pages) through {@code materials.service.RecordSources}, never {@code ScopeReads}. Terms and proposals (4.4)
+ * come later.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service"})

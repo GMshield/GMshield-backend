@@ -1,20 +1,29 @@
 package io.github.gmshield.knowledge.web;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.knowledge.service.Records;
+import io.github.gmshield.materials.service.RecordSources;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -32,6 +41,12 @@ import org.springframework.web.bind.annotation.RestController;
  * system being deleted are the same {@code request.not_found} (404). A core type renamed or removed is
  * {@code ontology.core_record_type} (409) and nothing changes. A malformed body, limit or offset is
  * {@code request.invalid} (400). Every answer is {@code no-store}.
+ *
+ * <p>Story 4.3: a record type's records, alphabetical by name, a page at a time; one record as its system shows it (its
+ * name, its record type, its fields and its source references); and a page of the record's version with its picture,
+ * the same shape as a material's page, streamed as WebP with {@code nosniff}. Only the records of the system's accepted
+ * versions are read ({@link Records}); any other record is the same {@code request.not_found}, and no name or field
+ * leaves then.
  */
 @RestController
 @Tag(name = "ontology")
@@ -39,18 +54,27 @@ class OntologyController {
 
     static final String SYSTEM_RECORD_TYPES = "/api/v1/systems/{id}/record-types";
     static final String RECORD_TYPE = "/api/v1/record-types/{id}";
+    static final String RECORD_TYPE_RECORDS = "/api/v1/record-types/{id}/records";
+    static final String SYSTEM_RECORD = "/api/v1/systems/{systemId}/records/{recordId}";
+    static final String SYSTEM_RECORD_PAGE = SYSTEM_RECORD + "/pages/{page}";
+    static final String SYSTEM_RECORD_PICTURE = SYSTEM_RECORD_PAGE + "/picture";
+    static final String WEBP = "image/webp";
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
     /** A page's position: 0, or up to six digits with no leading zero. */
     private static final Pattern OFFSET_TEXT = Pattern.compile("0|[1-9][0-9]{0,5}");
+    /** A page number from 1: no sign, no leading zero, at most seven digits. */
+    private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,6}");
     private static final String SESSION = "X-Session-Token";
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
 
     private final Ontology ontology;
+    private final Records records;
 
-    OntologyController(Ontology ontology) {
+    OntologyController(Ontology ontology, Records records) {
         this.ontology = ontology;
+        this.records = records;
     }
 
     @Schema(name = "RecordType", requiredProperties = {"id", "name", "core", "records", "version"})
@@ -179,6 +203,260 @@ class OntologyController {
             throw notFound();
         }
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @Schema(name = "RecordSummary", requiredProperties = {"id", "name", "materialName", "page"})
+    record RecordSummaryView(
+            @Schema(description = "The record's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000010")
+            String id,
+            @Schema(description = "The record's name, as it was extracted", example = "Fire Bolt") String name,
+            @Schema(description = "The name of the material the record was read from", example = "Livro do Jogador")
+            String materialName,
+            @Schema(description = "The first page the record was read from", format = "int32", minimum = "1",
+                    example = "242") int page) {
+
+        static RecordSummaryView of(Records.Summary summary) {
+            return new RecordSummaryView(summary.id().toString(), summary.name(), summary.materialName(),
+                    summary.page());
+        }
+
+        @Override
+        public String toString() {
+            return "RecordSummaryView[id=" + id + ", page=" + page + "]";
+        }
+    }
+
+    @Schema(name = "RecordPage", requiredProperties = {"items", "total"})
+    record RecordPageView(
+            @ArraySchema(schema = @Schema(implementation = RecordSummaryView.class)) List<RecordSummaryView> items,
+            @Schema(description = "How many records the record type has in all, whatever the page", format = "int64",
+                    example = "230") long total) {
+    }
+
+    @Schema(name = "RecordTypeOfRecord", requiredProperties = {"id", "core", "name"})
+    record RecordTypeOfView(
+            @Schema(description = "The record type's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
+            String id,
+            @Schema(description = "The core key of the record type: a client shows its own translation of it",
+                    allowableValues = {"rule", "spell", "item", "creature",
+                    "character_sheet", "encounter", "dungeon", "note"}, example = "spell") String core,
+            @Schema(description = "The record type's stored name", example = "spell") String name) {
+
+        static RecordTypeOfView of(Records.TypeOf type) {
+            return new RecordTypeOfView(type.id().toString(), type.core(), type.name());
+        }
+    }
+
+    @Schema(name = "RecordField", requiredProperties = {"name", "value"})
+    record RecordFieldView(
+            @Schema(description = "The field's name, as it was extracted", example = "Alcance") String name,
+            @Schema(description = "The field's value, as it was extracted", example = "36 metros") String value) {
+
+        @Override
+        public String toString() {
+            return "RecordFieldView";
+        }
+    }
+
+    @Schema(name = "RecordReference", requiredProperties = {"versionId", "materialName", "sectionPath", "page",
+        "passageIds"})
+    record RecordReferenceView(
+            @Schema(description = "The material version the record was read from", format = "uuid",
+                    example = "0190a0b0-0000-7000-8000-000000000020") String versionId,
+            @Schema(description = "The material's name", example = "Livro do Jogador") String materialName,
+            @ArraySchema(schema = @Schema(description = "A section title, outermost first", example = "Magias"))
+            List<String> sectionPath,
+            @Schema(description = "The page", format = "int32", minimum = "1", example = "242") int page,
+            @ArraySchema(arraySchema = @Schema(description = "The ids of the record's passages at this place, so the"
+                    + " source view marks them on the page as it marks an answer's cited passages"), minItems = 1,
+                    schema = @Schema(type = "string", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000009"))
+            List<String> passageIds) {
+
+        static RecordReferenceView of(Records.Reference reference) {
+            return new RecordReferenceView(reference.versionId().toString(), reference.materialName(),
+                    reference.sectionPath(), reference.page(),
+                    reference.passageIds().stream().map(UUID::toString).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "RecordReferenceView[versionId=" + versionId + ", page=" + page + "]";
+        }
+    }
+
+    @Schema(name = "Record", requiredProperties = {"id", "name", "recordType", "fields", "references"})
+    record RecordView(
+            @Schema(description = "The record's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000010")
+            String id,
+            @Schema(description = "The record's name, as it was extracted", example = "Fire Bolt") String name,
+            @Schema(description = "The system's record type of the record") RecordTypeOfView recordType,
+            @ArraySchema(arraySchema = @Schema(description = "The record's fields, in stored order; empty for a record"
+                    + " without fields"), schema = @Schema(implementation = RecordFieldView.class))
+            List<RecordFieldView> fields,
+            @ArraySchema(arraySchema = @Schema(description = "Where the record was read from: one reference per"
+                    + " distinct version, section path and page, in page order"),
+                    schema = @Schema(implementation = RecordReferenceView.class))
+            List<RecordReferenceView> references) {
+
+        static RecordView of(Records.Detail detail) {
+            return new RecordView(detail.id().toString(), detail.name(), RecordTypeOfView.of(detail.recordType()),
+                    detail.fields().stream().map(field -> new RecordFieldView(field.name(), field.value())).toList(),
+                    detail.references().stream().map(RecordReferenceView::of).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "RecordView[id=" + id + ", fields=" + fields.size() + ", references=" + references.size() + "]";
+        }
+    }
+
+    /** A text line of a picture page and its box. */
+    record LineView(String text, List<Double> box) {
+        @Override
+        public String toString() {
+            return "LineView[box=" + box + "]";
+        }
+    }
+
+    /** A passage on the page: its boxes, or its range in a text page's text. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    record SpotView(String id, List<List<Double>> boxes, List<Integer> range) {
+    }
+
+    /** A picture's size. */
+    record PictureView(int width, int height) {
+    }
+
+    /** A page of the record's version: the same shape as {@code MaterialPageView}, so one view renders both. */
+    record RecordSourcePageView(int page, int pageTotal, PictureView picture, List<LineView> lines, String text,
+                                List<SpotView> passages, String outcome) {
+
+        static RecordSourcePageView of(RecordSources.Page page) {
+            return new RecordSourcePageView(page.page(), page.pageTotal(), page.pictureWidth() == null
+                    || page.pictureHeight() == null ? null : new PictureView(page.pictureWidth(), page.pictureHeight()),
+                    page.lines().stream().map(line -> new LineView(line.text(), line.box())).toList(), page.text(),
+                    page.passages().stream().map(spot -> new SpotView(spot.id().toString(), spot.boxes(),
+                            spot.range())).toList(), page.outcome());
+        }
+
+        @Override
+        public String toString() {
+            return "RecordSourcePageView[page=" + page + ", pageTotal=" + pageTotal + "]";
+        }
+    }
+
+    private static final String RECORD_SUMMARY = " Only the records of the system's accepted versions are read: those"
+            + " of the ready versions of the materials attached to the system and of those of its campaigns."
+            + " request.not_found (404) for a system that is not the account's (another account's, unknown, malformed or"
+            + " being deleted), and for a record that is not one of those (another account's, unknown, malformed, of a"
+            + " version that needs review or is superseded, or of another system's materials): none is told apart, and"
+            + " no name or field is answered then;";
+
+    @GetMapping(path = RECORD_TYPE_RECORDS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listRecords", summary = "The records of one of the account's record types (contract"
+            + " 1.35.0), alphabetical by name (case ignored; accents order only names that are otherwise equal, the"
+            + " unaccented first; then by id), each as it was extracted: two records"
+            + " with the same name are two rows. Only the records of the accepted versions of the system's materials and"
+            + " of its campaigns' materials are listed; a type that is not core has none yet. A page starts at an offset"
+            + " and names the total of the list. request.not_found (404) for any other record type id, one of a system"
+            + " being deleted included; request.invalid (400) for a limit outside 1 to 50 or an offset outside 0 to"
+            + " 100000;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many to skip, 0 to 100000, for a"
+                        + " numbered page", schema = @Schema(type = "integer", format = "int32", minimum = "0",
+                                maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<RecordPageView> records(
+            @Parameter(description = "The record type's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        int size = limit(limit);
+        int from = offset(offset);
+        Records.SummaryPage page = parse(id).flatMap(typeId -> records.records(typeId, from, size))
+                .orElseThrow(OntologyController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new RecordPageView(
+                page.items().stream().map(RecordSummaryView::of).toList(), page.total()));
+    }
+
+    @GetMapping(path = SYSTEM_RECORD, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getRecord", summary = "One record as one of the account's systems shows it (contract"
+            + " 1.35.0): its name, the system's record type of its core key, its fields in stored order, and its source"
+            + " references, one per distinct version, section path and page, in page order." + RECORD_SUMMARY
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<RecordView> record(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("systemId") String systemId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId) {
+        return found(parse(systemId).flatMap(system -> parse(recordId).flatMap(record -> records.record(system, record)))
+                .map(RecordView::of));
+    }
+
+    @GetMapping(path = SYSTEM_RECORD_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getRecordSourcePage", summary = "One page of the version a record was read from, as one"
+            + " of the account's systems shows the record (contract 1.35.0): the same shape as MaterialPageView, for the"
+            + " source view of a record's reference; any page from 1 to the version's page total." + RECORD_SUMMARY
+            + " also for a page outside 1 to the page total or a page with no view (unless it is unreadable);"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "200", description = "The page",
+                    content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
+                            schema = @Schema(ref = "#/components/schemas/MaterialPageView"))))
+    ResponseEntity<RecordSourcePageView> recordPage(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("systemId") String systemId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId,
+            @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer", format = "int32",
+                    minimum = "1")) @PathVariable("page") String page) {
+        RecordSources.Page found = parse(systemId).flatMap(system -> parse(recordId).flatMap(record -> number(page)
+                        .flatMap(wanted -> records.page(system, record, wanted))))
+                .orElseThrow(OntologyController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(RecordSourcePageView.of(found));
+    }
+
+    // No `produces`: a refusal is problem JSON, which an image's Accept would otherwise turn into a 406.
+    @GetMapping(path = SYSTEM_RECORD_PICTURE)
+    @Operation(operationId = "getRecordSourcePagePicture", summary = "The picture of one page of the version a record"
+            + " was read from, as one of the account's systems shows the record (contract 1.35.0), as WebP, streamed."
+            + RECORD_SUMMARY + " also for a page outside 1 to the page total or a page with no picture;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "200", description = "The page's picture",
+                    content = @Content(mediaType = WEBP, schema = @Schema(type = "string", format = "binary"))))
+    void recordPicture(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("systemId") String systemId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId,
+            @Parameter(description = "The page's number, from 1", schema = @Schema(type = "integer", format = "int32",
+                    minimum = "1")) @PathVariable("page") String page,
+            @Parameter(hidden = true) HttpServletResponse response) throws IOException {
+        RecordSources.Picture picture = parse(systemId).flatMap(system -> parse(recordId).flatMap(record ->
+                        number(page).flatMap(wanted -> records.picture(system, record, wanted))))
+                .orElseThrow(OntologyController::notFound);
+        response.setStatus(HttpStatus.OK.value());
+        response.setContentType(WEBP);
+        response.setContentLengthLong(picture.size());
+        response.setHeader(HttpHeaders.CACHE_CONTROL, CacheControl.noStore().getHeaderValue());
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        try (OutputStream out = response.getOutputStream()) {
+            picture.writeTo(out);
+        }
+    }
+
+    /** A page's number from 1; a malformed one is no different from a page that is not one. */
+    private static Optional<Integer> number(String text) {
+        return text != null && NUMBER.matcher(text).matches() ? Optional.of(Integer.parseInt(text)) : Optional.empty();
     }
 
     /** A malformed id is no different from an unknown one. */
