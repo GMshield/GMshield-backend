@@ -68,7 +68,8 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #turn} and {@link #eventsAfter}: a turn of the owner, and its stored events after a sequence, decrypted,
  *       in order.</li>
  *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
- *       {@code removed} as of now when its source is removed ({@link Scopes#removedVersions}).</li>
+ *       {@code removed} as of now when its source is removed ({@link Scopes#removedVersions}); from Story 4.3 part C
+ *       a record's reference with the record's name and fields as stored, never read from the record again.</li>
  *   <li>{@link #stop} (Story 2.6): the GM's stop of a turn of the owner (else {@code request.not_found}), in one
  *       transaction that first locks the turn's job row, the lock its batches and its outcome take: a {@code waiting}
  *       or {@code offered} job is cancelled, a {@code running} one keeps its claim (so the worker can still post usage
@@ -777,8 +778,21 @@ public class Conversations {
                     vault.decryptText(TurnReferences.materialName(row.id(), row.ownerId()), row.materialName()),
                     TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
                             row.sectionPath())),
-                    row.page(), row.passageIds(), removed.contains(row.versionId()), row.tier())).toList();
+                    row.page(), row.passageIds(), removed.contains(row.versionId()), row.tier(), cited(row)))
+                    .toList();
         });
+    }
+
+    /** The record a stored reference names (Story 4.3 part C), decrypted; null for a passage place's reference. */
+    private TurnReference.Cited cited(TurnReferenceRow row) {
+        TurnReferenceRow.Recorded record = row.record();
+        if (record == null) {
+            return null;
+        }
+        return new TurnReference.Cited(record.recordId(), record.recordType(),
+                vault.decryptText(TurnReferences.recordName(row.id(), row.ownerId()), record.name()),
+                TurnReferences.fields(vault.decrypt(TurnReferences.recordFields(row.id(), row.ownerId()),
+                        record.fields())));
     }
 
     /**

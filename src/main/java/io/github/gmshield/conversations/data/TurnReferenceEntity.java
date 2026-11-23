@@ -56,6 +56,19 @@ class TurnReferenceEntity {
     @Column(name = "tier", updatable = false, length = 16)
     private String tier;
 
+    /** Story 4.3 part C (V38): the cited record's id, core type key, name and fields; all null on a passage's. */
+    @Column(name = "record_id", updatable = false)
+    private UUID recordId;
+
+    @Column(name = "record_type", updatable = false, length = 32)
+    private String recordType;
+
+    @Column(name = "record_name", updatable = false)
+    private byte[] recordName;
+
+    @Column(name = "record_fields", updatable = false)
+    private byte[] recordFields;
+
     protected TurnReferenceEntity() {
         // for Hibernate
     }
@@ -73,10 +86,17 @@ class TurnReferenceEntity {
         this.sectionPath = row.sectionPath();
         this.createdAt = row.createdAt();
         this.tier = row.tier();
+        if (row.record() != null) {
+            this.recordId = row.record().recordId();
+            this.recordType = row.record().recordType();
+            this.recordName = row.record().name();
+            this.recordFields = row.record().fields();
+        }
     }
 
     TurnReferenceRow row() {
         return new TurnReferenceRow(id, ownerId, turnId, number, versionId, materialId, page, List.of(passageIds),
-                materialName, sectionPath, createdAt, tier);
+                materialName, sectionPath, createdAt, tier, recordId == null ? null
+                : new TurnReferenceRow.Recorded(recordId, recordType, recordName, recordFields));
     }
 }

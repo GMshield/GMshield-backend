@@ -10,12 +10,15 @@ import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.jobs.service.JobEvent;
 import io.github.gmshield.jobs.service.JobEventBatch;
+import io.github.gmshield.jobs.service.JobRecord;
+import io.github.gmshield.jobs.service.JobRecordReads;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
+import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -68,6 +71,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * campaign's name, area, conversation name and excerpt; a running turn refused and another owner's never listed nor
  * saved; a dismissed answer and an archived campaign's left out until they come back with the same time; an unsave; and
  * a conversation being deleted leaving the list at once.
+ * Story 4.3 part C (V38): an answer job reads a record with its fields, cites it, and the record becomes a reference of
+ * its own in {@code turn_reference}, its name and fields encrypted ({@code record_name}, {@code record_fields}) beside
+ * its plain id and type, read back as written after the record is replaced, the four columns set together.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -92,6 +98,10 @@ class ConversationIntegrationTest {
     private Searches searches;
     @Autowired
     private JobClaims claims;
+    @Autowired
+    private JobRecordReads recordReads;
+    @Autowired
+    private ExtractedRecords extracted;
     @Autowired
     private JdbcClient jdbc;
     @Autowired
@@ -267,6 +277,94 @@ class ConversationIntegrationTest {
         assertThatThrownBy(() -> jdbc.sql("update turn_reference set tier = 'model' where turn_id = :turn")
                 .param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
                 .hasStackTraceContaining("turn_reference_tier_check");
+    }
+
+    @Test
+    void aCitedRecordIsStoredByValueAsAReferenceOfItsOwnOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        UUID first = Ids.newId();
+        UUID second = Ids.newId();
+        as(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "SRD 5.2.1"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, first, 0, 4), passage(owner, version, second, 1,
+                    4)));
+            return extracted.replaceRange(version, 1, 9, List.of(new ExtractedRecords.Extracted("spell",
+                    "Bola de Fogo", List.of(new ExtractedRecords.Field("Alcance", "45 m"),
+                    new ExtractedRecords.Field("Nível", "3")), List.of(first, second), 4)));
+        });
+        UUID record = jdbc.sql("select id from record where version_id = :version").param("version", version)
+                .query(UUID.class).single();
+        Conversations.Asked asked = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        UUID jobId = jdbc.sql("select job_id from turn where id = :id").param("id", asked.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of("azure-openai"));
+
+        List<JobRecord> read = recordReads.read(jobId, claim.claimId(), claim.grant(), List.of(record));
+        assertThat(read).singleElement().satisfies(one -> {
+            assertThat(one.name()).isEqualTo("Bola de Fogo");
+            assertThat(one.type()).isEqualTo("spell");
+            assertThat(one.tier()).isEqualTo("campaign");
+            assertThat(one.page()).isEqualTo(4);
+            assertThat(one.sectionPath()).containsExactly("Magias", "Fire Bolt");
+            assertThat(one.fields()).extracting(JobRecord.Field::name, JobRecord.Field::value).containsExactly(
+                    org.assertj.core.groups.Tuple.tuple("Alcance", "45 m"),
+                    org.assertj.core.groups.Tuple.tuple("Nível", "3"));
+        });
+        assertThatThrownBy(() -> recordReads.read(jobId, claim.claimId(), claim.grant(), List.of(record, first)))
+                .isInstanceOfSatisfying(ApiException.class, refused ->
+                        assertThat(refused.problem().code()).isEqualTo("scope.passage_refused"));
+        claims.events(jobId, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1, List.of(
+                JobEvent.delta("O alcance é 45 m."), JobEvent.citation(first, 5), JobEvent.recordCitation(record, 16))),
+                List.of());
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, null);
+
+        // The record's material is reprocessed: its records go; the reference keeps what the answer was written from.
+        as(owner, () -> extracted.replaceRange(version, 1, 9, List.of()));
+        List<TurnReference> references = as(owner, () -> conversations.references(asked.turnId()));
+
+        assertThat(references).extracting(TurnReference::number, TurnReference::kind, TurnReference::page)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(1, "passage", 4),
+                        org.assertj.core.groups.Tuple.tuple(2, "record", 4));
+        TurnReference cited = references.get(1);
+        assertThat(cited.record().id()).isEqualTo(record);
+        assertThat(cited.record().type()).isEqualTo("spell");
+        assertThat(cited.record().name()).isEqualTo("Bola de Fogo");
+        assertThat(cited.record().fields()).extracting(TurnReference.Field::name, TurnReference.Field::value)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple("Alcance", "45 m"),
+                        org.assertj.core.groups.Tuple.tuple("Nível", "3"));
+        assertThat(cited.passageIds()).containsExactlyInAnyOrder(first, second);
+        assertThat(cited.materialName()).isEqualTo("SRD 5.2.1");
+        assertThat(cited.tier()).isEqualTo("campaign");
+        assertThat(references.getFirst().record()).isNull();
+        Map<String, Object> row = jdbc.sql("select record_id, record_type, record_name, record_fields from"
+                + " turn_reference where turn_id = :turn and number = 2").param("turn", asked.turnId()).query()
+                .singleRow();
+        assertThat(row.get("record_id")).isEqualTo(record);
+        assertThat(row.get("record_type")).isEqualTo("spell");
+        assertThat(new String((byte[]) row.get("record_name"), StandardCharsets.ISO_8859_1)).doesNotContain("Bola");
+        assertThat(new String((byte[]) row.get("record_fields"), StandardCharsets.ISO_8859_1))
+                .doesNotContain("Alcance").doesNotContain("45 m");
+        assertThat(jdbc.sql("select count(*) from turn_reference where turn_id = :turn and number = 1 and record_id is"
+                + " null and record_type is null and record_name is null and record_fields is null")
+                .param("turn", asked.turnId()).query(Long.class).single()).isEqualTo(1L);
+        // The four are set together, and the type is a core key.
+        assertThatThrownBy(() -> jdbc.sql("update turn_reference set record_name = null where turn_id = :turn and"
+                + " number = 2").param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("turn_reference_record_check");
+        assertThatThrownBy(() -> jdbc.sql("update turn_reference set record_type = 'dragon' where turn_id = :turn and"
+                + " number = 2").param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("turn_reference_record_type_check");
+        // Another owner reads no reference.
+        assertThat(as(Ids.newId(), () -> conversations.references(asked.turnId()))).isEmpty();
     }
 
     @Test

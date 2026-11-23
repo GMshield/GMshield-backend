@@ -1374,6 +1374,52 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - Deploy order: backend → worker (its minimum backend contract becomes 1.18.0) → frontend. Until the worker is
     deployed, a search by name still puts the exact-name records first, and a search with a record-type filter fails
     with `scope.passage_refused` (the older worker returns passages).
+- **Records in answers (`conversations`, `scope`, `jobs`, `knowledge`, Story 4.3 part C, public contract 1.37.0,
+  internal contract 1.19.0, migration V38).** An answer job also reads the in-scope records the worker found, the model
+  cites a record by its id as it cites a passage, and a cited record becomes a source reference of its own, stored by
+  value with its name, type and fields.
+  - **Read.** `POST /internal/v1/jobs/{jobId}/claims/{claimId}/records` (`readJobRecords`, `jobs`), with
+    `X-Job-Grant`: body `{ids: [uuid]}`, 1 to 100 non-null ids. The checks are the passages read's, in the same order
+    (`JobClaimReads`, shared by `JobPassageReads` and `JobRecordReads`): 400 `request.invalid` for a malformed body,
+    403 `job.grant_refused`, 400 `job.records_invalid`, then the handler as the job's owner in a read-only
+    transaction through `JobHandler.records(JobRef, ids)`, whose default is 403 `job.records_refused`. `AnswerJobs`
+    answers through `Scopes.recordContents(frozen scope, ids)`: every id must be a record (`ExtractedRecords.located`)
+    of an allowed source still `ready` with a passage there on its first page, else the whole batch is 403
+    `scope.passage_refused` before anything is decrypted; then `ExtractedRecords.read` (new port method, implemented
+    by `knowledge`) decrypts the names and fields. The answer is `{records: [{id, tier, type, name, fields: [{name,
+    value}], page, sectionPath}]}` (`JobRecord`): its core type key, its first page and that page's first passage's
+    section path. Never cached.
+  - **Citations.** A `JobStreamEvent` `citation` names exactly one of `passageId` and `recordId` (else 400
+    `job.events_invalid`); a stored citation keeps whichever it named (`TurnEvent.recordId`), and the GM's stream sends
+    `{recordId, offset}` for a record (`TurnCitationEvent`: `passageId` is no longer required).
+  - **References.** `AnswerJobs.storeReferences` splits the cited ids: passages go through `Scopes.references` as
+    before; records through `Scopes.citedRecords`, one read with their fields in which an out-of-scope, unknown,
+    foreign or since-deleted id is dropped, never refused (so the `done` or stop path always ends the turn). In
+    first-citation order each record is a reference of its own
+    (`TurnReferences.groupCited`: the grouping key includes the record id), numbered with the passage places: its
+    version, material, first page, that page's first passage's section path, its passages on that page, its material's
+    name and its tier. `conversation.references_stored` adds `citedRecords` and `droppedRecords`.
+  - **V38.** `turn_reference.record_id uuid` and `record_type varchar(32)` (a core key, checked), plus `record_name`
+    and `record_fields` (a JSON array of `{name, value}`) encrypted under the bindings `turn_reference`/`record_name`
+    and `turn_reference`/`record_fields`; a check sets the four together (all null on a passage's reference).
+    `record_id` keeps no foreign key: records are hard-deleted and re-minted on reprocessing, and the stored reference
+    keeps its fields as they were when the answer was written (AD-11). Rolling back past V38: the previous release
+    reads a record reference as a passage reference (no name, no fields), but a stored citation event naming a
+    `recordId` and no `passageId` breaks its `TurnEvents.data`; once any record has been cited, the rollback needs
+    those turns' record citation events removed first (or is unsafe).
+  - **Read back.** `TurnSourceReference` gains `kind` (`passage` or `record`, always present) and, for a record,
+    `recordId`, `recordType` (core key), `name` and `fields: [{name, value}]` (`TurnReferenceField`). A passage id
+    appears in at most one passage reference of a turn; record references may share passage ids (two records read
+    from one page share its passages), and a record's may also name a passage a passage reference names. `removed` is
+    the version's state, as for passages. The reference page routes
+    (`/api/v1/turns/{turnId}/references/{number}/pages/{page}` and its picture) serve a record reference as any other:
+    the turn's ground, its version.
+  - Log lines (ids and counts only): `job.records_read` (`requested`, `records`), `scope.record_contents_read`,
+    `scope.cited_records_read` (`cited`, `kept`, `dropped`); a refusal is `request.refused` with its code. No name or
+    field is logged.
+  - Deploy order: backend → worker (its minimum backend contract becomes 1.19.0) → frontend (its minimum public
+    contract becomes 1.37.0) → pipeline. An older worker never asks for records, so answers stay passage-only until it
+    is deployed; an older frontend ignores `kind` and shows a record reference as a passage line.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

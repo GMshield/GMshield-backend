@@ -66,6 +66,11 @@ public final class TestMaterials {
         public java.util.Map<UUID, String> names(Collection<UUID> ids) {
             return java.util.Map.of();
         }
+
+        @Override
+        public List<Content> read(Collection<UUID> ids) {
+            return List.of();
+        }
     };
 
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */

@@ -35,8 +35,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * and first page stay plain, so the counts by type need no decryption. {@link #readRange} decrypts them for the input of
  * an index job only (Story 4.2 part B). From Story 4.3 part B each record also stores its name's keyed fingerprint
  * (entity {@value #RECORD}, field {@value #FIELD_NAME}, of the name's {@link Library#uniqueForm}), which
- * {@link #named} compares with a search's query; {@link #names} decrypts names for a search's answer only. Nothing here
- * logs a name or a field.
+ * {@link #named} compares with a search's query; {@link #names} decrypts names for a search's answer only. From Story
+ * 4.3 part C {@link #read} decrypts names and fields for an answer (the records handed to the model, and those it
+ * cited, stored by value with the turn). Nothing here logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -140,6 +141,20 @@ public class ExtractedRecordStore implements ExtractedRecords {
                     row.name())));
         }
         return Map.copyOf(found);
+    }
+
+    @Override
+    public List<Content> read(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        if (wanted.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, RecordRow> found = new HashMap<>();
+        store.findAll(wanted).forEach(row -> found.put(row.id(), row));
+        return wanted.stream().filter(found::containsKey).map(found::get).map(row -> new Content(row.id(),
+                row.versionId(), row.type(), row.firstPage(), vault.decryptText(name(row.id(), owner), row.name()),
+                fieldsOf(vault.decrypt(fields(row.id(), owner), row.fields())))).toList();
     }
 
     private static Located located(RecordRow row) {

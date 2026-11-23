@@ -11,11 +11,14 @@ import io.github.gmshield.jobs.service.JobEventBatch;
 import io.github.gmshield.jobs.service.JobHandler;
 import io.github.gmshield.jobs.service.JobPassage;
 import io.github.gmshield.jobs.service.JobProblems;
+import io.github.gmshield.jobs.service.JobRecord;
 import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.scope.service.CitedPlace;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeSettings;
+import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.ScopedRecordContent;
 import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
@@ -24,8 +27,12 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,6 +67,12 @@ import tools.jackson.databind.node.ObjectNode;
  *       with the material's name and the section path encrypted, and with the tier of its source in that scope (Story
  *       3.7: frozen at answer time, as the scope labelled it). No reference and no {@code model} tier marker make the
  *       answer {@code silent}.</li>
+ *   <li>Story 4.3 part C (internal contract 1.19.0): the job also reads records ({@link #records}, within the turn's
+ *       frozen scope, refused whole as passages are), and a citation names a passage or a record. A cited record is
+ *       kept, with its fields, or dropped within the turn's scope ({@link Scopes#citedRecords}: never refused) and
+ *       becomes a reference of its own, numbered with the others by first citation
+ *       and stored by value: its id, core type, name and fields (the last two encrypted), its first page, that page's
+ *       first passage's section path, its passages there, its material's name and its tier.</li>
  *   <li>A {@code tier} marker (Story 3.7) is stored with the batch's events only when its tier has a source in the
  *       turn's frozen scope; one with no source is dropped, never relayed. A {@code model} marker (Story 3.8) is
  *       stored only when the turn's frozen model-knowledge switch is on.</li>
@@ -135,6 +148,21 @@ public class AnswerJobs implements JobHandler {
                 passage.tier().word(), passage.text(), passage.sectionPath(), passage.page())).toList();
     }
 
+    /**
+     * The records with these ids within the turn's frozen scope (Story 4.3 part C), with their names and fields, as
+     * {@link #passages} reads passages: any id that is not a record of an allowed source still {@code ready} refuses
+     * the whole read ({@link Scopes#recordContents}).
+     */
+    @Override
+    public List<JobRecord> records(JobRef job, List<UUID> ids) {
+        return scopes.recordContents(scopeOf(turnOf(job), false), ids).stream().map(content -> {
+            ScopedRecord record = content.record();
+            return new JobRecord(record.recordId(), record.tier().word(), record.recordType(), record.name(),
+                    content.fields().stream().map(field -> new JobRecord.Field(field.name(), field.value())).toList(),
+                    record.page(), record.sectionPath());
+        }).toList();
+    }
+
     @Override
     public void events(JobRef job, JobEventBatch batch) {
         TurnRow turn = turnOf(job);
@@ -182,7 +210,7 @@ public class AnswerJobs implements JobHandler {
             return;
         }
         storeReferences(turn);
-        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, false, null)));
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, null, false, null)));
     }
 
     /**
@@ -195,7 +223,7 @@ public class AnswerJobs implements JobHandler {
             return false;
         }
         storeReferences(turn);
-        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, true, null)));
+        append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, null, true, null)));
         if (!store.markStopped(turn.id(), clock.instant().truncatedTo(ChronoUnit.MICROS))) {
             throw new IllegalStateException("conversations.turn_missing");
         }
@@ -215,35 +243,74 @@ public class AnswerJobs implements JobHandler {
 
     /** The turn's citations become its stored references, as the class says. */
     private void storeReferences(TurnRow turn) {
-        List<UUID> cited = conversations.storedEvents(turn.id(), 0).stream()
-                .filter(event -> TurnEvent.CITATION.equals(event.type())).map(TurnEvent::passageId)
-                .filter(Objects::nonNull).distinct().toList();
-        List<CitedPlace> places = cited.isEmpty() ? List.of() : scopes.references(scopeOf(turn, false), cited);
+        List<TurnEvent> citations = conversations.storedEvents(turn.id(), 0).stream()
+                .filter(event -> TurnEvent.CITATION.equals(event.type())).toList();
+        List<UUID> passageIds = citations.stream().map(TurnEvent::passageId).filter(Objects::nonNull)
+                .distinct().toList();
+        List<UUID> recordIds = citations.stream().map(TurnEvent::recordId).filter(Objects::nonNull)
+                .distinct().toList();
+        ResolvedScope scope = passageIds.isEmpty() && recordIds.isEmpty() ? null : scopeOf(turn, false);
+        Map<UUID, CitedPlace> places = new HashMap<>();
+        if (!passageIds.isEmpty()) {
+            scopes.references(scope, passageIds).forEach(place -> places.put(place.passageId(), place));
+        }
+        Map<UUID, ScopedRecordContent> records = new HashMap<>();
+        if (!recordIds.isEmpty()) {
+            // A citation is model output: a record out of the frozen scope, or gone since, is dropped, never refused.
+            scopes.citedRecords(scope, recordIds).forEach(content -> records.put(content.record().recordId(),
+                    content));
+        }
+        List<TurnReferences.Cited> cited = new ArrayList<>();
+        Set<UUID> seen = new HashSet<>();
+        for (TurnEvent citation : citations) {
+            UUID id = citation.recordId() != null ? citation.recordId() : citation.passageId();
+            if (id == null || !seen.add(id)) {
+                continue;
+            }
+            if (citation.recordId() != null && records.containsKey(id)) {
+                cited.add(TurnReferences.Cited.record(records.get(id)));
+            } else if (citation.recordId() == null && places.containsKey(id)) {
+                cited.add(TurnReferences.Cited.passage(places.get(id)));
+            }
+        }
         Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
         List<TurnReferenceRow> rows = new ArrayList<>();
-        for (TurnReferences.Grouped grouped : TurnReferences.group(places)) {
-            UUID rowId = Ids.newId();
-            CitedPlace place = grouped.place();
-            rows.add(new TurnReferenceRow(rowId, turn.ownerId(), turn.id(), grouped.number(), place.versionId(),
-                    place.materialId(), place.page(), grouped.passageIds(),
-                    vault.encryptText(TurnReferences.materialName(rowId, turn.ownerId()), place.materialName()),
-                    vault.encrypt(TurnReferences.sectionPath(rowId, turn.ownerId()),
-                            TurnReferences.pathJson(place.sectionPath())), now, place.tier().word()));
+        for (TurnReferences.Grouped grouped : TurnReferences.groupCited(cited)) {
+            rows.add(row(turn, grouped, now));
         }
         if (!rows.isEmpty()) {
             references.insertReferences(rows);
         }
         log.atInfo().addKeyValue("jobId", turn.jobId()).addKeyValue("turnId", turn.id())
-                .addKeyValue("cited", cited.size()).addKeyValue("dropped", cited.size() - places.size())
+                .addKeyValue("cited", passageIds.size()).addKeyValue("dropped", passageIds.size() - places.size())
+                .addKeyValue("citedRecords", recordIds.size())
+                .addKeyValue("droppedRecords", recordIds.size() - records.size())
                 .addKeyValue("references", rows.size()).addKeyValue("silent", rows.isEmpty())
                 .log("conversation.references_stored");
+    }
+
+    /** One grouped reference as stored: by value, its names, path and (for a record) name and fields encrypted. */
+    private TurnReferenceRow row(TurnRow turn, TurnReferences.Grouped grouped, Instant now) {
+        UUID rowId = Ids.newId();
+        UUID owner = turn.ownerId();
+        CitedPlace place = grouped.place();
+        ScopedRecordContent content = grouped.record();
+        TurnReferenceRow.Recorded recorded = content == null ? null : new TurnReferenceRow.Recorded(
+                content.record().recordId(), content.record().recordType(),
+                vault.encryptText(TurnReferences.recordName(rowId, owner), content.record().name()),
+                vault.encrypt(TurnReferences.recordFields(rowId, owner), TurnReferences.fieldsJson(content.fields())));
+        return new TurnReferenceRow(rowId, owner, turn.id(), grouped.number(), place.versionId(), place.materialId(),
+                place.page(), grouped.passageIds(),
+                vault.encryptText(TurnReferences.materialName(rowId, owner), place.materialName()),
+                vault.encrypt(TurnReferences.sectionPath(rowId, owner), TurnReferences.pathJson(place.sectionPath())),
+                now, place.tier().word(), recorded);
     }
 
     @Override
     public void failed(JobRef job, String code) {
         store.turnOfJob(job.id()).filter(turn -> !ended(turn, "failed")).ifPresent(turn ->
-                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, code, false,
-                        null))));
+                append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.ERROR, null, null, null, null, code,
+                        false, null))));
     }
 
     /** Stores the events after the turn's last sequence, encrypted, and wakes its streams after the commit. */
@@ -319,11 +386,12 @@ public class AnswerJobs implements JobHandler {
 
     private static TurnEvent turnEvent(JobEvent event) {
         return switch (event.type()) {
-            case JobEvent.DELTA -> new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null, false, null);
-            case JobEvent.TIER -> new TurnEvent(0, TurnEvent.TIER, null, null, event.offset(), null, false,
-                    event.tier());
-            default -> new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.offset(), null, false,
+            case JobEvent.DELTA -> new TurnEvent(0, TurnEvent.DELTA, event.text(), null, null, null, null, false,
                     null);
+            case JobEvent.TIER -> new TurnEvent(0, TurnEvent.TIER, null, null, null, event.offset(), null, false,
+                    event.tier());
+            default -> new TurnEvent(0, TurnEvent.CITATION, null, event.passageId(), event.recordId(), event.offset(),
+                    null, false, null);
         };
     }
 }

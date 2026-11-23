@@ -109,6 +109,11 @@ import tools.jackson.databind.node.ObjectNode;
  *       leaving out those of a records run not indexed yet ({@link ScopeReads#unindexedRecordRuns}), so a record is
  *       found by name only once the index can find it too; a record the worker returned (it is in the index, whatever
  *       its run says, for instance a run cut again by a reconcile) is never left out.</li>
+ *   <li>Story 4.3 part C (records in answers): {@link #recordContents} reads records by id within a resolved scope with
+ *       their names and fields, as {@link #passages} reads passages: in the order asked, each once, and the whole
+ *       request refused with {@value #REFUSED_CODE} (403), before anything is decrypted, when any id is not a record of
+ *       an allowed source still {@code ready}. {@link #citedRecords} reads an answer's cited records the same way, in
+ *       one read, but drops (never refuses) an id that is not one, as {@link #references} drops a cited passage.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -463,11 +468,99 @@ public class Scopes {
     }
 
     /**
+     * The records with these ids within {@code scope}, with their names and fields, as the class says (Story 4.3 part
+     * C): every id is checked first, and when any is not a record of an allowed source still {@code ready} (unknown,
+     * another owner's, of a version no longer {@code ready}, or out of every tier), the whole request is refused with
+     * {@value #REFUSED_CODE} (403) before anything is decrypted, and the refusal names no id.
+     */
+    public List<ScopedRecordContent> recordContents(ResolvedScope scope, List<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        if (!OwnerContext.require().equals(scope.ownerId()) || ids.stream().anyMatch(Objects::isNull)) {
+            throw refused(scope, ids.size());
+        }
+        List<UUID> wanted = ids.stream().distinct().toList();
+        Optional<List<ScopedRecordContent>> read = wanted.isEmpty() ? Optional.of(List.of())
+                : reading(() -> contents(scope, wanted, true));
+        if (read.isEmpty()) {
+            throw refused(scope, ids.size());
+        }
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("requested", ids.size())
+                .addKeyValue("records", read.get().size()).log("scope.record_contents_read");
+        return read.get();
+    }
+
+    /**
+     * The cited records with these ids within {@code scope}, with their names and fields (Story 4.3 part C, an answer's
+     * references): as {@link #recordContents}, but a citation is model output, so an id that is not a record of an
+     * allowed source still {@code ready} (unknown, another owner's, out of scope, or gone since it was handed) is
+     * dropped, never refused, in one read; the line carries the dropped count only.
+     */
+    public List<ScopedRecordContent> citedRecords(ResolvedScope scope, List<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        requireOwner(scope);
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        List<ScopedRecordContent> found = wanted.isEmpty() || scope.allowedSources().isEmpty() ? List.of()
+                : reading(() -> contents(scope, wanted, false)).orElseThrow();
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", wanted.size())
+                .addKeyValue("kept", found.size()).addKeyValue("dropped", wanted.size() - found.size())
+                .log("scope.cited_records_read");
+        return found;
+    }
+
+    /**
+     * The records with these distinct ids placed within {@code scope} and decrypted, in the order given; with
+     * {@code refuse}, empty as soon as any id is not one (before anything is decrypted), else those ids are left out.
+     * Runs in the caller's read transaction.
+     */
+    private Optional<List<ScopedRecordContent>> contents(ResolvedScope scope, List<UUID> wanted, boolean refuse) {
+        List<Placed> placed = located(scope, records.located(wanted));
+        if (refuse && placed.size() != wanted.size()) {
+            return Optional.empty();
+        }
+        Map<UUID, ExtractedRecords.Content> contents = new HashMap<>();
+        records.read(placed.stream().map(one -> one.record().id()).toList())
+                .forEach(content -> contents.put(content.id(), content));
+        List<ScopedRecordContent> found = new ArrayList<>();
+        for (Placed one : placed) {
+            ExtractedRecords.Content content = contents.get(one.record().id());
+            if (content == null && refuse) {
+                return Optional.empty();
+            }
+            if (content != null) {
+                found.add(new ScopedRecordContent(one.scoped(content.name()), content.fields().stream()
+                        .map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList()));
+            }
+        }
+        return Optional.of(List.copyOf(found));
+    }
+
+    /**
      * The records whose version is an allowed source of {@code scope} (still {@code ready}), in the order given, each
      * with the place of its first passage on its first page, the ids of its passages there, its name and its tier; a
      * record with no such passage in the scope is left out. Runs in the caller's read transaction.
      */
     private List<ScopedRecord> placed(ResolvedScope scope, Collection<ExtractedRecords.Located> located) {
+        List<Placed> placed = located(scope, located);
+        if (placed.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, String> names = records.names(placed.stream().map(one -> one.record().id()).toList());
+        return placed.stream().filter(one -> names.containsKey(one.record().id()))
+                .map(one -> one.scoped(names.get(one.record().id()))).toList();
+    }
+
+    /** A record placed within a scope before its name is read: its first passage on its first page, those passages. */
+    private record Placed(ExtractedRecords.Located record, ScopeReads.Place first, List<UUID> passageIds, Tier tier) {
+        ScopedRecord scoped(String name) {
+            return new ScopedRecord(record.id(), record.versionId(), first.materialId(), first.materialName(),
+                    first.sectionPath(), record.firstPage(), passageIds, record.type(), name, tier);
+        }
+    }
+
+    /** {@link #placed} without the names: nothing is decrypted but the places. */
+    private List<Placed> located(ResolvedScope scope, Collection<ExtractedRecords.Located> located) {
         Set<UUID> allowed = scope.allowedSources();
         List<ExtractedRecords.Located> inScope = located.stream()
                 .filter(record -> allowed.contains(record.versionId())).toList();
@@ -477,20 +570,16 @@ public class Scopes {
         Map<UUID, ScopeReads.Place> places = new HashMap<>();
         reads.places(inScope.stream().flatMap(record -> record.passageIds().stream()).distinct().toList(), allowed)
                 .forEach(place -> places.put(place.passageId(), place));
-        Map<UUID, String> names = records.names(inScope.stream().map(ExtractedRecords.Located::id).toList());
-        List<ScopedRecord> found = new ArrayList<>();
+        List<Placed> found = new ArrayList<>();
         for (ExtractedRecords.Located record : inScope) {
             List<ScopeReads.Place> onFirstPage = record.passageIds().stream().map(places::get)
                     .filter(place -> place != null && place.page() == record.firstPage()).toList();
-            String name = names.get(record.id());
             Optional<Tier> tier = scope.tierOf(record.versionId());
-            if (onFirstPage.isEmpty() || name == null || tier.isEmpty()) {
+            if (onFirstPage.isEmpty() || tier.isEmpty()) {
                 continue;
             }
-            ScopeReads.Place first = onFirstPage.getFirst();
-            found.add(new ScopedRecord(record.id(), record.versionId(), first.materialId(), first.materialName(),
-                    first.sectionPath(), record.firstPage(), onFirstPage.stream().map(ScopeReads.Place::passageId)
-                    .toList(), record.type(), name, tier.get()));
+            found.add(new Placed(record, onFirstPage.getFirst(), onFirstPage.stream()
+                    .map(ScopeReads.Place::passageId).toList(), tier.get()));
         }
         return List.copyOf(found);
     }

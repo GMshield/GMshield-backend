@@ -11,7 +11,8 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * How a batch's events are stored (Story 2.4): one JSON array, encrypted as a whole, of {@code {"type": "delta",
- * "text"}}, {@code {"type": "citation", "passageId", "offset"}}, {@code {"type": "tier", "tier", "offset"}} (Story
+ * "text"}}, {@code {"type": "citation", "passageId", "offset"}} (or, Story 4.3 part C, {@code "recordId"} in place of
+ * {@code "passageId"}), {@code {"type": "tier", "tier", "offset"}} (Story
  * 3.7), {@code {"type": "done"}} (with {@code "stopped": true} when the GM stopped the answer, Story 2.6) and
  * {@code {"type": "error", "code"}}, in order. Their sequences are the batch row's, so they are not stored here.
  */
@@ -36,8 +37,9 @@ final class TurnEvents {
         long sequence = firstSequence;
         for (JsonNode node : JSON.readTree(json)) {
             String passage = node.path("passageId").asString(null);
+            String record = node.path("recordId").asString(null);
             events.add(new TurnEvent(sequence++, node.path("type").asString(), node.path("text").asString(null),
-                    passage == null ? null : UUID.fromString(passage),
+                    passage == null ? null : UUID.fromString(passage), record == null ? null : UUID.fromString(record),
                     node.has("offset") ? node.path("offset").asInt() : null, node.path("code").asString(null),
                     node.path("stopped").asBoolean(false), node.path("tier").asString(null)));
         }
@@ -45,15 +47,16 @@ final class TurnEvents {
     }
 
     /**
-     * The event's data as stored: {@code {text}}, {@code {passageId, offset}}, {@code {tier, offset}}, {@code {}} (or
-     * {@code {stopped: true}}) or {@code {code}}. The stream sends a {@code done} event's data from {@link #doneData}
-     * instead.
+     * The event's data as stored: {@code {text}}, {@code {passageId, offset}} or {@code {recordId, offset}},
+     * {@code {tier, offset}}, {@code {}} (or {@code {stopped: true}}) or {@code {code}}. The stream sends a
+     * {@code done} event's data from {@link #doneData} instead.
      */
     static ObjectNode data(TurnEvent event) {
         ObjectNode data = JsonNodeFactory.instance.objectNode();
         switch (event.type()) {
             case TurnEvent.DELTA -> data.put("text", event.text());
-            case TurnEvent.CITATION -> data.put("passageId", event.passageId().toString()).put("offset", event.offset());
+            case TurnEvent.CITATION -> (event.recordId() != null ? data.put("recordId", event.recordId().toString())
+                    : data.put("passageId", event.passageId().toString())).put("offset", event.offset());
             case TurnEvent.TIER -> data.put("tier", event.tier()).put("offset", event.offset());
             case TurnEvent.ERROR -> data.put("code", event.code());
             default -> {
@@ -73,11 +76,13 @@ final class TurnEvents {
 
     /**
      * The data of a {@code done} event (Story 2.5), built when streamed from the turn's {@link Conversations.Ending}:
-     * {@code {stopped, silent, modelKnowledge, references: [{number, materialName, sectionPath, page, passageIds,
-     * removed, tier?}]}}, {@code tier} (Story 3.7) only on a reference stored with one. {@code stopped} (Story 2.6) is
-     * whether the GM stopped the answer; {@code silent} is true exactly when it was not stopped, there is no reference
-     * and (Story 3.8) no {@code model} tier event was stored: a stopped answer is never the silent one.
-     * {@code modelKnowledge} is the turn's frozen switch.
+     * {@code {stopped, silent, modelKnowledge, references: [{number, kind, materialName, sectionPath, page, passageIds,
+     * removed, tier?}]}}, {@code tier} (Story 3.7) only on a reference stored with one. {@code kind} (Story 4.3 part C)
+     * is {@code passage} or {@code record}; a record's reference adds {@code recordId}, {@code recordType},
+     * {@code name} and {@code fields: [{name, value}]}. {@code stopped} (Story 2.6) is whether the GM stopped the
+     * answer; {@code silent} is true exactly when it was not stopped, there is no reference and (Story 3.8) no
+     * {@code model} tier event was stored: a stopped answer is never the silent one. {@code modelKnowledge} is the
+     * turn's frozen switch.
      */
     static ObjectNode doneData(Conversations.Ending ending, boolean stopped) {
         List<TurnReference> references = ending.references();
@@ -89,6 +94,16 @@ final class TurnEvents {
         for (TurnReference reference : references) {
             ObjectNode entry = list.addObject();
             entry.put("number", reference.number());
+            entry.put("kind", reference.kind());
+            TurnReference.Cited record = reference.record();
+            if (record != null) {
+                entry.put("recordId", record.id().toString());
+                entry.put("recordType", record.type());
+                entry.put("name", record.name());
+                ArrayNode fields = entry.putArray("fields");
+                record.fields().forEach(field -> fields.addObject().put("name", field.name())
+                        .put("value", field.value()));
+            }
             entry.put("materialName", reference.materialName());
             ArrayNode path = entry.putArray("sectionPath");
             reference.sectionPath().forEach(path::add);

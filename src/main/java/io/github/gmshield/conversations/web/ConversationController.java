@@ -357,10 +357,13 @@ class ConversationController {
     record DeltaEvent(@Schema(description = "Display text, to append") String text) {
     }
 
-    @Schema(name = "TurnCitationEvent", requiredProperties = {"passageId", "offset"},
-            description = "The data of a citation event: a passage cited at a place of the answer's text")
+    @Schema(name = "TurnCitationEvent", requiredProperties = "offset",
+            description = "The data of a citation event: a passage cited at a place of the answer's text, or (contract"
+                    + " 1.37.0) a record: exactly one of passageId and recordId")
     record CitationEvent(
-            @Schema(format = "uuid") UUID passageId,
+            @Schema(description = "The cited passage; absent when recordId is given", format = "uuid") UUID passageId,
+            @Schema(description = "The cited record (contract 1.37.0); absent when passageId is given",
+                    format = "uuid") UUID recordId,
             @Schema(description = "Where the citation stands, in code points of the answer's text", format = "int32",
                     minimum = "0") int offset) {
     }
@@ -377,26 +380,48 @@ class ConversationController {
                     format = "int32", minimum = "0") int offset) {
     }
 
-    @Schema(name = "TurnSourceReference", requiredProperties = {"number", "materialName", "sectionPath", "page",
-        "passageIds", "removed"}, description = "A source reference of a completed answer, stored by value with the"
-            + " turn: one distinct place (material version, section path, page) the answer cited")
+    @Schema(name = "TurnSourceReference", requiredProperties = {"number", "kind", "materialName", "sectionPath",
+        "page", "passageIds", "removed"}, description = "A source reference of a completed answer, stored by value with"
+            + " the turn: one distinct place (material version, section path, page) the answer cited, or (contract"
+            + " 1.37.0) one record the answer cited, with its name, type and fields as they were when the answer was"
+            + " written, placed at its first page")
     record SourceReference(
             @Schema(description = "Its number, 1..n by first citation: unique within the turn and contiguous from 1",
                     format = "int32", minimum = "1") int number,
+            @Schema(description = "passage for a cited place, record for a cited record (contract 1.37.0)",
+                    allowableValues = {"passage", "record"}) String kind,
             @Schema(description = "The material's name") String materialName,
-            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty"),
-                    schema = @Schema(type = "string")) List<String> sectionPath,
-            @Schema(description = "The page", format = "int32", minimum = "1") int page,
+            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty. For a"
+                    + " record, its first passage's on its first page"), schema = @Schema(type = "string"))
+            List<String> sectionPath,
+            @Schema(description = "The page; for a record, its first page", format = "int32", minimum = "1") int page,
             @ArraySchema(arraySchema = @Schema(description = "The cited passages at this place, in the order first"
-                    + " cited; a passage id appears in at most one reference of the turn"), minItems = 1,
-                    schema = @Schema(type = "string", format = "uuid"))
+                    + " cited; a passage id appears in at most one passage reference of the turn. For a record, its"
+                    + " passages on its first page, so the source view marks them: record references may share them"),
+                    minItems = 1, schema = @Schema(type = "string", format = "uuid"))
             List<UUID> passageIds,
+            @Schema(description = "The cited record's id; only for a record (contract 1.37.0)", format = "uuid")
+            UUID recordId,
+            @Schema(description = "The record's core record type: a client shows its own translation of it; only for a"
+                    + " record (contract 1.37.0)", allowableValues = {"rule", "spell", "item", "creature",
+                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
+            @Schema(description = "The record's name, as it was when the answer was written; only for a record"
+                    + " (contract 1.37.0)") String name,
+            @ArraySchema(arraySchema = @Schema(description = "The record's fields in order, as they were when the"
+                    + " answer was written; may be empty; only for a record (contract 1.37.0)"),
+                    schema = @Schema(implementation = ReferenceField.class)) List<ReferenceField> fields,
             @Schema(description = "Whether its source has been removed since (its version gone, discarded or pending"
                     + " removal, or its material gone), as of when the event is sent. A version superseded by a newer"
                     + " accepted one is not removed") boolean removed,
             @Schema(description = "The tier its source had in the turn's scope when the answer was written (Story"
                     + " 3.7), kept when the source leaves the scope; absent for a reference stored before then",
                     allowableValues = {"campaign", "system", "other"}) String tier) {
+    }
+
+    @Schema(name = "TurnReferenceField", requiredProperties = {"name", "value"},
+            description = "One field of a cited record (contract 1.37.0)")
+    record ReferenceField(@Schema(description = "The field's name") String name,
+                          @Schema(description = "The field's value") String value) {
     }
 
     @Schema(name = "TurnDoneEvent", requiredProperties = {"stopped", "silent", "modelKnowledge", "references"},

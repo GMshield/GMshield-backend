@@ -4,13 +4,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.gmshield.scope.service.CitedPlace;
+import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.ScopedRecordContent;
 import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
-/** Story 2.5: how cited places become references: one per distinct (version, section path, page), by first citation. */
+/**
+ * Story 2.5: how cited places become references: one per distinct (version, section path, page), by first citation.
+ * Story 4.3 part C: a cited record is a reference of its own, at its first page's place, with its passages there.
+ */
 class TurnReferencesTest {
 
     private static final List<String> SECTION = List.of("Magias", "Fire Bolt");
@@ -63,5 +68,27 @@ class TurnReferencesTest {
         assertThat(grouped).extracting(TurnReferences.Grouped::number, group -> group.place().page())
                 .containsExactly(tuple(1, 7), tuple(2, 8));
         assertThat(TurnReferences.group(List.of())).isEmpty();
+    }
+
+    @Test
+    void aCitedRecordIsItsOwnReferenceEvenOnAPlaceAPassageWasCitedAt() {
+        UUID version = Ids.newId();
+        UUID material = Ids.newId();
+        UUID passage = Ids.newId();
+        UUID other = Ids.newId();
+        UUID recordId = Ids.newId();
+        ScopedRecordContent record = new ScopedRecordContent(new ScopedRecord(recordId, version, material, "Livro",
+                SECTION, 5, List.of(passage, other), "spell", "Luz", Tier.SYSTEM),
+                List.of(new ScopedRecordContent.Field("Nível", "0")));
+        CitedPlace place = new CitedPlace(passage, version, material, "Livro", SECTION, 5, Tier.SYSTEM);
+
+        List<TurnReferences.Grouped> grouped = TurnReferences.groupCited(List.of(TurnReferences.Cited.passage(place),
+                TurnReferences.Cited.record(record), TurnReferences.Cited.record(record)));
+
+        assertThat(grouped).extracting(TurnReferences.Grouped::number, TurnReferences.Grouped::passageIds,
+                TurnReferences.Grouped::record)
+                .containsExactly(tuple(1, List.of(passage), null), tuple(2, List.of(passage, other), record));
+        assertThat(grouped.get(1).place()).extracting(CitedPlace::page, CitedPlace::sectionPath, CitedPlace::tier)
+                .containsExactly(5, SECTION, Tier.SYSTEM);
     }
 }

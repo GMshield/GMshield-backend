@@ -17,7 +17,8 @@ import org.springframework.modulith.NamedInterface;
  *
  * <p>Story 4.3 part B: a campaign's search reads records through {@link #located}, {@link #named} and {@link #names},
  * for the {@code scope} module, which checks them against the campaign's scope. Whether a version is {@code ready} and
- * allowed is the caller's check, never this port's.
+ * allowed is the caller's check, never this port's. Story 4.3 part C: an answer reads the name and fields of the
+ * records it was handed or cited through {@link #read}, once the {@code scope} module has checked their ids.
  */
 @NamedInterface("service")
 public interface ExtractedRecords {
@@ -115,4 +116,27 @@ public interface ExtractedRecords {
 
     /** The decrypted names of the owner's records with these ids; an unknown id or another owner's is left out. */
     Map<UUID, String> names(Collection<UUID> ids);
+
+    /**
+     * One stored record as an answer reads it (Story 4.3 part C): its id, its version, its core type's key, its first
+     * page, its name and its fields in order, decrypted. {@code toString} names no content.
+     */
+    @NamedInterface("service")
+    record Content(UUID id, UUID versionId, String type, int firstPage, String name, List<Field> fields) {
+        public Content {
+            fields = List.copyOf(fields);
+        }
+
+        @Override
+        public String toString() {
+            return "Content[id=" + id + ", versionId=" + versionId + ", type=" + type + ", firstPage=" + firstPage
+                    + ", fields=" + fields.size() + "]";
+        }
+    }
+
+    /**
+     * The records with these ids, decrypted, in the order given, each once; an id that is not one of the owner's
+     * records is left out. The caller checks the ids against what it may read before it calls this.
+     */
+    List<Content> read(Collection<UUID> ids);
 }

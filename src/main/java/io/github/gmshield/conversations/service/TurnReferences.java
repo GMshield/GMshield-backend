@@ -1,6 +1,8 @@
 package io.github.gmshield.conversations.service;
 
 import io.github.gmshield.scope.service.CitedPlace;
+import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.ScopedRecordContent;
 import io.github.gmshield.vault.service.Binding;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -16,44 +18,83 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * How a turn's source references are made and stored (Story 2.5): the cited places become one reference per distinct
  * place {@code (version, section path, page)}, numbered 1..n by first citation, each with the ids of the passages cited
  * there in the order first cited. The material's name and the section path (a JSON array) are encrypted under bindings
- * of the reference row.
+ * of the reference row. From Story 4.3 part C a cited record is a reference of its own, whatever place it shares with
+ * other citations: its key includes the record's id, its place is its first passage's on its first page and its
+ * passages are its passages there; its name and fields (a JSON array of {@code {name, value}}) are encrypted under
+ * bindings of the reference row too.
  */
 final class TurnReferences {
 
     static final String ENTITY = "turn_reference";
     static final String FIELD_MATERIAL_NAME = "material_name";
     static final String FIELD_SECTION_PATH = "section_path";
+    static final String FIELD_RECORD_NAME = "record_name";
+    static final String FIELD_RECORD_FIELDS = "record_fields";
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     private TurnReferences() {
     }
 
-    /** One reference before it is stored: its number, a place cited there (the first) and every passage cited there. */
-    record Grouped(int number, CitedPlace place, List<UUID> passageIds) {
+    /**
+     * One citation as the scope placed it: a passage's place ({@code record} null), or a record with its content (its
+     * place is its first passage's on its first page). {@code toString} names ids only.
+     */
+    record Cited(CitedPlace place, ScopedRecordContent record) {
+        static Cited passage(CitedPlace place) {
+            return new Cited(place, null);
+        }
+
+        /** A cited record: its place is its first passage's on its first page. */
+        static Cited record(ScopedRecordContent content) {
+            ScopedRecord record = content.record();
+            return new Cited(new CitedPlace(record.passageIds().getFirst(), record.versionId(), record.materialId(),
+                    record.materialName(), record.sectionPath(), record.page(), record.tier()), content);
+        }
+
+        @Override
+        public String toString() {
+            return "Cited[place=" + place + ", record=" + (record == null ? null : record.record().recordId()) + "]";
+        }
+    }
+
+    /**
+     * One reference before it is stored: its number, a place cited there (the first), every passage cited there (a
+     * record's: its passages on its first page) and, for a record's reference, the record.
+     */
+    record Grouped(int number, CitedPlace place, List<UUID> passageIds, ScopedRecordContent record) {
         Grouped {
             passageIds = List.copyOf(passageIds);
         }
 
         @Override
         public String toString() {
-            return "Grouped[number=" + number + ", passages=" + passageIds.size() + "]";
+            return "Grouped[number=" + number + ", passages=" + passageIds.size() + ", record="
+                    + (record == null ? null : record.record().recordId()) + "]";
         }
     }
 
-    private record Key(UUID versionId, List<String> sectionPath, int page) {
+    private record Key(UUID versionId, List<String> sectionPath, int page, UUID recordId) {
     }
 
     /** The references of these cited places, given in the order first cited. */
     static List<Grouped> group(List<CitedPlace> places) {
-        Map<Key, List<CitedPlace>> byPlace = new LinkedHashMap<>();
-        for (CitedPlace place : places) {
-            byPlace.computeIfAbsent(new Key(place.versionId(), place.sectionPath(), place.page()),
-                    key -> new ArrayList<>()).add(place);
+        return groupCited(places.stream().map(Cited::passage).toList());
+    }
+
+    /** The references of these citations of passages and records, given in the order first cited. */
+    static List<Grouped> groupCited(List<Cited> cited) {
+        Map<Key, List<Cited>> byPlace = new LinkedHashMap<>();
+        for (Cited one : cited) {
+            CitedPlace place = one.place();
+            byPlace.computeIfAbsent(new Key(place.versionId(), place.sectionPath(), place.page(), one.record() == null
+                    ? null : one.record().record().recordId()), key -> new ArrayList<>()).add(one);
         }
         List<Grouped> grouped = new ArrayList<>(byPlace.size());
-        for (List<CitedPlace> same : byPlace.values()) {
-            grouped.add(new Grouped(grouped.size() + 1, same.getFirst(),
-                    same.stream().map(CitedPlace::passageId).distinct().toList()));
+        for (List<Cited> same : byPlace.values()) {
+            Cited first = same.getFirst();
+            List<UUID> passageIds = first.record() != null ? first.record().record().passageIds()
+                    : same.stream().map(one -> one.place().passageId()).distinct().toList();
+            grouped.add(new Grouped(grouped.size() + 1, first.place(), passageIds, first.record()));
         }
         return List.copyOf(grouped);
     }
@@ -64,6 +105,30 @@ final class TurnReferences {
 
     static Binding sectionPath(UUID referenceId, UUID owner) {
         return new Binding(ENTITY, FIELD_SECTION_PATH, referenceId, owner);
+    }
+
+    static Binding recordName(UUID referenceId, UUID owner) {
+        return new Binding(ENTITY, FIELD_RECORD_NAME, referenceId, owner);
+    }
+
+    static Binding recordFields(UUID referenceId, UUID owner) {
+        return new Binding(ENTITY, FIELD_RECORD_FIELDS, referenceId, owner);
+    }
+
+    /** A record's fields as stored with its reference: a JSON array of {@code {name, value}}, in order. */
+    static byte[] fieldsJson(List<ScopedRecordContent.Field> fields) {
+        ArrayNode array = JsonNodeFactory.instance.arrayNode();
+        fields.forEach(field -> array.addObject().put("name", field.name()).put("value", field.value()));
+        return JSON.writeValueAsBytes(array);
+    }
+
+    /** The fields {@link #fieldsJson} stored, in order. */
+    static List<TurnReference.Field> fields(byte[] json) {
+        List<TurnReference.Field> fields = new ArrayList<>();
+        for (JsonNode field : JSON.readTree(json)) {
+            fields.add(new TurnReference.Field(field.path("name").asString(), field.path("value").asString()));
+        }
+        return List.copyOf(fields);
     }
 
     static byte[] pathJson(List<String> sectionPath) {
