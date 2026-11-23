@@ -105,11 +105,13 @@ public class Uploads {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
     private final IngestionStart ingestion;
+    private final ExtractedRecords records;
 
     Uploads(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Library library,
             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock,
-            IngestionStart ingestion) {
+            IngestionStart ingestion, ExtractedRecords records) {
         this.ingestion = ingestion;
+        this.records = records;
         this.materials = materials;
         this.uploads = uploads;
         this.vault = vault;
@@ -522,6 +524,8 @@ public class Uploads {
         inTransaction(() -> {
             VersionRow version = materials.findVersion(row.versionId()).orElseThrow(UploadProblems::notFound);
             uploads.joined().delete(row.id());
+            // Story 4.2: a version's records go before it (a refused upload has none; the order holds anyway).
+            records.removeVersion(version.id());
             materials.deleteVersion(version.id());
             if (materials.versionsOf(version.materialId()).isEmpty()) {
                 materials.deleteMaterial(version.materialId());

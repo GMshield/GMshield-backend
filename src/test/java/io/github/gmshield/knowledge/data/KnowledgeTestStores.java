@@ -4,7 +4,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 
-/** The ontology's table in memory (Story 4.1), for Spring tests that run without PostgreSQL. */
+/** The ontology's tables in memory (Stories 4.1 and 4.2), for Spring tests that run without PostgreSQL. */
 @TestConfiguration(proxyBeanMethods = false)
 public class KnowledgeTestStores {
 
@@ -12,5 +12,11 @@ public class KnowledgeTestStores {
     @Primary
     InMemoryKnowledgeStore inMemoryKnowledge() {
         return new InMemoryKnowledgeStore();
+    }
+
+    @Bean
+    @Primary
+    InMemoryRecordStore inMemoryRecords() {
+        return new InMemoryRecordStore();
     }
 }

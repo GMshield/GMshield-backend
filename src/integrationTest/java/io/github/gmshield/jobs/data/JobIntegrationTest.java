@@ -118,7 +118,7 @@ class JobIntegrationTest {
                 }
 
                 @Override
-                public boolean callsModel() {
+                public boolean callsModel(JobRef job) {
                     return true;
                 }
 

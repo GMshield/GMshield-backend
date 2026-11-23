@@ -46,9 +46,11 @@ class CoreTypeBackfillTest {
         StaticListableBeanFactory beans = new StaticListableBeanFactory();
         beans.addBean("transactions", transactions);
         beans.addBean("clock", Clock.fixed(NOW, ZoneOffset.UTC));
+        // The fill reads no record count, so it needs neither the materials nor the records (Story 4.2).
         ontology = new Ontology(knowledge, vault, TestLibraries.library(library, vault,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class)),
-                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
+                null, null, beans.getBeanProvider(PlatformTransactionManager.class),
+                beans.getBeanProvider(Clock.class));
         backfill = new CoreTypeBackfill(new InMemoryMissingCoreTypes(library, knowledge), ontology);
     }
 

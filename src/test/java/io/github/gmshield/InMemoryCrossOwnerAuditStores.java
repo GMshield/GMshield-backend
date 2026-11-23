@@ -8,6 +8,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
@@ -38,7 +39,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     /** The in-memory stores the audit reads. */
     record Twins(InMemoryAccountStore accounts, InMemoryJobStorage jobs, InMemoryJobStream stream,
                  InMemoryLibraryStore library, InMemoryDeletionStore deletions, InMemoryScopeStore scopes,
-                 InMemoryKnowledgeStore knowledge, InMemoryMaterialStore materials, InMemoryUploadStorage uploads, InMemoryIndexStore index,
+                 InMemoryKnowledgeStore knowledge, InMemoryRecordStore records, InMemoryMaterialStore materials, InMemoryUploadStorage uploads, InMemoryIndexStore index,
                  InMemoryConversationStore conversations, InMemoryTurnReferenceStore references,
                  InMemorySearchStore searches, MutableClock clock, Vault vault) {
     }
@@ -102,7 +103,8 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     }
 
     /**
-     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type; material,
+     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type,
+     * record (Story 4.2, its passage links inside each row); material,
      * material version, material system, ingestion step, version file, page layer, page outcome, passage, outline,
      * page view, upload, index change, index removal; conversation and its deleting marks, turn, event batch, turn
      * reference, search, search result; job and job output. Every owner's rows.
@@ -117,6 +119,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
         tables.put("deletion", copy(twins.deletions().rows));
         tables.put("scope", copy(twins.scopes().rows));
         tables.put("record type", copy(twins.knowledge().recordTypes));
+        tables.put("record", copy(twins.records().records));
         tables.put("material", copy(twins.materials().materials));
         tables.put("material version", copy(twins.materials().versions));
         tables.put("material system", copy(twins.materials().systems));

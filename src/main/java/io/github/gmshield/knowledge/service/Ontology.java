@@ -5,6 +5,8 @@ import io.github.gmshield.knowledge.data.KnowledgeStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemCreated;
+import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.ReadyVersions;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -15,6 +17,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -41,8 +44,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ({@code ontology.core_record_type}, 409, nothing changes); a type that is not core (Story 4.4 adds them) is renamed on
  * the version it was read at ({@code request.stale_version}, 409, when it moved) to a name no other type of the system
  * has ({@code ontology.record_type_name_taken}, 409; {@code ontology.record_type_name_invalid}, 400, outside 1 to
- * {@value #NAME_MAX} code points after trimming), and removed while it has no records. A record type's record count is 0
- * until Story 4.2 stores records. Logs carry ids, counts and versions only.
+ * {@value #NAME_MAX} code points after trimming), and removed while it has no records
+ * ({@code ontology.record_type_in_use}, 409). From Story 4.2 a record type's record count is the number of records of
+ * its core type in the system's {@code ready} versions ({@link ReadyVersions#ofSystem}: the materials attached
+ * to the system and those of its campaigns), so a version that needs review counts nowhere; a type that is not core has
+ * none yet (records store a core key, and approved types come with Story 4.4). Logs carry ids, counts and versions only.
  */
 @Service
 public class Ontology {
@@ -56,21 +62,25 @@ public class Ontology {
     public static final int MAX_LIMIT = 50;
     /** The furthest position a list page may start at. */
     public static final int MAX_OFFSET = 100_000;
-    /** How many records a record type types: none until Story 4.2 stores records. */
+    /** How many records a type that is not core types (Story 4.2): none, until Story 4.4 extracts approved types. */
     static final long NO_RECORDS = 0;
     private static final Logger log = LoggerFactory.getLogger(Ontology.class);
 
     private final KnowledgeStore store;
     private final Vault vault;
     private final Library library;
+    private final ReadyVersions ready;
+    private final ExtractedRecords records;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
-    Ontology(KnowledgeStore store, Vault vault, Library library, ObjectProvider<PlatformTransactionManager> transactions,
-             ObjectProvider<Clock> clock) {
+    Ontology(KnowledgeStore store, Vault vault, Library library, ReadyVersions ready, ExtractedRecords records,
+             ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.store = store;
         this.vault = vault;
         this.library = library;
+        this.ready = ready;
+        this.records = records;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -139,14 +149,16 @@ public class Ontology {
         if (offset < 0 || offset > MAX_OFFSET) {
             throw new IllegalArgumentException("knowledge.offset_invalid");
         }
-        return reading(() -> library.system(systemId).map(system -> new RecordTypePage(
-                store.recordTypes(system.id(), offset, limit).stream().map(this::open).toList(),
-                store.recordTypeCount(system.id()))));
+        return reading(() -> library.system(systemId).map(system -> {
+            Map<String, Long> counts = counts(system.id());
+            return new RecordTypePage(store.recordTypes(system.id(), offset, limit).stream()
+                    .map(row -> open(row, counts)).toList(), store.recordTypeCount(system.id()));
+        }));
     }
 
     /** The owner's record type {@code id}; empty for an unknown id, another owner's or one of a system being deleted. */
     public Optional<RecordType> recordType(UUID id) {
-        return reading(() -> visible(id).map(this::open));
+        return reading(() -> visible(id).map(row -> open(row, counts(row.systemId()))));
     }
 
     /**
@@ -178,13 +190,16 @@ public class Ontology {
 
     /**
      * Removes the owner's record type {@code id}, as the class says; false for an unknown id, another owner's or one of a
-     * system being deleted; {@code request.stale_version} (409) when a rename committed meanwhile. Story 4.2 refuses a
-     * type that types records; none does yet.
+     * system being deleted; {@code request.stale_version} (409) when a rename committed meanwhile; and from Story 4.2
+     * {@code ontology.record_type_in_use} (409) for a type that types records.
      */
     public boolean delete(UUID id) {
         boolean deleted = writing(() -> visible(id).map(row -> {
             if (row.core() != null) {
                 throw new ApiException(KnowledgeProblems.CORE_RECORD_TYPE);
+            }
+            if (records(row, counts(row.systemId())) > 0) {
+                throw new ApiException(KnowledgeProblems.RECORD_TYPE_IN_USE);
             }
             return conflicts(() -> store.delete(id));
         }).orElse(false));
@@ -219,9 +234,22 @@ public class Ontology {
         return store.findRecordType(id).filter(row -> library.system(row.systemId()).isPresent());
     }
 
-    private RecordType open(RecordTypeRow row) {
+    private RecordType open(RecordTypeRow row, Map<String, Long> counts) {
         return new RecordType(row.id(), vault.decryptText(binding(row.id(), row.ownerId()), row.name()), row.core(),
-                NO_RECORDS, row.version());
+                records(row, counts), row.version());
+    }
+
+    /**
+     * The records of the system's {@code ready} versions by core type key (Story 4.2): those of the materials attached
+     * to it and of its campaigns' materials.
+     */
+    private Map<String, Long> counts(UUID systemId) {
+        return ready.ofSystem(systemId).map(records::countsByType).orElse(Map.of());
+    }
+
+    /** How many records a record type types: its core key's count; a type that is not core types none yet. */
+    private static long records(RecordTypeRow row, Map<String, Long> counts) {
+        return row.core() == null ? NO_RECORDS : counts.getOrDefault(row.core(), 0L);
     }
 
     /** A record type's name, trimmed, or {@code ontology.record_type_name_invalid}. */

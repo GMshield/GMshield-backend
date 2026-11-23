@@ -44,7 +44,7 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       comparison and the same event serve both.</li>
  *   <li>From Story 2.10 a claim may state the providers the worker holds a key for (at most 8, each
  *       {@code [a-z0-9-]{1,32}}; anything else is refused before the claim). A claim of a kind that calls a model
- *       ({@link JobHandler#callsModel()}) resolves the provider, model and tier through {@link ModelChoices}, records
+ *       ({@link JobHandler#callsModel(JobRef)}) resolves the provider, model and tier through {@link ModelChoices}, records
  *       them on the job row (overwriting the last claim's) and answers them with the claim. When the worker did not
  *       state that provider (no list means none), the claim rolls back without using an attempt and the job ends
  *       {@code failed} with {@code job.provider_unavailable}, as a job whose input failed does; the claim is answered
@@ -253,7 +253,7 @@ public class JobClaims {
         JobRow next = current.claimed(Ids.newId(), grantHash, now.plus(settings.renewEvery()),
                 now.plus(settings.claimLapse()), now);
         // Resolved again at every claim: a retry follows the setting as it is now.
-        ModelChoice model = handler.callsModel() ? models.resolve(ref(next)) : null;
+        ModelChoice model = handler.callsModel(ref(next)) ? models.resolve(ref(next)) : null;
         if (model != null) {
             if (!providers.contains(model.provider())) {
                 throw new ProviderUnavailable(model.provider(), providers);
@@ -315,21 +315,31 @@ public class JobClaims {
         report(jobId, claimId, grant, outcome, code, null, result);
     }
 
+    /** {@link #report(UUID, UUID, String, String, String, Boolean, JsonNode, List)} without usage. */
+    public void report(UUID jobId, UUID claimId, String grant, String outcome, String code, Boolean retry,
+                       JsonNode result) {
+        report(jobId, claimId, grant, outcome, code, retry, result, List.of());
+    }
+
     /**
      * The worker's outcome: {@code done} with an optional result, or {@code failed} with an optional code and an
      * optional {@code retry} ({@code false} ends the job at once). The job's change and the handler's call happen in
      * one transaction as the owner; a result the handler cannot record is {@code job.result_invalid} and changes
-     * nothing.
+     * nothing. From internal contract 1.17.0 (Story 4.2) the outcome may carry the usage of the attempt's model calls
+     * (at most {@value #MAX_USAGE}, checked as {@link #events} checks it, {@code request.invalid} otherwise), recorded
+     * once per call id for the attempt's model in that same transaction, whatever the outcome; a job whose attempt
+     * resolved no model records none.
      */
     public void report(UUID jobId, UUID claimId, String grant, String outcome, String code, Boolean retry,
-                       JsonNode result) {
+                       JsonNode result, List<CallUsage> calls) {
         boolean done = DONE.equals(outcome);
+        List<CallUsage> usage = calls == null ? List.of() : calls;
         if (!done && !FAILED.equals(outcome)
                 || code != null && (done || code.length() > MAX_CODE_LENGTH || !CODE.matcher(code).matches())
-                || result != null && !done || retry != null && done) {
+                || result != null && !done || retry != null && done || !validUsage(usage)) {
             throw JobProblems.invalid();
         }
-        Reported reported = new Reported(done, Boolean.FALSE.equals(retry), code, result);
+        Reported reported = new Reported(done, Boolean.FALSE.equals(retry), code, result, List.copyOf(usage));
         Instant now = clock.now();
         byte[] presented = hashOf(grant);
         JobRow seen = storage.joined().find(jobId).orElse(null);
@@ -466,8 +476,8 @@ public class JobClaims {
         return true;
     }
 
-    /** What the worker reported, once checked. */
-    private record Reported(boolean done, boolean lastAttempt, String code, JsonNode result) {
+    /** What the worker reported, once checked, with the usage of the attempt's model calls. */
+    private record Reported(boolean done, boolean lastAttempt, String code, JsonNode result, List<CallUsage> usage) {
     }
 
     /** The job's change and the handler's call, inside the owner's transaction of {@link #report}. */
@@ -491,6 +501,10 @@ public class JobClaims {
         }
         if (!storage.joined().replace(current, next)) {
             throw JobProblems.grantRefused();
+        }
+        if (!reported.usage().isEmpty() && current.modelProvider() != null) {
+            usage.record(job, new ModelChoice(current.modelProvider(), current.modelId(), current.modelTier()),
+                    reported.usage());
         }
         if (reported.done()) {
             JsonNode result = reported.result() == null ? JsonNodeFactory.instance.objectNode() : reported.result();

@@ -4,6 +4,8 @@
  * rows. Names are vault ciphertexts beside their keyed fingerprint, unique per owner and system, as the core key is; a
  * write those keys or the version refuse is a {@link io.github.gmshield.knowledge.data.KnowledgeConflict}. The fill of
  * the systems from before V34 lists them across owners through {@code JdbcClient} (ids only,
- * {@link io.github.gmshield.knowledge.data.MissingCoreTypes}), then works as each owner.
+ * {@link io.github.gmshield.knowledge.data.MissingCoreTypes}), then works as each owner. Story 4.2: {@code record} and
+ * {@code record_passage} (V35, {@link io.github.gmshield.knowledge.data.RecordStore}), the same way: a record's name
+ * and fields are vault ciphertexts, its links name passages of its owner.
  */
 package io.github.gmshield.knowledge.data;

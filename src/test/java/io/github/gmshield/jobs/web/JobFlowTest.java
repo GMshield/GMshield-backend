@@ -73,6 +73,13 @@ class JobFlowTest extends HttpTestSupport {
             return new io.github.gmshield.vault.data.InMemoryDataKeyStore();
         }
 
+        /** The usage of model calls (Story 4.2: an outcome's), kept in memory here. */
+        @org.springframework.context.annotation.Bean
+        @org.springframework.context.annotation.Primary
+        io.github.gmshield.limits.data.InMemoryUsageStore inMemoryUsage() {
+            return new io.github.gmshield.limits.data.InMemoryUsageStore();
+        }
+
         @org.springframework.context.annotation.Bean
         StatedRecipes statedRecipes() {
             return new StatedRecipes();
@@ -92,7 +99,7 @@ class JobFlowTest extends HttpTestSupport {
                 }
 
                 @Override
-                public boolean callsModel() {
+                public boolean callsModel(JobRef job) {
                     return true;
                 }
 
@@ -161,6 +168,8 @@ class JobFlowTest extends HttpTestSupport {
 
     @Autowired
     StatedRecipes recipes;
+    @Autowired
+    io.github.gmshield.limits.data.InMemoryUsageStore usage;
     @Autowired
     InMemoryJobStorage storage;
     @Autowired
@@ -630,6 +639,49 @@ class JobFlowTest extends HttpTestSupport {
                     .as(body).isEqualTo(400);
         }
         assertThat(storage.row(id).state()).isEqualTo("running");
+    }
+
+    @Test
+    void anOutcomesUsagePastSixteenWithANegativeCountOrANullItemIsInvalidAndChangesNothing() throws Exception {
+        UUID id = createProbe("interactive", 0, 0, null);
+        JsonNode claim = json(claim(id));
+        String seventeen = String.join(",", java.util.Collections.nCopies(17, usageOf(UUID.randomUUID(), 10)));
+        for (String calls : List.of(seventeen, usageOf(UUID.randomUUID(), -1), "null")) {
+            assertProblem(outcome(id, claim.path("claimId").asString(), claim.path("grant").asString(),
+                    "{\"outcome\":\"done\",\"usage\":[" + calls + "]}"), 400, "request.invalid");
+        }
+        assertThat(storage.row(id).state()).isEqualTo("running");
+        assertThat(usage.rows.values()).noneMatch(row -> row.jobId().equals(id));
+    }
+
+    @Test
+    void aModelJobsOutcomeRecordsItsUsageOnceAndAJobWithoutAModelRecordsNone() throws Exception {
+        UUID model = createAs(UUID.randomUUID(), TEST_MODEL);
+        JsonNode claim = json(claimStating(model, "{\"providers\":[\"azure-openai\"]}"));
+        UUID call = UUID.randomUUID();
+        assertThat(outcome(model, claim.path("claimId").asString(), claim.path("grant").asString(),
+                "{\"outcome\":\"failed\",\"code\":\"model.refused\",\"retry\":false,\"usage\":["
+                        + usageOf(call, 10) + "," + usageOf(call, 10) + "]}").statusCode()).isEqualTo(204);
+        assertThat(usage.rows.get(call)).satisfies(row -> {
+            assertThat(row.jobId()).isEqualTo(model);
+            assertThat(row.provider()).isEqualTo("azure-openai");
+            assertThat(row.input()).isEqualTo(10);
+        });
+        assertThat(usage.rows.values().stream().filter(row -> row.jobId().equals(model))).hasSize(1);
+
+        // A job whose attempt resolved no model: the outcome is accepted, and its usage recorded nowhere.
+        UUID probe = createProbe("interactive", 0, 0, null);
+        JsonNode probeClaim = json(claim(probe));
+        UUID probeCall = UUID.randomUUID();
+        assertThat(outcome(probe, probeClaim.path("claimId").asString(), probeClaim.path("grant").asString(),
+                "{\"outcome\":\"done\",\"usage\":[" + usageOf(probeCall, 10) + "]}").statusCode()).isEqualTo(204);
+        assertThat(storage.row(probe).state()).isEqualTo("done");
+        assertThat(usage.rows).doesNotContainKey(probeCall);
+    }
+
+    private static String usageOf(UUID callId, long input) {
+        return "{\"callId\":\"" + callId + "\",\"input\":" + input + ",\"cacheRead\":0,\"cacheWrite\":0,"
+                + "\"output\":3,\"reasoning\":0}";
     }
 
     @Test

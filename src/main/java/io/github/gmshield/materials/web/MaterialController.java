@@ -612,40 +612,55 @@ class MaterialController {
     @Schema(name = "ReportWarning", requiredProperties = {"code", "count"})
     record WarningView(
             @Schema(description = "What the backend found: report.pages_unreadable (pages that could not be read),"
-                    + " report.pages_unopened (of those, pages whose reading crashed, with no view) or"
-                    + " report.outline_empty (no section was found; count 0)", example = "report.pages_unreadable",
-                    allowableValues = {"report.pages_unreadable", "report.pages_unopened", "report.outline_empty"})
+                    + " report.pages_unopened (of those, pages whose reading crashed, with no view),"
+                    + " report.outline_empty (no section was found; count 0) or, from contract 1.34.0,"
+                    + " report.records_unread (pages whose records could not be read; their passages were kept)",
+                    example = "report.pages_unreadable", allowableValues = {"report.pages_unreadable",
+                    "report.pages_unopened", "report.outline_empty", "report.records_unread"})
             String code,
             @Schema(description = "How many", format = "int32", example = "12") int count) {
     }
 
-    @Schema(name = "MaterialReport", requiredProperties = {"outline", "unreadable", "warnings"})
+    @Schema(name = "ReportRecordCount", requiredProperties = {"type", "count"}, description = "How many records of one"
+            + " core type the version has (contract 1.34.0)")
+    record RecordCountView(
+            @Schema(description = "The core type's key", example = "spell", allowableValues = {"rule", "spell", "item",
+                    "creature", "character_sheet", "encounter", "dungeon", "note"}) String type,
+            @Schema(description = "How many, at least 1", format = "int64", minimum = "1", example = "30") long count) {
+    }
+
+    @Schema(name = "MaterialReport", requiredProperties = {"outline", "unreadable", "warnings", "records"})
     record ReportView(
             @ArraySchema(arraySchema = @Schema(description = "The sections in reading order"),
                     schema = @Schema(implementation = SectionView.class)) List<SectionView> outline,
             @ArraySchema(arraySchema = @Schema(description = "The unreadable pages, as runs of consecutive pages in"
                     + " page order"), schema = @Schema(implementation = RunView.class)) List<RunView> unreadable,
             @ArraySchema(arraySchema = @Schema(description = "Facts about the version, each with a count"),
-                    schema = @Schema(implementation = WarningView.class)) List<WarningView> warnings) {
+                    schema = @Schema(implementation = WarningView.class)) List<WarningView> warnings,
+            @ArraySchema(arraySchema = @Schema(description = "The version's records by core type (contract 1.34.0), in"
+                    + " the core types' order, each type with at least one; empty when it has none"),
+                    schema = @Schema(implementation = RecordCountView.class)) List<RecordCountView> records) {
 
         static ReportView of(Materials.Report report) {
             return new ReportView(report.outline().stream()
                     .map(section -> new SectionView(section.level(), section.title(), section.page())).toList(),
                     report.unreadable().stream().map(run -> new RunView(run.firstPage(), run.lastPage())).toList(),
                     report.warnings().stream().map(warning -> new WarningView(warning.code(), warning.count()))
-                            .toList());
+                            .toList(),
+                    report.records().stream().map(count -> new RecordCountView(count.type(), count.count())).toList());
         }
 
         @Override
         public String toString() {
-            return "ReportView[sections=" + outline.size() + ", unreadable=" + unreadable.size() + "]";
+            return "ReportView[sections=" + outline.size() + ", unreadable=" + unreadable.size() + ", records="
+                    + records.size() + "]";
         }
     }
 
     @GetMapping(path = REPORT, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getMaterialReport", summary = "The quality report of one of the account's materials:"
-            + " its current version's outline, unreadable pages and warnings, while that version needs review or is"
-            + " ready (the counts are the material's pages). request.not_found (404) for another owner's material,"
+            + " its current version's outline, unreadable pages, warnings and (contract 1.34.0) records by type, while"
+            + " that version needs review or is ready (the counts are the material's pages). request.not_found (404) for another owner's material,"
             + " an unknown or malformed id, or a version in any other state;" + SESSION_SUMMARY,
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))

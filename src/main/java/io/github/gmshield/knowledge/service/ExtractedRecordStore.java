@@ -1,0 +1,102 @@
+package io.github.gmshield.knowledge.service;
+
+import io.github.gmshield.knowledge.data.RecordRow;
+import io.github.gmshield.knowledge.data.RecordStore;
+import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.shared.service.Ids;
+import io.github.gmshield.shared.service.OwnerContext;
+import io.github.gmshield.vault.service.Binding;
+import io.github.gmshield.vault.service.Vault;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.JsonNodeFactory;
+
+/**
+ * The records a version's ingestion extracts (Story 4.2), stored for the {@code materials} module
+ * ({@link ExtractedRecords}), as the owner of the work and in the caller's transaction. Each record gets its id here; its
+ * name is encrypted bound to the entity {@value #RECORD}, the field {@value #FIELD_NAME} and the row, and its fields (a
+ * JSON array of {@code {name, value}} in order) bound to the field {@value #FIELD_FIELDS}. Its core type key, ordinal
+ * and first page stay plain, so the counts by type need no decryption. Nothing here logs a name or a field.
+ */
+@Service
+public class ExtractedRecordStore implements ExtractedRecords {
+
+    static final String RECORD = "record";
+    static final String FIELD_NAME = "name";
+    static final String FIELD_FIELDS = "fields";
+    private static final JsonMapper JSON = JsonMapper.builder().build();
+
+    private final RecordStore store;
+    private final Vault vault;
+    private final Clock clock;
+
+    ExtractedRecordStore(RecordStore store, Vault vault, ObjectProvider<Clock> clock) {
+        this.store = store;
+        this.vault = vault;
+        this.clock = clock.getIfAvailable(Clock::systemUTC);
+    }
+
+    @Override
+    public int replaceRange(UUID versionId, int firstPage, int lastPage, List<Extracted> records) {
+        UUID owner = requireTransaction();
+        int removed = store.deleteRange(versionId, firstPage, lastPage);
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        List<RecordRow> rows = new ArrayList<>(records.size());
+        for (int ordinal = 0; ordinal < records.size(); ordinal++) {
+            Extracted record = records.get(ordinal);
+            if (record.firstPage() < firstPage || record.firstPage() > lastPage) {
+                throw new IllegalArgumentException("knowledge.record_outside_range");
+            }
+            UUID id = Ids.newId();
+            rows.add(new RecordRow(id, owner, versionId, ordinal, record.firstPage(), record.type(),
+                    vault.encryptText(name(id, owner), record.name()),
+                    vault.encrypt(fields(id, owner), fieldsJson(record.fields())), record.passageIds(), now));
+        }
+        store.insert(rows);
+        return removed;
+    }
+
+    @Override
+    public int removeVersion(UUID versionId) {
+        requireTransaction();
+        return store.deleteOfVersion(versionId);
+    }
+
+    @Override
+    public Map<String, Long> countsByType(Collection<UUID> versionIds) {
+        OwnerContext.require();
+        return store.countsByType(versionIds);
+    }
+
+    static byte[] fieldsJson(List<Field> fields) {
+        ArrayNode array = JsonNodeFactory.instance.arrayNode();
+        fields.forEach(field -> array.addObject().put("name", field.name()).put("value", field.value()));
+        return JSON.writeValueAsBytes(array);
+    }
+
+    private static UUID requireTransaction() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("knowledge.transaction_required");
+        }
+        return OwnerContext.require();
+    }
+
+    static Binding name(UUID rowId, UUID owner) {
+        return new Binding(RECORD, FIELD_NAME, rowId, owner);
+    }
+
+    static Binding fields(UUID rowId, UUID owner) {
+        return new Binding(RECORD, FIELD_FIELDS, rowId, owner);
+    }
+}

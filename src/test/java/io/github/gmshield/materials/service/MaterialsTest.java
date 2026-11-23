@@ -79,10 +79,10 @@ class MaterialsTest {
                 beans.getBeanProvider(Clock.class));
         service = new Uploads(materials, uploads, vault, files, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
-                (version, upload) -> started.add(version));
+                (version, upload) -> started.add(version), TestMaterials.NO_RECORDS);
         reads = new Materials(materials, uploads, vault, files, ids -> ids.stream().filter(running::contains)
                 .collect(java.util.stream.Collectors.toSet()), library, new IngestionSettings(4),
-                beans.getBeanProvider(PlatformTransactionManager.class));
+                TestMaterials.NO_RECORDS, beans.getBeanProvider(PlatformTransactionManager.class));
         for (UUID gm : List.of(owner, other)) {
             as(gm, () -> new TransactionTemplate(transactions).execute(status -> {
                 library.createStarter(Language.EN);
@@ -487,7 +487,7 @@ class MaterialsTest {
         Materials watched = new Materials(materials, uploads, vault, files, ids -> {
             asked.add(List.copyOf(ids));
             return ids.stream().filter(running::contains).collect(java.util.stream.Collectors.toSet());
-        }, library, new IngestionSettings(4), beansFor(transactions));
+        }, library, new IngestionSettings(4), TestMaterials.NO_RECORDS, beansFor(transactions));
 
         assertThat(as(owner, () -> watched.find(material)).orElseThrow().pages().reading()).isEqualTo("text");
         assertThat(asked).singleElement().satisfies(ids -> assertThat(ids).containsExactly(layout));

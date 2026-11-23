@@ -20,6 +20,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
@@ -304,6 +305,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryKnowledgeStore knowledge;
     @Autowired
+    private InMemoryRecordStore records;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -373,8 +376,8 @@ class CrossOwnerAuditFlowTest {
     void start() {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
-                    library, deletions, scopes, knowledge, materials, uploads, index, conversations, references, searches, clock,
-                    vault), START);
+                    library, deletions, scopes, knowledge, records, materials, uploads, index, conversations, references,
+                    searches, clock, vault), START);
         }
         stores.start();
     }
@@ -935,8 +938,8 @@ class CrossOwnerAuditFlowTest {
 
     /**
      * A material uploaded with {@code metadata}, then cleaned (one page, one batch), triaged as text, read directly
-     * with a picture and a line, cut into one passage, and accepted; its index changes are then ended so the next
-     * ingestion runs.
+     * with a picture and a line, cut into one passage, its records read (Story 4.2: one spell record, from that
+     * passage), and accepted; its index changes are then ended so the next ingestion runs.
      */
     private Uploaded ingested(Gm gm, String metadata) throws Exception {
         Uploaded uploaded = upload(gm, pdf(MIB), metadata);
@@ -969,7 +972,17 @@ class CrossOwnerAuditFlowTest {
         report(passages, claim(passages.jobId()), "{\"pipelineVersion\":\"2\",\"passages\":[{\"page\":1,"
                 + "\"sectionPath\":[\"Magias\",\"Fire Bolt\"],\"text\":\"Fire Bolt deals 1d10 Fire damage\","
                 + "\"boxes\":[[0.1,0.2,0.9,0.3]]}],\"outline\":[{\"level\":1,\"title\":\"Magias\",\"page\":1}],"
-                + "\"next\":[]}");
+                + "\"next\":[{\"stage\":\"records\",\"firstPage\":1,\"lastPage\":1,\"input\":\"passages\"}]}");
+
+        Step records = offeredStep(uploaded.versionId());
+        assertThat(records.stage()).isEqualTo("records");
+        HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + records.jobId() + "/claims",
+                "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
+                "application/json");
+        assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        report(records, json(claimed), "{\"pipelineVersion\":\"2\",\"records\":[{\"type\":\"spell\",\"name\":"
+                + "\"Fire Bolt\",\"fields\":[{\"name\":\"Damage\",\"value\":\"1d10 Fire\"}],\"passageIds\":[\""
+                + stores.passage(uploaded.versionId()) + "\"]}],\"next\":[]}");
         HttpResponse<String> accepted = send(gm, "POST", "/api/v1/materials/" + uploaded.materialId() + "/accept", "");
         assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
         assertThat(json(accepted).path("state").asString()).isEqualTo("ready");

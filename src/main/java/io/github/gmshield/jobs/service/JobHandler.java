@@ -23,12 +23,12 @@ public interface JobHandler {
     Lane lane();
 
     /**
-     * Whether a job of this kind calls a model (Story 2.10). Each claim of such a kind resolves the provider, model and
-     * tier through {@link ModelChoices}, records them on the job row and sends them with the claim; a worker that did
-     * not state that provider is refused the job ({@code job.provider_unavailable}). No production kind calls a model
-     * yet.
+     * Whether this job calls a model (Story 2.10; from Story 4.2 per job, since only some steps of a kind may). Each
+     * claim of such a job resolves the provider, model and tier through {@link ModelChoices}, records them on the job
+     * row and sends them with the claim; a worker that did not state that provider is refused the job
+     * ({@code job.provider_unavailable}). Asked at each claim as the owner, in the claim's transaction.
      */
-    default boolean callsModel() {
+    default boolean callsModel(JobRef job) {
         return false;
     }
 

@@ -76,7 +76,7 @@ public class SearchJobs implements JobHandler {
     }
 
     @Override
-    public boolean callsModel() {
+    public boolean callsModel(JobRef job) {
         return false;
     }
 

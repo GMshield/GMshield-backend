@@ -716,6 +716,14 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<PassageRow> passagesOnPages(UUID versionId, int firstPage, int lastPage) {
+        return em().createQuery("select p from Passage p where p.versionId = :version and p.page between :first and"
+                        + " :last order by p.ordinal", PassageEntity.class)
+                .setParameter("version", versionId).setParameter("first", firstPage).setParameter("last", lastPage)
+                .getResultList().stream().map(PassageEntity::row).toList();
+    }
+
+    @Override
     public List<PassageRow> passagesOnPage(UUID versionId, int page) {
         return em().createQuery("select p from Passage p where p.versionId = :version and p.page = :page"
                         + " order by p.ordinal", PassageEntity.class)
@@ -891,6 +899,28 @@ class JpaMaterialStore implements MaterialStore {
         found.forEach(em()::remove);
         em().flush();
         return !found.isEmpty();
+    }
+
+    @Override
+    public boolean markRecordsUnread(UUID jobId) {
+        Optional<IngestionStepEntity> step = em().createQuery("select s from IngestionStep s where s.jobId = :job"
+                + " and s.inputPassages = true", IngestionStepEntity.class).setParameter("job", jobId).getResultList()
+                .stream().findFirst();
+        step.ifPresent(entity -> {
+            entity.unread(true);
+            em().flush();
+        });
+        return step.isPresent();
+    }
+
+    @Override
+    public int clearRecordsUnread(UUID versionId) {
+        List<IngestionStepEntity> found = em().createQuery("select s from IngestionStep s where s.versionId = :version"
+                + " and s.recordsUnread = true", IngestionStepEntity.class).setParameter("version", versionId)
+                .getResultList();
+        found.forEach(entity -> entity.unread(false));
+        em().flush();
+        return found.size();
     }
 
     @Override

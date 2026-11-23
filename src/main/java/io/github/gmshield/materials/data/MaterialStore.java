@@ -256,6 +256,12 @@ public interface MaterialStore {
     /** The current owner's passages on a page of a version, in reading order (Story 1.19). */
     List<PassageRow> passagesOnPage(UUID versionId, int page);
 
+    /**
+     * The current owner's passages of a version on the pages {@code firstPage} to {@code lastPage}, in reading order
+     * (Story 4.2: a records step's input).
+     */
+    List<PassageRow> passagesOnPages(UUID versionId, int firstPage, int lastPage);
+
     // --- review (Story 1.20)
 
     /** The current owner's versions of a material, oldest first; empty for an unknown material or another owner's. */
@@ -263,6 +269,15 @@ public interface MaterialStore {
 
     /** Every step of the current owner's version, ended or not, oldest first. */
     List<StepRow> steps(UUID versionId);
+
+    /**
+     * The current owner's records step of this job has its pages' records unread (Story 4.2: it failed for good); false
+     * when there is no such records step.
+     */
+    boolean markRecordsUnread(UUID jobId);
+
+    /** Every records step of the current owner's version has its records read again (Story 4.2); answers how many. */
+    int clearRecordsUnread(UUID versionId);
 
     /** Deletes the current owner's outcome ranges of a version that have this outcome; answers how many went. */
     int deleteOutcomes(UUID versionId, String outcome);

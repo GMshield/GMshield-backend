@@ -297,9 +297,12 @@ public class InMemoryMaterialStore implements MaterialStore {
         VersionRow version = versions.get(row.versionId());
         boolean jobTaken = row.jobId() != null && steps.values().stream().anyMatch(other -> other.ownerId().equals(owner)
                 && row.jobId().equals(other.jobId()));
-        // The table's checks: an input file or every text file, never both; only a step over every text file waits
-        // for its job.
-        boolean checked = (row.inputTexts() == (row.inputFileId() == null)) && (row.jobId() != null || row.inputTexts());
+        // The table's checks: an input file, every text file or (Story 4.2) the passages of a page range, exactly one;
+        // only a step over every text file waits for its job.
+        boolean input = row.inputPassages() ? !row.inputTexts() && row.inputFileId() == null && row.firstPage() != null
+                : row.inputTexts() == (row.inputFileId() == null);
+        boolean checked = input && (row.jobId() != null || row.inputTexts())
+                && (row.inputPassages() || !row.recordsUnread());
         if (steps.containsKey(row.id()) || jobTaken || !checked || version == null || !version.ownerId().equals(owner)) {
             throw new IllegalStateException("key or reference refused");
         }
@@ -675,6 +678,11 @@ public class InMemoryMaterialStore implements MaterialStore {
     }
 
     @Override
+    public List<PassageRow> passagesOnPages(UUID versionId, int firstPage, int lastPage) {
+        return passages(versionId).stream().filter(row -> row.page() >= firstPage && row.page() <= lastPage).toList();
+    }
+
+    @Override
     public List<PassageRow> passagesOnPage(UUID versionId, int page) {
         return passages(versionId).stream().filter(row -> row.page() == page).toList();
     }
@@ -887,6 +895,26 @@ public class InMemoryMaterialStore implements MaterialStore {
             RollbackUndo.onRollback(() -> systems.put(link.id(), link));
         }
         return !found.isEmpty();
+    }
+
+    @Override
+    public synchronized boolean markRecordsUnread(UUID jobId) {
+        Optional<StepRow> found = findStepByJob(jobId).filter(StepRow::inputPassages);
+        found.ifPresent(before -> {
+            steps.put(before.id(), before.unread(true));
+            RollbackUndo.onRollback(() -> steps.put(before.id(), before));
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public synchronized int clearRecordsUnread(UUID versionId) {
+        List<StepRow> found = steps(versionId).stream().filter(StepRow::recordsUnread).toList();
+        for (StepRow before : found) {
+            steps.put(before.id(), before.unread(false));
+            RollbackUndo.onRollback(() -> steps.put(before.id(), before));
+        }
+        return found.size();
     }
 
     @Override

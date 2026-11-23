@@ -82,6 +82,11 @@ public class Materials {
     public static final String PAGES_UNREADABLE = "report.pages_unreadable";
     public static final String PAGES_UNOPENED = "report.pages_unopened";
     public static final String OUTLINE_EMPTY = "report.outline_empty";
+    /** Story 4.2: the pages whose records could not be read (a records step failed for good). */
+    public static final String RECORDS_UNREAD = "report.records_unread";
+    /** The core types' keys in their fixed order (Story 4.1), the order of the report's records by type. */
+    static final List<String> CORE_ORDER = List.of("rule", "spell", "item", "creature", "character_sheet", "encounter",
+            "dungeon", "note");
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
     /** The furthest position a list page may start at (a page's {@code offset}): far past any library. */
@@ -95,6 +100,7 @@ public class Materials {
     private final Library library;
     private final FileStore files;
     private final IngestionSettings settings;
+    private final ExtractedRecords records;
 
     /** Those of these jobs of the bound owner that are offered or running ({@link Jobs#inProgress}). */
     @FunctionalInterface
@@ -104,17 +110,21 @@ public class Materials {
 
     @Autowired
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, Jobs jobs, Library library,
-              IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
-        this(materials, uploads, vault, files, jobs::inProgress, library, settings, transactions);
+              IngestionSettings settings, ExtractedRecords records,
+              ObjectProvider<PlatformTransactionManager> transactions) {
+        this(materials, uploads, vault, files, jobs::inProgress, library, settings, records, transactions);
     }
 
     /**
      * {@code library}: the campaigns of a system ({@link Library#campaignIdsOf}, Story 3.1) and the places a material
-     * belongs to ({@link Library#places}, Story 3.3).
+     * belongs to ({@link Library#places}, Story 3.3). {@code records}: the counts of a version's records by type for
+     * its report (Story 4.2).
      */
     Materials(MaterialStore materials, UploadStorage uploads, Vault vault, FileStore files, JobsInProgress inProgress,
-              Library library, IngestionSettings settings, ObjectProvider<PlatformTransactionManager> transactions) {
+              Library library, IngestionSettings settings, ExtractedRecords records,
+              ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
+        this.records = records;
         this.settings = settings;
         this.materials = materials;
         this.uploads = uploads;
@@ -358,14 +368,21 @@ public class Materials {
     public record Warning(String code, int count) {
     }
 
+    /** How many records of one core type a version has (Story 4.2): the type's key and the count, never 0. */
+    public record RecordCount(String type, long count) {
+    }
+
     /**
      * The quality report of a version (Story 1.20): its outline in reading order, its unreadable pages as runs, and
-     * its warnings. The counts are the material's {@link Pages}.
+     * its warnings. The counts are the material's {@link Pages}. From Story 4.2, its records by type, in the core
+     * types' order, each type with at least one.
      */
-    public record Report(List<Section> outline, List<PageRun> unreadable, List<Warning> warnings) {
+    public record Report(List<Section> outline, List<PageRun> unreadable, List<Warning> warnings,
+                         List<RecordCount> records) {
         @Override
         public String toString() {
-            return "Report[sections=" + outline.size() + ", unreadable=" + unreadable.size() + "]";
+            return "Report[sections=" + outline.size() + ", unreadable=" + unreadable.size() + ", records="
+                    + records.size() + "]";
         }
     }
 
@@ -473,7 +490,8 @@ public class Materials {
      * The quality report of the owner's material (Story 1.20): its current version's, while that version needs review
      * or is ready; empty for an unknown material, another owner's, or a version in any other state. The warnings:
      * {@value #PAGES_UNREADABLE} (the unreadable pages), {@value #PAGES_UNOPENED} (those of them with no page view: their
-     * reading crashed) and {@value #OUTLINE_EMPTY} (no section was found), each only when it holds.
+     * reading crashed) and {@value #OUTLINE_EMPTY} (no section was found), each only when it holds; from Story 4.2,
+     * {@value #RECORDS_UNREAD} (the pages of its records steps that failed for good), and its records by type.
      */
     public Optional<Report> report(UUID materialId) {
         return reading(() -> materials.current(materialId).map(CurrentVersion::version)
@@ -498,8 +516,20 @@ public class Materials {
                     if (outline.isEmpty()) {
                         warnings.add(new Warning(OUTLINE_EMPTY, 0));
                     }
-                    return new Report(outline, unreadable, List.copyOf(warnings));
+                    int unread = materials.steps(version.id()).stream().filter(StepRow::recordsUnread)
+                            .mapToInt(step -> step.lastPage() - step.firstPage() + 1).sum();
+                    if (unread > 0) {
+                        warnings.add(new Warning(RECORDS_UNREAD, unread));
+                    }
+                    return new Report(outline, unreadable, List.copyOf(warnings), recordCounts(version.id()));
                 }));
+    }
+
+    /** A version's records by type (Story 4.2), in the core types' order; a type with none is left out. */
+    private List<RecordCount> recordCounts(UUID versionId) {
+        Map<String, Long> counts = records.countsByType(List.of(versionId));
+        return CORE_ORDER.stream().filter(type -> counts.getOrDefault(type, 0L) > 0)
+                .map(type -> new RecordCount(type, counts.get(type))).toList();
     }
 
     /** The states whose report and pages the GM reads (Story 1.20). */
@@ -600,9 +630,10 @@ public class Materials {
         Map<UUID, List<PageRangeRow>> layers = byVersion(materials.pageLayers(counted));
         Map<UUID, List<PageRangeRow>> outcomes = byVersion(materials.pageOutcomes(counted));
         // The step in progress: the version's unended steps, then which of their jobs are offered or running.
-        // A held step has no job, and one over every text file reads no page: neither is ever in progress here.
+        // A held step has no job, and one over every text file or (Story 4.2) over passages reads no page: none is ever
+        // in progress here.
         List<StepRow> unended = counted.isEmpty() ? List.of() : materials.unendedSteps(counted).stream()
-                .filter(step -> step.jobId() != null && !step.inputTexts()).toList();
+                .filter(step -> step.jobId() != null && !step.inputTexts() && !step.inputPassages()).toList();
         Set<UUID> running = unended.isEmpty() ? Set.of()
                 : inProgress.of(unended.stream().map(StepRow::jobId).toList());
         Map<UUID, List<StepRow>> current = unended.stream().filter(step -> running.contains(step.jobId()))

@@ -19,6 +19,9 @@ final class KnowledgeProblems {
     /** Another record type of the system, a core one included, has the same name (its unique form). */
     static final ApiProblem RECORD_TYPE_NAME_TAKEN =
             ApiProblem.of(409, "ontology", "record_type_name_taken", "Record type name taken");
+    /** A record type that types records is removed (Story 4.2): its records would have no type. */
+    static final ApiProblem RECORD_TYPE_IN_USE =
+            ApiProblem.of(409, "ontology", "record_type_in_use", "Record type in use");
     /** The change names a version the item has left: someone changed it elsewhere. */
     static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");

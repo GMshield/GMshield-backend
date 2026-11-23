@@ -64,7 +64,9 @@ class OntologyController {
                     + " that is not core", types = {"string", "null"}, allowableValues = {"rule", "spell", "item",
                     "creature", "character_sheet", "encounter", "dungeon", "note"}, example = "character_sheet")
             String core,
-            @Schema(description = "How many records of the system have this type", format = "int64", minimum = "0",
+            @Schema(description = "How many records of the system have this type: from contract 1.34.0, the records"
+                    + " of the accepted versions of the materials of the system and of its campaigns",
+                    format = "int64", minimum = "0",
                     example = "0") long records,
             @Schema(description = "The record type's version: a rename names it and raises it by one", format = "int64",
                     example = "0") long version) {
@@ -165,7 +167,8 @@ class OntologyController {
     @DeleteMapping(path = RECORD_TYPE)
     @Operation(operationId = "deleteRecordType", summary = "Removes one of the account's record types that is not core"
             + " (204, no body). ontology.core_record_type (409) for a core type, which can be neither renamed nor"
-            + " removed; request.not_found (404) for any other id; nothing changes then;" + SESSION_SUMMARY,
+            + " removed; ontology.record_type_in_use (409, contract 1.34.0) for a type that types records;"
+            + " request.not_found (404) for any other id; nothing changes then;" + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")),
             responses = @ApiResponse(responseCode = "204", description = "The record type was removed"))
