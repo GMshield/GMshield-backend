@@ -44,8 +44,9 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>Its input is the question input of the turn's campaign within the scope settings frozen on the turn
  *       ({@link Scopes#questionInput}), and its passages are read within that scope ({@link Scopes#passages}). From
  *       Story 3.10 (internal contract 1.16.0) it adds {@code history: [{question, answer}]}, the conversation's earlier
- *       turns oldest first ({@link Conversations#history}): data for the model, never a source and never searched
- *       with; the line carries its count only.</li>
+ *       turns oldest first ({@link Conversations#history}; from Story 3.11 a dismissed turn is never among them, nor a
+ *       stopped or failed one), built for each claim, so a claim already made keeps the history it was given: data for
+ *       the model, never a source and never searched with; the line carries its count only.</li>
  *   <li>Each numbered batch of events the worker posts is stored once per claim, encrypted with the turn, its events
  *       taking the turn's next sequences; a number past the next one of its claim is
  *       {@code job.batch_out_of_order}. Once the turn has a batch, the job has delivered (no splice: it is never

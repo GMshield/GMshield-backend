@@ -74,7 +74,10 @@ import tools.jackson.databind.json.JsonMapper;
  * campaign, the searches, the materials, the usage); the removal waiting for a running answer's claim; a removal
  * resumed by the sweep after a stop mid-way; a campaign deleted meanwhile, after which both deletions end done; another
  * owner's conversation on both routes. The removal against PostgreSQL is in
- * {@code ConversationDeletionIntegrationTest}.
+ * {@code ConversationDeletionIntegrationTest}. Story 3.11: a deleting conversation's turns are not found on both
+ * dismissal routes, and a dismissed turn goes with its conversation. Story 3.12: the same on both bookmark routes; a
+ * saved turn leaves the saved list when its conversation or campaign starts being deleted, and goes with its row; a
+ * conversation marked deleting while the list is read is left out of that page and its total.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -385,6 +388,118 @@ class ConversationDeletionFlowTest {
                 .isEqualTo(1);
     }
 
+    @Test
+    void aDeletingConversationsTurnIsNotFoundOnBothDismissalRoutesAndItsDismissedTurnIsRemovedWithIt() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID dismissed = answered(gm, null, "questions", source);
+        UUID conversation = conversations.turns.get(dismissed).conversationId();
+        tick();
+        UUID shown = answered(gm, conversation, null, source);
+        // Story 3.11: a dismissed turn is not counted, but the deletion takes it too.
+        assertThat(send(gm, "PUT", "/api/v1/turns/" + dismissed + "/dismissal").statusCode()).isEqualTo(204);
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/deletion")).path("questions").asLong())
+                .isEqualTo(1);
+
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(202);
+
+        for (UUID turn : List.of(dismissed, shown)) {
+            assertNotFound(send(gm, "PUT", "/api/v1/turns/" + turn + "/dismissal"));
+            assertNotFound(send(gm, "DELETE", "/api/v1/turns/" + turn + "/dismissal"));
+        }
+        assertThat(conversations.turns.get(dismissed).dismissedAt()).isNotNull();
+        assertThat(conversations.turns.get(shown).dismissedAt()).isNull();
+
+        assertThat(deletion.sweep()).isEqualTo(1);
+
+        assertThat(conversations.turns).doesNotContainKeys(dismissed, shown);
+        assertThat(conversations.conversations).doesNotContainKey(conversation);
+        assertThat(conversations.batches.values()).noneMatch(batch -> batch.turnId().equals(dismissed));
+        assertThat(references.rows.values()).noneMatch(reference -> reference.turnId().equals(dismissed));
+    }
+
+    @Test
+    void aDeletingConversationsTurnIsNotFoundOnBothBookmarkRoutesAndItsSavedTurnLeavesTheListAndIsRemoved()
+            throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID saved = answered(gm, null, "questions", source);
+        UUID conversation = conversations.turns.get(saved).conversationId();
+        tick();
+        UUID kept = answered(gm, null, "rules", source);
+        UUID campaign = createCampaign(gm, "Mesa de domingo");
+        HttpResponse<String> asked = send(gm, "POST", "/api/v1/campaigns/" + campaign + "/turns",
+                "{\"question\":\"Quanto dano?\"}");
+        UUID elsewhere = UUID.fromString(json(asked).path("id").asString());
+        Source there = source(gm, campaign);
+        Claim claim = claim(conversations.turns.get(elsewhere).jobId());
+        assertThat(sendAsWorker("POST", claim.path("events"), "{\"batch\":1,\"events\":[{\"type\":\"delta\","
+                + "\"text\":\"1d10\"},{\"type\":\"citation\",\"passageId\":\"" + there.passageId()
+                + "\",\"offset\":4}],\"usage\":[]}", claim.grant()).statusCode()).isEqualTo(200);
+        assertThat(sendAsWorker("POST", claim.path("outcome"), "{\"outcome\":\"done\"}", claim.grant())
+                .statusCode()).isEqualTo(204);
+        for (UUID turn : List.of(saved, kept, elsewhere)) {
+            tick();
+            assertThat(send(gm, "PUT", "/api/v1/turns/" + turn + "/bookmark").statusCode()).isEqualTo(204);
+        }
+        assertThat(ids(json(get(gm, "/api/v1/saved-answers")).path("items"), "turnId"))
+                .containsExactly(elsewhere.toString(), kept.toString(), saved.toString());
+
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(202);
+
+        // Story 3.12: from the delete's commit its turns are not found on both routes and leave the list.
+        assertNotFound(send(gm, "PUT", "/api/v1/turns/" + saved + "/bookmark"));
+        assertNotFound(send(gm, "DELETE", "/api/v1/turns/" + saved + "/bookmark"));
+        assertThat(conversations.turns.get(saved).bookmarkedAt()).isNotNull();
+        JsonNode listed = json(get(gm, "/api/v1/saved-answers"));
+        assertThat(ids(listed.path("items"), "turnId")).containsExactly(elsewhere.toString(), kept.toString());
+        assertThat(listed.path("total").asLong()).isEqualTo(2);
+        // A campaign being deleted: its saved answer leaves the list at once too.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + campaign).statusCode()).isEqualTo(202);
+        assertThat(ids(json(get(gm, "/api/v1/saved-answers")).path("items"), "turnId"))
+                .containsExactly(kept.toString());
+
+        assertThat(deletion.sweep()).isEqualTo(2);
+
+        // The rows go, and the bookmarks with them; the other conversation's saved turn stays.
+        assertThat(conversations.turns).doesNotContainKeys(saved, elsewhere);
+        assertThat(conversations.turns.get(kept).bookmarkedAt()).isNotNull();
+        JsonNode after = json(get(gm, "/api/v1/saved-answers"));
+        assertThat(ids(after.path("items"), "turnId")).containsExactly(kept.toString());
+        assertThat(after.path("total").asLong()).isEqualTo(1);
+    }
+
+    @Test
+    void aConversationMarkedDeletingWhileTheSavedListIsReadIsLeftOutOfThatPageAndItsTotal() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID going = answered(gm, null, "questions", source);
+        UUID conversation = conversations.turns.get(going).conversationId();
+        tick();
+        UUID kept = answered(gm, null, "rules", source);
+        for (UUID turn : List.of(going, kept)) {
+            tick();
+            assertThat(send(gm, "PUT", "/api/v1/turns/" + turn + "/bookmark").statusCode()).isEqualTo(204);
+        }
+        // Story 3.12: the conversation starts being deleted after the page's saved turns were read and before the
+        // conversations behind them are (another connection's commit, READ COMMITTED): a 200, never a 500.
+        conversations.afterSavedTurns.set(() -> conversations.deleting.add(conversation));
+        try {
+            HttpResponse<String> listed = get(gm, "/api/v1/saved-answers");
+
+            assertThat(listed.statusCode()).as(listed.body()).isEqualTo(200);
+            JsonNode page = json(listed);
+            assertThat(ids(page.path("items"), "turnId")).containsExactly(kept.toString());
+            // The total is counted after the mark, so it leaves the deleting conversation out as well.
+            assertThat(page.path("total").asLong()).isEqualTo(1);
+            assertThat(page.has("nextCursor")).isFalse();
+            assertThat(conversations.afterSavedTurns.get()).isNull();
+        } finally {
+            conversations.afterSavedTurns.set(null);
+            conversations.deleting.remove(conversation);
+        }
+    }
+
     // --- helpers
 
     /** The clock moves on, so what is asked next comes later. */
@@ -414,12 +529,17 @@ class ConversationDeletionFlowTest {
 
     /** An accepted material of the GM's campaign with one passage. */
     private Source source(Gm gm) {
+        return source(gm, gm.campaign());
+    }
+
+    /** An accepted material of the campaign with one passage. */
+    private Source source(Gm gm, UUID campaign) {
         return as(gm.id(), () -> {
             Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
             UUID materialId = Ids.newId();
             materials.insertMaterial(new MaterialRow(materialId, gm.id(),
                     TestMaterials.materialName(vault, materialId, gm.id(), "Livro"), now, "rulebook", null,
-                    gm.campaign()));
+                    campaign));
             UUID versionId = Ids.newId();
             materials.insertVersion(new VersionRow(versionId, gm.id(), materialId, "ready", "pdf", 1000L, now, now));
             UUID passageId = Ids.newId();
@@ -470,6 +590,12 @@ class ConversationDeletionFlowTest {
     private static List<String> ids(JsonNode items) {
         List<String> found = new ArrayList<>();
         items.forEach(item -> found.add(item.path("id").asString()));
+        return found;
+    }
+
+    private static List<String> ids(JsonNode items, String field) {
+        List<String> found = new ArrayList<>();
+        items.forEach(item -> found.add(item.path(field).asString()));
         return found;
     }
 

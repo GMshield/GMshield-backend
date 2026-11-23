@@ -36,6 +36,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -56,7 +57,11 @@ import tools.jackson.databind.json.JsonMapper;
  * (paged by offset, the most recently asked first), one conversation, its stored turns with their events, its rename on
  * its version, and a question that continues a conversation or starts one in an area. From Story 3.10 part B, what goes
  * with a conversation (its question count) and its deletion (202, no body): from then on it and its turns are
- * {@code request.not_found} on every route.
+ * {@code request.not_found} on every route. From Story 3.11, the GM's dismissal of an ended turn (PUT) and its undo
+ * (DELETE) on {@code /turns/{turnId}/dismissal}: a dismissed turn is left out of its conversation's turns, its question
+ * counts and the history sent with a later question. From Story 3.12, the GM's bookmark of a done turn's answer (PUT)
+ * and its removal (DELETE) on {@code /turns/{turnId}/bookmark}, whether each stored turn is saved, and the GM's saved
+ * answers across all their campaigns ({@code /saved-answers}, paged by offset, the newest saved first).
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -69,6 +74,9 @@ class ConversationController {
     static final String OF_CAMPAIGN = "/api/v1/campaigns/{campaignId}/conversation";
     static final String EVENTS = "/api/v1/turns/{turnId}/events";
     static final String STOP = "/api/v1/turns/{turnId}/stop";
+    static final String DISMISSAL = "/api/v1/turns/{turnId}/dismissal";
+    static final String BOOKMARK = "/api/v1/turns/{turnId}/bookmark";
+    static final String SAVED_ANSWERS = "/api/v1/saved-answers";
     static final String REFERENCE_PAGE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}";
     static final String REFERENCE_PICTURE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture";
     static final String SOURCE_PAGE = "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}";
@@ -129,7 +137,8 @@ class ConversationController {
             description = "A campaign's conversation (contract 1.19.0)")
     record OfCampaignView(
             @Schema(description = "The conversation's id", format = "uuid") UUID id,
-            @Schema(description = "How many questions it holds", format = "int64", minimum = "0", example = "3")
+            @Schema(description = "How many questions it shows (from contract 1.31.0 a dismissed one is not counted)",
+                    format = "int64", minimum = "0", example = "3")
             long questions) {
     }
 
@@ -174,7 +183,8 @@ class ConversationController {
             @Schema(allowableValues = {"questions", "rules"}) String area,
             @Schema(description = "The GM's name for it, or else its first question's first 60 code points, cut at a"
                     + " word boundary") String name,
-            @Schema(description = "How many questions it holds", format = "int64", minimum = "1", example = "3")
+            @Schema(description = "How many questions it shows: from contract 1.31.0 a dismissed one is not counted, so"
+                    + " it may be 0", format = "int64", minimum = "0", example = "3")
             long questions,
             @Schema(description = "When its first question was asked", format = "date-time") String createdAt,
             @Schema(description = "When its newest question was asked", format = "date-time") String lastAskedAt,
@@ -229,8 +239,9 @@ class ConversationController {
     @Schema(name = "ConversationDeletion", requiredProperties = "questions",
             description = "What goes with a conversation if it is deleted (contract 1.30.0)")
     record ConversationDeletionView(
-            @Schema(description = "How many questions it holds: each goes with its answer, events and source"
-                    + " references", format = "int64", minimum = "0", example = "3") long questions) {
+            @Schema(description = "How many questions it shows (from contract 1.31.0 a dismissed one is not counted,"
+                    + " though it goes too): each goes with its answer, events and source references", format = "int64",
+                    minimum = "0", example = "3") long questions) {
     }
 
     @Schema(name = "ConversationChange", requiredProperties = {"version", "name"},
@@ -263,10 +274,10 @@ class ConversationController {
         }
     }
 
-    @Schema(name = "StoredTurn", requiredProperties = {"id", "question", "language", "createdAt", "events"},
-            description = "A turn of a conversation with its stored events (contract 1.29.0). A turn whose answer is"
-                    + " still being written has no done or error event yet: its stream continues after the last"
-                    + " sequence")
+    @Schema(name = "StoredTurn", requiredProperties = {"id", "question", "language", "createdAt", "events",
+        "bookmarked"}, description = "A turn of a conversation with its stored events (contract 1.29.0). A turn whose"
+            + " answer is still being written has no done or error event yet: its stream continues after the last"
+            + " sequence")
     record StoredTurnView(
             @Schema(format = "uuid") UUID id,
             @Schema(description = "The GM's question") String question,
@@ -274,12 +285,13 @@ class ConversationController {
                     allowableValues = {"pt-BR", "en"}) String language,
             @Schema(format = "date-time") String createdAt,
             @ArraySchema(arraySchema = @Schema(description = "Its stored events, by sequence"),
-                    schema = @Schema(implementation = StoredEventView.class)) List<StoredEventView> events) {
+                    schema = @Schema(implementation = StoredEventView.class)) List<StoredEventView> events,
+            @Schema(description = "Whether the GM saved its answer (contract 1.32.0)") boolean bookmarked) {
 
         static StoredTurnView of(Conversations.StoredTurn turn) {
             return new StoredTurnView(turn.id(), turn.question(), turn.language(), turn.createdAt().toString(),
                     turn.events().stream().map(event -> new StoredEventView(event.sequence(), event.type(),
-                            JSON.convertValue(event.data(), OBJECT))).toList());
+                            JSON.convertValue(event.data(), OBJECT))).toList(), turn.bookmarked());
         }
 
         @Override
@@ -293,6 +305,43 @@ class ConversationController {
     record TurnsView(
             @ArraySchema(arraySchema = @Schema(description = "Its newest 200 turns, oldest first"),
                     schema = @Schema(implementation = StoredTurnView.class)) List<StoredTurnView> items) {
+    }
+
+    @Schema(name = "SavedAnswer", requiredProperties = {"turnId", "conversationId", "campaignId", "campaignName", "area",
+        "conversationName", "savedAt", "excerpt"}, description = "A saved answer (contract 1.32.0)")
+    record SavedAnswerView(
+            @Schema(description = "The saved turn's id", format = "uuid") UUID turnId,
+            @Schema(description = "Its conversation's id", format = "uuid") UUID conversationId,
+            @Schema(description = "Its conversation's campaign's id", format = "uuid") UUID campaignId,
+            @Schema(description = "The campaign's name") String campaignName,
+            @Schema(description = "Its conversation's area", allowableValues = {"questions", "rules"}) String area,
+            @Schema(description = "Its conversation's name: the GM's name for it, or else its first question's first 60"
+                    + " code points, cut at a word boundary") String conversationName,
+            @Schema(description = "When the GM saved it", format = "date-time") String savedAt,
+            @Schema(description = "The answer's text with its Markdown removed and its white space made single spaces,"
+                    + " cut at a word boundary to at most 280 code points", maxLength = 280) String excerpt) {
+
+        static SavedAnswerView of(Conversations.Saved saved) {
+            return new SavedAnswerView(saved.turnId(), saved.conversationId(), saved.campaignId(),
+                    saved.campaignName(), saved.area().word(), saved.conversationName(), saved.savedAt().toString(),
+                    saved.excerpt());
+        }
+
+        @Override
+        public String toString() {
+            return "SavedAnswerView[turnId=" + turnId + "]";
+        }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "SavedAnswerPage", requiredProperties = {"items", "total"},
+            description = "One page of the account's saved answers (contract 1.32.0)")
+    record SavedPageView(
+            @ArraySchema(arraySchema = @Schema(description = "The newest saved first"),
+                    schema = @Schema(implementation = SavedAnswerView.class)) List<SavedAnswerView> items,
+            @Schema(description = "The offset of the next page, as text; absent on the last", example = "20")
+            String nextCursor,
+            @Schema(description = "How many saved answers are listed", format = "int64", example = "27") long total) {
     }
 
     @Schema(name = "Turn", requiredProperties = {"id", "conversationId", "language"})
@@ -532,8 +581,9 @@ class ConversationController {
 
     @GetMapping(path = CONVERSATIONS, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "listConversations", summary = "The campaign's conversations of one area (contract 1.29.0),"
-            + " the most recently asked first, each with its name and question count. A page starts at an offset and"
-            + " names the total of the list. A conversation is made by its first question, so none is empty."
+            + " the most recently asked first, each with its name and question count (from contract 1.31.0 dismissed"
+            + " questions are not counted). A page starts at an offset and names the total of the list. A conversation"
+            + " is made by its first question, so none is empty, though all its questions may be dismissed."
             + " request.invalid (400) without an area or for one that is not one, a limit outside 1 to 50, or an offset"
             + " outside 0 to 100000; request.not_found (404) for a campaign that is not the account's (unknown, another"
             + " account's or malformed)",
@@ -582,8 +632,9 @@ class ConversationController {
     @Operation(operationId = "listConversationTurns", summary = "A conversation's turns (contract 1.29.0): its newest"
             + " 200, oldest first, each with its question, language and stored events as its stream sends them (a"
             + " done event's data built when read, so removed is as of then). A turn still being answered has no done"
-            + " or error event yet; its stream continues after its last sequence. request.not_found (404) for a"
-            + " conversation that is not the account's",
+            + " or error event yet; its stream continues after its last sequence. From contract 1.31.0 a dismissed turn"
+            + " is left out (the 200 are the newest shown ones). request.not_found (404) for a conversation that is not"
+            + " the account's",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<TurnsView> turns(
@@ -620,8 +671,9 @@ class ConversationController {
 
     @GetMapping(path = CONVERSATION_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getConversationDeletion", summary = "What goes with one of the account's conversations if"
-            + " it is deleted (contract 1.30.0): how many questions it holds, each with its answer. request.not_found"
-            + " (404) for any other id (unknown, another account's, malformed, or of a conversation or campaign being"
+            + " it is deleted (contract 1.30.0): how many questions it shows, each with its answer (from contract"
+            + " 1.31.0 a dismissed one is not counted, though it is deleted too). request.not_found (404) for any other"
+            + " id (unknown, another account's, malformed, or of a conversation or campaign being"
             + " deleted)",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -697,6 +749,108 @@ class ConversationController {
             @PathVariable("turnId") String turnId) {
         conversations.stop(parse(turnId).orElseThrow(ConversationProblems::notFound));
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    private static final String DISMISSAL_NOT_FOUND = " request.not_found (404) for a turn that is not the account's"
+            + " (unknown, another account's or malformed) or of a conversation being deleted; nothing changes then."
+            + " Neither the conversation's version nor its newest question's time moves";
+
+    @PutMapping(path = DISMISSAL)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "dismissTurn", summary = "Dismiss the turn's answer (contract 1.31.0; 204): from now on the"
+            + " turn, with its question and answer, is left out of its conversation's turns and question counts and is"
+            + " never sent as history to a later question; its own events, references and reference pages still"
+            + " answer, and the conversation's default name stays its first question's. Only an ended turn (stopped,"
+            + " or with a done or error event) is dismissed: conversation.turn_running (409) otherwise, and nothing"
+            + " changes. A turn dismissed already stays as it is (204 too), so repeating it is safe."
+            + DISMISSAL_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The turn is dismissed"))
+    ResponseEntity<Void> dismiss(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.dismiss(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = DISMISSAL)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "restoreTurn", summary = "Undo the dismissal of the turn's answer (contract 1.31.0; 204):"
+            + " the turn is shown again where it was, listed with its conversation's turns, counted, and sent as"
+            + " history again. A turn that is shown already stays as it is (204 too), so repeating it is safe."
+            + DISMISSAL_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The turn is shown"))
+    ResponseEntity<Void> restore(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.restore(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    private static final String BOOKMARK_NOT_FOUND = " request.not_found (404) for a turn that is not the account's"
+            + " (unknown, another account's or malformed) or of a conversation being deleted; nothing changes then."
+            + " Neither the conversation's version nor its newest question's time moves. A bookmark gives the answer no"
+            + " standing as a source: the scope, retrieval and the history sent with a later question never read it";
+
+    @PutMapping(path = BOOKMARK)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "bookmarkTurn", summary = "Save the turn's answer (contract 1.32.0; 204): from now on its"
+            + " conversation's turns say it is bookmarked, and it heads the saved answers. Only a done turn (its last"
+            + " event a done event, neither stopped nor silent) is saved: conversation.turn_not_done (409) for a turn"
+            + " still running, stopped, failed or silent, and nothing changes. A turn saved already keeps the time it was saved (204 too), so"
+            + " repeating it is safe." + BOOKMARK_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The answer is saved"))
+    ResponseEntity<Void> bookmark(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.bookmark(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = BOOKMARK)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "unbookmarkTurn", summary = "Remove the turn's answer from the saved answers (contract"
+            + " 1.32.0; 204), whatever the turn's state. A turn that is not saved stays as it is (204 too), so repeating"
+            + " it is safe." + BOOKMARK_NOT_FOUND,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The answer is not saved"))
+    ResponseEntity<Void> unbookmark(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.unbookmark(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @GetMapping(path = SAVED_ANSWERS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listSavedAnswers", summary = "The account's saved answers across all its campaigns"
+            + " (contract 1.32.0), the newest saved first, each with its campaign's name, its conversation's area and"
+            + " name, when it was saved and an excerpt. A page starts at an offset and names the total of the list."
+            + " Left out (and not counted): a dismissed answer (its bookmark is kept, so undoing the dismissal lists it"
+            + " again), an answer of a conversation being deleted, and the answers of an archived campaign (listed again"
+            + " once it is restored) or of a campaign being deleted. request.invalid (400) for a limit outside 1 to 50,"
+            + " or an offset outside 0 to 100000",
+            parameters = {
+                @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the newest saved to"
+                        + " skip, 0 to 100000", schema = @Schema(type = "integer", format = "int32",
+                                minimum = "0", maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<SavedPageView> savedAnswers(
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        Conversations.SavedPage page = conversations.saved(offset(offset), limit(limit));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new SavedPageView(
+                page.items().stream().map(SavedAnswerView::of).toList(),
+                page.nextOffset() == null ? null : page.nextOffset().toString(), page.total()));
     }
 
     private static final String REFERENCE_SUMMARY = " The ground is the path: a source reference stored with a turn of"

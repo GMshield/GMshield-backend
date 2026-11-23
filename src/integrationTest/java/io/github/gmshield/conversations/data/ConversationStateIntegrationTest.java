@@ -10,6 +10,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Map;
@@ -28,6 +29,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Story 3.10 part B on PostgreSQL: only the store's bulk updates write {@code conversation.state} and
  * {@code last_asked_at}. A rename whose entity was loaded before a delete (and a question) committed on another
  * connection flushes its name and version only: the row stays {@code deleting}, with the newer {@code last_asked_at}.
+ *
+ * <p>Story 3.11 on PostgreSQL: only the store's bulk updates write {@code turn.dismissed_at}. A stop whose turn was
+ * loaded before a dismissal committed on another connection flushes its {@code stopped_at} only: the turn keeps both.
+ *
+ * <p>Story 3.12 on PostgreSQL: the same for {@code turn.bookmarked_at}, written by the store's bulk updates only.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -37,6 +43,10 @@ import org.springframework.transaction.support.TransactionTemplate;
     "gmshield.files.dir=${java.io.tmpdir}/gmshield-deletion-it"})
 @ActiveProfiles("test-mode")
 class ConversationStateIntegrationTest {
+
+    private static final String STOPPED_AT = "select stopped_at from turn where id = ?";
+    private static final String DISMISSED_AT = "select dismissed_at from turn where id = ?";
+    private static final String BOOKMARKED_AT = "select bookmarked_at from turn where id = ?";
 
     @Autowired
     private Library library;
@@ -86,5 +96,86 @@ class ConversationStateIntegrationTest {
         assertThat(row.get("name")).isNotNull();
         assertThat(jdbc.sql("select last_asked_at from conversation where id = ?").param(conversation)
                 .query(OffsetDateTime.class).single().toInstant()).isEqualTo(later.toInstant());
+    }
+
+    @Test
+    void aStopLoadedBeforeADismissalCommittedKeepsTheDismissalAndTheStop() {
+        UUID owner = Ids.newId();
+        UUID campaign = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        }));
+        UUID turn = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Quanto dano?", null,
+                Area.QUESTIONS)).turnId();
+        Instant dismissedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        Instant stoppedAt = dismissedAt.plusSeconds(1);
+        TransactionTemplate other = new TransactionTemplate(transactions);
+        other.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            EntityManager em = EntityManagerFactoryUtils.getTransactionalEntityManager(entities);
+            // The stop's transaction holds the turn as it was: shown, not stopped.
+            TurnEntity loaded = em.createQuery("select t from Turn t where t.id = :id", TurnEntity.class)
+                    .setParameter("id", turn).getSingleResult();
+            assertThat(loaded.row(java.util.Set.of()).dismissedAt()).isNull();
+            // Another connection commits the GM's dismissal.
+            other.executeWithoutResult(moved -> assertThat(store.markDismissed(turn, dismissedAt)).isTrue());
+            // The stop flushes the entity it holds, whose dismissed_at is still null in memory.
+            assertThat(store.markStopped(turn, stoppedAt)).isTrue();
+            return null;
+        }));
+
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+        assertThat(turnTime(turn, DISMISSED_AT)).isEqualTo(dismissedAt);
+
+        // And the other way round: an undo's bulk update leaves the stop as it is.
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                store.clearDismissed(turn)));
+        assertThat(turnTime(turn, DISMISSED_AT)).isNull();
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+    }
+
+    @Test
+    void aStopLoadedBeforeABookmarkCommittedKeepsTheBookmarkAndTheStop() {
+        UUID owner = Ids.newId();
+        UUID campaign = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        }));
+        UUID turn = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Quanto dano?", null,
+                Area.QUESTIONS)).turnId();
+        Instant bookmarkedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        Instant stoppedAt = bookmarkedAt.plusSeconds(1);
+        TransactionTemplate other = new TransactionTemplate(transactions);
+        other.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            EntityManager em = EntityManagerFactoryUtils.getTransactionalEntityManager(entities);
+            TurnEntity loaded = em.createQuery("select t from Turn t where t.id = :id", TurnEntity.class)
+                    .setParameter("id", turn).getSingleResult();
+            assertThat(loaded.row(java.util.Set.of()).bookmarkedAt()).isNull();
+            // Another connection commits a bookmark (the store's bulk update, whatever the turn's state).
+            other.executeWithoutResult(moved -> assertThat(store.markBookmarked(turn, bookmarkedAt)).isTrue());
+            // The stop flushes the entity it holds, whose bookmarked_at is still null in memory.
+            assertThat(store.markStopped(turn, stoppedAt)).isTrue();
+            return null;
+        }));
+
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isEqualTo(bookmarkedAt);
+        // A second mark keeps the first time; the clear leaves the stop as it is.
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                assertThat(store.markBookmarked(turn, stoppedAt)).isFalse()));
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isEqualTo(bookmarkedAt);
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status ->
+                store.clearBookmarked(turn)));
+        assertThat(turnTime(turn, BOOKMARKED_AT)).isNull();
+        assertThat(turnTime(turn, STOPPED_AT)).isEqualTo(stoppedAt);
+    }
+
+    /** The turn's time read by {@code query} (one of those above), or null. */
+    private Instant turnTime(UUID turn, String query) {
+        OffsetDateTime time = jdbc.sql(query).param(turn).query(OffsetDateTime.class).list().getFirst();
+        return time == null ? null : time.toInstant();
     }
 }
