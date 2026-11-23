@@ -47,8 +47,8 @@ campaigns, below; it may use `shared` and `vault`), `materials` (materials and t
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
 use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
 `jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
-`scope`, `library` and `vault`), `knowledge` (each system's ontology, Story 4.1, below; it may use `shared`, `vault`
-and `library`, and `library` may not use it) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+`scope`, `library` and `vault`), `knowledge` (each system's ontology, Story 4.1, and the extracted records, Story 4.2, below; it may
+use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `library` nor `materials` may use it) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
 `library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
@@ -996,7 +996,7 @@ and `library`, and `library` may not use it) and `accounts` (sign-in with Google
     only the allowed sources the filter keeps, before the pending passages are read: a tier filter empties the other
     tiers' `sources` and `pending`, a material filter keeps only that material's version (and its pending passages).
     A filter only narrows: a tier or material switched off, or a material in no tier, leaves nothing.
-  - **The job (`SearchJobs`, `library.search`, interactive, `callsModel()` false).** Its input is
+  - **The job (`SearchJobs`, `library.search`, interactive, `callsModel(job)` false).** Its input is
     `Scopes.searchInput`: the question input's shape (`{query, owner, modelKnowledge, tiers: [{tier, sources,
     pending}], tokenKey}`) with `query` in place of `question`, within the search's campaign's current stored settings
     narrowed by its filters. Its passages route (the worker reads the candidates' text to put the exact query first)
@@ -1210,14 +1210,15 @@ and `library`, and `library` may not use it) and `accounts` (sign-in with Google
     tests run it themselves). A read never writes.
   - `GET /api/v1/systems/{id}/record-types?limit&offset` (`listRecordTypes`) answers `{items, total}`: the core types in
     their fixed order, then the others oldest first; `limit` 1 to 50 (default 20) and `offset` 0 to 100000, else 400
-    `request.invalid`. Each item: `id`, `name`, `core` (null for a type that is not core), `records` (0 until Story 4.2
-    stores records) and `version`. `GET /api/v1/record-types/{id}` (`getRecordType`) answers one.
+    `request.invalid`. Each item: `id`, `name`, `core` (null for a type that is not core), `records` (from Story 4.2 the
+    records of that core type in the system's accepted versions) and `version`. `GET /api/v1/record-types/{id}` (`getRecordType`) answers one.
   - `PATCH /api/v1/record-types/{id}` (`changeRecordType`, `{version, name}`) and `DELETE` (`deleteRecordType`, 204):
     a core type is 409 `ontology.core_record_type` and nothing changes. A type that is not core is renamed on its
     version (`request.stale_version`, 409), to 1 to 120 code points after trimming (`ontology.record_type_name_invalid`,
     400, params `min` and `max`) that no other type of the system has, core ones included
     (`ontology.record_type_name_taken`, 409), and removed (204; `request.stale_version`, 409, when a rename committed
-    meanwhile; Story 4.2 refuses one that types records). Story 4.4 adds the approval that creates them.
+    meanwhile; from Story 4.2 409 `ontology.record_type_in_use` for one that types records). Story 4.4 adds the
+    approval that creates them.
   - Another owner's system or record type, an unknown or malformed id, and a system being deleted (or a record type of
     one) are 404 `request.not_found` on every route. `/api/v1/record-types` joins `LibraryOwnerFilter.LIBRARY_ROUTES`,
     and the four routes join the cross-owner audit (`CrossOwnerAuditFlowTest`, whose world now holds A's core record
@@ -1234,6 +1235,52 @@ and `library`, and `library` may not use it) and `accounts` (sign-in with Google
     system's record types removed by its deletion).
   - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.33.0). The worker and the
     internal contract (1.16.0) do not change.
+
+- **Extract rules, spells and items (`materials`, `knowledge`, `jobs`, Story 4.2 part A, internal contract 1.17.0,
+  public contract 1.34.0, migration V35).** Records are not indexed as Qdrant points yet (part B).
+  - `V35__record.sql`: `record (id, owner_id, version_id, ordinal, first_page, type, name, fields, created_at)`, `type`
+    one of the eight core keys (`record_type_check`; this release extracts `rule`, `spell` and `item`), and
+    `record_passage (owner_id, record_id, passage_id)`. Every reference carries the owner and none cascades: whatever
+    replaces or removes a version's passages removes its records first, in the same transaction. `ingestion_step` gains
+    `input_passages` (a records step, with a page range and no input file) and `records_unread` (a records step that
+    failed for good). The previous release does not understand a records step: rolling back past V35 is safe only while
+    none exists.
+  - The chain: a report that carries passages may name next steps `{stage: "records", firstPage, lastPage, input:
+    "passages"}` (the worker asks one per 10 pages that hold passages); the input `passages` belongs to that stage only
+    (`ingestion.next_input_unknown`). Each gets its job at once, so the version needs review only once they have all
+    ended. Its claim input names `input: "passages"` and `recordTypes: ["rule", "spell", "item"]`; `GET
+    .../inputs/passages` streams the passages of its pages as JSON Lines `{id, page, sectionPath, text}`, decrypted in
+    the input's read transaction. Its report carries `records` (at most 1,000), each a `type` of those, a non-blank
+    `name` (at most 200 code points), `fields` (at most 64 `{name, value}`, each non-blank, at most 200 and 8,000 code
+    points) and 1 to 100 distinct `passageIds`, each a passage of the version on the step's pages; anything else, or
+    records from another step, or a records step without them, is 400 `job.result_invalid` (`ingestion.record_invalid`)
+    and nothing is kept. The step's run of records is replaced (`ExtractedRecords.replaceRange`), so the same step
+    reported again never adds to them; a record's first page is the lowest of its passages'.
+  - A records step that ends failed (a refusal or truncation the worker reports with `retry: false`, an outage after
+    its last attempt, a provider the worker does not hold) never fails the version: its pages are marked
+    `records_unread`, and the chain still ends in `needs_review`. A pipeline change still restarts the chain.
+  - Models: `JobHandler.callsModel(JobRef)` is per job; ingestion answers true for a records step only, so only its
+    claim resolves a model and the job row records it. From internal contract 1.17.0 the outcome (`JobOutcome`) may
+    carry `usage` (at most 16 `JobCallUsage`, checked as an events batch's, else 400 `request.invalid`), recorded once
+    per worker call id for the attempt's model in the outcome's transaction, done or failed.
+  - Storage (`knowledge`): `service.ExtractedRecordStore` implements the `materials` port
+    `service.ExtractedRecords` (`replaceRange`, `removeVersion`, `countsByType`), so `materials` depends on nothing of
+    `knowledge`; `knowledge` may now use `materials :: service`, whose named interface also holds `ExtractedRecords` and
+    `ReadyVersions`. A record's name (entity `record`, field `name`) and its fields (field `fields`, a JSON array of
+    `{name, value}` in order) are vault ciphertexts bound to the row and owner.
+  - Removal: a passages report, a restart (`IngestionSteps.startOver`), a reprocess, a discard (`VersionRemoval`), a
+    version's deletion (`SystemMaterialsDeletion`) and a refused upload (`Uploads.refuse`) remove the version's records
+    before its passages; the first three also clear the unread marks. A reprocess re-mints every passage of the
+    version, so it removes every record of the version, not only the reread pages', and the held passages step asks
+    every records step again: one model call per 10-page run that holds a passage.
+  - Reads: `GET /api/v1/materials/{id}/report` adds `records: [{type, count}]` (core order, types with at least one) and
+    the warning `report.records_unread` (the unread pages). The records tab's counts (`records` of each core type) are
+    the records of the `ready` versions of the materials attached to the system and of its campaigns' materials
+    (`materials.service.ReadyVersions`): a version that needs review counts in its own report only.
+  - Log lines (ids and counts only): `ingestion.passages_opened`, `ingestion.records_recorded` (the step's pages, its
+    records by type, how many it replaced) and `ingestion.records_unread` (the failed step's code and page count).
+  - Deploy order: the backend (internal 1.17.0, public 1.34.0), then the worker (its minimum backend contract becomes
+    1.17.0; a records step under an older worker's pipeline restarts the chain), then the frontend.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
@@ -1268,7 +1315,7 @@ and `library`, and `library` may not use it) and `accounts` (sign-in with Google
     virtual thread as the turn's owner (captured before it starts), is woken after each commit that stores an event,
     and polls every second (`gmshield.conversations.poll`) as a backstop, so replay, a reopened stream and a second
     instance need nothing more. A client that leaves never touches the job. Another owner's turn is 404.
-  - `AnswerJobs` (`question.answer`, interactive, `callsModel()`): its input is `Scopes.questionInput` of the turn's
+  - `AnswerJobs` (`question.answer`, interactive, `callsModel(job)`): its input is `Scopes.questionInput` of the turn's
     campaign under its frozen settings, its passages `Scopes.passages` within that scope.
   - `POST /internal/v1/jobs/{jobId}/claims/{claimId}/events` (`jobs`), with `X-Job-Grant`: `{batch, events: [{type:
     delta, text} | {type: citation, passageId, offset}], usage: [{callId, responseId?, input, cacheRead, cacheWrite,
@@ -1421,8 +1468,8 @@ and `library`, and `library` may not use it) and `accounts` (sign-in with Google
     (`DataSourceTransactionManager` over a `DelegatingDataSource`), because a JPA transaction needs an owner.
   - Every backend line about a job carries the trace id of the request that created it; the worker logs
     under it and sends it back in `traceparent`.
-  - **Models (Story 2.10, AD-18, internal contract 1.9.0).** A `JobHandler` whose `callsModel()` is true (default
-    false; `question.answer` from Story 2.4) gets a model per attempt. A claim may state `providers` (at most 8, each
+  - **Models (Story 2.10, AD-18, internal contract 1.9.0).** A `JobHandler` whose `callsModel(job)` is true (default
+    false; `question.answer` from Story 2.4, an ingestion records step from Story 4.2) gets a model per attempt. A claim may state `providers` (at most 8, each
     `^[a-z0-9-]{1,32}$`, else 400 `request.invalid` before the claim): those the worker holds a key for. For such a
     kind each claim asks `jobs.service.ModelChoices` (implemented by `limits`) for the provider, model and tier,
     records them on the job row (`model_provider`, `model_id`, `model_tier`, `V16__job_model.sql`; overwritten at

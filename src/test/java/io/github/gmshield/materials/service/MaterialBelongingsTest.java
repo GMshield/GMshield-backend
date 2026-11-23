@@ -101,9 +101,10 @@ class MaterialBelongingsTest {
                 beans.getBeanProvider(Clock.class));
         service = new Uploads(materials, uploads, vault, TestVaults.files(vault, root), library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class),
-                (version, upload) -> { });
+                (version, upload) -> { }, TestMaterials.NO_RECORDS);
         reads = new Materials(materials, uploads, vault, TestVaults.files(vault, root), ids -> java.util.Set.of(),
-                library, new IngestionSettings(4), beans.getBeanProvider(PlatformTransactionManager.class));
+                library, new IngestionSettings(4), TestMaterials.NO_RECORDS,
+                beans.getBeanProvider(PlatformTransactionManager.class));
         belongings = new MaterialBelongings(materials, service, reads,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         for (UUID gm : List.of(owner, other)) {

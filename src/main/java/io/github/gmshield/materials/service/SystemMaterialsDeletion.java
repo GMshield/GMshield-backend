@@ -81,6 +81,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     private final IndexStore index;
     private final UploadStorage uploads;
     private final IngestionSteps ingestion;
+    private final ExtractedRecords records;
     private final IndexChanges indexChanges;
     private final IndexRemovals indexRemovals;
     private final VersionRemoval removal;
@@ -91,9 +92,10 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     SystemMaterialsDeletion(MaterialStore materials, IndexStore index, UploadStorage uploads, IngestionSteps ingestion,
                             IndexChanges indexChanges, IndexRemovals indexRemovals, VersionRemoval removal,
-                            FileStore files, Jobs jobs, ObjectProvider<PlatformTransactionManager> transactions,
-                            ObjectProvider<Clock> clock) {
+                            FileStore files, Jobs jobs, ExtractedRecords records,
+                            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.materials = materials;
+        this.records = records;
         this.index = index;
         this.uploads = uploads;
         this.ingestion = ingestion;
@@ -253,6 +255,8 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
             List<UUID> named = new ArrayList<>();
             // Page views first: each names its picture file.
             materials.deletePageViews(versionId);
+            // Story 4.2: the records first, since they link to the passages.
+            records.removeVersion(versionId);
             materials.deletePassages(versionId);
             materials.deleteOutline(versionId);
             materials.deletePageRanges(versionId);

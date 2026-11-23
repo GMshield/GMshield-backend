@@ -27,7 +27,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * version still flagged (a restart, a failure). It has three parts, each safe to repeat:
  *
  * <ol>
- *   <li>in one transaction, with the version locked: its page views, passages, outline, page layers and outcomes go;</li>
+ *   <li>in one transaction, with the version locked: its page views, records (Story 4.2: before the passages they
+ *       link to), passages, outline, page layers and outcomes go;</li>
  *   <li>the file store removes the pieces of every version file (the original, batches, texts and pictures);</li>
  *   <li>in one transaction: the {@code version_file} rows go, the complete raw upload becomes {@code removing} (its
  *       pieces and row go after the commit, and the upload sweep finishes them), and the flag is cleared.</li>
@@ -43,12 +44,14 @@ public class VersionRemoval {
     private final MaterialStore materials;
     private final FileStore files;
     private final IngestionSteps ingestion;
+    private final ExtractedRecords records;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
-    VersionRemoval(MaterialStore materials, FileStore files, IngestionSteps ingestion,
+    VersionRemoval(MaterialStore materials, FileStore files, IngestionSteps ingestion, ExtractedRecords records,
                    ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.materials = materials;
+        this.records = records;
         this.files = files;
         this.ingestion = ingestion;
         this.transactions = transactions;
@@ -69,6 +72,7 @@ public class VersionRemoval {
             }
             // Page views first: each names its picture file.
             materials.deletePageViews(versionId);
+            records.removeVersion(versionId);
             materials.deletePassages(versionId);
             materials.deleteOutline(versionId);
             materials.deletePageRanges(versionId);

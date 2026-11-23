@@ -3,10 +3,16 @@ package io.github.gmshield.materials.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.jobs.service.JobFiles;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.jobs.service.Jobs;
+import io.github.gmshield.knowledge.data.RecordRow;
+import io.github.gmshield.knowledge.data.RecordStore;
+import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.library.service.Language;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.StaleIndexes;
 import io.github.gmshield.materials.data.OutlineRow;
@@ -19,6 +25,7 @@ import io.github.gmshield.materials.data.VersionFileRow;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
+import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayInputStream;
@@ -1415,6 +1422,207 @@ class IngestionIntegrationTest {
 
     private static String layoutStep(int first, int last, UUID input) {
         return "{\"stage\":\"layout\",\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"input\":\"" + input + "\"}";
+    }
+
+    // --- Story 4.2: records
+
+    @Autowired
+    private Library library;
+    @Autowired
+    private Ontology ontology;
+    @Autowired
+    private RecordStore recordStore;
+
+    @Test
+    void recordsAreStoredEncryptedRemovedBeforeTheirPassagesClearedOnReprocessAndCountedOnceAccepted()
+            throws Exception {
+        UUID owner = Ids.newId();
+        write(owner, () -> library.createStarter(Language.EN));
+        UUID system = jdbc.sql("select id from system where owner_id = ?").param(owner).query(UUID.class).single();
+        Chain chain = completed(owner, pdf(MIB), new Uploads.Details(null, null, null, List.of(system.toString())));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId()
+                        + "\"},\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + ",{\"stage\":\"passages\",\"firstPage\":1,"
+                        + "\"lastPage\":3,\"input\":\"texts\"}]}"));
+        JobClaims.Claim layout = claimOffered(chain);
+        layoutReport(chain, layout, 1, 3, List.of(2), List.of(1, 2, 3));
+        recordsOf(chain, "Fireball");
+
+        // Encrypted on PostgreSQL: the name and fields columns hold vault ciphertexts, bound to the record.
+        Map<String, Object> row = jdbc.sql("select id, owner_id, type, first_page, ordinal, name, fields from record"
+                + " where version_id = ?").param(chain.versionId()).query().singleRow();
+        UUID recordId = (UUID) row.get("id");
+        assertThat(row).containsEntry("owner_id", owner).containsEntry("type", "spell").containsEntry("first_page", 3)
+                .containsEntry("ordinal", 0);
+        for (String column : List.of("name", "fields")) {
+            byte[] stored = (byte[]) row.get(column);
+            assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContain("Fireball")
+                    .doesNotContain("Evocation");
+            assertThat(new String(stored, StandardCharsets.UTF_16BE)).doesNotContain("Fireball");
+        }
+        assertThat(vault.decryptText(new Binding("record", "name", recordId, owner), (byte[]) row.get("name")))
+                .isEqualTo("Fireball");
+        assertThat(new String(vault.decrypt(new Binding("record", "fields", recordId, owner),
+                (byte[]) row.get("fields")), StandardCharsets.UTF_8))
+                .isEqualTo("[{\"name\":\"School\",\"value\":\"Evocation\"}]");
+        UUID passageOnThree = jdbc.sql("select id from passage where version_id = ? and page = 3")
+                .param(chain.versionId()).query(UUID.class).single();
+        assertThat(jdbc.sql("select owner_id, passage_id from record_passage where record_id = ?").param(recordId)
+                .query().singleRow()).containsEntry("owner_id", owner).containsEntry("passage_id", passageOnThree);
+        assertThat(jdbc.sql("select model_provider from job j join ingestion_step s on s.job_id = j.id"
+                + " where s.version_id = ? and s.input_passages").param(chain.versionId()).query(String.class).single())
+                .isEqualTo("azure-openai");
+        assertThat(jdbc.sql("select count(*) from model_call_usage where owner_id = ?").param(owner).query(Long.class)
+                .single()).isEqualTo(1L);
+
+        // Nothing cascades: the passages cannot go while a record links to them, and another owner's record cannot
+        // link to them at all.
+        assertThatThrownBy(() -> write(owner, () -> store.deletePassages(chain.versionId())))
+                .isInstanceOf(RuntimeException.class);
+        assertThat(count("record", chain.versionId())).isEqualTo(1);
+        UUID other = Ids.newId();
+        UUID foreign = Ids.newId();
+        assertThatThrownBy(() -> write(other, () -> recordStore.insert(List.of(new RecordRow(foreign, other,
+                chain.versionId(), 0, 1, "spell", new byte[] {1}, new byte[] {1}, List.of(passageOnThree),
+                Instant.now().truncatedTo(ChronoUnit.MICROS)))))).isInstanceOf(RuntimeException.class);
+        assertThat(jdbc.sql("select count(*) from record where id = ?").param(foreign).query(Long.class).single())
+                .isZero();
+
+        // Not accepted: the records tab counts nothing yet.
+        assertThat(spellCount(owner, system)).isZero();
+
+        // Reprocess: the records and their links go before the passages, in the reprocess's transaction.
+        as(owner, () -> actions.act(chain.materialId(), "reprocess"));
+        assertThat(count("record", chain.versionId())).isZero();
+        assertThat(jdbc.sql("select count(*) from record_passage where record_id = ?").param(recordId).query(Long.class)
+                .single()).isZero();
+        assertThat(jdbc.sql("select count(*) from ingestion_step where version_id = ? and records_unread")
+                .param(chain.versionId()).query(Long.class).single()).isZero();
+        JobClaims.Claim reread = claimOffered(chain);
+        layoutReport(chain, reread, 2, 2, List.of(), List.of(2));
+        recordsOf(chain, "Shield");
+        assertThat(count("record", chain.versionId())).isEqualTo(1);
+
+        // Accepted: the records of its ready version count under their core type.
+        as(owner, () -> actions.act(chain.materialId(), "accept"));
+        assertThat(spellCount(owner, system)).isEqualTo(1);
+
+        // A version's removal (a replacement's discard) takes its records with it, before its passages. The accept's
+        // index changes would hold the ingestion lane.
+        freeTheIngestionLane();
+        Chain replacement = completed(owner, pdf(MIB), new Uploads.Details(null, null, null, null,
+                chain.materialId().toString()));
+        reviewedWithRecords(replacement);
+        assertThat(count("record", replacement.versionId())).isEqualTo(1);
+        as(owner, () -> actions.act(replacement.materialId(), "discard"));
+        assertThat(count("record", replacement.versionId())).isZero();
+        assertThat(count("passage", replacement.versionId())).isZero();
+        assertThat(spellCount(owner, system)).isEqualTo(1);
+    }
+
+    @Test
+    void aRestartRemovesTheVersionsRecordsAndTheirLinksBeforeItsPassagesOnPostgres() throws Exception {
+        Chain chain = completed(pdf(MIB));
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId()
+                        + "\"},\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + ",{\"stage\":\"passages\",\"firstPage\":1,"
+                        + "\"lastPage\":3,\"input\":\"texts\"}]}"));
+        layoutReport(chain, claimOffered(chain), 1, 3, List.of(), List.of(1, 2, 3));
+        JobClaims.Claim passages = claimOffered(chain);
+        claims.report(passages.jobId(), passages.claimId(), passages.grant(), "done", null, null,
+                JSON.readTree(passagesReport("Texto", "Capítulo", "Seção").replace("\"pipelineVersion\":\"4\"",
+                        "\"pipelineVersion\":\"5\"").replace("\"next\":[]", "\"next\":[{\"stage\":\"records\","
+                        + "\"firstPage\":1,\"lastPage\":1,\"input\":\"passages\"},{\"stage\":\"records\","
+                        + "\"firstPage\":2,\"lastPage\":3,\"input\":\"passages\"}]")));
+        UUID page1 = jdbc.sql("select id from passage where version_id = ? and page = 1").param(chain.versionId())
+                .query(UUID.class).single();
+        JobClaims.Claim first = claimOfferedWithModel(chain);
+        assertThat(first.input().path("firstPage").asInt()).isEqualTo(1);
+        claims.report(first.jobId(), first.claimId(), first.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"records\":[{\"type\":\"rule\",\"name\":\"Agarrar\",\"fields\":[],"
+                        + "\"passageIds\":[\"" + page1 + "\"]}],\"next\":[]}"));
+        assertThat(count("record", chain.versionId())).isEqualTo(1);
+        UUID recordId = jdbc.sql("select id from record where version_id = ?").param(chain.versionId())
+                .query(UUID.class).single();
+
+        // The other records step reports under another pipeline: the chain restarts from the stored original.
+        JobClaims.Claim second = claimOfferedWithModel(chain);
+        claims.report(second.jobId(), second.claimId(), second.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"6\",\"records\":[],\"next\":[]}"));
+
+        assertThat(count("record", chain.versionId())).isZero();
+        assertThat(jdbc.sql("select count(*) from record_passage where record_id = ?").param(recordId).query(Long.class)
+                .single()).isZero();
+        assertThat(count("passage", chain.versionId())).isZero();
+        assertThat(state(chain.versionId())).isEqualTo("processing");
+        assertThat(jdbc.sql("select s.stage, s.input_file_id, j.state from ingestion_step s join job j on j.id = s.job_id"
+                + " where s.version_id = ? and s.ended_at is null").param(chain.versionId()).query().singleRow())
+                .containsEntry("stage", "clean").containsEntry("input_file_id", original.fileId())
+                .containsEntry("state", "offered");
+    }
+
+    /** The version's step job that is offered, claimed stating the provider a records step's model needs. */
+    private JobClaims.Claim claimOfferedWithModel(Chain chain) {
+        UUID job = jdbc.sql("select s.job_id from ingestion_step s join job j on j.id = s.job_id"
+                + " where s.version_id = ? and j.state = 'offered'").param(chain.versionId()).query(UUID.class).single();
+        return claims.claim(job, null, List.of("azure-openai"));
+    }
+
+    /** A replacement read to review with a passage on each of its 3 pages and one spell record from page 3. */
+    private void reviewedWithRecords(Chain chain) throws Exception {
+        JobClaims.Claim clean = claims.claim(chain.jobId());
+        JobFiles.Stored original = store(chain, clean, pdf(4000));
+        JobFiles.Stored batch = store(chain, clean, pdf(3000));
+        claims.report(chain.jobId(), clean.claimId(), clean.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"pageTotal\":3,\"original\":{\"fileId\":\"" + original.fileId()
+                        + "\"},\"batches\":[{\"fileId\":\"" + batch.fileId() + "\",\"firstPage\":1,\"lastPage\":3}],"
+                        + "\"next\":[" + layoutStep(1, 3, batch.fileId()) + ",{\"stage\":\"passages\",\"firstPage\":1,"
+                        + "\"lastPage\":3,\"input\":\"texts\"}]}"));
+        layoutReport(chain, claimOffered(chain), 1, 3, List.of(), List.of(1, 2, 3));
+        recordsOf(chain, "Bless");
+    }
+
+    /**
+     * The offered passages step reports passages on pages 1 and 3 and a records step over the three pages, which is
+     * claimed stating the provider and reports one spell named {@code name} from page 3, with one call's usage.
+     */
+    private void recordsOf(Chain chain, String name) throws Exception {
+        JobClaims.Claim passages = claimOffered(chain);
+        claims.report(passages.jobId(), passages.claimId(), passages.grant(), "done", null, null,
+                JSON.readTree(passagesReport("Texto", "Capítulo", "Seção").replace("\"pipelineVersion\":\"4\"",
+                        "\"pipelineVersion\":\"5\"").replace("\"next\":[]", "\"next\":[{\"stage\":\"records\","
+                        + "\"firstPage\":1,\"lastPage\":3,\"input\":\"passages\"}]")));
+        UUID job = jdbc.sql("select s.job_id from ingestion_step s join job j on j.id = s.job_id"
+                + " where s.version_id = ? and j.state = 'offered'").param(chain.versionId()).query(UUID.class).single();
+        JobClaims.Claim records = claims.claim(job, null, List.of("azure-openai"));
+        assertThat(records.model().provider()).isEqualTo("azure-openai");
+        assertThat(records.input().path("recordTypes").toString()).isEqualTo("[\"rule\",\"spell\",\"item\"]");
+        UUID page3 = jdbc.sql("select id from passage where version_id = ? and page = 3").param(chain.versionId())
+                .query(UUID.class).single();
+        claims.report(job, records.claimId(), records.grant(), "done", null, null, JSON.readTree(
+                "{\"pipelineVersion\":\"5\",\"records\":[{\"type\":\"spell\",\"name\":\"" + name + "\",\"fields\":"
+                        + "[{\"name\":\"School\",\"value\":\"Evocation\"}],\"passageIds\":[\"" + page3 + "\"]}],"
+                        + "\"next\":[]}"), List.of(new CallUsage(Ids.newId(), null, 900, 0, 0, 120, 0, false)));
+        assertThat(state(chain.versionId())).isEqualTo("needs_review");
+    }
+
+    private long count(String table, UUID versionId) {
+        return jdbc.sql("select count(*) from " + table + " where version_id = ?").param(versionId).query(Long.class)
+                .single();
+    }
+
+    /** The records tab's count of the system's spell type. */
+    private long spellCount(UUID owner, UUID system) throws Exception {
+        return as(owner, () -> ontology.recordTypes(system, 0, 8)).orElseThrow().items().stream()
+                .filter(type -> "spell".equals(type.core())).findFirst().orElseThrow().records();
     }
 
     // --- helpers

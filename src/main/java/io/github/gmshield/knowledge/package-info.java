@@ -6,8 +6,12 @@
  * nor removed. Every table is a library table (owner column, Hibernate {@code @TenantId}, JPA and JPQL only, names
  * encrypted through {@code vault}); another owner's item is "not found", exactly like an unknown one. Its part of a
  * system's deletion is {@code service.SystemRecordTypesDeletion} (a {@code library.service.SystemDeletionHandler}), so
- * {@code library} depends on nothing here. Records (4.2), terms and proposals (4.4) come later.
+ * {@code library} depends on nothing here. From Story 4.2 it stores the records a version's ingestion extracts
+ * ({@code record}, {@code record_passage}) for the {@code materials} module, through the port
+ * {@code materials.service.ExtractedRecords} that {@code service.ExtractedRecordStore} implements, so {@code materials}
+ * depends on nothing here either; and each record type's count is the records of the system's {@code ready} versions
+ * of that core type. Terms and proposals (4.4) come later.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
-        allowedDependencies = {"shared :: service", "vault :: service", "library :: service"})
+        allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service"})
 package io.github.gmshield.knowledge;

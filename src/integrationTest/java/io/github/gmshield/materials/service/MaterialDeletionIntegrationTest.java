@@ -43,7 +43,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * version, with one {@code index.removal} per version; a superseded version removed keeps the material and its ready
  * version, and an earlier reference to it reads removed and its page is not found; for the {@code material} kind, the
  * removal waits for a running claim and takes a replacement whose upload completed during the wait; a failed
- * {@code index.removal} gets a new job and its row moves to it.
+ * {@code index.removal} gets a new job and its row moves to it. Story 4.2: a material's deletion and a system's
+ * take the records of their versions with them (no reference cascades), even when an earlier pass already ran a
+ * version's removal and left its records.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so both share one application context (and its
@@ -91,6 +93,8 @@ class MaterialDeletionIntegrationTest {
     private JdbcClient jdbc;
     @Autowired
     private PlatformTransactionManager transactions;
+    @Autowired
+    private ExtractedRecords extracted;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID campaign, UUID system) {
@@ -176,6 +180,73 @@ class MaterialDeletionIntegrationTest {
         for (UUID version : List.of(first.versionId(), second, third)) {
             assertThat(count("index_removal", "version_id = ?", version)).isOne();
         }
+    }
+
+    @Test
+    void aDeletedMaterialTakesTheRecordsOfItsVersionsBeforeTheirPassagesOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID material = materialWith(a.id(), a.campaign(), null);
+        UUID ready = versionWithPage(a.id(), material, "ready", Instant.now());
+        versionFileAndPassage(a.id(), ready);
+        withRecords(a.id(), ready);
+        UUID kept = materialWith(a.id(), a.campaign(), null);
+        UUID keptVersion = versionWithPage(a.id(), kept, "ready", Instant.now());
+        versionFileAndPassage(a.id(), keptVersion);
+        withRecords(a.id(), keptVersion);
+
+        assertThat(as(a.id(), () -> materialDeletions.delete(material))).isTrue();
+        // As if an earlier pass had run the version's removal and stopped: its records are still there, so only the
+        // deletion's own removal of them lets its passages and its row go.
+        write(a.id(), () -> store.clearRemovalPending(ready, Instant.now().truncatedTo(ChronoUnit.MICROS)));
+        assertThat(count("record", "version_id = ?", ready)).isEqualTo(2);
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(material).query(UUID.class)
+                .single();
+
+        assertThat(deletion.run(a.id(), deletionId)).isTrue();
+
+        assertThat(count("material", "id = ?", material)).isZero();
+        assertThat(count("material_version", "id = ?", ready)).isZero();
+        assertThat(count("passage", "version_id = ?", ready)).isZero();
+        assertThat(count("record", "version_id = ?", ready)).isZero();
+        assertThat(count("record_passage", "owner_id = ? and record_id not in (select id from record)", a.id()))
+                .isZero();
+        assertThat(jdbc.sql("select done_at from deletion where id = ?").param(deletionId).query().singleRow()
+                .get("done_at")).isNotNull();
+        // Another material's records stay.
+        assertThat(count("record", "version_id = ?", keptVersion)).isEqualTo(2);
+        assertThat(count("record_passage", "record_id in (select id from record where version_id = ?)", keptVersion))
+                .isEqualTo(2);
+    }
+
+    @Test
+    void aDeletedSystemTakesTheRecordsOfItsMaterialsVersionsOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID system = as(a.id(), () -> library.createSystem(new Library.SystemFields("Tormenta", "20", null))).id();
+        UUID campaign = as(a.id(), () -> library.createCampaign(system, "Mesa de quinta")).orElseThrow().id();
+        UUID material = materialWith(a.id(), campaign, null);
+        UUID ready = versionWithPage(a.id(), material, "ready", Instant.now());
+        versionFileAndPassage(a.id(), ready);
+        withRecords(a.id(), ready);
+        UUID starterMaterial = materialWith(a.id(), a.campaign(), null);
+        UUID starterVersion = versionWithPage(a.id(), starterMaterial, "ready", Instant.now());
+        versionFileAndPassage(a.id(), starterVersion);
+        withRecords(a.id(), starterVersion);
+
+        assertThat(as(a.id(), () -> deletion.delete(system))).isTrue();
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(system).query(UUID.class)
+                .single();
+
+        assertThat(deletion.run(a.id(), deletionId)).isTrue();
+
+        assertThat(count("system", "id = ?", system)).isZero();
+        assertThat(count("material", "id = ?", material)).isZero();
+        assertThat(count("material_version", "id = ?", ready)).isZero();
+        assertThat(count("passage", "version_id = ?", ready)).isZero();
+        assertThat(count("record", "version_id = ?", ready)).isZero();
+        assertThat(count("record_passage", "owner_id = ? and record_id not in (select id from record)", a.id()))
+                .isZero();
+        // The starter system's material keeps its records.
+        assertThat(count("record", "version_id = ?", starterVersion)).isEqualTo(2);
     }
 
     @Test
@@ -392,6 +463,17 @@ class MaterialDeletionIntegrationTest {
                             null, List.of(0, 5)))), now)));
         });
         return List.of(fileId);
+    }
+
+    /** Two records of the version (Story 4.2), a spell and an item, from its first passage, as ingestion stores. */
+    private void withRecords(UUID owner, UUID versionId) throws Exception {
+        UUID passage = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1").param(versionId)
+                .query(UUID.class).single();
+        write(owner, () -> extracted.replaceRange(versionId, 1, 1, List.of(
+                new ExtractedRecords.Extracted("spell", "Bola de Fogo",
+                        List.of(new ExtractedRecords.Field("Nível", "3")), List.of(passage), 1),
+                new ExtractedRecords.Extracted("item", "Corda", List.of(), List.of(passage), 1))));
+        assertThat(count("record", "version_id = ?", versionId)).isEqualTo(2);
     }
 
     private String state(UUID version) {

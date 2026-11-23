@@ -21,6 +21,10 @@ import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.service.JobSweep;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
+import io.github.gmshield.knowledge.data.RecordRow;
+import io.github.gmshield.limits.data.InMemoryUsageStore;
+import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
@@ -142,6 +146,12 @@ class IngestionFlowTest {
         @Primary
         AuditStore inMemoryAudit() {
             return new InMemoryAuditStore();
+        }
+
+        @Bean
+        @Primary
+        InMemoryUsageStore inMemoryUsage() {
+            return new InMemoryUsageStore();
         }
     }
 
@@ -2281,7 +2291,7 @@ class IngestionFlowTest {
         assertThat(json(answer).toString()).isEqualTo("{\"outline\":[{\"level\":1,\"title\":\"A\",\"page\":1}],"
                 + "\"unreadable\":[{\"firstPage\":9,\"lastPage\":9},{\"firstPage\":40,\"lastPage\":41}],"
                 + "\"warnings\":[{\"code\":\"report.pages_unreadable\",\"count\":3},"
-                + "{\"code\":\"report.pages_unopened\",\"count\":2}]}");
+                + "{\"code\":\"report.pages_unopened\",\"count\":2}],\"records\":[]}");
         int stepsBefore = steps(uploaded.versionId()).size();
 
         // Matrix row "Reprocess": pages 9 and 40-41, read by two layout steps, give two new steps.
@@ -2772,6 +2782,432 @@ class IngestionFlowTest {
             report(step, claim, result);
         }
         assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    // --- Story 4.2: records
+
+    @Autowired
+    private InMemoryRecordStore records;
+    @Autowired
+    private InMemoryUsageStore usage;
+    @Autowired
+    private ExtractedRecords extracted;
+
+    @Test
+    void aRecordsStepReadsOnlyItsPagesPassagesWithTheTypeNamesAndItsRecordsAreStoredEncryptedWithTheirUsage()
+            throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null, "filename "
+                + Base64.getEncoder().encodeToString("Livro.pdf".getBytes(StandardCharsets.UTF_8)) + ",system "
+                + Base64.getEncoder().encodeToString(system.toString().getBytes(StandardCharsets.UTF_8)));
+        cleanReport(uploaded.jobId(), claim(uploaded.jobId()), 25, "2", true);
+        for (int i = 0; i < 4; i++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claim(step.jobId());
+            report(step, claim, step.stage().equals("triage") ? triage(step, step.firstPage(), step.lastPage(), List.of())
+                    : layout(step, claim, step.firstPage(), step.lastPage(), List.of()));
+        }
+        StepRow passages = passagesStep(uploaded.versionId());
+        // The passages report names one records step per ten pages, each over the passages of its pages.
+        report(passages, claim(passages.jobId()), passagesReport(passage(3, "Intro", "Prefácio"),
+                passage(12, "Fireball\nfake:record spell Fireball", "Magias", "Fireball"),
+                passage(15, "Shield\nA ward.", "Magias", "Shield"), passage(21, "Grappling\nA rule.", "Regras"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 10) + "," + recordsStep(11, 20) + ","
+                        + recordsStep(21, 25) + "]"));
+        List<PassageRow> stored = passages(uploaded.versionId());
+        assertThat(state(gm, uploaded)).isEqualTo("processing");
+        assertThat(steps(uploaded.versionId()).stream().filter(StepRow::inputPassages))
+                .extracting(StepRow::stage, StepRow::firstPage, StepRow::lastPage, StepRow::inputFileId)
+                .containsExactlyInAnyOrder(tuple("records", 1, 10, null), tuple("records", 11, 20, null),
+                        tuple("records", 21, 25, null));
+
+        UUID callId = UUID.randomUUID();
+        for (int round = 0; round < 3; round++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            assertThat(step.stage()).isEqualTo("records");
+            // Only a records step calls a model: a claim that states no provider is refused, and the job ends failed.
+            JsonNode claim = claimWithModel(step.jobId());
+            JsonNode input = claim.path("input");
+            assertThat(claim.path("model").path("provider").asString()).isEqualTo("azure-openai");
+            assertThat(jobs.row(step.jobId()).modelProvider()).isEqualTo("azure-openai");
+            assertThat(input.path("stage").asString()).isEqualTo("records");
+            assertThat(input.path("input").asString()).isEqualTo("passages");
+            assertThat(input.path("recordTypes").toString()).isEqualTo("[\"rule\",\"spell\",\"item\"]");
+            assertThat(input.path("firstPage").asInt()).isEqualTo(step.firstPage());
+            assertThat(input.path("lastPage").asInt()).isEqualTo(step.lastPage());
+            assertThat(input.has("inputFileId")).isFalse();
+            assertThat(input(step.jobId(), claim, "source").statusCode()).isEqualTo(404);
+            assertThat(input(step.jobId(), claim, "texts").statusCode()).isEqualTo(404);
+            HttpResponse<byte[]> opened = input(step.jobId(), claim, "passages");
+            assertThat(opened.statusCode()).isEqualTo(200);
+            List<JsonNode> lines = new String(opened.body(), StandardCharsets.UTF_8).lines().map(JSON::readTree).toList();
+            // Matrix row "Spell pages": only the passages of the step's own pages, with their backend ids.
+            assertThat(lines).allSatisfy(line -> assertThat(line.path("page").asInt())
+                    .isBetween(step.firstPage(), step.lastPage()));
+            if (step.firstPage() == 1) {
+                assertThat(lines).extracting(line -> line.path("id").asString())
+                        .containsExactly(stored.get(0).id().toString());
+                // Matrix row "Prose only": no record, and the passages stay.
+                report(step, claim, "{\"pipelineVersion\":\"2\",\"records\":[],\"next\":[]}");
+            } else if (step.firstPage() == 11) {
+                assertThat(lines).extracting(line -> line.path("id").asString(), line -> line.path("text").asString(),
+                        line -> line.path("sectionPath").toString()).containsExactly(
+                        tuple(stored.get(1).id().toString(), "Fireball\nfake:record spell Fireball",
+                                "[\"Magias\",\"Fireball\"]"),
+                        tuple(stored.get(2).id().toString(), "Shield\nA ward.", "[\"Magias\",\"Shield\"]"));
+                // The usage comes with the outcome, counted once per worker-minted call id however often it is sent.
+                HttpResponse<String> reported = outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":"
+                        + recordsReport(record("spell", "Fireball", stored.get(1).id(), "Level", "3"),
+                        record("spell", "Shield", stored.get(2).id(), "Level", "1", "Casting time", "1 reaction"))
+                        + ",\"usage\":[" + callUsage(callId) + "," + callUsage(callId) + "]}");
+                assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+            } else {
+                report(step, claim, recordsReport(record("rule", "Grappling", stored.get(3).id(), "Check",
+                        "Athletics")));
+            }
+        }
+
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(usage.rows.get(callId)).satisfies(row -> {
+            assertThat(row.ownerId()).isEqualTo(gm.id());
+            assertThat(row.provider()).isEqualTo("azure-openai");
+            assertThat(row.input()).isEqualTo(1200);
+        });
+        assertThat(usage.rows.values().stream().filter(row -> row.callId().equals(callId))).hasSize(1);
+        List<RecordRow> rows = recordsOf(uploaded.versionId());
+        assertThat(rows).extracting(RecordRow::type, RecordRow::firstPage, RecordRow::passageIds).containsExactly(
+                tuple("spell", 12, List.of(stored.get(1).id())), tuple("spell", 15, List.of(stored.get(2).id())),
+                tuple("rule", 21, List.of(stored.get(3).id())));
+        assertThat(rows).allSatisfy(row -> assertThat(row.ownerId()).isEqualTo(gm.id()));
+        RecordRow shield = rows.get(1);
+        // Matrix row "Encrypted": the name and the fields are vault ciphertexts, bound to the record.
+        assertThat(new String(shield.name(), StandardCharsets.ISO_8859_1)).doesNotContain("Shield");
+        assertThat(new String(shield.fields(), StandardCharsets.ISO_8859_1)).doesNotContain("reaction");
+        assertThat(vault.decryptText(new Binding("record", "name", shield.id(), gm.id()), shield.name()))
+                .isEqualTo("Shield");
+        assertThat(JSON.readTree(vault.decrypt(new Binding("record", "fields", shield.id(), gm.id()), shield.fields()))
+                .toString()).isEqualTo("[{\"name\":\"Level\",\"value\":\"1\"},{\"name\":\"Casting time\","
+                        + "\"value\":\"1 reaction\"}]");
+        assertThat(passages(uploaded.versionId())).isEqualTo(stored);
+
+        // The quality report lists the counts by type; the records tab counts nothing until the GM accepts.
+        JsonNode reportView = json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report"));
+        assertThat(reportView.path("records").toString())
+                .isEqualTo("[{\"type\":\"rule\",\"count\":1},{\"type\":\"spell\",\"count\":2}]");
+        assertThat(reportView.path("warnings").toString()).doesNotContain("records_unread");
+        assertThat(recordCounts(gm, system)).containsEntry("spell", 0L).containsEntry("rule", 0L);
+        accept(gm, uploaded);
+        assertThat(recordCounts(gm, system)).containsEntry("rule", 1L).containsEntry("spell", 2L)
+                .containsEntry("item", 0L).containsEntry("creature", 0L);
+        // Ids and counts only: never a name, a field or a passage's text in the log.
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Shield")
+                || String.valueOf(event.getKeyValuePairs()).contains("Shield")
+                || String.valueOf(event.getKeyValuePairs()).contains("reaction"));
+    }
+
+    @Test
+    void aCampaignMaterialsRecordsCountUnderItsSystemOnceAccepted() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        String campaign = json(get(gm, "/api/v1/campaigns")).path("items").get(0).path("id").asString();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Campanha.pdf", null, "filename "
+                + Base64.getEncoder().encodeToString("Campanha.pdf".getBytes(StandardCharsets.UTF_8)) + ",campaign "
+                + Base64.getEncoder().encodeToString(campaign.getBytes(StandardCharsets.UTF_8)));
+        StepRow passages = passagesStepAfterReading(uploaded, 2);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Bless", "Magias"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 2) + "]"));
+        StepRow step = offeredStep(uploaded.versionId());
+        report(step, claimWithModel(step.jobId()), recordsReport(record("spell", "Bless",
+                passages(uploaded.versionId()).getFirst().id())));
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(recordCounts(gm, system)).containsEntry("spell", 0L);
+
+        accept(gm, uploaded);
+
+        // The material belongs to the system's campaign, not to the system itself: its records count there too.
+        assertThat(recordCounts(gm, system)).containsEntry("spell", 1L).containsEntry("rule", 0L);
+    }
+
+    @Test
+    void aRecordsStepClaimedWithoutTheProviderEndsAndOnlyItsPagesAreUnread() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 2);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Um", "A"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 2) + "]"));
+        StepRow step = offeredStep(uploaded.versionId());
+        // No provider stated: the claim is refused, no attempt is used, and the step ends as a failed records step.
+        HttpResponse<String> refused = worker("POST", "/internal/v1/jobs/" + step.jobId() + "/claims", null);
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
+        assertThat(jobs.row(step.jobId()).state()).isEqualTo("failed");
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report")).path("warnings").toString())
+                .contains("{\"code\":\"report.records_unread\",\"count\":2}");
+    }
+
+    @Test
+    void aRecordsReportThatBreaksARuleIsRefusedAndKeepsNothing() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 12);
+        // A records step over a file, or another stage over passages, is refused with the passages report.
+        for (String next : List.of("{\"stage\":\"records\",\"firstPage\":1,\"lastPage\":10,\"input\":\""
+                + UUID.randomUUID() + "\"}", "{\"stage\":\"layout\",\"firstPage\":1,\"lastPage\":10,\"input\":"
+                + "\"passages\"}", "{\"stage\":\"records\",\"input\":\"passages\"}")) {
+            HttpResponse<String> answer = outcome(passages.jobId(), claim(passages.jobId()), "{\"outcome\":\"done\","
+                    + "\"result\":" + passagesReport(passage(1, "Um", "A")).replace("\"next\":[]", "\"next\":["
+                    + next + "]") + "}");
+            assertThat(answer.statusCode()).as(next).isEqualTo(400);
+            assertThat(json(answer).path("code").asString()).isEqualTo("job.result_invalid");
+            jobs.rows.computeIfPresent(passages.jobId(), (id, row) -> row.released("offered", null, row.updatedAt()));
+        }
+        // A step that is not a records step reports no records, not even none.
+        HttpResponse<String> withRecords = outcome(passages.jobId(), claim(passages.jobId()), "{\"outcome\":\"done\","
+                + "\"result\":" + passagesReport(passage(1, "Um", "A")).replace("\"next\":[]", "\"next\":[],"
+                + "\"records\":[]") + "}");
+        assertThat(withRecords.statusCode()).as(withRecords.body()).isEqualTo(400);
+        assertThat(json(withRecords).path("code").asString()).isEqualTo("job.result_invalid");
+        jobs.rows.computeIfPresent(passages.jobId(), (id, row) -> row.released("offered", null, row.updatedAt()));
+        assertThat(passages(uploaded.versionId())).isEmpty();
+        report(passages, claim(passages.jobId()), passagesReport(passage(2, "Um", "A"), passage(11, "Dois", "B"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 10) + "," + recordsStep(11, 12) + "]"));
+        List<PassageRow> stored = passages(uploaded.versionId());
+        StepRow step = offeredStep(uploaded.versionId());
+        JsonNode claim = claimWithModel(step.jobId());
+        UUID own = step.firstPage() == 1 ? stored.get(0).id() : stored.get(1).id();
+        UUID otherRun = step.firstPage() == 1 ? stored.get(1).id() : stored.get(0).id();
+        // Matrix row "Bad output": an unknown type, a blank name, a passage id that was not given, a bad field.
+        for (String bad : List.of(record("creature", "Goblin", own), record("monster", "Goblin", own),
+                record("spell", "  ", own), record("spell", "Fireball", otherRun),
+                record("spell", "Fireball", UUID.randomUUID()), record("spell", "Fireball", own, "Level", " "),
+                "{\"type\":\"spell\",\"name\":\"Fireball\",\"fields\":[],\"passageIds\":[]}",
+                "{\"type\":\"spell\",\"name\":\"Fireball\",\"fields\":[],\"passageIds\":[\"" + own + "\",\"" + own
+                        + "\"]}")) {
+            HttpResponse<String> answer = outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":"
+                    + recordsReport(record("spell", "Shield", own), bad) + "}");
+            assertThat(answer.statusCode()).as(bad).isEqualTo(400);
+            assertThat(json(answer).path("code").asString()).isEqualTo("job.result_invalid");
+        }
+        // A records step must report records; a step that is not one must not.
+        assertThat(outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":{\"pipelineVersion\":\"2\","
+                + "\"next\":[]}}").statusCode()).isEqualTo(400);
+        // And it reports nothing but its records: passages would replace the version's, next steps start new ones.
+        for (String extra : List.of("\"passages\":[" + passage(2, "Outro", "A") + "],\"outline\":[]",
+                "\"next\":[" + recordsStep(1, 10) + "]", "\"pages\":[{\"firstPage\":1,\"lastPage\":1,"
+                        + "\"outcome\":\"read_directly\"}]")) {
+            HttpResponse<String> answer = outcome(step.jobId(), claim, "{\"outcome\":\"done\",\"result\":"
+                    + recordsReport(record("spell", "Shield", own)).replace("\"next\":[]", extra.startsWith("\"next")
+                    ? extra : "\"next\":[]," + extra) + "}");
+            assertThat(answer.statusCode()).as(extra).isEqualTo(400);
+            assertThat(json(answer).path("code").asString()).isEqualTo("job.result_invalid");
+        }
+        assertThat(passages(uploaded.versionId())).isEqualTo(stored);
+        assertThat(steps(uploaded.versionId())).filteredOn(StepRow::inputPassages).hasSize(2);
+        assertThat(recordsOf(uploaded.versionId())).isEmpty();
+        report(step, claim, recordsReport(record("spell", "Shield", own)));
+        assertThat(recordsOf(uploaded.versionId())).hasSize(1);
+        StepRow second = offeredStep(uploaded.versionId());
+        JsonNode secondClaim = claimWithModel(second.jobId());
+        report(second, secondClaim, "{\"pipelineVersion\":\"2\",\"records\":[],\"next\":[]}");
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(logged.list).noneMatch(event -> String.valueOf(event.getKeyValuePairs()).contains("Goblin"));
+    }
+
+    @Test
+    void aRecordsStepThatFailsForGoodLeavesTheVersionWithItsPassagesAndWarnsRecordsUnread() throws Exception {
+        Gm gm = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        StepRow passages = passagesStepAfterReading(uploaded, 14);
+        report(passages, claim(passages.jobId()), passagesReport(passage(2, "Um", "A"), passage(12, "Dois", "B"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 10) + "," + recordsStep(11, 14) + "]"));
+        for (int round = 0; round < 2; round++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claimWithModel(step.jobId());
+            if (step.firstPage() == 1) {
+                // An outage is retried; a refusal (or a truncation) ends the step at once, with its usage.
+                HttpResponse<String> outage = outcome(step.jobId(), claim, "{\"outcome\":\"failed\",\"code\":"
+                        + "\"model.unavailable\"}");
+                assertThat(outage.statusCode()).as(outage.body()).isEqualTo(204);
+                assertThat(jobs.row(step.jobId()).state()).isIn("waiting", "offered");
+                jobs.rows.computeIfPresent(step.jobId(), (id, row) -> row.released("offered", null, row.updatedAt()));
+                JsonNode again = claimWithModel(step.jobId());
+                UUID call = UUID.randomUUID();
+                HttpResponse<String> refused = outcome(step.jobId(), again, "{\"outcome\":\"failed\",\"code\":"
+                        + "\"model.refused\",\"retry\":false,\"usage\":[" + callUsage(call) + "]}");
+                assertThat(refused.statusCode()).as(refused.body()).isEqualTo(204);
+                assertThat(jobs.row(step.jobId()).state()).isEqualTo("failed");
+                assertThat(usage.rows).containsKey(call);
+            } else {
+                report(step, claim, recordsReport(record("item", "Rope", passages(uploaded.versionId()).get(1).id())));
+            }
+        }
+        // Matrix row "Step fails for good": the version completes with its passages, and the report warns.
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+        assertThat(passages(uploaded.versionId())).hasSize(2);
+        JsonNode reportView = json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/report"));
+        assertThat(reportView.path("warnings").toString()).contains("{\"code\":\"report.records_unread\",\"count\":10}");
+        assertThat(reportView.path("records").toString()).isEqualTo("[{\"type\":\"item\",\"count\":1}]");
+        assertThat(actions(gm, uploaded)).contains("accept");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.records_unread"));
+    }
+
+    @Test
+    void reprocessAndARestartAndADiscardRemoveTheVersionsRecordsFirst() throws Exception {
+        Gm gm = signUp();
+        // Reprocess: page 2 unreadable; the records go, and so do the unread marks.
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        withRecords(gm, uploaded, List.of(2));
+        assertThat(recordsOf(uploaded.versionId())).hasSize(1);
+        assertThat(steps(uploaded.versionId())).anyMatch(StepRow::recordsUnread);
+        HttpResponse<String> reprocessed = act(gm, uploaded, "reprocess");
+        assertThat(reprocessed.statusCode()).as(reprocessed.body()).isEqualTo(200);
+        assertThat(recordsOf(uploaded.versionId())).isEmpty();
+        assertThat(passages(uploaded.versionId())).isEmpty();
+        assertThat(steps(uploaded.versionId())).noneMatch(StepRow::recordsUnread);
+        // The reprocess's steps would hold the ingestion lane.
+        endEveryUnendedJob();
+
+        // A restart (a report under another pipeline) removes them too.
+        Uploaded restarted = upload(gm, pdf(MIB), "Outro.pdf", null);
+        StepRow passages = passagesStepAfterReading(restarted, 3);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Um", "A"), passage(3, "Tres", "B"))
+                .replace("\"next\":[]", "\"next\":[" + recordsStep(1, 1) + "," + recordsStep(2, 3) + "]"));
+        StepRow first = offeredStep(restarted.versionId());
+        assertThat(first.firstPage()).isEqualTo(1);
+        report(first, claimWithModel(first.jobId()), recordsReport(record("spell", "Bless",
+                passages(restarted.versionId()).get(0).id())));
+        assertThat(recordsOf(restarted.versionId())).hasSize(1);
+        StepRow second = offeredStep(restarted.versionId());
+        report(second, claimWithModel(second.jobId()), "{\"pipelineVersion\":\"3\",\"records\":[],\"next\":[]}");
+        assertThat(steps(restarted.versionId())).filteredOn(step -> step.endedAt() == null)
+                .extracting(StepRow::stage).containsExactly("clean");
+        assertThat(recordsOf(restarted.versionId())).isEmpty();
+        assertThat(passages(restarted.versionId())).isEmpty();
+        endEveryUnendedJob();
+
+        // A discard removes them with the rest of the version.
+        Uploaded discarded = upload(gm, pdf(MIB), "Terceiro.pdf", null);
+        withRecords(gm, discarded, List.of());
+        assertThat(recordsOf(discarded.versionId())).hasSize(1);
+        HttpResponse<String> gone = act(gm, discarded, "discard");
+        assertThat(gone.statusCode()).as(gone.body()).isEqualTo(200);
+        assertThat(recordsOf(discarded.versionId())).isEmpty();
+        assertThat(passages(discarded.versionId())).isEmpty();
+    }
+
+    @Test
+    void theSameRunReportedAgainReplacesItsRecordsAndAnotherOwnerSeesNone() throws Exception {
+        Gm gm = signUp();
+        Gm other = signUp();
+        Uploaded uploaded = upload(gm, pdf(MIB), "Livro.pdf", null);
+        withRecords(gm, uploaded, List.of());
+        UUID passageId = passages(uploaded.versionId()).getFirst().id();
+        List<ExtractedRecords.Extracted> two = List.of(
+                new ExtractedRecords.Extracted("spell", "Bless", List.of(), List.of(passageId), 1),
+                new ExtractedRecords.Extracted("item", "Rope", List.of(new ExtractedRecords.Field("Weight", "10 lb")),
+                        List.of(passageId), 1));
+        // Matrix row "Repeat": the same run's records are replaced, never added to.
+        for (int round = 0; round < 2; round++) {
+            OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                    extracted.replaceRange(uploaded.versionId(), 1, 2, two)));
+        }
+        assertThat(recordsOf(uploaded.versionId())).extracting(RecordRow::type).containsExactly("spell", "item");
+        // Another owner's call sees and removes nothing of it.
+        assertThat(OwnerContext.callAs(other.id(), () -> extracted.countsByType(List.of(uploaded.versionId()))))
+                .isEmpty();
+        Integer removed = OwnerContext.callAs(other.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.removeVersion(uploaded.versionId())));
+        assertThat(removed).isZero();
+        assertThat(OwnerContext.callAs(gm.id(), () -> extracted.countsByType(List.of(uploaded.versionId()))))
+                .containsEntry("spell", 1L).containsEntry("item", 1L);
+    }
+
+    /**
+     * A PDF of two pages read to review, {@code unreadable} pages unreadable, with one passage on page 1 and one records
+     * step over both pages that reports one spell from it; with an unreadable page, a second records step (pages 2 to
+     * 2) fails for good first.
+     */
+    private void withRecords(Gm gm, Uploaded uploaded, List<Integer> unreadable) throws Exception {
+        JsonNode cleanClaim = claim(uploaded.jobId());
+        UUID original = output(uploaded.jobId(), cleanClaim, pdf(4000));
+        UUID batch = output(uploaded.jobId(), cleanClaim, pdf(3000));
+        report(steps(uploaded.versionId()).getFirst(), cleanClaim, "{\"pipelineVersion\":\"2\",\"pageTotal\":2,"
+                + "\"original\":{\"fileId\":\"" + original + "\"},\"batches\":[{\"fileId\":\"" + batch
+                + "\",\"firstPage\":1,\"lastPage\":2}],\"next\":[{\"stage\":\"triage\",\"firstPage\":1,\"lastPage\":2,"
+                + "\"input\":\"" + batch + "\"}," + passagesStep(2) + "]}");
+        StepRow triage = offeredStep(uploaded.versionId());
+        report(triage, claim(triage.jobId()), triage(triage, 1, 2, List.of()));
+        StepRow layout = offeredStep(uploaded.versionId());
+        JsonNode layoutClaim = claim(layout.jobId());
+        report(layout, layoutClaim, layout(layout, layoutClaim, 1, 2, unreadable));
+        StepRow passages = offeredStep(uploaded.versionId());
+        String next = unreadable.isEmpty() ? recordsStep(1, 2) : recordsStep(1, 1) + "," + recordsStep(2, 2);
+        report(passages, claim(passages.jobId()), passagesReport(passage(1, "Um", "A"))
+                .replace("\"outline\":[]", "\"outline\":[" + section(1, "A", 1) + "]")
+                .replace("\"next\":[]", "\"next\":[" + next + "]"));
+        for (int round = 0; round < (unreadable.isEmpty() ? 1 : 2); round++) {
+            StepRow step = offeredStep(uploaded.versionId());
+            JsonNode claim = claimWithModel(step.jobId());
+            if (step.firstPage() == 2) {
+                assertThat(outcome(step.jobId(), claim, "{\"outcome\":\"failed\",\"code\":\"model.truncated\","
+                        + "\"retry\":false}").statusCode()).isEqualTo(204);
+            } else {
+                report(step, claim, recordsReport(record("spell", "Bless", passages(uploaded.versionId()).getFirst()
+                        .id(), "Level", "1")));
+            }
+        }
+        assertThat(state(gm, uploaded)).isEqualTo("needs_review");
+    }
+
+    private static String recordsStep(int first, int last) {
+        return "{\"stage\":\"records\",\"firstPage\":" + first + ",\"lastPage\":" + last + ",\"input\":\"passages\"}";
+    }
+
+    private static String recordsReport(String... found) {
+        return "{\"pipelineVersion\":\"2\",\"records\":[" + String.join(",", found) + "],\"next\":[]}";
+    }
+
+    /** A record of {@code type} named {@code name} from one passage, with fields as name, value, name, value... */
+    private static String record(String type, String name, UUID passageId, String... fields) {
+        StringBuilder pairs = new StringBuilder();
+        for (int i = 0; i + 1 < fields.length; i += 2) {
+            pairs.append(pairs.isEmpty() ? "" : ",").append("{\"name\":\"").append(fields[i])
+                    .append("\",\"value\":\"").append(fields[i + 1]).append("\"}");
+        }
+        return "{\"type\":\"" + type + "\",\"name\":\"" + name + "\",\"fields\":[" + pairs + "],\"passageIds\":[\""
+                + passageId + "\"]}";
+    }
+
+    private static String callUsage(UUID callId) {
+        return "{\"callId\":\"" + callId + "\",\"responseId\":\"chatcmpl-1\",\"input\":1200,\"cacheRead\":0,"
+                + "\"cacheWrite\":0,\"output\":300,\"reasoning\":0}";
+    }
+
+    /** A claim that states the provider the test mode resolves: a records step calls a model. */
+    private JsonNode claimWithModel(UUID jobId) throws Exception {
+        HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + jobId + "/claims",
+                "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
+                "application/json");
+        assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        return json(claimed);
+    }
+
+    private List<RecordRow> recordsOf(UUID versionId) {
+        return records.records.values().stream().filter(row -> row.versionId().equals(versionId))
+                .sorted(Comparator.comparingInt(RecordRow::firstPage).thenComparingInt(RecordRow::ordinal)).toList();
+    }
+
+    private UUID starterSystem(Gm gm) throws Exception {
+        return UUID.fromString(json(get(gm, "/api/v1/systems")).path("items").get(0).path("id").asString());
+    }
+
+    /** The record count of each core type of the system's records tab. */
+    private Map<String, Long> recordCounts(Gm gm, UUID system) throws Exception {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("items")
+                .forEach(item -> counts.put(item.path("core").asString(), item.path("records").asLong()));
+        return counts;
     }
 
     // --- Story 2.1: the index

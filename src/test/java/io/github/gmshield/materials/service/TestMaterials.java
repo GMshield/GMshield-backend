@@ -25,6 +25,24 @@ public final class TestMaterials {
     private TestMaterials() {
     }
 
+    /** Records that are never stored (Story 4.2), for the tests that build the services by hand. */
+    public static final ExtractedRecords NO_RECORDS = new ExtractedRecords() {
+        @Override
+        public int replaceRange(UUID versionId, int firstPage, int lastPage, List<Extracted> records) {
+            return 0;
+        }
+
+        @Override
+        public int removeVersion(UUID versionId) {
+            return 0;
+        }
+
+        @Override
+        public java.util.Map<String, Long> countsByType(Collection<UUID> versionIds) {
+            return java.util.Map.of();
+        }
+    };
+
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */
     public static Optional<Materials.Passage> passage(Materials materials, UUID id) {
         return materials.passage(id);

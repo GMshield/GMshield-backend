@@ -11,8 +11,8 @@ import org.hibernate.annotations.TenantId;
 /**
  * {@code ingestion_step} (Story 1.15): Hibernate fills {@code owner_id} from the owner of the work and filters every
  * query by it. Its version is a plain id: the database's key on (owner, version) keeps it within the same owner.
- * Written once; only {@code ended_at} changes, once (Story 1.16), and a held step's {@code job_id}, once, when its job
- * is created (Story 1.18).
+ * Written once; only {@code ended_at} changes, once (Story 1.16), a held step's {@code job_id}, once, when its job
+ * is created (Story 1.18), and a records step's {@code records_unread} (Story 4.2).
  */
 @Entity(name = "IngestionStep")
 @Table(name = "ingestion_step")
@@ -47,6 +47,12 @@ class IngestionStepEntity {
     @Column(name = "input_texts", nullable = false, updatable = false)
     private boolean inputTexts;
 
+    @Column(name = "input_passages", nullable = false, updatable = false)
+    private boolean inputPassages;
+
+    @Column(name = "records_unread", nullable = false)
+    private boolean recordsUnread;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -67,6 +73,8 @@ class IngestionStepEntity {
         this.lastPage = row.lastPage();
         this.inputFileId = row.inputFileId();
         this.inputTexts = row.inputTexts();
+        this.inputPassages = row.inputPassages();
+        this.recordsUnread = row.recordsUnread();
         this.createdAt = row.createdAt();
         this.endedAt = row.endedAt();
     }
@@ -87,8 +95,15 @@ class IngestionStepEntity {
         return true;
     }
 
+    /** A records step's pages are unread, or read again (Story 4.2); any other step keeps false. */
+    void unread(boolean unread) {
+        if (inputPassages) {
+            recordsUnread = unread;
+        }
+    }
+
     StepRow row() {
-        return new StepRow(id, ownerId, versionId, jobId, stage, firstPage, lastPage, inputFileId, inputTexts, createdAt,
-                endedAt);
+        return new StepRow(id, ownerId, versionId, jobId, stage, firstPage, lastPage, inputFileId, inputTexts,
+                inputPassages, recordsUnread, createdAt, endedAt);
     }
 }

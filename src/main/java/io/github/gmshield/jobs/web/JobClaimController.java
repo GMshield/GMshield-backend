@@ -113,7 +113,16 @@ class JobClaimController {
             @Schema(description = "For failed only: category.reason in lower case") String code,
             @Schema(description = "For failed only: false ends the job at once, without another attempt (an input no"
                     + " attempt can change); absent or true lets the backend retry while attempts remain") Boolean retry,
-            @Schema(description = "For done only: the result for the job's handler") Map<String, Object> result) {
+            @Schema(description = "For done only: the result for the job's handler") Map<String, Object> result,
+            @ArraySchema(maxItems = JobClaims.MAX_USAGE, arraySchema = @Schema(description = "The usage of the"
+                    + " attempt's model calls not posted with events (contract 1.17.0), done or failed, recorded once"
+                    + " per call id; absent means none"), schema = @Schema(implementation = JobCallUsage.class))
+            List<JobCallUsage> usage) {
+
+        @Override
+        public String toString() {
+            return "JobOutcome[outcome=" + outcome + "]";
+        }
     }
 
     @Schema(name = "JobStreamEvent", requiredProperties = "type", description = "One answer event (contract 1.10.0): a"
@@ -222,7 +231,9 @@ class JobClaimController {
                                  @RequestHeader(name = GRANT_HEADER, required = false) String grant,
                                  @RequestBody JobOutcome body) {
         JsonNode result = body.result() == null ? null : JSON.valueToTree(body.result());
-        claims.report(jobId, claimId, grant, body.outcome(), body.code(), body.retry(), result);
+        List<CallUsage> usage = body.usage() == null ? List.of()
+                : body.usage().stream().map(call -> call == null ? null : call.usage()).toList();
+        claims.report(jobId, claimId, grant, body.outcome(), body.code(), body.retry(), result, usage);
         return ResponseEntity.noContent().build();
     }
 
