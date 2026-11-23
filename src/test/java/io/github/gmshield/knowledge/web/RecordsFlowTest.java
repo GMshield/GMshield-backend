@@ -56,6 +56,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.KeyValuePair;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -234,7 +235,7 @@ class RecordsFlowTest {
                 || String.valueOf(event.getKeyValuePairs()).contains("Bola")
                 || String.valueOf(event.getKeyValuePairs()).contains("Grimório"));
         assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.records_listed")
-                && String.valueOf(event.getKeyValuePairs()).matches(".*total=\"?46\"?.*"));
+                && hasPair(event, "total", 46L));
     }
 
     // --- empty type
@@ -503,7 +504,7 @@ class RecordsFlowTest {
         assertProblem(get(path + "/pages/1", gm.session()), 404, "request.not_found");
         assertThat(bytes(path + "/pages/1/picture", gm.session()).statusCode()).isEqualTo(404);
         assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.records_listed")
-                && String.valueOf(event.getKeyValuePairs()).matches(".*found=\"?false\"?.*"));
+                && hasPair(event, "found", false));
     }
 
     // --- helpers: records
@@ -552,6 +553,12 @@ class RecordsFlowTest {
                 null, vault.encryptText(new Binding("record_type", "name", id, gm.id()), name),
                 vault.fingerprint("record_type", "name", Library.uniqueForm(name)), 0, Instant.now()))));
         return id;
+    }
+
+    /** Whether a log event carries this key with this value (no pattern over the pairs' text, Sonar S8786). */
+    private static boolean hasPair(ILoggingEvent event, String key, Object value) {
+        List<KeyValuePair> pairs = event.getKeyValuePairs();
+        return pairs != null && pairs.stream().anyMatch(pair -> key.equals(pair.key) && value.equals(pair.value));
     }
 
     /** Every property name of a JSON tree, by path, so two answers' shapes compare. */
