@@ -57,7 +57,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       failed run is not counted here.</li>
  *   <li>{@link #failed} (indexing at worker start): how many passages of these versions are in runs whose job failed,
  *       counted the same way, and whether a retry of one of them remains (fewer than
- *       {@link IndexChangeRow#MAX_RETRIES} retries); none is empty.</li>
+ *       {@link IndexChangeRow#MAX_RETRIES} retries); none is empty. These three read passages runs only: a records
+ *       run (Story 4.2 part B) changes none of them until Story 4.3.</li>
  *   <li>{@link #passages}: passages by id, checked before anything is decrypted: every id must be a passage of the
  *       owner, of one of the given versions, and that version {@code ready}; otherwise nothing is read.</li>
  *   <li>{@link #places} (Story 2.5): where cited passages stand, filtered rather than refused: a passage that is not
@@ -285,12 +286,12 @@ public class ScopeReads {
             Set<UUID> versions = new LinkedHashSet<>(versionIds);
             List<UUID> pending = new ArrayList<>();
             for (UUID versionId : versions) {
-                for (int[] range : merged(IndexChanges.unended(index, unendedJobs, versionId))) {
+                for (int[] range : merged(passageRuns(IndexChanges.unended(index, unendedJobs, versionId)))) {
                     pending.addAll(materials.passageIds(versionId, range[0], range[1]));
                 }
             }
             for (UUID versionId : versions) {
-                for (int[] range : merged(IndexChanges.failed(index, failedJobs, versionId))) {
+                for (int[] range : merged(passageRuns(IndexChanges.failed(index, failedJobs, versionId)))) {
                     pending.addAll(materials.passageIds(versionId, range[0], range[1]));
                 }
             }
@@ -309,7 +310,7 @@ public class ScopeReads {
         return reading(() -> {
             long remaining = 0;
             for (UUID versionId : new LinkedHashSet<>(versionIds)) {
-                for (int[] range : merged(IndexChanges.unended(index, unendedJobs, versionId))) {
+                for (int[] range : merged(passageRuns(IndexChanges.unended(index, unendedJobs, versionId)))) {
                     remaining += materials.countPassages(versionId, range[0], range[1]);
                 }
             }
@@ -330,7 +331,7 @@ public class ScopeReads {
             long passages = 0;
             boolean retrying = false;
             for (UUID versionId : new LinkedHashSet<>(versionIds)) {
-                List<IndexChangeRow> runs = IndexChanges.failed(index, failedJobs, versionId);
+                List<IndexChangeRow> runs = passageRuns(IndexChanges.failed(index, failedJobs, versionId));
                 retrying |= runs.stream().anyMatch(run -> run.retries() < IndexChangeRow.MAX_RETRIES);
                 for (int[] range : merged(runs)) {
                     passages += materials.countPassages(versionId, range[0], range[1]);
@@ -339,6 +340,14 @@ public class ScopeReads {
             return passages == 0 ? Optional.<IndexingFailure>empty()
                     : Optional.of(new IndexingFailure(Math.toIntExact(passages), retrying));
         });
+    }
+
+    /**
+     * The passages runs among these: until Story 4.3 reads records, a records run (Story 4.2 part B), pending or failed,
+     * changes neither the keyword fallback nor the GM's notices.
+     */
+    private static List<IndexChangeRow> passageRuns(List<IndexChangeRow> runs) {
+        return runs.stream().filter(run -> !run.records()).toList();
     }
 
     /**

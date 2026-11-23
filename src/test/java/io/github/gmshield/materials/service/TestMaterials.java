@@ -41,6 +41,16 @@ public final class TestMaterials {
         public java.util.Map<String, Long> countsByType(Collection<UUID> versionIds) {
             return java.util.Map.of();
         }
+
+        @Override
+        public List<Integer> firstPages(UUID versionId) {
+            return List.of();
+        }
+
+        @Override
+        public List<Stored> readRange(UUID versionId, int firstPage, int lastPage) {
+            return List.of();
+        }
     };
 
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */

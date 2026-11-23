@@ -42,6 +42,18 @@ public interface ExtractedRecords {
     }
 
     /**
+     * One stored record as the index reads it (Story 4.2 part B): its id, its core type's key, its first page, its name
+     * and its fields in order, decrypted. {@code toString} names no content.
+     */
+    @NamedInterface("service")
+    record Stored(UUID id, String type, int firstPage, String name, List<Field> fields) {
+        @Override
+        public String toString() {
+            return "Stored[id=" + id + ", type=" + type + ", firstPage=" + firstPage + ", fields=" + fields.size() + "]";
+        }
+    }
+
+    /**
      * The version's records whose first page is within {@code firstPage} to {@code lastPage} become {@code records}, in
      * that order (a records step's report, Story 4.2: the same step reported again replaces its records, never adds to
      * them). Answers how many records went.
@@ -53,4 +65,16 @@ public interface ExtractedRecords {
 
     /** How many records each of these versions' records has by core type key; a type with none is left out. */
     Map<String, Long> countsByType(Collection<UUID> versionIds);
+
+    /**
+     * The first page of each of the version's records, one entry per record, by first page then ordinal (how the index
+     * cuts its records runs, Story 4.2 part B); empty for a version with none.
+     */
+    List<Integer> firstPages(UUID versionId);
+
+    /**
+     * The version's records whose first page is within {@code firstPage} to {@code lastPage}, decrypted, in the order of
+     * {@link #firstPages} (one records run's input, Story 4.2 part B). Only the index job's input reads them.
+     */
+    List<Stored> readRange(UUID versionId, int firstPage, int lastPage);
 }
