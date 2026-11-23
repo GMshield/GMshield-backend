@@ -30,10 +30,13 @@ val boundaryFixtures: SourceSet by sourceSets.creating
 
 // Integration tests (Story 1.11): run against a real PostgreSQL and Redis at the test-mode hosts
 // (postgres:5432, redis:6379), never by `check`. The pipeline's integration stage runs them in the
-// Dockerfile's `integration` stage beside throwaway services.
+// Dockerfile's `integration` stage beside throwaway services. The unit tests' classes are on their classpath too:
+// CrossOwnerAuditIntegrationTest runs CrossOwnerAuditFlowTest's routes, probes and worlds on PostgreSQL, shared
+// rather than copied (Gradle runs only this source set's own test classes). A bean in the test sources must be
+// @Profile("unit"), @TestConfiguration or @TestComponent, or component scanning puts it in every integration context.
 val integrationTest: SourceSet by sourceSets.creating {
-    compileClasspath += sourceSets.main.get().output
-    runtimeClasspath += sourceSets.main.get().output
+    compileClasspath += sourceSets.main.get().output + sourceSets.test.get().output
+    runtimeClasspath += sourceSets.main.get().output + sourceSets.test.get().output
 }
 configurations[integrationTest.implementationConfigurationName].extendsFrom(configurations.testImplementation.get())
 configurations[integrationTest.runtimeOnlyConfigurationName].extendsFrom(configurations.testRuntimeOnly.get())

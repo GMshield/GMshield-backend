@@ -2,7 +2,7 @@ package io.github.gmshield;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.gmshield.accounts.data.AccountRow;
+import io.github.gmshield.CrossOwnerAuditStores.Step;
 import io.github.gmshield.accounts.data.AccountStore;
 import io.github.gmshield.accounts.data.InMemoryAccountStore;
 import io.github.gmshield.accounts.data.InMemorySessionStore;
@@ -15,11 +15,9 @@ import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.conversations.data.InMemoryConversationStore;
 import io.github.gmshield.conversations.data.InMemorySearchStore;
 import io.github.gmshield.conversations.data.InMemoryTurnReferenceStore;
-import io.github.gmshield.conversations.data.SearchRow;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
-import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
@@ -29,8 +27,6 @@ import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.InMemoryUploadStorage;
 import io.github.gmshield.materials.data.MaterialTestStores;
-import io.github.gmshield.materials.data.PassageRow;
-import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.scope.data.InMemoryScopeStore;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
@@ -47,7 +43,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -87,8 +82,13 @@ import tools.jackson.databind.node.ObjectNode;
  * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
  * a random id on that route (the trace id aside), and a route with a container and an item ({@code own}) answers the
  * same with B's own container. B's body and header fields that name an item ({@link #probes}) answer exactly what a
- * random id gets. Afterwards every in-memory table is as it was (no job, no event, no row, no version, bookmark,
- * dismissal or last question changed), A reads back each item unchanged, and B's own lists hold none of A's ids.
+ * random id gets. Afterwards the compared tables ({@link CrossOwnerAuditStores#tables}) are as they were (no job, no
+ * event, no row, no version, bookmark, dismissal or last question changed), A reads back each item unchanged, and B's
+ * own lists hold none of A's ids.
+ *
+ * <p>Here the audit runs on the in-memory twins of the stores ({@link InMemoryCrossOwnerAuditStores}).
+ * {@code CrossOwnerAuditIntegrationTest} runs the same audit, its routes, probes and worlds, on PostgreSQL and Redis
+ * through {@link #against}: whatever the audit reads beside HTTP goes through {@link CrossOwnerAuditStores}.
  *
  * <p>{@code CrossOwnerRouteGuardTest} keeps {@link #ROUTES} complete against the public OpenAPI document.
  */
@@ -319,8 +319,21 @@ class CrossOwnerAuditFlowTest {
     private MutableClock clock;
     @Autowired
     private Vault vault;
+    /** What the audit reads beside HTTP: the in-memory twins here, unless {@link #against} gave others. */
+    private CrossOwnerAuditStores stores;
 
     private final HttpClient client = HttpClient.newHttpClient();
+
+    /**
+     * The audit against the application at {@code port}, reading {@code stores}: the integration audit's way in. Its
+     * caller runs {@link #start} before each test.
+     */
+    static CrossOwnerAuditFlowTest against(int port, CrossOwnerAuditStores stores) {
+        CrossOwnerAuditFlowTest audit = new CrossOwnerAuditFlowTest();
+        audit.port = port;
+        audit.stores = stores;
+        return audit;
+    }
 
     record Gm(UUID id, String session, UUID campaign) {
     }
@@ -358,11 +371,12 @@ class CrossOwnerAuditFlowTest {
 
     @BeforeEach
     void start() {
-        clock.set(START);
-        // One ingestion job at a time: end whatever an earlier test left unended.
-        jobs.rows.replaceAll((id, row) -> Set.of("offered", "running", "waiting").contains(row.state())
-                ? row.released("cancelled", null, row.updatedAt()) : row);
-        stream.clear();
+        if (stores == null) {
+            stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
+                    library, deletions, scopes, knowledge, materials, uploads, index, conversations, references, searches, clock,
+                    vault), START);
+        }
+        stores.start();
     }
 
     // --- route ids
@@ -372,8 +386,8 @@ class CrossOwnerAuditFlowTest {
         World a = theirs();
         World b = mine();
         Map<String, String> readBefore = reads(a);
-        Map<String, Map<Object, Object>> before = tables();
-        Map<String, List<UUID>> offeredBefore = offered();
+        Map<String, Map<Object, Object>> before = stores.tables(owners(a, b));
+        Map<String, List<UUID>> offeredBefore = stores.offered();
         assertHeld(before, a);
 
         SoftAssertions softly = new SoftAssertions();
@@ -405,8 +419,9 @@ class CrossOwnerAuditFlowTest {
             }
         }
         // Nothing was written: no row, job, version, bookmark, dismissal or last question changed, nothing offered.
-        softly.assertThat(differences(before, tables())).as("tables changed by B's requests").isEmpty();
-        softly.assertThat(offered()).as("work offered for B's requests").isEqualTo(offeredBefore);
+        softly.assertThat(differences(before, stores.tables(owners(a, b)))).as("tables changed by B's requests")
+                .isEmpty();
+        softly.assertThat(stores.offered()).as("work offered for B's requests").isEqualTo(offeredBefore);
         softly.assertAll();
         assertUnchanged(a, readBefore);
         assertNoneOfTheirs(b, a);
@@ -483,7 +498,7 @@ class CrossOwnerAuditFlowTest {
         World b = mine();
         Map<String, String> readBefore = reads(a);
         Map<String, String> mineBefore = reads(b);
-        Map<String, Map<Object, Object>> before = tables();
+        Map<String, Map<Object, Object>> before = stores.tables(owners(a, b));
 
         SoftAssertions softly = new SoftAssertions();
         int searchesMade = 0;
@@ -518,16 +533,16 @@ class CrossOwnerAuditFlowTest {
         softly.assertAll();
 
         // Only B's searches were recorded, each with its job; nothing else was added, changed or removed.
-        List<String> changed = differences(before, tables());
+        List<String> changed = differences(before, stores.tables(owners(a, b)));
         assertThat(changed).as("tables changed by B's requests")
                 .allMatch(line -> ADDED_SEARCH_OR_JOB.matcher(line).matches());
-        List<JobRow> made = jobs.rows.values().stream().filter(row -> !before.get("job").containsKey(row.id()))
-                .toList();
+        List<CrossOwnerAuditStores.Job> made = stores.jobs(owners(a, b)).stream()
+                .filter(row -> !before.get("job").containsKey(row.id())).toList();
         assertThat(made).hasSize(searchesMade).allSatisfy(job -> {
             assertThat(job.ownerId()).isEqualTo(b.gm().id());
             assertThat(job.kind()).isEqualTo("library.search");
         });
-        List<SearchRow> recorded = searches.searches.values().stream()
+        List<CrossOwnerAuditStores.Search> recorded = stores.searches(owners(a, b)).stream()
                 .filter(row -> !before.get("search").containsKey(row.id())).toList();
         assertThat(recorded).hasSize(searchesMade).allSatisfy(search -> {
             assertThat(search.ownerId()).isEqualTo(b.gm().id());
@@ -569,12 +584,11 @@ class CrossOwnerAuditFlowTest {
         Uploaded first = ingested(gm, metadata("Livro.pdf", "campaign", gm.campaign().toString()));
         Uploaded second = ingested(gm, metadata("Livro 2a impressao.pdf", "material", first.materialId()));
         assertThat(second.materialId()).isEqualTo(first.materialId());
-        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("superseded");
+        assertThat(stores.versionState(first.versionId())).isEqualTo("superseded");
         items.put("material", first.materialId());
         items.put("superseded", first.versionId().toString());
         items.put("version", second.versionId().toString());
-        UUID passage = materials.passages.values().stream().filter(row -> row.versionId().equals(second.versionId()))
-                .map(PassageRow::id).findFirst().orElseThrow();
+        UUID passage = stores.passage(second.versionId());
         items.put("passage", passage.toString());
 
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
@@ -615,8 +629,7 @@ class CrossOwnerAuditFlowTest {
         items.put("conversationVersion", version(gm, "/api/v1/conversations/" + items.get("conversation")));
         Set<String> hidden = new LinkedHashSet<>();
         hidden.add(gm.id().toString());
-        jobs.rows.values().stream().filter(job -> gm.id().equals(job.ownerId()))
-                .forEach(job -> hidden.add(job.id().toString()));
+        stores.jobIds(gm.id()).forEach(job -> hidden.add(job.toString()));
         World world = new World(gm, Map.copyOf(items), Set.copyOf(hidden));
 
         // Each id is live: A's own reads of the audited routes answer 200.
@@ -748,70 +761,19 @@ class CrossOwnerAuditFlowTest {
         return JSON.readTree(answer.body()).path("code").asString();
     }
 
-    /**
-     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type; material,
-     * material version, material system, ingestion step, version file, page layer, page outcome, passage, outline,
-     * page view, upload, index change, index removal; conversation and its deleting marks, turn, event batch, turn
-     * reference, search, search result; job and job output.
-     */
-    private Map<String, Map<Object, Object>> tables() {
-        Map<String, Map<Object, Object>> tables = new LinkedHashMap<>();
-        tables.put("system", copy(library.systems));
-        tables.put("campaign", copy(library.campaigns));
-        tables.put("system deleting", copy(library.deleting));
-        tables.put("campaign deleting", copy(library.deletingCampaigns));
-        tables.put("deletion", copy(deletions.rows));
-        tables.put("scope", copy(scopes.rows));
-        tables.put("record type", copy(knowledge.recordTypes));
-        tables.put("material", copy(materials.materials));
-        tables.put("material version", copy(materials.versions));
-        tables.put("material system", copy(materials.systems));
-        tables.put("ingestion step", copy(materials.steps));
-        tables.put("version file", copy(materials.files));
-        tables.put("page layer", copy(materials.layers));
-        tables.put("page outcome", copy(materials.outcomes));
-        tables.put("passage", copy(materials.passages));
-        tables.put("outline", copy(materials.outlines));
-        tables.put("page view", copy(materials.pageViews));
-        tables.put("upload", copy(uploads.rows));
-        tables.put("index change", copy(index.changes));
-        tables.put("index removal", copy(index.removals));
-        tables.put("conversation", copy(conversations.conversations));
-        tables.put("conversation deleting", copy(conversations.deleting));
-        tables.put("turn", copy(conversations.turns));
-        tables.put("event batch", copy(conversations.batches));
-        tables.put("turn reference", copy(references.rows));
-        tables.put("search", copy(searches.searches));
-        tables.put("search result", copy(searches.results));
-        tables.put("job", copy(jobs.rows));
-        tables.put("job output", copy(jobs.outputs));
-        return tables;
+    /** The audit's two accounts: the rows of the stores that it compares are theirs. */
+    private static List<UUID> owners(World a, World b) {
+        return List.of(a.gm().id(), b.gm().id());
     }
 
     /** The tables compared hold A's items: they are the application's own stores. */
-    private static void assertHeld(Map<String, Map<Object, Object>> tables, World a) {
-        Map<String, List<String>> held = Map.of("system", List.of("system"), "record type", List.of("recordType"),
-                "campaign", List.of("campaign"),
-                "material", List.of("material", "imageSetMaterial"), "material version", List.of("version",
-                        "superseded", "imageSet"), "passage", List.of("passage"), "upload", List.of("upload"),
-                "conversation", List.of("conversation", "rulesConversation"), "turn", List.of("turn",
-                        "dismissedTurn", "waitingTurn"), "search", List.of("search"));
-        held.forEach((table, items) -> items.forEach(item -> assertThat(tables.get(table))
+    private void assertHeld(Map<String, Map<Object, Object>> tables, World a) {
+        stores.held().forEach((table, items) -> items.forEach(item -> assertThat(tables.get(table))
                 .as("the %s table holds A's %s", table, item).containsKey(UUID.fromString(a.get(item)))));
     }
 
-    private static Map<Object, Object> copy(Map<?, ?> table) {
-        return new HashMap<>(table);
-    }
-
-    private static Map<Object, Object> copy(Collection<?> marks) {
-        Map<Object, Object> copied = new HashMap<>();
-        marks.forEach(mark -> copied.put(mark, Boolean.TRUE));
-        return copied;
-    }
-
     /** Each row added, removed or changed since {@code before}, as {@code <table> <key> <what>}. */
-    private static List<String> differences(Map<String, Map<Object, Object>> before,
+    static List<String> differences(Map<String, Map<Object, Object>> before,
                                             Map<String, Map<Object, Object>> after) {
         List<String> found = new ArrayList<>();
         before.forEach((table, rows) -> {
@@ -827,12 +789,6 @@ class CrossOwnerAuditFlowTest {
                     .forEach(key -> found.add(table + " " + key + " added"));
         });
         return found;
-    }
-
-    private Map<String, List<UUID>> offered() {
-        Map<String, List<UUID>> offered = new HashMap<>();
-        stream.streams.keySet().forEach(name -> offered.put(name, stream.offered(name)));
-        return offered;
     }
 
     // --- requests
@@ -962,7 +918,7 @@ class CrossOwnerAuditFlowTest {
     /** The asked turn answered: claimed, one batch with a citation of {@code passage}, done. */
     private UUID answered(HttpResponse<String> asked, UUID passage) throws Exception {
         UUID turnId = UUID.fromString(json(asked).path("id").asString());
-        UUID jobId = conversations.turns.get(turnId).jobId();
+        UUID jobId = stores.turnJob(turnId);
         HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + jobId + "/claims",
                 "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
                 "application/json");
@@ -984,7 +940,7 @@ class CrossOwnerAuditFlowTest {
      */
     private Uploaded ingested(Gm gm, String metadata) throws Exception {
         Uploaded uploaded = upload(gm, pdf(MIB), metadata);
-        StepRow clean = offeredStep(uploaded.versionId());
+        Step clean = offeredStep(uploaded.versionId());
         JsonNode claim = claim(clean.jobId());
         UUID original = output(clean.jobId(), claim, pdf(4000));
         UUID batch = output(clean.jobId(), claim, pdf(3000));
@@ -993,12 +949,12 @@ class CrossOwnerAuditFlowTest {
                 + ":\"triage\",\"firstPage\":1,\"lastPage\":1,\"input\":\"" + batch + "\"},{\"stage\":\"passages\","
                 + "\"firstPage\":1,\"lastPage\":1,\"input\":\"texts\"}]}");
 
-        StepRow triage = offeredStep(uploaded.versionId());
+        Step triage = offeredStep(uploaded.versionId());
         report(triage, claim(triage.jobId()), "{\"pipelineVersion\":\"2\",\"layers\":[{\"firstPage\":1,\"lastPage\""
                 + ":1,\"layer\":\"text\"}],\"next\":[{\"stage\":\"layout\",\"firstPage\":1,\"lastPage\":1,\"input\":\""
                 + triage.inputFileId() + "\"}]}");
 
-        StepRow layout = offeredStep(uploaded.versionId());
+        Step layout = offeredStep(uploaded.versionId());
         JsonNode layoutClaim = claim(layout.jobId());
         UUID text = output(layout.jobId(), layoutClaim, "{\"pages\":[]}".getBytes(StandardCharsets.UTF_8));
         UUID picture = output(layout.jobId(), layoutClaim, webp(1000));
@@ -1008,7 +964,7 @@ class CrossOwnerAuditFlowTest {
                 + ":1545,\"height\":2000},\"lines\":[{\"text\":\"Fire Bolt\",\"box\":[0.1,0.2,0.9,0.25]}]}],"
                 + "\"next\":[]}");
 
-        StepRow passages = offeredStep(uploaded.versionId());
+        Step passages = offeredStep(uploaded.versionId());
         assertThat(passages.stage()).isEqualTo("passages");
         report(passages, claim(passages.jobId()), "{\"pipelineVersion\":\"2\",\"passages\":[{\"page\":1,"
                 + "\"sectionPath\":[\"Magias\",\"Fire Bolt\"],\"text\":\"Fire Bolt deals 1d10 Fire damage\","
@@ -1018,9 +974,7 @@ class CrossOwnerAuditFlowTest {
         assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
         assertThat(json(accepted).path("state").asString()).isEqualTo("ready");
         // Its index changes would hold the ingestion lane.
-        jobs.rows.replaceAll((id, row) -> row.lane().equals("ingestion")
-                && Set.of("offered", "running", "waiting").contains(row.state())
-                ? row.released("cancelled", null, row.updatedAt()) : row);
+        stores.endIngestion();
         return uploaded;
     }
 
@@ -1053,9 +1007,8 @@ class CrossOwnerAuditFlowTest {
     }
 
     /** The version's one step whose job is offered. */
-    private StepRow offeredStep(UUID versionId) {
-        List<StepRow> offered = materials.steps.values().stream().filter(step -> step.versionId().equals(versionId))
-                .filter(step -> step.jobId() != null && jobs.row(step.jobId()).state().equals("offered")).toList();
+    private Step offeredStep(UUID versionId) {
+        List<Step> offered = stores.offeredSteps(versionId);
         assertThat(offered).as("the offered step of %s", versionId).hasSize(1);
         return offered.getFirst();
     }
@@ -1074,7 +1027,7 @@ class CrossOwnerAuditFlowTest {
         return UUID.fromString(json(stored).path("fileId").asString());
     }
 
-    private void report(StepRow step, JsonNode claim, String result) throws Exception {
+    private void report(Step step, JsonNode claim, String result) throws Exception {
         HttpResponse<String> reported = claimed(step.jobId(), claim, "outcome",
                 "{\"outcome\":\"done\",\"result\":" + result + "}");
         assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
@@ -1113,7 +1066,8 @@ class CrossOwnerAuditFlowTest {
         return URI.create("http://127.0.0.1:" + port + path);
     }
 
-    private Gm signUp() throws Exception {
+    /** A new account through the Google stand-in, with its session and its first campaign. */
+    Gm signUp() throws Exception {
         String sub = "audit-" + UUID.randomUUID();
         JsonNode started = json(post("/api/v1/sign-in/google", null));
         String state = null;
@@ -1135,13 +1089,12 @@ class CrossOwnerAuditFlowTest {
         complete.put("termsAccepted", true);
         HttpResponse<String> response = post("/api/v1/sign-in/complete", complete);
         assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
-        AccountRow row = accounts.findByGoogleIdFingerprint(vault.fingerprint("account", "google_id", sub))
-                .orElseThrow();
         String session = json(response).path("sessionToken").asString();
-        HttpResponse<String> campaign = exchange(HttpRequest.newBuilder(uri("/api/v1/campaigns/current"))
+        HttpResponse<String> current = exchange(HttpRequest.newBuilder(uri("/api/v1/campaigns/current"))
                 .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", session).GET(),
                 "GET /api/v1/campaigns/current");
-        return new Gm(row.id(), session, UUID.fromString(json(campaign).path("id").asString()));
+        UUID campaign = UUID.fromString(json(current).path("id").asString());
+        return new Gm(stores.account(sub), session, campaign);
     }
 
     private HttpResponse<String> post(String path, Map<String, Object> body) throws Exception {

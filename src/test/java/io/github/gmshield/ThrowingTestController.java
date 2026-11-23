@@ -8,13 +8,18 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.Map;
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.filter.OncePerRequestFilter;
 
-/** Test only: handlers and a filter that fail in each way the error model must cover. Outside both APIs. */
+/**
+ * Test only: handlers and a filter that fail in each way the error model must cover. Outside both APIs. Profile
+ * {@code unit}: the integration tests' contexts, which scan the test classes too, leave them out.
+ */
+@Profile("unit")
 @RestController
 public class ThrowingTestController {
 
@@ -38,6 +43,7 @@ public class ThrowingTestController {
     }
 
     /** Fails after the trace id filter and before any controller: the exception leaves the filter chain. */
+    @Profile("unit")
     @Component
     public static class FailingFilter extends OncePerRequestFilter {
 
