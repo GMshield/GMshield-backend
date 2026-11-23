@@ -29,6 +29,7 @@ import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -66,6 +67,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * restore names the version it was made on ({@code request.stale_version}, 409, when it is stale). The current campaign
  * is the ready, not archived campaign the GM chose last ({@link #chooseCampaign}), else the oldest ready, not archived
  * one; none when there is none. Choosing never raises a campaign's version, and archiving forgets that it was chosen.
+ *
+ * <p>Story 4.1: both paths that create a system (the starter system and {@link #createSystem}) publish
+ * {@link SystemCreated} inside the transaction that inserts it, so a listener's rows (the core record types of
+ * {@code knowledge}) exist with the system or not at all.
  */
 @Service
 public class Library {
@@ -94,13 +99,15 @@ public class Library {
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
+    private final ApplicationEventPublisher events;
 
     Library(LibraryStore store, Vault vault, ObjectProvider<PlatformTransactionManager> transactions,
-            ObjectProvider<Clock> clock) {
+            ObjectProvider<Clock> clock, ApplicationEventPublisher events) {
         this.store = store;
         this.vault = vault;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
+        this.events = events;
     }
 
     /** A system with its name, edition and description, decrypted (null when none), and its version. */
@@ -149,7 +156,7 @@ public class Library {
     /**
      * A first sign-in's starter library: one system and one campaign of it, named in the account's language,
      * for the owner of the work. Runs only inside the caller's transaction, so that the account and its starter
-     * library exist together or not at all.
+     * library exist together or not at all. Publishes {@link SystemCreated} in that transaction (Story 4.1).
      */
     public void createStarter(Language language) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
@@ -161,6 +168,7 @@ public class Library {
         UUID systemId = Ids.newId();
         store.insertSystem(new SystemRow(systemId, owner, vault.encryptText(binding(SYSTEM, FIELD_NAME, systemId, owner),
                 names[0]), nameFingerprint(names[0], null), now));
+        events.publishEvent(new SystemCreated(owner, systemId));
         UUID campaignId = Ids.newId();
         store.insertCampaign(new CampaignRow(campaignId, owner, systemId,
                 vault.encryptText(binding(CAMPAIGN, FIELD_NAME, campaignId, owner), names[1]),
@@ -288,7 +296,8 @@ public class Library {
      * {@code request.system_name_invalid}, {@code request.system_edition_invalid} or
      * {@code request.system_description_invalid} (400) for a field outside its limits, and
      * {@code request.system_name_taken} (409) when another system of the owner has the same name and edition;
-     * nothing is stored then.
+     * nothing is stored then. Publishes {@link SystemCreated} in the transaction that inserts it (Story 4.1): a listener
+     * that fails rolls the system back.
      */
     public GameSystem createSystem(SystemFields fields) {
         String name = name(fields.name(), LibraryProblems.SYSTEM_NAME_INVALID);
@@ -308,6 +317,7 @@ public class Library {
                 store.insertSystem(row);
                 return row;
             });
+            events.publishEvent(new SystemCreated(owner, id));
             return new GameSystem(id, name, edition, description, row.version());
         });
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("systemId", id).log("library.system_created");

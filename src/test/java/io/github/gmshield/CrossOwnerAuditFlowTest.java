@@ -21,6 +21,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.MutableClock;
+import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
@@ -79,7 +80,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Story 3.13 part C: the cross-owner audit. Account A owns one item of every library kind of Epic 3 and before: a
- * system and a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second
+ * system (from Story 4.1 with its core record types) and a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second
  * version that is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
  * open uploads; a conversation with a done, bookmarked turn whose reference opens a page, a done, dismissed turn, a
  * search, and a turn still waiting in a second conversation. Account B then walks {@link #ROUTES}, every public route
@@ -173,6 +174,12 @@ class CrossOwnerAuditFlowTest {
                     .json("{\"version\":{systemVersion},\"name\":\"Tomado\"}"),
             route("GET", "/api/v1/systems/{id}/deletion", "id", "system"),
             route("DELETE", "/api/v1/systems/{id}", "id", "system"),
+            // a system's record types (Story 4.1)
+            route("GET", "/api/v1/systems/{id}/record-types", "id", "system"),
+            route("GET", "/api/v1/record-types/{id}", "id", "recordType"),
+            route("PATCH", "/api/v1/record-types/{id}", "id", "recordType")
+                    .json("{\"version\":{recordTypeVersion},\"name\":\"Tomado\"}"),
+            route("DELETE", "/api/v1/record-types/{id}", "id", "recordType"),
             // campaigns
             route("GET", "/api/v1/campaigns/{id}", "id", "campaign"),
             route("PATCH", "/api/v1/campaigns/{id}", "id", "campaign")
@@ -294,6 +301,8 @@ class CrossOwnerAuditFlowTest {
     private InMemoryDeletionStore deletions;
     @Autowired
     private InMemoryScopeStore scopes;
+    @Autowired
+    private InMemoryKnowledgeStore knowledge;
     @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
@@ -551,6 +560,11 @@ class CrossOwnerAuditFlowTest {
         String system = json(get(gm, "/api/v1/campaigns/current")).path("system").path("id").asString();
         items.put("system", system);
         items.put("campaign", gm.campaign().toString());
+        // A core record type of the system (Story 4.1): another account's rename or removal is "not found", not the
+        // core refusal that its owner gets.
+        JsonNode spell = json(get(gm, "/api/v1/systems/" + system + "/record-types")).path("items").get(1);
+        assertThat(spell.path("core").asString()).isEqualTo("spell");
+        items.put("recordType", spell.path("id").asString());
 
         Uploaded first = ingested(gm, metadata("Livro.pdf", "campaign", gm.campaign().toString()));
         Uploaded second = ingested(gm, metadata("Livro 2a impressao.pdf", "material", first.materialId()));
@@ -594,6 +608,7 @@ class CrossOwnerAuditFlowTest {
         items.put("rulesConversation", json(waiting).path("conversationId").asString());
 
         items.put("systemVersion", version(gm, "/api/v1/systems/" + system));
+        items.put("recordTypeVersion", version(gm, "/api/v1/record-types/" + items.get("recordType")));
         items.put("campaignVersion", version(gm, "/api/v1/campaigns/" + gm.campaign()));
         items.put("scopeVersion", version(gm, "/api/v1/campaigns/" + gm.campaign() + "/scope"));
         items.put("materialVersion", version(gm, "/api/v1/materials/" + first.materialId()));
@@ -690,7 +705,8 @@ class CrossOwnerAuditFlowTest {
                 "/api/v1/materials", "/api/v1/saved-answers", "/api/v1/campaigns/current",
                 "/api/v1/conversations/current", "/api/v1/campaigns/" + b.gm().campaign() + "/scope",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=questions",
-                "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=rules")) {
+                "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=rules",
+                "/api/v1/systems/" + b.get("system") + "/record-types")) {
             Answer list = send(b.gm(), new Request("GET", path, null, List.of()));
             softly.assertThat(list.status()).as("B's %s: %s", path, list.body()).isEqualTo(200);
             softly.assertThat(leaks(list, a, Set.of())).as("B's %s names A's items", path).isEmpty();
@@ -733,7 +749,7 @@ class CrossOwnerAuditFlowTest {
     }
 
     /**
-     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope; material,
+     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type; material,
      * material version, material system, ingestion step, version file, page layer, page outcome, passage, outline,
      * page view, upload, index change, index removal; conversation and its deleting marks, turn, event batch, turn
      * reference, search, search result; job and job output.
@@ -746,6 +762,7 @@ class CrossOwnerAuditFlowTest {
         tables.put("campaign deleting", copy(library.deletingCampaigns));
         tables.put("deletion", copy(deletions.rows));
         tables.put("scope", copy(scopes.rows));
+        tables.put("record type", copy(knowledge.recordTypes));
         tables.put("material", copy(materials.materials));
         tables.put("material version", copy(materials.versions));
         tables.put("material system", copy(materials.systems));
@@ -773,7 +790,8 @@ class CrossOwnerAuditFlowTest {
 
     /** The tables compared hold A's items: they are the application's own stores. */
     private static void assertHeld(Map<String, Map<Object, Object>> tables, World a) {
-        Map<String, List<String>> held = Map.of("system", List.of("system"), "campaign", List.of("campaign"),
+        Map<String, List<String>> held = Map.of("system", List.of("system"), "record type", List.of("recordType"),
+                "campaign", List.of("campaign"),
                 "material", List.of("material", "imageSetMaterial"), "material version", List.of("version",
                         "superseded", "imageSet"), "passage", List.of("passage"), "upload", List.of("upload"),
                 "conversation", List.of("conversation", "rulesConversation"), "turn", List.of("turn",
