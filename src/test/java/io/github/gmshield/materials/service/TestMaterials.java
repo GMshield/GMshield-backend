@@ -51,6 +51,21 @@ public final class TestMaterials {
         public List<Stored> readRange(UUID versionId, int firstPage, int lastPage) {
             return List.of();
         }
+
+        @Override
+        public List<Located> located(Collection<UUID> ids) {
+            return List.of();
+        }
+
+        @Override
+        public List<Located> named(Collection<UUID> versionIds, String name) {
+            return List.of();
+        }
+
+        @Override
+        public java.util.Map<UUID, String> names(Collection<UUID> ids) {
+            return java.util.Map.of();
+        }
     };
 
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */

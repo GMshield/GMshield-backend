@@ -207,6 +207,9 @@ class CrossOwnerAuditFlowTest {
                     .json("{\"question\":\"Quem leva a coroa?\",\"conversationId\":\"{conversation}\"}"),
             route("POST", "/api/v1/campaigns/{campaignId}/searches", "campaignId", "campaign")
                     .json("{\"query\":\"Fire Bolt\"}"),
+            // a record as a campaign shows it, for a search's record result (Story 4.3 part B)
+            route("GET", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign", "recordId",
+                    "record").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

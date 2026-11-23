@@ -60,7 +60,8 @@ class JobClaimController {
             Instant lapsesAt,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "Send it in X-Job-Grant") String grant,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String kind,
-            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "The handler's input for this attempt")
+            @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "The handler's input for this attempt."
+                    + " From contract 1.18.0 a library.search input may carry recordType, a core record type")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")
@@ -113,7 +114,9 @@ class JobClaimController {
             @Schema(description = "For failed only: category.reason in lower case") String code,
             @Schema(description = "For failed only: false ends the job at once, without another attempt (an input no"
                     + " attempt can change); absent or true lets the backend retry while attempts remain") Boolean retry,
-            @Schema(description = "For done only: the result for the job's handler") Map<String, Object> result,
+            @Schema(description = "For done only: the result for the job's handler. From contract 1.18.0 a"
+                    + " library.search result's ids may name records of the scope next to passages")
+            Map<String, Object> result,
             @ArraySchema(maxItems = JobClaims.MAX_USAGE, arraySchema = @Schema(description = "The usage of the"
                     + " attempt's model calls not posted with events (contract 1.17.0), done or failed, recorded once"
                     + " per call id; absent means none"), schema = @Schema(implementation = JobCallUsage.class))

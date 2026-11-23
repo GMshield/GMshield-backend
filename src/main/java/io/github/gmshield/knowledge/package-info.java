@@ -11,9 +11,12 @@
  * {@code materials.service.ExtractedRecords} that {@code service.ExtractedRecordStore} implements, so {@code materials}
  * depends on nothing here either; and each record type's count is the records of the system's {@code ready} versions
  * of that core type. From Story 4.3 {@code service.Records} reads a system's records (a type's list, one record, its
- * version's pages) through {@code materials.service.RecordSources}, never {@code ScopeReads}. Terms and proposals (4.4)
- * come later.
+ * version's pages) through {@code materials.service.RecordSources}, never {@code ScopeReads}. From Story 4.3 part B it
+ * also reads one record as a campaign shows it, within the campaign's current scope as {@code scope.service.Scopes}
+ * resolves it ({@code scope} depends on nothing here: it reads records through the port {@code ExtractedRecords}), and
+ * stores each record's name fingerprint for a search's exact-name match. Terms and proposals (4.4) come later.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
-        allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service"})
+        allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service",
+                "scope :: service"})
 package io.github.gmshield.knowledge;

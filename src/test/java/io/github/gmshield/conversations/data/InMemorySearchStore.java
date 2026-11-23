@@ -67,7 +67,8 @@ public class InMemorySearchStore implements SearchStore {
             ownerFor(row.ownerId());
             SearchRow search = searches.get(row.searchId());
             boolean repeated = results.values().stream().anyMatch(other -> other.searchId().equals(row.searchId())
-                    && (other.rank() == row.rank() || other.passageId().equals(row.passageId())));
+                    && (other.rank() == row.rank() || row.passageId() != null && row.passageId().equals(
+                    other.passageId()) || row.recordId() != null && row.recordId().equals(other.recordId())));
             if (search == null || !search.ownerId().equals(row.ownerId()) || repeated || row.rank() < 1
                     || row.rank() > 20 || results.putIfAbsent(row.id(), row) != null) {
                 throw new IllegalStateException("key, reference or check refused");

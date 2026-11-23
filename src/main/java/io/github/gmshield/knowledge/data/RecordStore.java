@@ -44,4 +44,17 @@ public interface RecordStore {
 
     /** The ids of the passages the current owner's record links to, in order; empty for an unknown id or another owner's. */
     List<UUID> passagesOf(UUID recordId);
+
+    /**
+     * The current owner's records with these ids (Story 4.3 part B), each with its passage ids in order, in no particular
+     * order; an unknown id or another owner's is left out.
+     */
+    List<RecordRow> findAll(Collection<UUID> ids);
+
+    /**
+     * The current owner's records of the versions with these ids whose name fingerprint is {@code nameFingerprint}
+     * (Story 4.3 part B: an equality on a keyed fingerprint, never a text search), each with its passage ids in order,
+     * by id. A record without a fingerprint (stored before V37) never matches.
+     */
+    List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint);
 }

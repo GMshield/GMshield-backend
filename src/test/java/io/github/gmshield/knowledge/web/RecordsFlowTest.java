@@ -1,6 +1,7 @@
 package io.github.gmshield.knowledge.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
@@ -15,6 +16,7 @@ import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
+import io.github.gmshield.conversations.data.InMemorySearchStore;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
@@ -22,6 +24,8 @@ import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.materials.data.IndexChangeRow;
+import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.MaterialTestStores;
 import io.github.gmshield.materials.data.PassageRow;
@@ -48,6 +52,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -83,6 +88,15 @@ import tools.jackson.databind.json.JsonMapper;
  * reference carries the ids of the record's passages at its place, and a page of the record's version is the same
  * answer as the material's own page. The same reads against PostgreSQL are in {@code IngestionIntegrationTest}; the
  * cross-owner rows are also in {@code CrossOwnerAuditFlowTest}.
+ *
+ * <p>Story 4.3 part B, records in a campaign's library search, with the worker's part played through the internal
+ * API: a record whose name equals the query (case and surrounding space aside) leads, with its type, place and passages,
+ * whether the worker found it or not; two such records lead in the worker's order; records of a material switched off,
+ * of a version that needs review, of another owner and of a records run not indexed yet are never added, and a worker
+ * that returns one fails the search; a record-type filter keeps only that type; no line names a record. And the record
+ * as a campaign shows it: in scope (any tier, the other tier included once on) it opens with the campaign's system's
+ * type and its references open on the scope's ground; switched off, needing review, another owner's, unknown or
+ * malformed, it is {@code request.not_found}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -145,6 +159,10 @@ class RecordsFlowTest {
     private ExtractedRecords extracted;
     @Autowired
     private PlatformTransactionManager transactions;
+    @Autowired
+    private InMemorySearchStore searchStore;
+    @Autowired
+    private InMemoryIndexStore index;
     @Autowired
     private Vault vault;
 
@@ -505,6 +523,337 @@ class RecordsFlowTest {
         assertThat(bytes(path + "/pages/1/picture", gm.session()).statusCode()).isEqualTo(404);
         assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.records_listed")
                 && hasPair(event, "found", false));
+    }
+
+    // --- Story 4.3 part B: records in the library search
+
+    @Test
+    void aRecordWhoseNameEqualsTheQueryLeadsWithItsTypePlaceAndPassagesAndTheRestKeepTheWorkersOrder()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Tesouros.pdf", "system", gm.system().toString()), List.of(
+                record("item", "Vorpal Sword", 1, List.of(new Field("Raridade", "Lendária"))),
+                record("spell", "Luz", 1, List.of()), record("item", "Espada Curta", 1, List.of())));
+        String vorpal = recordOf(book.versionId(), "Vorpal Sword");
+        String light = recordOf(book.versionId(), "Luz");
+        String sword = recordOf(book.versionId(), "Espada Curta");
+        UUID passage = book.passages().getFirst();
+
+        // Case and surrounding space aside, the query is the record's name; the worker did not return the record.
+        Search search = search(gm, Map.of("query", "  vorpal SWORD "));
+        assertThat(search.claim().path("input").has("recordType")).isFalse();
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + passage + "\",\"" + light + "\",\"" + sword
+                + "\"]}");
+
+        JsonNode results = ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results");
+        assertThat(results).hasSize(4);
+        JsonNode first = results.get(0);
+        assertThat(first.propertyNames()).containsExactlyInAnyOrder("kind", "recordId", "versionId", "materialName",
+                "sectionPath", "page", "name", "recordType", "passageIds", "tier");
+        assertThat(first.path("kind").asString()).isEqualTo("record");
+        assertThat(first.path("recordId").asString()).isEqualTo(vorpal);
+        assertThat(first.path("name").asString()).isEqualTo("Vorpal Sword");
+        assertThat(first.path("recordType").asString()).isEqualTo("item");
+        assertThat(first.path("versionId").asString()).isEqualTo(book.versionId().toString());
+        assertThat(first.path("materialName").asString()).isEqualTo("Tesouros.pdf");
+        assertThat(first.path("sectionPath").get(0).asString()).isEqualTo("Magias");
+        assertThat(first.path("page").asInt()).isEqualTo(1);
+        assertThat(first.path("passageIds")).extracting(JsonNode::asString).containsExactly(passage.toString());
+        assertThat(first.path("tier").asString()).isEqualTo("system");
+        // Then the worker's order: a passage, and the two other records with their own types.
+        assertThat(results.get(1).path("kind").asString()).isEqualTo("passage");
+        assertThat(results.get(1).path("passageId").asString()).isEqualTo(passage.toString());
+        assertThat(results.get(1).has("firstWords")).isTrue();
+        assertThat(results.get(2).path("recordId").asString()).isEqualTo(light);
+        assertThat(results.get(2).path("recordType").asString()).isEqualTo("spell");
+        assertThat(results.get(3).path("recordId").asString()).isEqualTo(sword);
+        assertThat(results.get(3).has("firstWords")).isFalse();
+        // The record opens as the campaign shows it, and its reference's page opens on the scope's ground.
+        JsonNode opened = ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + vorpal, gm.session()));
+        assertThat(opened.path("name").asString()).isEqualTo("Vorpal Sword");
+        assertThat(opened.path("recordType").path("id").asString()).isEqualTo(typeId(gm, gm.system(), "item"));
+        assertThat(opened.path("fields").get(0).path("value").asString()).isEqualTo("Lendária");
+        JsonNode reference = opened.path("references").get(0);
+        ok(get("/api/v1/campaigns/" + gm.campaign() + "/sources/" + reference.path("versionId").asString()
+                + "/pages/" + reference.path("page").asInt(), gm.session()));
+        // No line names a record or the query.
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().toLowerCase(Locale.ROOT)
+                .contains("vorpal") || String.valueOf(event.getKeyValuePairs()).toLowerCase(Locale.ROOT)
+                .contains("vorpal") || String.valueOf(event.getKeyValuePairs()).contains("Lendária"));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("search.done")
+                && hasPair(event, "records", 3L) && hasPair(event, "exactNames", 1));
+    }
+
+    @Test
+    void twoRecordsWithTheQueryAsTheirNameLeadInTheWorkersOrderThenTheRest() throws Exception {
+        Gm gm = signUp();
+        Ingested one = accepted(gm, metadata("Um.pdf", "system", gm.system().toString()), spells("Luz", "Escudo"));
+        Ingested two = accepted(gm, metadata("Dois.pdf", "campaign", gm.campaign().toString()), spells("LUZ"));
+        String lightOfOne = recordOf(one.versionId(), "Luz");
+        String lightOfTwo = recordOf(two.versionId(), "LUZ");
+        String shield = recordOf(one.versionId(), "Escudo");
+        UUID passage = two.passages().get(1);
+
+        Search search = search(gm, Map.of("query", "Luz"));
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + passage + "\",\"" + shield + "\",\""
+                + lightOfTwo + "\",\"" + lightOfOne + "\"]}");
+
+        JsonNode results = ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results");
+        assertThat(results).extracting(result -> result.path("recordId").asString(""))
+                .containsExactly(lightOfTwo, lightOfOne, "", shield);
+        assertThat(results.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(results.get(1).path("tier").asString()).isEqualTo("system");
+    }
+
+    @Test
+    void onlyInScopeAcceptedAndIndexedRecordsAreAddedAndAWorkerThatReturnsAnotherFailsTheSearch()
+            throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Luz"));
+        Ingested off = accepted(gm, metadata("Desligado.pdf", "system", gm.system().toString()), spells("Luz"));
+        Ingested theirs = accepted(them, metadata("Deles.pdf", "system", them.system().toString()), spells("Luz"));
+        Ingested review = ingested(gm, metadata("Rascunho.pdf", "system", gm.system().toString()));
+        store(gm, review, spells("Luz"));
+        String visible = recordOf(book.versionId(), "Luz");
+        String switchedOff = recordOf(off.versionId(), "Luz");
+        String reviewing = recordOf(review.versionId(), "Luz");
+        String another = recordOf(theirs.versionId(), "Luz");
+        scope(gm, true, List.of(off.materialId()));
+
+        // Each one the worker could not have found is never added by name; only the visible record leads.
+        Search search = search(gm, Map.of("query", "luz"));
+        report(search.jobId(), search.claim(), "{\"ids\":[]}");
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString()).containsExactly(visible);
+
+        // A worker that returns any of them fails the whole search, as a forged passage does.
+        for (String forged : List.of(switchedOff, reviewing, another, UUID.randomUUID().toString())) {
+            Search refused = search(gm, Map.of("query", "Luz"));
+            report(refused.jobId(), refused.claim(), "{\"ids\":[\"" + visible + "\",\"" + forged + "\"]}");
+            JsonNode read = ok(get("/api/v1/searches/" + refused.id(), gm.session()));
+            assertThat(read.path("state").asString()).as(forged).isEqualTo("failed");
+            assertThat(read.path("code").asString()).isEqualTo("scope.passage_refused");
+            assertThat(read.path("results")).isEmpty();
+        }
+
+        // A version whose records run has not ended: its passages are found, its records are not yet.
+        Ingested pending = ingested(gm, metadata("Novo.pdf", "system", gm.system().toString()));
+        store(gm, pending, spells("Luz"));
+        HttpResponse<String> accepted = send("POST", "/api/v1/materials/" + pending.materialId() + "/accept",
+                gm.session(), null);
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+        Search indexing = search(gm, Map.of("query", "Luz"));
+        assertThat(strings(indexing.claim().path("input").path("tiers").get(1).path("pending")))
+                .contains(pending.passages().getFirst().toString());
+        report(indexing.jobId(), indexing.claim(), "{\"ids\":[\"" + pending.passages().getFirst() + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + indexing.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString("") + result.path("passageId").asString(""))
+                .containsExactly(visible, pending.passages().getFirst().toString());
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("scope.named_records_read")
+                && hasPair(event, "unindexed", 1));
+    }
+
+    @Test
+    void aRecordWhoseRecordsRunFailedForGoodIsNotAddedByName() throws Exception {
+        Gm gm = signUp();
+        Ingested book = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        store(gm, book, spells("Luz"));
+        acceptHoldingRuns(gm, book);
+        IndexChangeRow run = recordsRuns(book.versionId()).getFirst();
+        // Its job ends failed, and its retries are spent: it stays failed for good.
+        jobs.rows.computeIfPresent(run.jobId(), (id, row) -> row.released("failed", "index.embedding_unavailable",
+                row.updatedAt()));
+        index.changes.put(run.jobId(), new IndexChangeRow(run.jobId(), run.ownerId(), run.versionId(),
+                run.firstOrdinal(), run.lastOrdinal(), null, IndexChangeRow.MAX_RETRIES, true));
+        endIngestion();
+        assertThat(jobs.rows.get(run.jobId()).state()).isEqualTo("failed");
+
+        Search search = search(gm, Map.of("query", "Luz"));
+        report(search.jobId(), search.claim(), "{\"ids\":[]}");
+
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).isEmpty();
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("scope.named_records_read")
+                && hasPair(event, "found", 0) && hasPair(event, "unindexed", 1));
+    }
+
+    @Test
+    void onlyTheRecordsOfARunNotEndedAreLeftOutAndOneTheWorkerReturnedStillLeads() throws Exception {
+        Gm gm = signUp();
+        Ingested book = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        // 201 records on page 1 make one run of page 1; a record on page 3 makes a second run.
+        List<Extracted> found = new ArrayList<>(spells("Luz"));
+        for (int i = 0; i < 200; i++) {
+            found.add(record("rule", "Regra " + i, 1, List.of()));
+        }
+        found.add(new Extracted("spell", "LUZ", List.of(), List.of(book.passages().get(1)), 3));
+        store(gm, book, found);
+        acceptHoldingRuns(gm, book);
+        List<IndexChangeRow> runs = recordsRuns(book.versionId());
+        assertThat(runs).extracting(IndexChangeRow::firstOrdinal, IndexChangeRow::lastOrdinal)
+                .containsExactly(tuple(1, 1), tuple(3, 3));
+        // The first run ends; the second has not.
+        jobs.rows.computeIfPresent(runs.getFirst().jobId(), (id, row) -> row.released("cancelled", null,
+                row.updatedAt()));
+        String onPageOne = recordOf(book.versionId(), "Luz");
+        String onPageThree = recordOf(book.versionId(), "LUZ");
+
+        Search search = search(gm, Map.of("query", "luz"));
+        report(search.jobId(), search.claim(), "{\"ids\":[]}");
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString()).containsExactly(onPageOne);
+
+        // The worker found the unfinished run's record anyway (it is in the index): it leads with the other.
+        Search returned = search(gm, Map.of("query", "luz"));
+        report(returned.jobId(), returned.claim(), "{\"ids\":[\"" + book.passages().getFirst() + "\",\""
+                + onPageThree + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + returned.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString("")).containsExactly(onPageThree, onPageOne, "");
+        endIngestion();
+    }
+
+    @Test
+    void aRecordTypeFilterKeepsOnlyThatTypeAndAResultOfAnotherTypeFailsTheSearch() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), List.of(
+                record("spell", "Luz", 1, List.of()), record("item", "Lanterna", 1, List.of())));
+        String light = recordOf(book.versionId(), "Luz");
+        String lantern = recordOf(book.versionId(), "Lanterna");
+
+        Search search = search(gm, Map.of("query", "Luz", "recordType", "item"));
+        assertThat(search.claim().path("input").path("recordType").asString()).isEqualTo("item");
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + lantern + "\"]}");
+
+        // The spell named "Luz" is not added: only items.
+        JsonNode read = ok(get("/api/v1/searches/" + search.id(), gm.session()));
+        assertThat(read.path("recordType").asString()).isEqualTo("item");
+        assertThat(read.path("results")).extracting(result -> result.path("recordId").asString())
+                .containsExactly(lantern);
+        // Under the filter, a spell from the worker fails the search.
+        Search wrong = search(gm, Map.of("query", "Luz", "recordType", "item"));
+        report(wrong.jobId(), wrong.claim(), "{\"ids\":[\"" + light + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + wrong.id(), gm.session())).path("code").asString())
+                .isEqualTo("scope.passage_refused");
+        // Under "spell" the exact name leads; nothing matching is an empty, done search.
+        Search spell = search(gm, Map.of("query", "luz", "recordType", "spell"));
+        report(spell.jobId(), spell.claim(), "{\"ids\":[]}");
+        assertThat(ok(get("/api/v1/searches/" + spell.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString()).containsExactly(light);
+        Search none = search(gm, Map.of("query", "Luz", "recordType", "creature"));
+        report(none.jobId(), none.claim(), "{\"ids\":[]}");
+        JsonNode empty = ok(get("/api/v1/searches/" + none.id(), gm.session()));
+        assertThat(empty.path("state").asString()).isEqualTo("done");
+        assertThat(empty.path("results")).isEmpty();
+    }
+
+    @Test
+    void aStoredRecordResultLeavesTheSearchWhenItsMaterialIsSwitchedOffAndComesBackWhenOn() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Luz"));
+        String light = recordOf(book.versionId(), "Luz");
+        Search search = search(gm, Map.of("query", "Escuridão"));
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + light + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).hasSize(1);
+
+        scope(gm, false, List.of(book.materialId()));
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).isEmpty();
+        scope(gm, false, List.of());
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).hasSize(1);
+    }
+
+    // --- Story 4.3 part B: a record as a campaign shows it
+
+    @Test
+    void aRecordOpensFromACampaignWithinItsCurrentScopeAndAnythingElseIsNotFound() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Luz"));
+        UUID otherSystem = createSystem(gm, "Outro");
+        Ingested elsewhere = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()), spells("Sombra"));
+        Ingested review = ingested(gm, metadata("Rascunho.pdf", "system", gm.system().toString()));
+        store(gm, review, spells("Pendente"));
+        String light = recordOf(book.versionId(), "Luz");
+        String shadow = recordOf(elsewhere.versionId(), "Sombra");
+        String pending = recordOf(review.versionId(), "Pendente");
+        String campaign = "/api/v1/campaigns/" + gm.campaign() + "/records/";
+
+        // The same answer as the system's, with the campaign's system's type.
+        JsonNode read = ok(get(campaign + light, gm.session()));
+        assertThat(read).isEqualTo(ok(get("/api/v1/systems/" + gm.system() + "/records/" + light, gm.session())));
+        // Another system's material is in the other tier: not found while it is off, found once it is on, with the
+        // campaign's system's record type.
+        assertProblem(get(campaign + shadow, gm.session()), 404, "request.not_found");
+        scope(gm, true, List.of());
+        JsonNode other = ok(get(campaign + shadow, gm.session()));
+        assertThat(other.path("recordType").path("id").asString()).isEqualTo(typeId(gm, gm.system(), "spell"));
+        // Switched off, needing review, another owner's, unknown or malformed: all the same not found.
+        scope(gm, true, List.of(UUID.fromString(book.materialId())));
+        Map<String, Object> unknown = withoutTraceId(assertProblem(get(campaign + UUID.randomUUID(), gm.session()),
+                404, "request.not_found"));
+        List<String[]> refused = List.of(
+                new String[] {gm.session(), campaign + light},
+                new String[] {gm.session(), campaign + pending},
+                new String[] {gm.session(), campaign + "not-an-id"},
+                new String[] {gm.session(), "/api/v1/campaigns/not-an-id/records/" + shadow},
+                new String[] {gm.session(), "/api/v1/campaigns/" + UUID.randomUUID() + "/records/" + shadow},
+                new String[] {them.session(), campaign + shadow},
+                new String[] {them.session(), "/api/v1/campaigns/" + them.campaign() + "/records/" + shadow});
+        for (String[] request : refused) {
+            HttpResponse<String> answer = get(request[1], request[0]);
+            assertThat(withoutTraceId(assertProblem(answer, 404, "request.not_found"))).as(request[1])
+                    .isEqualTo(unknown);
+            assertThat(answer.body()).doesNotContain("Luz").doesNotContain("Sombra").doesNotContain("Pendente");
+        }
+        assertThat(get(campaign + shadow, null).statusCode()).isEqualTo(401);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.campaign_record_read")
+                && hasPair(event, "found", false));
+    }
+
+    // --- helpers: searches
+
+    /** A search of the GM's current campaign, created through the public API and claimed as the worker. */
+    private record Search(UUID id, UUID jobId, JsonNode claim) {
+    }
+
+    private Search search(Gm gm, Map<String, Object> body) throws Exception {
+        HttpResponse<String> created = send("POST", "/api/v1/campaigns/" + gm.campaign() + "/searches", gm.session(),
+                body);
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(202);
+        UUID id = UUID.fromString(json(created).path("id").asString());
+        UUID jobId = searchStore.searches.get(id).jobId();
+        return new Search(id, jobId, claim(jobId));
+    }
+
+    /** Accepts the version and leaves its index changes as they are (offered), unlike {@link #accept}. */
+    private void acceptHoldingRuns(Gm gm, Ingested ingested) throws Exception {
+        HttpResponse<String> accepted = send("POST", "/api/v1/materials/" + ingested.materialId() + "/accept",
+                gm.session(), null);
+        assertThat(accepted.statusCode()).as(accepted.body()).isEqualTo(200);
+    }
+
+    /** The version's records runs, by first page. */
+    private List<IndexChangeRow> recordsRuns(UUID versionId) {
+        return index.changes.values().stream().filter(row -> row.versionId().equals(versionId) && row.records())
+                .sorted(Comparator.comparingInt(IndexChangeRow::firstOrdinal)).toList();
+    }
+
+    /** The GM's campaign's scope: every tier on, the other tier as given, these materials switched off. */
+    private void scope(Gm gm, boolean otherTier, List<?> materialsOff) throws Exception {
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/scope";
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("version", ok(get(path, gm.session())).path("version").asLong());
+        body.put("campaignTier", true);
+        body.put("systemTier", true);
+        body.put("otherTier", otherTier);
+        body.put("modelKnowledge", false);
+        body.put("materialsOff", materialsOff.stream().map(String::valueOf).toList());
+        ok(send("PUT", path, gm.session(), body));
+    }
+
+    private static List<String> strings(JsonNode node) {
+        List<String> found = new ArrayList<>();
+        node.forEach(item -> found.add(item.asString()));
+        return found;
     }
 
     // --- helpers: records

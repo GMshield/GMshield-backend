@@ -47,6 +47,10 @@ import org.springframework.web.bind.annotation.RestController;
  * the same shape as a material's page, streamed as WebP with {@code nosniff}. Only the records of the system's accepted
  * versions are read ({@link Records}); any other record is the same {@code request.not_found}, and no name or field
  * leaves then.
+ *
+ * <p>Story 4.3 part B: one record as a campaign shows it (a search's record result), the same answer, for a record of a
+ * version in the campaign's current scope; its references open the source view on the ground of that scope, whose
+ * pages the conversations module serves.
  */
 @RestController
 @Tag(name = "ontology")
@@ -58,6 +62,7 @@ class OntologyController {
     static final String SYSTEM_RECORD = "/api/v1/systems/{systemId}/records/{recordId}";
     static final String SYSTEM_RECORD_PAGE = SYSTEM_RECORD + "/pages/{page}";
     static final String SYSTEM_RECORD_PICTURE = SYSTEM_RECORD_PAGE + "/picture";
+    static final String CAMPAIGN_RECORD = "/api/v1/campaigns/{campaignId}/records/{recordId}";
     static final String WEBP = "image/webp";
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
@@ -397,6 +402,27 @@ class OntologyController {
             @PathVariable("recordId") String recordId) {
         return found(parse(systemId).flatMap(system -> parse(recordId).flatMap(record -> records.record(system, record)))
                 .map(RecordView::of));
+    }
+
+    @GetMapping(path = CAMPAIGN_RECORD, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getCampaignRecord", summary = "One record as one of the account's campaigns shows it"
+            + " (contract 1.36.0, a search's record result): the same answer as getRecord, its record type the"
+            + " campaign's system's type of its core key. Only a record of an accepted version in the campaign's current"
+            + " scope is read (its tiers and materials switched on, any tier); its references open the source view on"
+            + " the ground of that scope (getScopeSourcePage). request.not_found (404) for a campaign that is not the"
+            + " account's (another account's, unknown, malformed or being deleted), and for a record that is not one of"
+            + " those (another account's, unknown, malformed, of a version that needs review or is superseded, or of a"
+            + " material switched off or outside the scope): none is told apart, and no name or field is answered then;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<RecordView> campaignRecord(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId) {
+        return found(parse(campaignId).flatMap(campaign -> parse(recordId)
+                .flatMap(record -> records.inCampaign(campaign, record))).map(RecordView::of));
     }
 
     @GetMapping(path = SYSTEM_RECORD_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)

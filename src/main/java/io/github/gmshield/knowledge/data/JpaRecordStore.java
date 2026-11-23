@@ -33,6 +33,9 @@ class JpaRecordStore implements RecordStore {
             + " and r.recordType = :type";
     private static final String LINKS_OF = "select l.passageId from RecordPassage l where l.recordId = :record"
             + " order by l.passageId";
+    private static final String BY_IDS = "select r from Record r where r.id in :ids";
+    private static final String NAMED = "select r from Record r where r.versionId in :versions"
+            + " and r.nameFingerprint = :fingerprint order by r.id";
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
             + " group by r.recordType order by r.recordType";
 
@@ -59,10 +62,8 @@ class JpaRecordStore implements RecordStore {
 
     @Override
     public List<RecordRow> ofVersion(UUID versionId) {
-        List<RecordEntity> found = em().createQuery(OF_VERSION, RecordEntity.class).setParameter("version", versionId)
-                .getResultList();
-        Map<UUID, List<UUID>> links = links(found);
-        return found.stream().map(entity -> entity.row(links.getOrDefault(entity.id(), List.of()))).toList();
+        return withLinks(em().createQuery(OF_VERSION, RecordEntity.class).setParameter("version", versionId)
+                .getResultList());
     }
 
     @Override
@@ -109,6 +110,28 @@ class JpaRecordStore implements RecordStore {
     @Override
     public List<UUID> passagesOf(UUID recordId) {
         return em().createQuery(LINKS_OF, UUID.class).setParameter("record", recordId).getResultList();
+    }
+
+    @Override
+    public List<RecordRow> findAll(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return withLinks(em().createQuery(BY_IDS, RecordEntity.class).setParameter("ids", ids).getResultList());
+    }
+
+    @Override
+    public List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return withLinks(em().createQuery(NAMED, RecordEntity.class).setParameter("versions", versionIds)
+                .setParameter("fingerprint", nameFingerprint).getResultList());
+    }
+
+    private List<RecordRow> withLinks(List<RecordEntity> found) {
+        Map<UUID, List<UUID>> links = links(found);
+        return found.stream().map(entity -> entity.row(links.getOrDefault(entity.id(), List.of()))).toList();
     }
 
     /** Removes the records' links, then the records themselves; answers how many records went. */

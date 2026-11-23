@@ -58,7 +58,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@link #failed} (indexing at worker start): how many passages of these versions are in runs whose job failed,
  *       counted the same way, and whether a retry of one of them remains (fewer than
  *       {@link IndexChangeRow#MAX_RETRIES} retries); none is empty. These three read passages runs only: a records
- *       run (Story 4.2 part B) changes none of them until Story 4.3.</li>
+ *       run (Story 4.2 part B), pending or failed, changes none of them (no keyword fallback for records).</li>
+ *   <li>{@link #unindexedRecordRuns} (Story 4.3 part B): the records runs of these versions whose index change has not
+ *       ended or whose job failed, by page: their records are not searchable yet, so a search's exact-name records
+ *       leave them out, as the index does.</li>
  *   <li>{@link #passages}: passages by id, checked before anything is decrypted: every id must be a passage of the
  *       owner, of one of the given versions, and that version {@code ready}; otherwise nothing is read.</li>
  *   <li>{@link #places} (Story 2.5): where cited passages stand, filtered rather than refused: a passage that is not
@@ -343,8 +346,42 @@ public class ScopeReads {
     }
 
     /**
-     * The passages runs among these: until Story 4.3 reads records, a records run (Story 4.2 part B), pending or failed,
-     * changes neither the keyword fallback nor the GM's notices.
+     * A records run of a version that is not indexed (Story 4.3 part B): its index change has not ended, or its job
+     * failed. It covers the version's records whose first page is within {@code firstPage} to {@code lastPage}.
+     */
+    @NamedInterface("service")
+    public record RecordRun(UUID versionId, int firstPage, int lastPage) {
+
+        /** Whether a record of the version with this first page is in the run. */
+        public boolean covers(UUID version, int page) {
+            return versionId.equals(version) && page >= firstPage && page <= lastPage;
+        }
+    }
+
+    /**
+     * The owner's records runs of these versions whose index change has not ended or whose job failed, as the class
+     * says; each version as given, then by first page.
+     */
+    public List<RecordRun> unindexedRecordRuns(Collection<UUID> versionIds) {
+        if (versionIds.isEmpty()) {
+            return List.of();
+        }
+        return reading(() -> {
+            List<RecordRun> runs = new ArrayList<>();
+            for (UUID versionId : new LinkedHashSet<>(versionIds)) {
+                List<IndexChangeRow> open = new ArrayList<>(IndexChanges.unended(index, unendedJobs, versionId));
+                open.addAll(IndexChanges.failed(index, failedJobs, versionId));
+                open.stream().filter(IndexChangeRow::records).sorted(Comparator.comparingInt(
+                        IndexChangeRow::firstOrdinal)).forEach(run -> runs.add(new RecordRun(versionId,
+                        run.firstOrdinal(), run.lastOrdinal())));
+            }
+            return List.copyOf(runs);
+        });
+    }
+
+    /**
+     * The passages runs among these: a records run (Story 4.2 part B), pending or failed, changes neither the keyword
+     * fallback nor the GM's notices.
      */
     private static List<IndexChangeRow> passageRuns(List<IndexChangeRow> runs) {
         return runs.stream().filter(run -> !run.records()).toList();

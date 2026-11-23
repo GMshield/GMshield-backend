@@ -1747,7 +1747,8 @@ class ConversationFlowTest {
         assertThat(stream.offered("gmshield:work:interactive")).contains(job.id());
         JsonNode pending = json(get(gm, searchPath(searchId)));
         assertThat(pending.propertyNames()).containsExactlyInAnyOrder("id", "campaignId", "query", "tier",
-                "materialId", "state", "results");
+                "materialId", "recordType", "state", "results");
+        assertThat(pending.path("recordType").isNull()).isTrue();
         assertThat(pending.path("state").asString()).isEqualTo("pending");
         assertThat(pending.path("query").asString()).isEqualTo(QUERY);
         assertThat(pending.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
@@ -1778,8 +1779,9 @@ class ConversationFlowTest {
         assertThat(done.has("code")).isFalse();
         JsonNode results = done.path("results");
         assertThat(results).hasSize(2);
-        assertThat(results.get(0).propertyNames()).containsExactlyInAnyOrder("passageId", "versionId",
+        assertThat(results.get(0).propertyNames()).containsExactlyInAnyOrder("kind", "passageId", "versionId",
                 "materialName", "sectionPath", "page", "firstWords", "tier");
+        assertThat(results.get(0).path("kind").asString()).isEqualTo("passage");
         assertThat(results.get(0).path("passageId").asString()).isEqualTo(ofSystem.passages().getFirst().toString());
         assertThat(results.get(0).path("tier").asString()).isEqualTo("system");
         assertThat(results.get(0).path("firstWords").asString()).isEqualTo(PASSAGE_TEXT + " 0");
@@ -1900,6 +1902,41 @@ class ConversationFlowTest {
     }
 
     @Test
+    void aRecordTypeFilterIsStoredAndHandedToTheWorkerAndAPassageResultUnderItIsRefused() throws Exception {
+        Gm gm = signUp();
+        Source own = source(gm, gm.campaign(), List.of(1));
+
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/searches",
+                "{\"query\":\"" + QUERY + "\",\"recordType\":\"spell\"}");
+
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(202);
+        UUID searchId = UUID.fromString(json(created).path("id").asString());
+        SearchRow row = searchStore.searches.get(searchId);
+        assertThat(row.recordType()).isEqualTo("spell");
+        assertThat(json(get(gm, searchPath(searchId))).path("recordType").asString()).isEqualTo("spell");
+        Claim claim = claimSearch(row.jobId());
+        assertThat(fieldNames(claim.input())).containsExactly("query", "owner", "modelKnowledge", "tiers",
+                "tokenKey", "recordType");
+        assertThat(claim.input().path("recordType").asString()).isEqualTo("spell");
+        // Only records of that type may come back: a passage of the scope fails the search as a forged id does.
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[\"" + own.passages().getFirst()
+                + "\"]}}").statusCode()).isEqualTo(204);
+        JsonNode read = json(get(gm, searchPath(searchId)));
+        assertThat(read.path("state").asString()).isEqualTo("failed");
+        assertThat(read.path("code").asString()).isEqualTo("scope.passage_refused");
+        assertThat(logged.list).anyMatch(event -> "search.created".equals(event.getFormattedMessage())
+                && event.getKeyValuePairs() != null && event.getKeyValuePairs().stream()
+                .anyMatch(pair -> "recordType".equals(pair.key) && "spell".equals(pair.value)));
+        // Nothing found under a type is an empty, done search.
+        Claim nothing = claimSearch(UUID.fromString(searchStore.searches.get(UUID.fromString(json(send(gm, "POST",
+                "/api/v1/campaigns/" + gm.campaign() + "/searches", "{\"query\":\"x\",\"recordType\":\"note\"}"))
+                .path("id").asString())).jobId().toString()));
+        assertThat(report(nothing, "{\"outcome\":\"done\",\"result\":{\"ids\":[]}}").statusCode()).isEqualTo(204);
+        assertThat(json(get(gm, searchPath(searchStore.anySearchOfJob(nothing.jobId()).orElseThrow().id())))
+                .path("state").asString()).isEqualTo("done");
+    }
+
+    @Test
     void anEmptyScopeIsSearchedAsNothingAndAFailedJobFailsTheSearchWithItsCode() throws Exception {
         Gm gm = signUp();
 
@@ -1930,8 +1967,11 @@ class ConversationFlowTest {
         for (String query : new String[] {"", "   \n\t", longest + "a"}) {
             assertProblem(createSearch(gm, gm.campaign(), query, null, null), 400, "request.invalid");
         }
+        // Story 4.3 part B: a record type that is not a core key (case included) is refused too.
         for (String body : List.of("{}", "{nope", "null", "{\"query\":\"x\",\"tier\":\"model\"}",
-                "{\"query\":\"x\",\"tier\":\"\"}", "{\"query\":\"x\",\"materialId\":\"nope\"}")) {
+                "{\"query\":\"x\",\"tier\":\"\"}", "{\"query\":\"x\",\"materialId\":\"nope\"}",
+                "{\"query\":\"x\",\"recordType\":\"dragon\"}", "{\"query\":\"x\",\"recordType\":\"Spell\"}",
+                "{\"query\":\"x\",\"recordType\":\"\"}", "{\"query\":\"x\",\"recordType\":5}")) {
             assertProblem(send(gm, "POST", path, body), 400, "request.invalid");
         }
         assertThat(searchStore.searches).hasSize(searchesBefore);

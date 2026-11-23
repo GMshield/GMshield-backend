@@ -14,6 +14,10 @@ import org.springframework.modulith.NamedInterface;
  *
  * <p>Whatever replaces or removes a version's passages removes its records first ({@link #removeVersion}), in the same
  * transaction: a record links to the passages it was read from.
+ *
+ * <p>Story 4.3 part B: a campaign's search reads records through {@link #located}, {@link #named} and {@link #names},
+ * for the {@code scope} module, which checks them against the campaign's scope. Whether a version is {@code ready} and
+ * allowed is the caller's check, never this port's.
  */
 @NamedInterface("service")
 public interface ExtractedRecords {
@@ -77,4 +81,38 @@ public interface ExtractedRecords {
      * {@link #firstPages} (one records run's input, Story 4.2 part B). Only the index job's input reads them.
      */
     List<Stored> readRange(UUID versionId, int firstPage, int lastPage);
+
+    /**
+     * Where a stored record stands (Story 4.3 part B): its id, its version, its core type's key, its first page and the
+     * ids of every passage it links to, in order. {@code toString} names ids and numbers only.
+     */
+    @NamedInterface("service")
+    record Located(UUID id, UUID versionId, String type, int firstPage, List<UUID> passageIds) {
+        public Located {
+            passageIds = List.copyOf(passageIds);
+        }
+
+        @Override
+        public String toString() {
+            return "Located[id=" + id + ", versionId=" + versionId + ", type=" + type + ", firstPage=" + firstPage
+                    + ", passages=" + passageIds.size() + "]";
+        }
+    }
+
+    /**
+     * The records with these ids, in the order given, each once; an id that is not one of the owner's records is left
+     * out. Nothing is decrypted.
+     */
+    List<Located> located(Collection<UUID> ids);
+
+    /**
+     * The records of these versions whose name equals {@code name} once both are in their unique form (trimmed, NFC,
+     * lower case in the root locale: {@code library.service.Library#uniqueForm}), found by an equality on the name's
+     * keyed fingerprint, never by a text search; by id. A record stored before V37 has no fingerprint and never
+     * matches. Nothing is decrypted.
+     */
+    List<Located> named(Collection<UUID> versionIds, String name);
+
+    /** The decrypted names of the owner's records with these ids; an unknown id or another owner's is left out. */
+    Map<UUID, String> names(Collection<UUID> ids);
 }
