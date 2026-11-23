@@ -55,6 +55,16 @@ public interface JobHandler {
     }
 
     /**
+     * The records with these ids (1 to 100, none null), for the job's live claim (Story 4.3 part C), served to the
+     * worker by {@code POST .../records}: as {@link #passages}, the handler checks every id against what its job may
+     * read before anything is decrypted, and answers them in the order asked, each once. Runs as the owner, in a read
+     * transaction of its own. A kind whose jobs read no record keeps this default: {@code job.records_refused} (403).
+     */
+    default List<JobRecord> records(JobRef job, List<UUID> ids) {
+        throw JobProblems.recordsRefused();
+    }
+
+    /**
      * A numbered batch of answer events of the job's live claim (Story 2.4), posted by the worker to
      * {@code POST .../events}: the handler stores it once, or accepts a batch it already stored (a repeated number of
      * the same claim) without storing it again, and refuses a gap with {@link JobProblems#batchOutOfOrder()}. Runs as

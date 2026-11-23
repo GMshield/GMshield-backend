@@ -7,10 +7,11 @@ import java.util.UUID;
  * One answer event the worker posts in a batch (Story 2.4, internal contract 1.10.0): a {@code delta} with its display
  * text, a {@code citation} of a passage id at a code-point offset of the answer's text, or (Story 3.7, contract 1.14.0)
  * a {@code tier} marker: a tier's version of the answer starts at that offset; from Story 3.8 (contract 1.15.0) the
- * tier word {@code model} marks a part from the model's own knowledge. The text is library-derived:
- * {@code toString} never names it.
+ * tier word {@code model} marks a part from the model's own knowledge. From Story 4.3 part C (contract 1.19.0) a
+ * {@code citation} names exactly one of a passage id and a record id. The text is library-derived: {@code toString}
+ * never names it.
  */
-public record JobEvent(String type, String text, UUID passageId, Integer offset, String tier) {
+public record JobEvent(String type, String text, UUID passageId, UUID recordId, Integer offset, String tier) {
 
     public static final String DELTA = "delta";
     public static final String CITATION = "citation";
@@ -24,15 +25,20 @@ public record JobEvent(String type, String text, UUID passageId, Integer offset,
     public static final Set<String> TIERS = Set.of("campaign", "system", "other", MODEL);
 
     public static JobEvent delta(String text) {
-        return new JobEvent(DELTA, text, null, null, null);
+        return new JobEvent(DELTA, text, null, null, null, null);
     }
 
     public static JobEvent citation(UUID passageId, int offset) {
-        return new JobEvent(CITATION, null, passageId, offset, null);
+        return new JobEvent(CITATION, null, passageId, null, offset, null);
+    }
+
+    /** A citation of a record (Story 4.3 part C). */
+    public static JobEvent recordCitation(UUID recordId, int offset) {
+        return new JobEvent(CITATION, null, null, recordId, offset, null);
     }
 
     public static JobEvent tier(String tier, int offset) {
-        return new JobEvent(TIER, null, null, offset, tier);
+        return new JobEvent(TIER, null, null, null, offset, tier);
     }
 
     @Override

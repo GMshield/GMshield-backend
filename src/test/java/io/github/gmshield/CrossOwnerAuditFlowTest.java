@@ -79,7 +79,8 @@ import tools.jackson.databind.node.ObjectNode;
  * system (from Story 4.1 with its core record types, and from Story 4.3 the spell record of its accepted version) and
  * a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second version that
  * is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
- * open uploads; a conversation with a done, bookmarked turn whose reference opens a page, a done, dismissed turn, a
+ * open uploads; a conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it
+ * also cites the record, which becomes a reference of its own), a done, dismissed turn, a
  * search, and a turn still waiting in a second conversation. Account B then walks {@link #ROUTES}, every public route
  * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
  * a random id on that route (the trace id aside), and a route with a container and an item ({@code own}) answers the
@@ -626,11 +627,12 @@ class CrossOwnerAuditFlowTest {
         items.put("upload", json(set).path("images").get(0).path("uploadId").asString());
 
         HttpResponse<String> asked = ask(gm, "{\"question\":\"" + QUESTION + "\"}");
-        UUID turn = answered(asked, passage);
+        // Story 4.3 part C: the turn also cites the spell record, so it has a record reference too.
+        UUID turn = answered(asked, passage, items.get("record"));
         items.put("conversation", json(asked).path("conversationId").asString());
         items.put("turn", turn.toString());
         assertThat(send(gm, "PUT", "/api/v1/turns/" + turn + "/bookmark", "").statusCode()).isEqualTo(204);
-        UUID dismissed = answered(ask(gm, "{\"question\":\"E Ray of Frost?\"}"), passage);
+        UUID dismissed = answered(ask(gm, "{\"question\":\"E Ray of Frost?\"}"), passage, null);
         items.put("dismissedTurn", dismissed.toString());
         assertThat(send(gm, "PUT", "/api/v1/turns/" + dismissed + "/dismissal", "").statusCode()).isEqualTo(204);
 
@@ -936,8 +938,11 @@ class CrossOwnerAuditFlowTest {
         return asked;
     }
 
-    /** The asked turn answered: claimed, one batch with a citation of {@code passage}, done. */
-    private UUID answered(HttpResponse<String> asked, UUID passage) throws Exception {
+    /**
+     * The asked turn answered: claimed, one batch with a citation of {@code passage} and (Story 4.3 part C) one of
+     * {@code record} when given, done.
+     */
+    private UUID answered(HttpResponse<String> asked, UUID passage, String record) throws Exception {
         UUID turnId = UUID.fromString(json(asked).path("id").asString());
         UUID jobId = stores.turnJob(turnId);
         HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + jobId + "/claims",
@@ -947,7 +952,8 @@ class CrossOwnerAuditFlowTest {
         JsonNode claim = json(claimed);
         HttpResponse<String> events = claimed(jobId, claim, "events", "{\"batch\":1,\"events\":[{\"type\":\"delta\","
                 + "\"text\":\"Fire Bolt causa 1d10 de dano de fogo.\"},{\"type\":\"citation\",\"passageId\":\""
-                + passage + "\",\"offset\":0}],\"usage\":[]}");
+                + passage + "\",\"offset\":0}" + (record == null ? "" : ",{\"type\":\"citation\",\"recordId\":\""
+                + record + "\",\"offset\":0}") + "],\"usage\":[]}");
         assertThat(events.statusCode()).as(events.body()).isEqualTo(200);
         HttpResponse<String> done = claimed(jobId, claim, "outcome", "{\"outcome\":\"done\"}");
         assertThat(done.statusCode()).as(done.body()).isEqualTo(204);

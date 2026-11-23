@@ -131,13 +131,17 @@ class JobClaimController {
     @Schema(name = "JobStreamEvent", requiredProperties = "type", description = "One answer event (contract 1.10.0): a"
             + " delta with its display text, a citation of a given passage id at a code-point offset of the answer's"
             + " text, or (contract 1.14.0) a tier marker: the version of that tier starts at the offset. From contract"
-            + " 1.15.0 the tier model marks a part from the model's own knowledge. Each type carries its own fields and"
-            + " no other")
+            + " 1.15.0 the tier model marks a part from the model's own knowledge. From contract 1.19.0 a citation"
+            + " names exactly one of passageId and recordId. Each type carries its own fields and no other")
     record JobStreamEvent(
             @Schema(allowableValues = {"delta", "citation", "tier"}) String type,
             @Schema(description = "For delta only: 1 to 16,384 code points of display text, citation markers removed",
                     maxLength = JobClaims.MAX_DELTA) String text,
-            @Schema(description = "For citation only: the cited passage's id", format = "uuid") UUID passageId,
+            @Schema(description = "For citation only: the cited passage's id; absent when recordId is given",
+                    format = "uuid") UUID passageId,
+            @Schema(description = "For citation only (contract 1.19.0): the cited record's id, a record given for this"
+                    + " answer; absent when passageId is given. A record outside the turn's scope is dropped",
+                    format = "uuid") UUID recordId,
             @Schema(description = "For citation and tier only: where the citation or the tier's version stands, in"
                     + " code points of the answer's text", minimum = "0", format = "int32") Integer offset,
             @Schema(description = "For tier only: the tier of a passage handed for this answer, or model (contract"
@@ -146,7 +150,7 @@ class JobClaimController {
                     + " dropped", allowableValues = {"campaign", "system", "other", "model"}) String tier) {
 
         JobEvent event() {
-            return new JobEvent(type, text, passageId, offset, tier);
+            return new JobEvent(type, text, passageId, recordId, offset, tier);
         }
 
         @Override

@@ -16,6 +16,9 @@ public final class JobProblems {
             "Job passages request invalid");
     static final ApiProblem PASSAGES_REFUSED = ApiProblem.of(403, CATEGORY, "passages_refused",
             "Job passages refused");
+    static final ApiProblem RECORDS_INVALID = ApiProblem.of(400, CATEGORY, "records_invalid",
+            "Job records request invalid");
+    static final ApiProblem RECORDS_REFUSED = ApiProblem.of(403, CATEGORY, "records_refused", "Job records refused");
     static final ApiProblem EVENTS_INVALID = ApiProblem.of(400, CATEGORY, "events_invalid", "Job events invalid");
     static final ApiProblem EVENTS_REFUSED = ApiProblem.of(403, CATEGORY, "events_refused", "Job events refused");
     static final ApiProblem BATCH_OUT_OF_ORDER = ApiProblem.of(409, CATEGORY, "batch_out_of_order",
@@ -65,6 +68,14 @@ public final class JobProblems {
 
     static ApiException passagesRefused() {
         return new ApiException(PASSAGES_REFUSED);
+    }
+
+    static ApiException recordsInvalid() {
+        return new ApiException(RECORDS_INVALID);
+    }
+
+    static ApiException recordsRefused() {
+        return new ApiException(RECORDS_REFUSED);
     }
 
     static ApiException eventsInvalid() {
