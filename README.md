@@ -771,6 +771,27 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     carry `indexRecipe` (`[A-Za-z0-9._-]{1,32}`, else `job.result_invalid`); it is kept on the row, and when no
     index change of the version is left unended and every row of its set reports one recipe,
     `material_version.index_recipe` records it. A superseded version keeps its points and its jobs run on.
+  - **Records runs (Story 4.2 part B, migration V36).** When the version has records, its set also holds runs of its
+    records, after its passages runs: each takes the next 200 records by first page, then the rest of the page where
+    it would end, so no page is split across two runs (`index_change.records` true; `first_ordinal` and `last_ordinal`
+    hold the run's first and last page). A records run's claim input names `records: "records"` instead of
+    `passages`, and `GET …/inputs/records` serves JSON Lines `{id, page, type, name, fields: [{name, value}]}` (the
+    record's id, first page and core type key, its name and fields decrypted through `ExtractedRecords.readRange`, for
+    that run only; the line `index.records_opened` logs the count). The worker writes one point per record, its id the
+    record's id. The version records its recipe only once its records runs are done too, and the retry sweep moves a
+    failed records run like a passages run (`records` kept). Until Story 4.3, `ScopeReads.pendingPassages`,
+    `indexing` and `failed` read passages runs only, so a pending or failed records run changes neither the keyword
+    fallback nor the GM's notices. V36 is additive (`records boolean not null default false`); rolling back past it
+    is safe only while no records row exists, and it leaves record points in Qdrant that an older worker's search
+    would return, so each source's removal has to run again. Only a worker of this release reads a records run: an
+    older one fails it with `index.input_invalid`, the retry sweep moves it (at most 3 times), and once its retries are
+    spent the next reconcile (a backend start) cuts it again. Records exist only from pipeline "8", so deploy the
+    backend, then the worker.
+  - **Reconcile with records runs.** `IndexReconcile` calls `IndexChanges.reconcile`: when every passages run of a
+    stale version's set already reports the stated recipe, only its records runs are deleted and cut again (the line
+    `index.records_restarted` logs ids and counts), so a records run that failed for good never makes the passages be
+    indexed again, and the GM's notices stay as they are; the version records the recipe once the new records runs are
+    done (at once when it has no record left to cut). Otherwise the whole set is created again, as before.
   - The recipe (AD-10): `POST …/claims` takes an optional body `{indexRecipe}` (400 `request.invalid` for one that is
     not a recipe). A recipe other than the last one stated since the start (the first one always) publishes
     `jobs.service.IndexRecipeStated` after the claim, whatever its answer. `IndexReconcile` then runs off the

@@ -25,7 +25,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * once, after that claim and off its request, one at a time in the order asked. It visits each owner with a
  * {@code ready} version recorded under another recipe, or none ({@link StaleIndexes}: ids only), as that owner, each in a
  * transaction of its own, and gives every such version that has no unended index change a new set of index changes
- * ({@link IndexChanges#start}), with the version locked, so a version is never given two sets at once. One owner's
+ * ({@link IndexChanges#reconcile}: only new records runs when its passages runs already report that recipe), with the
+ * version locked, so a version is never given two sets at once. One owner's
  * failure never stops the others; it is logged by error type, and the next reconcile tries again.
  */
 @Service
@@ -89,7 +90,7 @@ public class IndexReconcile {
                                     .filter(version -> Materials.READY.equals(version.state())
                                             && !recipe.equals(version.indexRecipe())).isPresent();
                             if (stillStale && !changes.pending(found.id())) {
-                                changes.start(found);
+                                changes.reconcile(found, recipe);
                                 started.incrementAndGet();
                             }
                         }

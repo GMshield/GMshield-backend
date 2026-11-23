@@ -11,6 +11,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -27,7 +28,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * ({@link ExtractedRecords}), as the owner of the work and in the caller's transaction. Each record gets its id here; its
  * name is encrypted bound to the entity {@value #RECORD}, the field {@value #FIELD_NAME} and the row, and its fields (a
  * JSON array of {@code {name, value}} in order) bound to the field {@value #FIELD_FIELDS}. Its core type key, ordinal
- * and first page stay plain, so the counts by type need no decryption. Nothing here logs a name or a field.
+ * and first page stay plain, so the counts by type need no decryption. {@link #readRange} decrypts them for the input of
+ * an index job only (Story 4.2 part B). Nothing here logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -77,6 +79,37 @@ public class ExtractedRecordStore implements ExtractedRecords {
     public Map<String, Long> countsByType(Collection<UUID> versionIds) {
         OwnerContext.require();
         return store.countsByType(versionIds);
+    }
+
+    @Override
+    public List<Integer> firstPages(UUID versionId) {
+        OwnerContext.require();
+        return store.ofVersion(versionId).stream().map(RecordRow::firstPage).toList();
+    }
+
+    @Override
+    public List<Stored> readRange(UUID versionId, int firstPage, int lastPage) {
+        UUID owner = OwnerContext.require();
+        List<Stored> found = new ArrayList<>();
+        for (RecordRow row : store.ofVersion(versionId)) {
+            if (row.firstPage() >= firstPage && row.firstPage() <= lastPage) {
+                found.add(new Stored(row.id(), row.type(), row.firstPage(),
+                        vault.decryptText(name(row.id(), owner), row.name()),
+                        fieldsOf(vault.decrypt(fields(row.id(), owner), row.fields()))));
+            }
+        }
+        return List.copyOf(found);
+    }
+
+    static List<Field> fieldsOf(byte[] json) {
+        List<Field> found = new ArrayList<>();
+        try {
+            JSON.readTree(json).forEach(field -> found.add(new Field(field.path("name").asString(),
+                    field.path("value").asString())));
+        } finally {
+            Arrays.fill(json, (byte) 0);
+        }
+        return List.copyOf(found);
     }
 
     static byte[] fieldsJson(List<Field> fields) {

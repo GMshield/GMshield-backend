@@ -58,7 +58,7 @@ class JpaIndexStore implements IndexStore {
             return List.of();
         }
         return em().createQuery("select c from IndexChange c where c.jobId in :ids and c.retries < :most"
-                        + " order by c.versionId, c.firstOrdinal", IndexChangeEntity.class)
+                        + " order by c.versionId, c.records, c.firstOrdinal", IndexChangeEntity.class)
                 .setParameter("ids", List.copyOf(jobIds)).setParameter("most", (short) IndexChangeRow.MAX_RETRIES)
                 .getResultList().stream().map(IndexChangeEntity::row).toList();
     }
@@ -71,7 +71,7 @@ class JpaIndexStore implements IndexStore {
         }
         IndexChangeRow before = found.get().row();
         IndexChangeRow moved = new IndexChangeRow(newJobId, before.ownerId(), before.versionId(), before.firstOrdinal(),
-                before.lastOrdinal(), null, before.retries() + 1);
+                before.lastOrdinal(), null, before.retries() + 1, before.records());
         EntityManager em = em();
         em.remove(found.get());
         em.flush();
@@ -83,6 +83,15 @@ class JpaIndexStore implements IndexStore {
     @Override
     public int deleteChanges(UUID versionId) {
         List<IndexChangeEntity> found = changeEntities(versionId);
+        found.forEach(em()::remove);
+        em().flush();
+        return found.size();
+    }
+
+    @Override
+    public int deleteRecordChanges(UUID versionId) {
+        List<IndexChangeEntity> found = changeEntities(versionId).stream().filter(change -> change.row().records())
+                .toList();
         found.forEach(em()::remove);
         em().flush();
         return found.size();
@@ -141,7 +150,7 @@ class JpaIndexStore implements IndexStore {
 
     private List<IndexChangeEntity> changeEntities(UUID versionId) {
         return em().createQuery("select c from IndexChange c where c.versionId = :version"
-                + " order by c.firstOrdinal", IndexChangeEntity.class).setParameter("version", versionId)
+                + " order by c.records, c.firstOrdinal", IndexChangeEntity.class).setParameter("version", versionId)
                 .getResultList();
     }
 

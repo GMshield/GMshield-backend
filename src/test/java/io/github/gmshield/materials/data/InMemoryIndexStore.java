@@ -54,7 +54,8 @@ public class InMemoryIndexStore implements IndexStore {
     public List<IndexChangeRow> changes(UUID versionId) {
         UUID owner = OwnerContext.require();
         return changes.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId))
-                .sorted(Comparator.comparingInt(IndexChangeRow::firstOrdinal)).toList();
+                .sorted(Comparator.comparing(IndexChangeRow::records).thenComparingInt(IndexChangeRow::firstOrdinal))
+                .toList();
     }
 
     @Override
@@ -63,7 +64,7 @@ public class InMemoryIndexStore implements IndexStore {
         found.ifPresent(before -> {
             ownerFor(before.ownerId());
             changes.put(jobId, new IndexChangeRow(before.jobId(), before.ownerId(), before.versionId(),
-                    before.firstOrdinal(), before.lastOrdinal(), recipe, before.retries()));
+                    before.firstOrdinal(), before.lastOrdinal(), recipe, before.retries(), before.records()));
             RollbackUndo.onRollback(() -> changes.put(jobId, before));
         });
         return found.isPresent();
@@ -74,7 +75,7 @@ public class InMemoryIndexStore implements IndexStore {
         UUID owner = OwnerContext.require();
         return changes.values().stream().filter(row -> row.ownerId().equals(owner) && jobIds.contains(row.jobId())
                         && row.retries() < IndexChangeRow.MAX_RETRIES)
-                .sorted(Comparator.comparing(IndexChangeRow::versionId)
+                .sorted(Comparator.comparing(IndexChangeRow::versionId).thenComparing(IndexChangeRow::records)
                         .thenComparingInt(IndexChangeRow::firstOrdinal)).toList();
     }
 
@@ -87,7 +88,7 @@ public class InMemoryIndexStore implements IndexStore {
         IndexChangeRow before = found.get();
         ownerFor(before.ownerId());
         IndexChangeRow moved = new IndexChangeRow(newJobId, before.ownerId(), before.versionId(), before.firstOrdinal(),
-                before.lastOrdinal(), null, before.retries() + 1);
+                before.lastOrdinal(), null, before.retries() + 1, before.records());
         if (moved.retries() > IndexChangeRow.MAX_RETRIES || changes.containsKey(newJobId)
                 || refusedMoves.contains(jobId)) {
             throw new IllegalStateException("key or check refused");
@@ -104,6 +105,17 @@ public class InMemoryIndexStore implements IndexStore {
     @Override
     public synchronized int deleteChanges(UUID versionId) {
         List<IndexChangeRow> found = changes(versionId);
+        for (IndexChangeRow row : found) {
+            ownerFor(row.ownerId());
+            changes.remove(row.jobId());
+            RollbackUndo.onRollback(() -> changes.put(row.jobId(), row));
+        }
+        return found.size();
+    }
+
+    @Override
+    public synchronized int deleteRecordChanges(UUID versionId) {
+        List<IndexChangeRow> found = changes(versionId).stream().filter(IndexChangeRow::records).toList();
         for (IndexChangeRow row : found) {
             ownerFor(row.ownerId());
             changes.remove(row.jobId());

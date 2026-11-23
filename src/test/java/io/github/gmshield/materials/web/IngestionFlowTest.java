@@ -44,6 +44,7 @@ import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.IndexReconcile;
 import io.github.gmshield.materials.service.IndexRetrySweep;
 import io.github.gmshield.materials.service.Materials;
+import io.github.gmshield.materials.service.ScopeReads;
 import io.github.gmshield.materials.service.TestMaterials;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.shared.service.TraceContext;
@@ -3218,6 +3219,8 @@ class IngestionFlowTest {
     private IndexReconcile reconciles;
     @Autowired
     private io.github.gmshield.jobs.service.Jobs jobService;
+    @Autowired
+    private ScopeReads scopeReads;
 
     @Test
     void acceptingAVersionCreatesItsIndexChangesInRunsOf200InTheAcceptTransaction() throws Exception {
@@ -3695,7 +3698,8 @@ class IngestionFlowTest {
 
     private List<IndexChangeRow> indexChanges(UUID versionId) {
         return index.changes.values().stream().filter(row -> row.versionId().equals(versionId))
-                .sorted(Comparator.comparingInt(IndexChangeRow::firstOrdinal)).toList();
+                .sorted(Comparator.comparing(IndexChangeRow::records).thenComparingInt(IndexChangeRow::firstOrdinal))
+                .toList();
     }
 
     private void report(IndexChangeRow change, JsonNode claim, String result) throws Exception {
@@ -3711,6 +3715,336 @@ class IngestionFlowTest {
                 "Content-Type", "application/json");
         assertThat(stated.statusCode()).as(stated.body()).isEqualTo(404);
         reconciles.settled().get(10, TimeUnit.SECONDS);
+    }
+
+    // --- Story 4.2 part B: the records runs
+
+    @Test
+    void acceptingAVersionWithRecordsIndexesThemInRunsByPageAndTheRecipeWaitsForThem() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        Uploaded uploaded = reviewedWithPassages(gm, 250);
+        // 230 records, 15 a page from page 1: the 200th is on page 14, whose last record is the 210th.
+        List<ExtractedRecords.Extracted> found = storeRecords(gm, uploaded, 230, 15);
+        accept(gm, uploaded);
+
+        // Matrix row "Accept with records": 2 passages runs, then 2 records runs, cut by first page.
+        List<IndexChangeRow> changes = indexChanges(uploaded.versionId());
+        assertThat(changes).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal,
+                IndexChangeRow::lastOrdinal, IndexChangeRow::recipe).containsExactly(tuple(false, 0, 199, null),
+                tuple(false, 200, 249, null), tuple(true, 1, 14, null), tuple(true, 15, 16, null));
+        assertThat(changes).allSatisfy(change -> assertThat(jobs.row(change.jobId()).kind()).isEqualTo("index.change"));
+        List<RecordRow> stored = recordsOf(uploaded.versionId());
+        Map<UUID, Integer> served = new LinkedHashMap<>();
+
+        for (IndexChangeRow change : changes) {
+            JsonNode claim = claim(change.jobId());
+            JsonNode input = claim.path("input");
+            String name = change.records() ? "records" : "passages";
+            String other = change.records() ? "passages" : "records";
+            assertThat(input.propertyNames()).containsExactlyInAnyOrder("source", "owner", "kind", "language",
+                    "tokenKey", name);
+            assertThat(input.path(name).asString()).isEqualTo(name);
+            // Exactly one input per run: a passages run serves no records, a records run no passages.
+            assertThat(input(change.jobId(), claim, other).statusCode()).isEqualTo(404);
+            HttpResponse<byte[]> opened = input(change.jobId(), claim, name);
+            assertThat(opened.statusCode()).isEqualTo(200);
+            List<JsonNode> lines = new String(opened.body(), StandardCharsets.UTF_8).lines().map(JSON::readTree)
+                    .toList();
+            if (change.records()) {
+                assertThat(lines).allSatisfy(line -> {
+                    assertThat(line.propertyNames()).containsExactly("id", "page", "type", "name", "fields");
+                    assertThat(line.path("page").asInt()).isBetween(change.firstOrdinal(), change.lastOrdinal());
+                    served.put(UUID.fromString(line.path("id").asString()), line.path("page").asInt());
+                });
+                assertThat(lines).hasSize(change.firstOrdinal() == 1 ? 210 : 20);
+            } else {
+                assertThat(lines).hasSize(change.firstOrdinal() == 0 ? 200 : 50);
+            }
+            // The version records the recipe only once every run is done, its records runs included.
+            assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isNull();
+            report(change, claim, "{\"indexRecipe\":\"1\",\"points\":" + lines.size() + "}");
+        }
+
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo("1");
+        // One line per record, in page order, its id the record's id, its page the record's first page.
+        assertThat(served.keySet()).containsExactlyElementsOf(stored.stream().map(RecordRow::id).toList());
+        assertThat(served.values()).containsExactlyElementsOf(stored.stream().map(RecordRow::firstPage).toList());
+        RecordRow first = stored.getFirst();
+        assertThat(found.getFirst().name()).isEqualTo("Magia 0");
+        assertThat(served).containsEntry(first.id(), 1);
+        // Names and fields leave only through the input: no log line holds them.
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("Magia")
+                || String.valueOf(event.getKeyValuePairs()).contains("Magia")
+                || String.valueOf(event.getKeyValuePairs()).contains("Componente"));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("index.records_opened")
+                && String.valueOf(event.getKeyValuePairs()).contains("records=\"210\""));
+    }
+
+    @Test
+    void aRecordsRunServesEachRecordDecryptedWithItsTypeAndFieldsInOrder() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        Uploaded uploaded = reviewedWithPassages(gm, 2);
+        UUID passageId = passages(uploaded.versionId()).getFirst().id();
+        OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.replaceRange(uploaded.versionId(), 1, 10, List.of(
+                        new ExtractedRecords.Extracted("spell", "Bola de Fogo", List.of(
+                                new ExtractedRecords.Field("Nível", "3"),
+                                new ExtractedRecords.Field("Alcance", "45 m\n\"longo\"")), List.of(passageId), 2),
+                        new ExtractedRecords.Extracted("item", "Corda", List.of(), List.of(passageId), 7)))));
+        accept(gm, uploaded);
+        List<IndexChangeRow> changes = indexChanges(uploaded.versionId());
+        assertThat(changes).extracting(IndexChangeRow::records).containsExactly(false, true);
+        IndexChangeRow passagesRun = changes.get(0);
+        IndexChangeRow run = changes.get(1);
+        assertThat(run).extracting(IndexChangeRow::firstOrdinal, IndexChangeRow::lastOrdinal).containsExactly(2, 7);
+        report(passagesRun, claim(passagesRun.jobId()), "{\"indexRecipe\":\"1\"}");
+        List<RecordRow> stored = recordsOf(uploaded.versionId());
+
+        JsonNode claim = claim(run.jobId());
+        List<JsonNode> lines = new String(input(run.jobId(), claim, "records").body(), StandardCharsets.UTF_8).lines()
+                .map(JSON::readTree).toList();
+
+        assertThat(lines).extracting(JsonNode::toString).containsExactly(
+                "{\"id\":\"" + stored.get(0).id() + "\",\"page\":2,\"type\":\"spell\",\"name\":\"Bola de Fogo\","
+                        + "\"fields\":[{\"name\":\"Nível\",\"value\":\"3\"},{\"name\":\"Alcance\","
+                        + "\"value\":\"45 m\\n\\\"longo\\\"\"}]}",
+                "{\"id\":\"" + stored.get(1).id() + "\",\"page\":7,\"type\":\"item\",\"name\":\"Corda\","
+                        + "\"fields\":[]}");
+        report(run, claim, "{\"indexRecipe\":\"1\"}");
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo("1");
+    }
+
+    @Test
+    void aVersionWithoutRecordsGetsPassagesRunsOnlyAndAVersionNeverAcceptedNone() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        Uploaded prose = reviewedWithPassages(gm, 3);
+        accept(gm, prose);
+        // Matrix row "No records": passages runs only, as before.
+        assertThat(indexChanges(prose.versionId())).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal,
+                IndexChangeRow::lastOrdinal).containsExactly(tuple(false, 0, 2));
+        // Its index change would hold the ingestion lane.
+        endEveryUnendedJob();
+
+        // Records of a version under review get no run, so no point.
+        Uploaded reviewed = reviewedWithPassages(gm, 3);
+        storeRecords(gm, reviewed, 5, 5);
+        assertThat(indexChanges(reviewed.versionId())).isEmpty();
+        endEveryUnendedJob();
+    }
+
+    @Test
+    void aFailedRecordsRunIsRetriedAsARecordsRunAndNeverShowsInSearchOrTheNotices() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        Uploaded uploaded = reviewedWithPassages(gm, 3);
+        storeRecords(gm, uploaded, 4, 2);
+        accept(gm, uploaded);
+        List<IndexChangeRow> changes = indexChanges(uploaded.versionId());
+        assertThat(changes).extracting(IndexChangeRow::records).containsExactly(false, true);
+        IndexChangeRow passagesRun = changes.get(0);
+        IndexChangeRow recordsRun = changes.get(1);
+        List<UUID> version = List.of(uploaded.versionId());
+
+        // While both runs are pending, the notice counts the 3 passages; the records add nothing.
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.indexing(version)))
+                .contains(new ScopeReads.Indexing(3));
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.pendingPassages(version))).hasSize(3);
+        report(passagesRun, claim(passagesRun.jobId()), "{\"indexRecipe\":\"1\"}");
+        // Matrix row "Search": the passages are indexed; the pending records run changes neither the notice nor search.
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.indexing(version))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.pendingPassages(version))).isEmpty();
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isNull();
+
+        // Matrix row "Records run fails": Ollama or Qdrant down; the notices stay as if there were no records.
+        fail(recordsRun);
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.failed(version))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.indexing(version))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.pendingPassages(version))).isEmpty();
+
+        // The sweep retries it like a passages run: a new job, the same pages, still a records run.
+        onlyTheseFailedRunsToRetry(gm);
+        assertThat(retries.sweep()).isEqualTo(1);
+        IndexChangeRow moved = indexChanges(uploaded.versionId()).get(1);
+        assertThat(moved.jobId()).isNotEqualTo(recordsRun.jobId());
+        assertThat(moved).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal, IndexChangeRow::lastOrdinal,
+                IndexChangeRow::retries).containsExactly(true, 1, 2, 1);
+        JsonNode claim = claim(moved.jobId());
+        assertThat(claim.path("input").path("records").asString()).isEqualTo("records");
+        assertThat(new String(input(moved.jobId(), claim, "records").body(), StandardCharsets.UTF_8).lines())
+                .hasSize(4);
+        report(moved, claim, "{\"indexRecipe\":\"1\"}");
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo("1");
+    }
+
+    @Test
+    void aRecordsRunFailedForGoodIsCutAgainAloneAtTheNextReconcileAndANewRecipeIndexesTheWholeSetAgain()
+            throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        String recipe = "r" + UUID.randomUUID().toString().substring(0, 8);
+        Uploaded uploaded = reviewedWithPassages(gm, 3);
+        storeRecords(gm, uploaded, 4, 2);
+        accept(gm, uploaded);
+        List<UUID> version = List.of(uploaded.versionId());
+        IndexChangeRow passagesRun = indexChanges(uploaded.versionId()).get(0);
+        report(passagesRun, claim(passagesRun.jobId()), "{\"indexRecipe\":\"" + recipe + "\"}");
+        IndexChangeRow passagesDone = indexChanges(uploaded.versionId()).get(0);
+        assertThat(passagesDone.recipe()).isEqualTo(recipe);
+        // The records run fails, and so does each of its 3 retries: the sweep has none left.
+        IndexChangeRow recordsRun = indexChanges(uploaded.versionId()).get(1);
+        fail(recordsRun);
+        for (int retry = 1; retry <= IndexChangeRow.MAX_RETRIES; retry++) {
+            onlyTheseFailedRunsToRetry(gm);
+            assertThat(retries.sweep()).isEqualTo(1);
+            recordsRun = indexChanges(uploaded.versionId()).get(1);
+            fail(recordsRun);
+        }
+        assertThat(retries.sweep()).isZero();
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isNull();
+
+        // Matrix row "Records run failed for good, then a backend start": the reconcile under the same recipe cuts
+        // only the records runs again; the passages row, its points and the notices stay as they are.
+        stateRecipeWithoutClaim(recipe);
+        List<IndexChangeRow> restarted = indexChanges(uploaded.versionId());
+        assertThat(restarted).hasSize(2);
+        assertThat(restarted.get(0)).isEqualTo(passagesDone);
+        IndexChangeRow fresh = restarted.get(1);
+        assertThat(fresh.jobId()).isNotEqualTo(recordsRun.jobId());
+        assertThat(fresh).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal, IndexChangeRow::lastOrdinal,
+                IndexChangeRow::recipe, IndexChangeRow::retries).containsExactly(true, 1, 2, null, 0);
+        assertThat(jobs.row(fresh.jobId()).state()).isIn("waiting", "offered");
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isNull();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.indexing(version))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.failed(version))).isEmpty();
+        assertThat(OwnerContext.callAs(gm.id(), () -> scopeReads.pendingPassages(version))).isEmpty();
+        assertThat(logged.list).filteredOn(event -> "index.records_restarted".equals(event.getFormattedMessage())
+                        && event.getKeyValuePairs().toString().contains(uploaded.versionId().toString()))
+                .singleElement().satisfies(event -> assertThat(event.getKeyValuePairs().toString())
+                        .contains("recordJobs=\"1\"").contains("replaced=\"1\"").doesNotContain("Magia"));
+        // The recipe is recorded once the new records run is done. The reconcile may have given other tests' versions
+        // new sets too: none of them takes the lane from this run.
+        jobs.rows.replaceAll((id, row) -> !id.equals(fresh.jobId()) && Set.of("waiting", "offered", "running")
+                .contains(row.state()) ? row.released("cancelled", null, row.updatedAt()) : row);
+        sweep.sweep();
+        assertThat(jobs.row(fresh.jobId()).state()).isEqualTo("offered");
+        JsonNode claim = claim(fresh.jobId());
+        assertThat(new String(input(fresh.jobId(), claim, "records").body(), StandardCharsets.UTF_8).lines())
+                .hasSize(4);
+        report(fresh, claim, "{\"indexRecipe\":\"" + recipe + "\"}");
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo(recipe);
+
+        // Matrix row "New recipe stated": the passages are at the old recipe, so the whole set is created again.
+        stateRecipeWithoutClaim("r" + UUID.randomUUID().toString().substring(0, 8));
+        List<IndexChangeRow> renewed = indexChanges(uploaded.versionId());
+        assertThat(renewed).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal,
+                IndexChangeRow::lastOrdinal, IndexChangeRow::recipe).containsExactly(tuple(false, 0, 2, null),
+                tuple(true, 1, 2, null));
+        assertThat(renewed.get(0).jobId()).isNotEqualTo(passagesDone.jobId());
+        assertThat(renewed.get(1).jobId()).isNotEqualTo(fresh.jobId());
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isNull();
+        endEveryUnendedJob();
+    }
+
+    @Test
+    void aReconcileIndexesTheWholeSetAgainWhenOnePassagesRunAmongSeveralDoesNotReportTheRecipe() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        String recipe = "r" + UUID.randomUUID().toString().substring(0, 8);
+        Uploaded uploaded = reviewedWithPassages(gm, 401);
+        storeRecords(gm, uploaded, 4, 2);
+        accept(gm, uploaded);
+        List<IndexChangeRow> changes = indexChanges(uploaded.versionId());
+        assertThat(changes).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal)
+                .containsExactly(tuple(false, 0), tuple(false, 200), tuple(false, 400), tuple(true, 1));
+        // Passages runs 0 and 2 report the recipe; run 1 fails, and so does each of its 3 retries. (The ingestion lane
+        // offers one job at a time, in order; the records run is ended so that the retries are offered.)
+        report(changes.get(0), claim(changes.get(0).jobId()), "{\"indexRecipe\":\"" + recipe + "\"}");
+        IndexChangeRow failing = changes.get(1);
+        fail(failing);
+        report(changes.get(2), claim(changes.get(2).jobId()), "{\"indexRecipe\":\"" + recipe + "\"}");
+        endEveryUnendedJob();
+        for (int retry = 1; retry <= IndexChangeRow.MAX_RETRIES; retry++) {
+            onlyTheseFailedRunsToRetry(gm);
+            assertThat(retries.sweep()).isEqualTo(1);
+            failing = indexChanges(uploaded.versionId()).get(1);
+            fail(failing);
+        }
+        assertThat(retries.sweep()).isZero();
+        List<IndexChangeRow> before = indexChanges(uploaded.versionId());
+
+        stateRecipeWithoutClaim(recipe);
+
+        // Not every passages run reports the recipe: the whole set is created again, passages and records runs alike.
+        List<IndexChangeRow> after = indexChanges(uploaded.versionId());
+        assertThat(after).extracting(IndexChangeRow::records, IndexChangeRow::firstOrdinal, IndexChangeRow::recipe,
+                IndexChangeRow::retries).containsExactly(tuple(false, 0, null, 0), tuple(false, 200, null, 0),
+                tuple(false, 400, null, 0), tuple(true, 1, null, 0));
+        assertThat(after).extracting(IndexChangeRow::jobId).doesNotContainAnyElementsOf(
+                before.stream().map(IndexChangeRow::jobId).toList());
+        assertThat(logged.list).noneMatch(event -> "index.records_restarted".equals(event.getFormattedMessage())
+                && event.getKeyValuePairs().toString().contains(uploaded.versionId().toString()));
+        endEveryUnendedJob();
+    }
+
+    @Test
+    void aReconcileWhosePassagesRunsReportTheRecipeAndThatHasNoRecordToCutRecordsTheRecipe() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        String recipe = "r" + UUID.randomUUID().toString().substring(0, 8);
+        Uploaded uploaded = reviewedWithPassages(gm, 3);
+        accept(gm, uploaded);
+        IndexChangeRow passagesRun = indexChanges(uploaded.versionId()).getFirst();
+        report(passagesRun, claim(passagesRun.jobId()), "{\"indexRecipe\":\"" + recipe + "\"}");
+        IndexChangeRow passagesDone = indexChanges(uploaded.versionId()).getFirst();
+        // Every run of the set reports the recipe, yet the version holds none (as no route leaves it today).
+        OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status ->
+                materials.recordIndexRecipe(uploaded.versionId(), null)));
+
+        stateRecipeWithoutClaim(recipe);
+
+        // Nothing is indexed again: the set is complete under the recipe, which the version records.
+        assertThat(indexChanges(uploaded.versionId())).containsExactly(passagesDone);
+        assertThat(materials.versions.get(uploaded.versionId()).indexRecipe()).isEqualTo(recipe);
+        endEveryUnendedJob();
+    }
+
+    @Test
+    void discardingAVersionCancelsItsRecordsRunsWithItsPassagesRuns() throws Exception {
+        Gm gm = signUp();
+        endEveryUnendedJob();
+        Uploaded uploaded = reviewedWithPassages(gm, 3);
+        storeRecords(gm, uploaded, 2, 1);
+        // A version under review has no index change: a records run is recorded here, as a removed ready version may
+        // still have one.
+        UUID change = OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                jobService.create("index.change", job -> index.insertChange(new IndexChangeRow(job.id(), gm.id(),
+                        uploaded.versionId(), 1, 2, null, 0, true))).id()));
+
+        // Matrix row "Remove / discard": the run is cancelled, and the removal (by owner and source) takes its points.
+        assertThat(act(gm, uploaded, "discard").statusCode()).isEqualTo(200);
+
+        assertThat(jobs.row(change).state()).isEqualTo("cancelled");
+        assertThat(index.removals.values()).anyMatch(row -> row.versionId().equals(uploaded.versionId()));
+        endEveryUnendedJob();
+    }
+
+    /**
+     * Stores {@code count} spell records of the version, {@code perPage} a page from page 1, through the port as a
+     * records step would: record i is "Magia i" with one field, read from the version's first passage.
+     */
+    private List<ExtractedRecords.Extracted> storeRecords(Gm gm, Uploaded uploaded, int count, int perPage) {
+        UUID passageId = passages(uploaded.versionId()).getFirst().id();
+        List<ExtractedRecords.Extracted> found = IntStream.range(0, count).mapToObj(i ->
+                new ExtractedRecords.Extracted("spell", "Magia " + i, List.of(new ExtractedRecords.Field("Componente",
+                        "V" + i)), List.of(passageId), 1 + i / perPage)).toList();
+        int lastPage = 1 + (count - 1) / perPage;
+        OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.replaceRange(uploaded.versionId(), 1, lastPage, found)));
+        assertThat(recordsOf(uploaded.versionId())).hasSize(count);
+        return found;
     }
 
     // --- owners

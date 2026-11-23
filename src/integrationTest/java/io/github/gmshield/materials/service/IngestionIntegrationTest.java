@@ -2,6 +2,7 @@ package io.github.gmshield.materials.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
@@ -41,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,6 +53,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -1131,7 +1134,7 @@ class IngestionIntegrationTest {
             ByteArrayOutputStream read = new ByteArrayOutputStream();
             JobFiles.Opened opened = jobFiles.open(claim.jobId(), claim.claimId(), claim.grant(), "passages");
             opened.input().writeTo(read);
-            List<tools.jackson.databind.JsonNode> lines = read.toString(StandardCharsets.UTF_8).lines()
+            List<JsonNode> lines = read.toString(StandardCharsets.UTF_8).lines()
                     .map(JSON::readTree).toList();
             assertThat(lines).hasSize((int) change.get("last_ordinal") - (int) change.get("first_ordinal") + 1);
             assertThat(lines.getFirst().path("ordinal").asInt()).isEqualTo(change.get("first_ordinal"));
@@ -1236,6 +1239,155 @@ class IngestionIntegrationTest {
         assertThat(jdbc.sql("select state from job where id = ?").param(claim.jobId()).query(String.class).single())
                 .isEqualTo("done");
         freeTheIngestionLane();
+    }
+
+    // --- Story 4.2 part B: the records runs on Postgres
+
+    @Autowired
+    private ExtractedRecords extracted;
+    @Value("${gmshield.jobs.max-attempts}")
+    private int maxAttempts;
+
+    @Test
+    void anAcceptWithRecordsCreatesRecordsRunsWhoseRecipeTheVersionWaitsForAndARetryKeepsThemOnPostgres()
+            throws Exception {
+        Chain chain = reviewed(4, List.of());
+        UUID passageId = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1")
+                .param(chain.versionId()).query(UUID.class).single();
+        write(chain.owner(), () -> extracted.replaceRange(chain.versionId(), 1, 4, List.of(
+                new ExtractedRecords.Extracted("spell", "Fireball", List.of(new ExtractedRecords.Field("Level", "3")),
+                        List.of(passageId), 1),
+                new ExtractedRecords.Extracted("item", "Rope", List.of(), List.of(passageId), 3))));
+        List<UUID> recordIds = jdbc.sql("select id from record where version_id = ? order by first_page")
+                .param(chain.versionId()).query(UUID.class).list();
+
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+
+        // One passages run, then one records run over pages 1 to 3: its first and last page in the ordinal columns.
+        List<Map<String, Object>> changes = jdbc.sql("select c.job_id, c.first_ordinal, c.last_ordinal, c.records,"
+                + " c.recipe, j.kind from index_change c join job j on j.id = c.job_id where c.version_id = ?"
+                + " order by c.records, c.first_ordinal").param(chain.versionId()).query().listOfRows();
+        assertThat(changes).satisfiesExactly(
+                passages -> assertThat(passages).containsEntry("records", false).containsEntry("first_ordinal", 0)
+                        .containsEntry("kind", "index.change"),
+                records -> assertThat(records).containsEntry("records", true).containsEntry("first_ordinal", 1)
+                        .containsEntry("last_ordinal", 3).containsEntry("kind", "index.change"));
+        JobClaims.Claim passagesClaim = claims.claim((UUID) changes.get(0).get("job_id"));
+        claims.report(passagesClaim.jobId(), passagesClaim.claimId(), passagesClaim.grant(), "done", null, null,
+                JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+        // The passages are indexed; the version still waits for its records run.
+        assertThat(versionRecipe(chain)).isNull();
+
+        UUID recordsJob = (UUID) changes.get(1).get("job_id");
+        // Its last attempt: the worker reports Qdrant down with no retry flag, so the job ends failed.
+        jdbc.sql("update job set attempt = ? where id = ?").params(maxAttempts - 1, recordsJob).update();
+        JobClaims.Claim failing = claims.claim(recordsJob);
+        assertThat(failing.input().path("records").asString()).isEqualTo("records");
+        assertThat(failing.input().has("passages")).isFalse();
+        claims.report(failing.jobId(), failing.claimId(), failing.grant(), "failed", "index.store_unavailable", null,
+                null);
+        assertThat(jdbc.sql("select state from job where id = ?").param(recordsJob).query(String.class).single())
+                .isEqualTo("failed");
+        jdbc.sql("update job set state = 'cancelled' where kind = 'index.change' and state = 'failed'"
+                + " and owner_id <> ?").param(chain.owner()).update();
+
+        assertThat(retrySweep.sweep()).isEqualTo(1);
+
+        Map<String, Object> moved = jdbc.sql("select job_id, first_ordinal, last_ordinal, records, retries"
+                + " from index_change where version_id = ? and records").param(chain.versionId()).query().singleRow();
+        assertThat(moved).doesNotContainEntry("job_id", recordsJob).containsEntry("first_ordinal", 1)
+                .containsEntry("last_ordinal", 3).containsEntry("retries", 1);
+        JobClaims.Claim retried = claims.claim((UUID) moved.get("job_id"));
+        ByteArrayOutputStream read = new ByteArrayOutputStream();
+        jobFiles.open(retried.jobId(), retried.claimId(), retried.grant(), "records").input().writeTo(read);
+        List<JsonNode> lines = read.toString(StandardCharsets.UTF_8).lines().map(JSON::readTree)
+                .toList();
+        assertThat(lines).extracting(line -> line.path("id").asString())
+                .containsExactlyElementsOf(recordIds.stream().map(UUID::toString).toList());
+        assertThat(lines.getFirst().toString()).isEqualTo("{\"id\":\"" + recordIds.getFirst() + "\",\"page\":1,"
+                + "\"type\":\"spell\",\"name\":\"Fireball\",\"fields\":[{\"name\":\"Level\",\"value\":\"3\"}]}");
+        claims.report(retried.jobId(), retried.claimId(), retried.grant(), "done", null, null,
+                JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+
+        assertThat(versionRecipe(chain)).isEqualTo("it-1");
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void recordsWrittenLaterPagesFirstAreRunAndServedByFirstPageThenOrdinalAndAReconcileCutsOnlyThemAgainOnPostgres()
+            throws Exception {
+        Chain chain = reviewed(4, List.of());
+        UUID passageId = jdbc.sql("select id from passage where version_id = ? order by ordinal limit 1")
+                .param(chain.versionId()).query(UUID.class).single();
+        // The records step of pages 11-20 reports before the one of pages 1-10, and neither lists its records by page:
+        // record ids, minted in that order, follow neither the pages nor the ordinals.
+        List<ExtractedRecords.Extracted> later = new ArrayList<>();
+        later.add(record("Tarde 15", 15, passageId));
+        IntStream.range(0, 200).forEach(i -> later.add(record("Página 12 n" + i, 12, passageId)));
+        write(chain.owner(), () -> extracted.replaceRange(chain.versionId(), 11, 20, later));
+        write(chain.owner(), () -> extracted.replaceRange(chain.versionId(), 1, 10, List.of(
+                record("Cedo 3", 3, passageId), record("Cedo 1", 1, passageId))));
+        List<UUID> byPage = jdbc.sql("select id from record where version_id = ? order by first_page, ordinal")
+                .param(chain.versionId()).query(UUID.class).list();
+        assertThat(jdbc.sql("select id from record where version_id = ? order by id").param(chain.versionId())
+                .query(UUID.class).list()).isNotEqualTo(byPage);
+
+        as(chain.owner(), () -> actions.act(chain.materialId(), "accept"));
+
+        // The first run takes 200 records (pages 1, 3 and 198 of page 12), then the rest of page 12; then page 15.
+        List<Map<String, Object>> changes = jdbc.sql("select job_id, first_ordinal, last_ordinal, records, recipe"
+                + " from index_change where version_id = ? order by records, first_ordinal")
+                .param(chain.versionId()).query().listOfRows();
+        assertThat(changes).extracting(row -> row.get("records"), row -> row.get("first_ordinal"),
+                row -> row.get("last_ordinal")).containsExactly(tuple(false, 0, 1), tuple(true, 1, 12),
+                tuple(true, 15, 15));
+        JobClaims.Claim passagesClaim = claims.claim((UUID) changes.get(0).get("job_id"));
+        claims.report(passagesClaim.jobId(), passagesClaim.claimId(), passagesClaim.grant(), "done", null, null,
+                JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+        List<String> served = new ArrayList<>();
+        for (Map<String, Object> change : changes.subList(1, 3)) {
+            JobClaims.Claim claim = claims.claim((UUID) change.get("job_id"));
+            ByteArrayOutputStream read = new ByteArrayOutputStream();
+            jobFiles.open(claim.jobId(), claim.claimId(), claim.grant(), "records").input().writeTo(read);
+            read.toString(StandardCharsets.UTF_8).lines().map(JSON::readTree)
+                    .forEach(line -> served.add(line.path("id").asString()));
+            claims.report(claim.jobId(), claim.claimId(), claim.grant(), "done", null, null,
+                    JSON.readTree("{\"indexRecipe\":\"it-1\"}"));
+        }
+        // The records input lines follow "order by first_page, ordinal", across both steps.
+        assertThat(served).containsExactlyElementsOf(byPage.stream().map(UUID::toString).toList());
+        assertThat(versionRecipe(chain)).isEqualTo("it-1");
+
+        // As if the page-15 run had failed for good instead (no recipe, its retries spent, the version none): the next
+        // reconcile under it-1 cuts only the records runs again; the passages row stays, and the version's recipe waits
+        // for the new runs.
+        UUID lastRun = (UUID) changes.get(2).get("job_id");
+        jdbc.sql("update material_version set index_recipe = null where id = ?").param(chain.versionId()).update();
+        jdbc.sql("update index_change set recipe = null, retries = 3 where job_id = ?").param(lastRun).update();
+        Map<String, Object> passagesRow = jdbc.sql("select job_id, first_ordinal, last_ordinal, recipe, retries"
+                + " from index_change where version_id = ? and not records").param(chain.versionId()).query()
+                .singleRow();
+
+        assertThat(reconcile.reconcile("it-1")).isPositive();
+
+        assertThat(jdbc.sql("select job_id, first_ordinal, last_ordinal, recipe, retries from index_change"
+                + " where version_id = ? and not records").param(chain.versionId()).query().singleRow())
+                .isEqualTo(passagesRow);
+        List<Map<String, Object>> recut = jdbc.sql("select job_id, first_ordinal, last_ordinal, recipe, retries"
+                + " from index_change where version_id = ? and records order by first_ordinal")
+                .param(chain.versionId()).query().listOfRows();
+        assertThat(recut).extracting(row -> row.get("first_ordinal"), row -> row.get("last_ordinal"),
+                row -> row.get("recipe"), row -> row.get("retries")).containsExactly(tuple(1, 12, null, 0),
+                tuple(15, 15, null, 0));
+        assertThat(recut).extracting(row -> row.get("job_id")).doesNotContainAnyElementsOf(
+                changes.stream().map(row -> row.get("job_id")).toList());
+        assertThat(versionRecipe(chain)).isNull();
+        freeTheIngestionLane();
+    }
+
+    private static ExtractedRecords.Extracted record(String name, int page, UUID passageId) {
+        return new ExtractedRecords.Extracted("spell", name, List.of(new ExtractedRecords.Field("Nível", "1")),
+                List.of(passageId), page);
     }
 
     private List<Map<String, Object>> indexChanges(Chain chain) {

@@ -17,6 +17,7 @@ import io.github.gmshield.vault.service.Vault;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
@@ -31,24 +32,35 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.JsonNodeFactory;
 import tools.jackson.databind.node.ObjectNode;
 
 /**
  * The index changes of a material version (Story 2.1, AD-10, AD-13): the job kind {@value #KIND} on the ingestion
- * lane, one job per run of at most {@value #RUN} of the version's passages by ordinal. The job row holds no content:
- * the run is an {@code index_change} row keyed by the job.
+ * lane, one job per run of at most {@value #RUN} of the version's passages by ordinal, and (Story 4.2 part B) one job
+ * per run of its records by first page: at most {@value #RUN} records, extended to the last record of the page where the
+ * run would end, so no page is split across two runs (a record's ordinal is unique only within one step's report). The
+ * job row holds no content: the run is an {@code index_change} row keyed by the job, a records row marked
+ * {@code records}, with its first and last page in place of ordinals.
  *
  * <ul>
  *   <li>{@link #start}: in the caller's transaction, with the version locked (an accept, or the reconcile of
  *       {@link IndexReconcile}): the version's earlier set of rows goes, its recipe is cleared, and a job is created for
- *       each run, in ordinal order. A version with no passage gets none.</li>
+ *       each run: the passages runs in ordinal order, then the records runs in page order. A version with no passage
+ *       and no record gets none.</li>
+ *   <li>{@link #reconcile}: the same, except when every passages run of the version's set already reports the stated
+ *       recipe: then only its records runs are cut again, so a records run that failed for good never makes the
+ *       passages be indexed again.</li>
  *   <li>{@link #input}: at the claim, for a {@code ready} or {@code superseded} version (a superseded version keeps its
  *       points), the worker gets {@code source} (the version's id), {@code owner}, the material's {@code kind} and
  *       {@code language} (null when not given), {@code tokenKey} (Base64 of {@link Vault#ownerTokenKey}, never logged
- *       or stored) and {@code passages}, the name of its input, which {@link #openInput} serves.</li>
- *   <li>{@link #openInput}: the run's passages as JSON Lines {@code {id, ordinal, page, title, text}}, decrypted for
- *       that run only; the title is the last element of the passage's section path, or empty.</li>
+ *       or stored) and the name of its input, which {@link #openInput} serves: {@code passages} for a passages run,
+ *       {@code records} for a records run (exactly one of the two).</li>
+ *   <li>{@link #openInput}: a passages run as JSON Lines {@code {id, ordinal, page, title, text}}, decrypted for that
+ *       run only; the title is the last element of the passage's section path, or empty. A records run as JSON Lines
+ *       {@code {id, page, type, name, fields: [{name, value}]}} (its first page and its core type's key), decrypted for
+ *       that run only: a record's name and fields leave the backend only there.</li>
  *   <li>{@link #completed}: the result's {@code indexRecipe} is recorded on the row, with the version locked; when no
  *       index change of the version is left unended and every row of its set reports that same recipe, the version
  *       records it.</li>
@@ -62,7 +74,9 @@ import tools.jackson.databind.node.ObjectNode;
  *
  * A run whose job ended {@code failed} still counts as not indexed: its passages stay in the keyword fallback
  * ({@link ScopeReads#pendingPassages}) and the GM's notice reports them ({@link ScopeReads#failed}), but not as
- * indexing ({@link ScopeReads#indexing}). A {@code cancelled} run is neither.
+ * indexing ({@link ScopeReads#indexing}). A {@code cancelled} run is neither. Those reads see passages runs only: until
+ * Story 4.3, a records run, pending or failed, changes neither the search nor the notices. The version's recipe waits
+ * for every run of its set, records runs included.
  *
  * Nothing here logs a name, a text or the token key.
  */
@@ -70,9 +84,11 @@ import tools.jackson.databind.node.ObjectNode;
 public class IndexChanges implements JobHandler {
 
     public static final String KIND = "index.change";
-    /** The name of an index change's input in the internal API. */
+    /** The name of a passages run's input in the internal API. */
     public static final String PASSAGES = "passages";
-    /** The most passages one index change covers. */
+    /** The name of a records run's input in the internal API (Story 4.2 part B). */
+    public static final String RECORDS = "records";
+    /** The most passages one index change covers, and the records a records run covers before its last page ends. */
     static final int RUN = 200;
     /** An index recipe as the worker reports it (AD-10). */
     static final Pattern RECIPE = Pattern.compile("[A-Za-z0-9._-]{1,32}");
@@ -86,12 +102,14 @@ public class IndexChanges implements JobHandler {
     private final MaterialStore materials;
     private final IndexStore index;
     private final Vault vault;
+    private final ExtractedRecords records;
 
-    IndexChanges(Jobs jobs, MaterialStore materials, IndexStore index, Vault vault) {
+    IndexChanges(Jobs jobs, MaterialStore materials, IndexStore index, Vault vault, ExtractedRecords records) {
         this.jobs = jobs;
         this.materials = materials;
         this.index = index;
         this.vault = vault;
+        this.records = records;
     }
 
     /** A new set of index changes for the version, as the class says; answers how many jobs it created. */
@@ -108,10 +126,73 @@ public class IndexChanges implements JobHandler {
                     null)));
             created++;
         }
+        List<Integer> pages = records.firstPages(version.id());
+        int recordJobs = startRecords(owner, version.id(), pages);
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", version.id())
-                .addKeyValue("passages", ordinals.size()).addKeyValue("jobs", created).addKeyValue("replaced", replaced)
-                .log("index.changes_created");
+                .addKeyValue("passages", ordinals.size()).addKeyValue("records", pages.size())
+                .addKeyValue("jobs", created + recordJobs).addKeyValue("recordJobs", recordJobs)
+                .addKeyValue("replaced", replaced).log("index.changes_created");
+        return created + recordJobs;
+    }
+
+    /**
+     * The reconcile of a stale version under {@code recipe} ({@link IndexReconcile}), in the caller's transaction, with
+     * the version locked and none of its index changes unended. When the version's set has passages runs and each one
+     * reports {@code recipe}, only its records runs are cut again (a records run that failed for good, Story 4.2 part
+     * B): its passages runs, their points and the GM's notices stay as they are, and the version's recipe still waits for
+     * the new records runs; with no record to cut, the set is complete under {@code recipe}, which the version then
+     * records. Otherwise the whole set is replaced ({@link #start}). Answers how many jobs it created.
+     */
+    int reconcile(VersionRow version, String recipe) {
+        List<IndexChangeRow> passagesRuns = index.changes(version.id()).stream().filter(row -> !row.records()).toList();
+        boolean passagesIndexed = !passagesRuns.isEmpty()
+                && passagesRuns.stream().allMatch(row -> recipe.equals(row.recipe()));
+        if (!passagesIndexed) {
+            return start(version);
+        }
+        UUID owner = OwnerContext.require();
+        int replaced = index.deleteRecordChanges(version.id());
+        List<Integer> pages = records.firstPages(version.id());
+        int recordJobs = startRecords(owner, version.id(), pages);
+        if (recordJobs == 0) {
+            materials.recordIndexRecipe(version.id(), recipe);
+        }
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", version.id())
+                .addKeyValue("passagesRuns", passagesRuns.size()).addKeyValue("records", pages.size())
+                .addKeyValue("recordJobs", recordJobs).addKeyValue("replaced", replaced)
+                .log("index.records_restarted");
+        return recordJobs;
+    }
+
+    /** Creates a records run's job for each of {@link #recordRuns}, in page order; answers how many. */
+    private int startRecords(UUID owner, UUID versionId, List<Integer> pages) {
+        int created = 0;
+        for (int[] run : recordRuns(pages)) {
+            jobs.create(KIND, job -> index.insertChange(new IndexChangeRow(job.id(), owner, versionId, run[0], run[1],
+                    null, 0, true)));
+            created++;
+        }
         return created;
+    }
+
+    /**
+     * The records runs of a version whose records have these first pages, in order, as {@code {firstPage, lastPage}}:
+     * each takes the next {@value #RUN} records, then every further record on the page of the last one taken, so no
+     * page is split across two runs.
+     */
+    static List<int[]> recordRuns(List<Integer> pages) {
+        List<int[]> runs = new ArrayList<>();
+        int from = 0;
+        while (from < pages.size()) {
+            int to = Math.min(from + RUN, pages.size()) - 1;
+            int last = pages.get(to);
+            while (to + 1 < pages.size() && pages.get(to + 1) == last) {
+                to++;
+            }
+            runs.add(new int[] {pages.get(from), last});
+            from = to + 1;
+        }
+        return runs;
     }
 
     /** Whether an index change of the owner's version has not ended. */
@@ -173,8 +254,9 @@ public class IndexChanges implements JobHandler {
             retried++;
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", row.versionId())
                     .addKeyValue("failedJobId", row.jobId()).addKeyValue("jobId", job.id())
-                    .addKeyValue("firstOrdinal", row.firstOrdinal()).addKeyValue("lastOrdinal", row.lastOrdinal())
-                    .addKeyValue("retries", row.retries() + 1).log("index.change_retried");
+                    .addKeyValue("recordsRun", row.records()).addKeyValue("firstOrdinal", row.firstOrdinal())
+                    .addKeyValue("lastOrdinal", row.lastOrdinal()).addKeyValue("retries", row.retries() + 1)
+                    .log("index.change_retried");
         }
         return retried;
     }
@@ -218,11 +300,17 @@ public class IndexChanges implements JobHandler {
             input.put("kind", material.kind());
             input.put("language", material.language());
             input.put("tokenKey", Base64.getEncoder().encodeToString(key));
-            input.put(PASSAGES, PASSAGES);
+            String name = inputName(row);
+            input.put(name, name);
         } finally {
             Arrays.fill(key, (byte) 0);
         }
         return input;
+    }
+
+    /** The name of the row's input: {@value #RECORDS} for a records run, {@value #PASSAGES} otherwise. */
+    private static String inputName(IndexChangeRow row) {
+        return row.records() ? RECORDS : PASSAGES;
     }
 
     private Optional<VersionRow> indexed(IndexChangeRow row) {
@@ -231,12 +319,15 @@ public class IndexChanges implements JobHandler {
 
     @Override
     public Optional<JobInput> openInput(JobRef job, String name) {
-        if (!PASSAGES.equals(name)) {
+        if (!PASSAGES.equals(name) && !RECORDS.equals(name)) {
             return Optional.empty();
         }
         Optional<IndexChangeRow> row = index.findChange(job.id());
-        if (row.isEmpty() || indexed(row.get()).isEmpty()) {
+        if (row.isEmpty() || !inputName(row.get()).equals(name) || indexed(row.get()).isEmpty()) {
             return Optional.empty();
+        }
+        if (row.get().records()) {
+            return Optional.of(recordLines(job, row.get()));
         }
         UUID owner = job.ownerId();
         ByteArrayOutputStream lines = new ByteArrayOutputStream();
@@ -260,8 +351,32 @@ public class IndexChanges implements JobHandler {
     }
 
     /**
-     * A run's passages, decrypted in the input's read transaction: a run is bounded ({@value #RUN} passages of at most
-     * 16,384 code points), and the vault is not read once that transaction ended. Kept only until it is written.
+     * A records run as JSON Lines {@code {id, page, type, name, fields: [{name, value}]}}, as the class says. Logs the
+     * count only.
+     */
+    private Lines recordLines(JobRef job, IndexChangeRow row) {
+        ByteArrayOutputStream lines = new ByteArrayOutputStream();
+        List<ExtractedRecords.Stored> found = records.readRange(row.versionId(), row.firstOrdinal(), row.lastOrdinal());
+        for (ExtractedRecords.Stored record : found) {
+            ObjectNode line = JsonNodeFactory.instance.objectNode();
+            line.put("id", record.id().toString());
+            line.put("page", record.firstPage());
+            line.put("type", record.type());
+            line.put("name", record.name());
+            ArrayNode fields = line.putArray("fields");
+            record.fields().forEach(field -> fields.addObject().put("name", field.name()).put("value", field.value()));
+            lines.writeBytes(JSON.writeValueAsBytes(line));
+            lines.write('\n');
+        }
+        log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("versionId", row.versionId())
+                .addKeyValue("records", found.size()).log("index.records_opened");
+        return new Lines(lines.toByteArray());
+    }
+
+    /**
+     * A run's passages or records, decrypted in the input's read transaction: a run is bounded ({@value #RUN}
+     * passages of at most 16,384 code points; about {@value #RUN} records, each from one records step's bounded
+     * answer), and the vault is not read once that transaction ended. Kept only until it is written.
      */
     private static final class Lines implements JobInput {
         private final byte[] bytes;
@@ -311,14 +426,16 @@ public class IndexChanges implements JobHandler {
             materials.recordIndexRecipe(versionId, recipe);
         }
         log.atInfo().addKeyValue("versionId", versionId).addKeyValue("jobId", job.id())
-                .addKeyValue("firstOrdinal", row.firstOrdinal()).addKeyValue("lastOrdinal", row.lastOrdinal())
-                .addKeyValue("recipe", recipe).addKeyValue("versionIndexed", last && uniform).log("index.change_done");
+                .addKeyValue("recordsRun", row.records()).addKeyValue("firstOrdinal", row.firstOrdinal())
+                .addKeyValue("lastOrdinal", row.lastOrdinal()).addKeyValue("recipe", recipe)
+                .addKeyValue("versionIndexed", last && uniform).log("index.change_done");
     }
 
     @Override
     public void failed(JobRef job, String code) {
         // The version keeps no recipe. The retry sweep gives this run a new job, at most MAX_RETRIES times; after that,
-        // the next reconcile (a backend start, or a new recipe) indexes the version again.
+        // the next reconcile (a backend start, or a new recipe) indexes the version again: only its records runs when
+        // every passages run already reports that recipe (reconcile).
         log.atWarn().addKeyValue("jobId", job.id()).addKeyValue("code", code).log("index.change_failed");
     }
 }

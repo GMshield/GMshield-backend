@@ -1,0 +1,12 @@
+-- Story 4.2 (part B): an accepted version's records are indexed too, one Qdrant point per record. A version's set of
+-- index changes gains runs of its records next to its runs of passages: `records` tells them apart. For a records row,
+-- first_ordinal and last_ordinal hold the first and the last page of its run (a record's first page, inclusive): a
+-- record's ordinal is unique only within one step's report, so pages delimit the run, and no page is split across two
+-- runs. A passages row keeps its passage ordinals, as before.
+-- The previous backend release reads every row as a run of passages: rolling back past V36 is safe only while no
+-- records row exists, which holds until the first release with V36 (delete the records rows first, then reconcile).
+-- A rollback also leaves the record points in Qdrant, which an older worker's search would return (it has no filter
+-- on record_type): each source with records then has to be removed from the index again (its index.removal run once
+-- more), before its passages are indexed again.
+-- Structure only: no trigger, procedure or row-level security.
+alter table index_change add column records boolean not null default false;
