@@ -44,3 +44,7 @@ gmshield:
     # Nor does the campaign fingerprint fill at start (Story 3.2): the tests run it.
     campaign-fingerprints:
       enabled: false
+  # Nor does the fill of the core record types at start (Story 4.1): the tests run it.
+  knowledge:
+    core-backfill:
+      enabled: false

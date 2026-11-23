@@ -7,6 +7,7 @@ import io.github.gmshield.conversations.data.InMemoryTurnReferenceStore;
 import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.MutableClock;
+import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
@@ -37,7 +38,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     /** The in-memory stores the audit reads. */
     record Twins(InMemoryAccountStore accounts, InMemoryJobStorage jobs, InMemoryJobStream stream,
                  InMemoryLibraryStore library, InMemoryDeletionStore deletions, InMemoryScopeStore scopes,
-                 InMemoryMaterialStore materials, InMemoryUploadStorage uploads, InMemoryIndexStore index,
+                 InMemoryKnowledgeStore knowledge, InMemoryMaterialStore materials, InMemoryUploadStorage uploads, InMemoryIndexStore index,
                  InMemoryConversationStore conversations, InMemoryTurnReferenceStore references,
                  InMemorySearchStore searches, MutableClock clock, Vault vault) {
     }
@@ -101,7 +102,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     }
 
     /**
-     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope; material,
+     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type; material,
      * material version, material system, ingestion step, version file, page layer, page outcome, passage, outline,
      * page view, upload, index change, index removal; conversation and its deleting marks, turn, event batch, turn
      * reference, search, search result; job and job output. Every owner's rows.
@@ -115,6 +116,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
         tables.put("campaign deleting", copy(twins.library().deletingCampaigns));
         tables.put("deletion", copy(twins.deletions().rows));
         tables.put("scope", copy(twins.scopes().rows));
+        tables.put("record type", copy(twins.knowledge().recordTypes));
         tables.put("material", copy(twins.materials().materials));
         tables.put("material version", copy(twins.materials().versions));
         tables.put("material system", copy(twins.materials().systems));
@@ -142,7 +144,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
 
     @Override
     public Map<String, List<String>> held() {
-        return Map.of("system", List.of("system"), "campaign", List.of("campaign"),
+        return Map.of("system", List.of("system"), "record type", List.of("recordType"), "campaign", List.of("campaign"),
                 "material", List.of("material", "imageSetMaterial"), "material version", List.of("version",
                         "superseded", "imageSet"), "passage", List.of("passage"), "upload", List.of("upload"),
                 "conversation", List.of("conversation", "rulesConversation"), "turn", List.of("turn",

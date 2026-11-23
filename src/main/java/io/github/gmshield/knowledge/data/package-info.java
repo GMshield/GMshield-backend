@@ -1,0 +1,9 @@
+/**
+ * Story 4.1: {@code record_type} (V34), through JPA entities and JPQL only: Hibernate fills and filters {@code owner_id}
+ * ({@code @TenantId}) from the owner of the work, so no query here names an owner and none can reach another owner's
+ * rows. Names are vault ciphertexts beside their keyed fingerprint, unique per owner and system, as the core key is; a
+ * write those keys or the version refuse is a {@link io.github.gmshield.knowledge.data.KnowledgeConflict}. The fill of
+ * the systems from before V34 lists them across owners through {@code JdbcClient} (ids only,
+ * {@link io.github.gmshield.knowledge.data.MissingCoreTypes}), then works as each owner.
+ */
+package io.github.gmshield.knowledge.data;

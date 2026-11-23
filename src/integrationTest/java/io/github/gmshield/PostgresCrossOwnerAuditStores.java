@@ -136,7 +136,7 @@ final class PostgresCrossOwnerAuditStores implements CrossOwnerAuditStores {
 
     @Override
     public Map<String, List<String>> held() {
-        return Map.of("system", List.of("system"), "campaign", List.of("campaign"),
+        return Map.of("system", List.of("system"), "record_type", List.of("recordType"), "campaign", List.of("campaign"),
                 "material", List.of("material", "imageSetMaterial"), "material_version", List.of("version",
                         "superseded", "imageSet"), "passage", List.of("passage"), "upload", List.of("upload"),
                 "conversation", List.of("conversation", "rulesConversation"), "turn", List.of("turn",

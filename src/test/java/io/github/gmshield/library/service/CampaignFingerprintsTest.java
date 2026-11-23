@@ -43,7 +43,7 @@ class CampaignFingerprintsTest {
         beans.addBean("transactions", transactions);
         beans.addBean("clock", Clock.fixed(NOW, ZoneOffset.UTC));
         library = new Library(store, vault, beans.getBeanProvider(PlatformTransactionManager.class),
-                beans.getBeanProvider(Clock.class));
+                beans.getBeanProvider(Clock.class), event -> { });
     }
 
     @Test

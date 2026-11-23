@@ -39,7 +39,7 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Ten modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Eleven modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
@@ -47,7 +47,8 @@ campaigns, below; it may use `shared` and `vault`), `materials` (materials and t
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
 use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
 `jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
-`scope`, `library` and `vault`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+`scope`, `library` and `vault`), `knowledge` (each system's ontology, Story 4.1, below; it may use `shared`, `vault`
+and `library`, and `library` may not use it) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
 `library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
@@ -1184,6 +1185,55 @@ use `shared`, `library`, `materials` and `vault`), `limits` (the model setting a
   - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.32.0). The worker and
     the internal contract (1.16.0) do not change. After a rollback the bookmarks are kept but not shown; rolling
     forward shows them again.
+
+- **The core vocabulary in every system (`knowledge`, Story 4.1, public contract 1.33.0, migration V34).** The eleventh
+  module holds each system's ontology; Story 4.1 stores its record types. No term, record, extraction or proposal yet
+  (Stories 4.2 to 4.6), and nothing comes from model knowledge.
+  - `V34__record_type.sql`: `record_type (id, owner_id, system_id, core, name, name_fingerprint, version, created_at)`.
+    `core` is null or one of the eight core keys (`record_type_core_check`): `rule`, `spell`, `item`, `creature`,
+    `character_sheet`, `encounter`, `dungeon`, `note`. The composite key `(owner_id, system_id) → system(owner_id, id)`
+    keeps a record type within its owner; `(owner_id, system_id, core)` and `(owner_id, system_id, name_fingerprint)`
+    are unique (their indexes serve the reads by system). Additive: the previous release neither reads nor writes it.
+  - The name is a vault ciphertext (entity `record_type`, field `name`, the row, the owner) beside the keyed fingerprint
+    of its `Library.uniqueForm`. A core type is identified by its plaintext `core`; its stored name is the key in
+    English (`character_sheet` → "character sheet", `service.CoreRecordTypes`), so a type approved later (Story 4.4)
+    can never take a core type's name. The frontend shows its own translation of `core`, never the stored name.
+  - Seeding: both paths that create a system (`Library.createStarter`, `Library.createSystem`) publish
+    `library.service.SystemCreated(ownerId, systemId)` inside their transaction; `Ontology.systemCreated`, a synchronous
+    `@EventListener`, inserts the eight core types in that transaction, so they exist with the system or not at all
+    (`knowledge.core_types_seeded`). `library` depends on nothing of `knowledge` (`ModuleBoundaryTest`).
+  - Systems from before V34: `service.CoreTypeBackfill` runs once the application is ready. `data.JdbcCoreTypeBackfill`
+    lists, across owners and over ids only, the ready systems with fewer than eight core types, in id order; each is
+    filled as its owner by `Ontology.fillCore`, which adds only the missing keys. A second backend filling at once is
+    refused by the core key and that system is filled at the next start; a failure is logged (`knowledge.core_types_failed`,
+    ids only) and never blocks the start. `gmshield.knowledge.core-backfill.enabled=false` switches it off (the unit
+    tests run it themselves). A read never writes.
+  - `GET /api/v1/systems/{id}/record-types?limit&offset` (`listRecordTypes`) answers `{items, total}`: the core types in
+    their fixed order, then the others oldest first; `limit` 1 to 50 (default 20) and `offset` 0 to 100000, else 400
+    `request.invalid`. Each item: `id`, `name`, `core` (null for a type that is not core), `records` (0 until Story 4.2
+    stores records) and `version`. `GET /api/v1/record-types/{id}` (`getRecordType`) answers one.
+  - `PATCH /api/v1/record-types/{id}` (`changeRecordType`, `{version, name}`) and `DELETE` (`deleteRecordType`, 204):
+    a core type is 409 `ontology.core_record_type` and nothing changes. A type that is not core is renamed on its
+    version (`request.stale_version`, 409), to 1 to 120 code points after trimming (`ontology.record_type_name_invalid`,
+    400, params `min` and `max`) that no other type of the system has, core ones included
+    (`ontology.record_type_name_taken`, 409), and removed (204; `request.stale_version`, 409, when a rename committed
+    meanwhile; Story 4.2 refuses one that types records). Story 4.4 adds the approval that creates them.
+  - Another owner's system or record type, an unknown or malformed id, and a system being deleted (or a record type of
+    one) are 404 `request.not_found` on every route. `/api/v1/record-types` joins `LibraryOwnerFilter.LIBRARY_ROUTES`,
+    and the four routes join the cross-owner audit (`CrossOwnerAuditFlowTest`, whose world now holds A's core record
+    type).
+  - A system's deletion: `service.SystemRecordTypesDeletion` (a `SystemDeletionHandler`, part `recordTypes`, counting 0)
+    removes its record types before the system's own row; a campaign's, a material's, a version's or a conversation's
+    deletion takes nothing here.
+  - Log lines (ids, counts and versions only): `knowledge.core_types_seeded` (a new system's eight),
+    `knowledge.core_types_filled` (the core types the fill added to one system), `knowledge.core_types_backfilled` (a
+    start's fill: how many systems it added types to, how many failed), `knowledge.core_types_failed` (one system's fill
+    failed; it is tried again at the next start), `knowledge.core_types_deferred` (the whole start fill stopped, for
+    example when the list of systems could not be read: nothing more is filled on that start, the next start tries
+    again), `knowledge.record_type_renamed`, `knowledge.record_type_deleted`, and `knowledge.deletion_removed` (a
+    system's record types removed by its deletion).
+  - Deploy order: the backend first, then the frontend (its minimum public contract becomes 1.33.0). The worker and the
+    internal contract (1.16.0) do not change.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
