@@ -1,6 +1,7 @@
 package io.github.gmshield.scope.service;
 
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.ScopeReads;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
@@ -11,6 +12,7 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -95,6 +97,18 @@ import tools.jackson.databind.node.ObjectNode;
  *       resolved scope, in the order given, each once: an id that is not a passage of an allowed source still
  *       {@code ready} is dropped, never refused (a result stored earlier may have left the scope since); each carries
  *       its place, its material's name, its text and its tier.</li>
+ *   <li>Story 4.3 part B (records in search): {@link #searchInput(ResolvedScope, String, String)} adds a record-type
+ *       filter ({@code recordType}, a core key) when the search has one. {@link #records} reads records by id within a
+ *       resolved scope, in the order given, each once: a record whose version is not an allowed source still
+ *       {@code ready} (unknown, another owner's, out of scope) is dropped, never refused; each carries its first
+ *       page's place (the section path of its first passage there), the ids of its passages on that page, its core
+ *       type, its name and its tier; its line {@code scope.records_read} counts the ids asked, the records kept and
+ *       the ids that are no allowed record ({@code notRecords}: a search's passage ids among them, or a record out of
+ *       the scope). {@link #namedRecords} finds the records of a resolved scope whose name equals a
+ *       query (an equality on a keyed fingerprint, {@link ExtractedRecords#named}), of one core type when one is given,
+ *       leaving out those of a records run not indexed yet ({@link ScopeReads#unindexedRecordRuns}), so a record is
+ *       found by name only once the index can find it too; a record the worker returned (it is in the index, whatever
+ *       its run says, for instance a run cut again by a reconcile) is never left out.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -119,12 +133,15 @@ public class Scopes {
 
     private final Library library;
     private final ScopeReads reads;
+    private final ExtractedRecords records;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    Scopes(Library library, ScopeReads reads, Vault vault, ObjectProvider<PlatformTransactionManager> transactions) {
+    Scopes(Library library, ScopeReads reads, ExtractedRecords records, Vault vault,
+           ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
         this.reads = reads;
+        this.records = records;
         this.vault = vault;
         this.transactions = transactions;
     }
@@ -400,6 +417,84 @@ public class Scopes {
         return results;
     }
 
+    /** The records with these ids within {@code scope}, as the class says (Story 4.3 part B). */
+    public List<ScopedRecord> records(ResolvedScope scope, List<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        requireOwner(scope);
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        List<ScopedRecord> found = wanted.isEmpty() || scope.allowedSources().isEmpty() ? List.of()
+                : reading(() -> placed(scope, records.located(wanted)));
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("requested", wanted.size())
+                .addKeyValue("records", found.size()).addKeyValue("notRecords", wanted.size() - found.size())
+                .log("scope.records_read");
+        return found;
+    }
+
+    /**
+     * The records of {@code scope} whose name equals {@code name}, of the core type {@code recordType} when it is not
+     * null, as the class says (Story 4.3 part B); by id. A record among {@code returned} (the ids the worker found) is
+     * kept even when its records run is not indexed.
+     */
+    public List<ScopedRecord> namedRecords(ResolvedScope scope, String name, String recordType,
+                                           Collection<UUID> returned) {
+        Objects.requireNonNull(scope, "scope");
+        requireOwner(scope);
+        Set<UUID> allowed = scope.allowedSources();
+        if (name == null || name.isBlank() || allowed.isEmpty()) {
+            return List.of();
+        }
+        int[] unindexed = {0};
+        List<ScopedRecord> found = reading(() -> {
+            List<ExtractedRecords.Located> named = records.named(allowed, name).stream()
+                    .filter(record -> recordType == null || recordType.equals(record.type())).toList();
+            List<ScopeReads.RecordRun> runs = reads.unindexedRecordRuns(named.stream()
+                    .map(ExtractedRecords.Located::versionId).distinct().toList());
+            Set<UUID> byWorker = Set.copyOf(returned);
+            List<ExtractedRecords.Located> indexed = named.stream().filter(record -> byWorker.contains(record.id())
+                    || runs.stream().noneMatch(run -> run.covers(record.versionId(), record.firstPage()))).toList();
+            unindexed[0] = named.size() - indexed.size();
+            return placed(scope, indexed);
+        });
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("found", found.size())
+                .addKeyValue("unindexed", unindexed[0]).addKeyValue("recordType", recordType == null ? "none"
+                        : recordType).log("scope.named_records_read");
+        return found;
+    }
+
+    /**
+     * The records whose version is an allowed source of {@code scope} (still {@code ready}), in the order given, each
+     * with the place of its first passage on its first page, the ids of its passages there, its name and its tier; a
+     * record with no such passage in the scope is left out. Runs in the caller's read transaction.
+     */
+    private List<ScopedRecord> placed(ResolvedScope scope, Collection<ExtractedRecords.Located> located) {
+        Set<UUID> allowed = scope.allowedSources();
+        List<ExtractedRecords.Located> inScope = located.stream()
+                .filter(record -> allowed.contains(record.versionId())).toList();
+        if (inScope.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, ScopeReads.Place> places = new HashMap<>();
+        reads.places(inScope.stream().flatMap(record -> record.passageIds().stream()).distinct().toList(), allowed)
+                .forEach(place -> places.put(place.passageId(), place));
+        Map<UUID, String> names = records.names(inScope.stream().map(ExtractedRecords.Located::id).toList());
+        List<ScopedRecord> found = new ArrayList<>();
+        for (ExtractedRecords.Located record : inScope) {
+            List<ScopeReads.Place> onFirstPage = record.passageIds().stream().map(places::get)
+                    .filter(place -> place != null && place.page() == record.firstPage()).toList();
+            String name = names.get(record.id());
+            Optional<Tier> tier = scope.tierOf(record.versionId());
+            if (onFirstPage.isEmpty() || name == null || tier.isEmpty()) {
+                continue;
+            }
+            ScopeReads.Place first = onFirstPage.getFirst();
+            found.add(new ScopedRecord(record.id(), record.versionId(), first.materialId(), first.materialName(),
+                    first.sectionPath(), record.firstPage(), onFirstPage.stream().map(ScopeReads.Place::passageId)
+                    .toList(), record.type(), name, tier.get()));
+        }
+        return List.copyOf(found);
+    }
+
     /** Which of these versions are removed for the owner, as the class says. */
     public Set<UUID> removedVersions(Set<UUID> versionIds) {
         Objects.requireNonNull(versionIds, "versionIds");
@@ -474,11 +569,24 @@ public class Scopes {
      * {@value #MAX_QUERY} characters (code points), else {@code IllegalArgumentException}.
      */
     public ObjectNode searchInput(ResolvedScope scope, String query) {
+        return searchInput(scope, query, null);
+    }
+
+    /**
+     * {@link #searchInput(ResolvedScope, String)} with a record-type filter (Story 4.3 part B, internal contract
+     * 1.18.0): when {@code recordType} (a core key) is not null, the input also carries {@code recordType}, and the
+     * worker returns only records of that type.
+     */
+    public ObjectNode searchInput(ResolvedScope scope, String query, String recordType) {
         Objects.requireNonNull(scope, "scope");
         if (query == null || query.isEmpty() || query.codePointCount(0, query.length()) > MAX_QUERY) {
             throw new IllegalArgumentException("scope.query_invalid");
         }
-        return textInput(scope, "query", query, "scope.search_input");
+        ObjectNode input = textInput(scope, "query", query, "scope.search_input");
+        if (recordType != null) {
+            input.put("recordType", recordType);
+        }
+        return input;
     }
 
     /**

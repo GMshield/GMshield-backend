@@ -9,12 +9,21 @@ import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.JobResultInvalid;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.scope.service.CitedPlace;
+import io.github.gmshield.scope.service.ResolvedScope;
+import io.github.gmshield.scope.service.ScopedRecord;
 import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.vault.service.Vault;
+import java.text.Collator;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -41,6 +50,15 @@ import tools.jackson.databind.JsonNode;
  *       Otherwise the ids are stored in rank order with their version and tier, and the search ends {@code done}.</li>
  *   <li>The job's end in {@code failed} ends the search {@code failed} with the job's code. A search pruned or deleted
  *       meanwhile changes nothing.</li>
+ *   <li>Story 4.3 part B (internal contract 1.18.0): the input carries the search's record-type filter as
+ *       {@code recordType} when it has one, and {@code result.ids} may hold record ids next to passage ids. Each id is
+ *       a record of an allowed source still {@code ready} ({@link Scopes#records}) or a passage as before; with a
+ *       record-type filter, only records of that type. Anything else refuses the whole result as above. Then the
+ *       records of the narrowed scope whose name equals the query ({@link Scopes#namedRecords}, an equality on a keyed
+ *       fingerprint, never a text search; only records the index can already find, or that the worker returned) come
+ *       first: those the worker
+ *       returned in its order, then the others by name and id; then every other id in the worker's order. At most
+ *       {@value Searches#MAX_RESULTS} are stored, each as a passage or a record with its version and tier.</li>
  * </ul>
  *
  * Lines carry ids, counts and codes, never the query or a passage's text.
@@ -84,7 +102,7 @@ public class SearchJobs implements JobHandler {
     public JsonNode input(JobRef job) {
         SearchRow search = searchOf(job);
         String query = vault.decryptText(Searches.query(search.id(), search.ownerId()), search.query());
-        return scopes.searchInput(searches.scopeOf(search, true), query);
+        return scopes.searchInput(searches.scopeOf(search, true), query, search.recordType());
     }
 
     @Override
@@ -101,25 +119,67 @@ public class SearchJobs implements JobHandler {
             return;
         }
         SearchRow search = found.get();
-        List<CitedPlace> places = ids.isEmpty() ? List.of() : scopes.references(searches.scopeOf(search, false), ids);
-        if (places.size() != ids.size()) {
+        ResolvedScope scope = searches.scopeOf(search, false);
+        String type = search.recordType();
+        Map<UUID, ScopedRecord> records = new LinkedHashMap<>();
+        if (!ids.isEmpty()) {
+            scopes.records(scope, ids).forEach(record -> records.put(record.recordId(), record));
+        }
+        List<UUID> passageIds = ids.stream().filter(id -> !records.containsKey(id)).toList();
+        List<CitedPlace> places = passageIds.isEmpty() ? List.of() : scopes.references(scope, passageIds);
+        long wrongType = type == null ? 0 : places.size() + records.values().stream()
+                .filter(record -> !type.equals(record.recordType())).count();
+        if (places.size() != passageIds.size() || wrongType > 0) {
             store.endSearch(search.id(), SearchRow.FAILED, REFUSED_CODE);
             log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("searchId", search.id())
-                    .addKeyValue("ids", ids.size()).addKeyValue("refused", ids.size() - places.size())
-                    .addKeyValue("reason", REFUSED_CODE).log("search.result_refused");
+                    .addKeyValue("ids", ids.size()).addKeyValue("refused", passageIds.size() - places.size())
+                    .addKeyValue("wrongType", wrongType).addKeyValue("reason", REFUSED_CODE)
+                    .log("search.result_refused");
             return;
         }
+        String query = vault.decryptText(Searches.query(search.id(), search.ownerId()), search.query());
+        List<ScopedRecord> named = scopes.namedRecords(scope, query, type, records.keySet());
+        named.forEach(record -> records.putIfAbsent(record.recordId(), record));
+        Map<UUID, CitedPlace> placeOf = new HashMap<>();
+        places.forEach(place -> placeOf.put(place.passageId(), place));
         List<SearchResultRow> rows = new ArrayList<>();
-        for (CitedPlace place : places) {
-            rows.add(new SearchResultRow(Ids.newId(), search.ownerId(), search.id(), rows.size() + 1,
-                    place.passageId(), place.versionId(), place.tier().word()));
+        for (UUID id : ranked(ids, named)) {
+            ScopedRecord record = records.get(id);
+            CitedPlace place = placeOf.get(id);
+            if (record != null) {
+                rows.add(new SearchResultRow(Ids.newId(), search.ownerId(), search.id(), rows.size() + 1, null, id,
+                        record.versionId(), record.tier().word()));
+            } else if (place != null) {
+                rows.add(new SearchResultRow(Ids.newId(), search.ownerId(), search.id(), rows.size() + 1, id, null,
+                        place.versionId(), place.tier().word()));
+            }
         }
         if (!rows.isEmpty()) {
             store.insertResults(rows);
         }
         store.endSearch(search.id(), SearchRow.DONE, null);
         log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("searchId", search.id())
-                .addKeyValue("results", rows.size()).log("search.done");
+                .addKeyValue("results", rows.size())
+                .addKeyValue("records", rows.stream().filter(SearchResultRow::record).count())
+                .addKeyValue("exactNames", named.size()).log("search.done");
+    }
+
+    /**
+     * The order the results are stored in, at most {@value Searches#MAX_RESULTS}: the exact-name records the worker
+     * returned, in its order; then the other exact-name records, by name (root-locale collation) and id; then every
+     * other id, in the worker's order.
+     */
+    static List<UUID> ranked(List<UUID> ids, List<ScopedRecord> named) {
+        Set<UUID> exact = new HashSet<>();
+        named.forEach(record -> exact.add(record.recordId()));
+        Set<UUID> returned = new HashSet<>(ids);
+        Collator collator = Collator.getInstance(Locale.ROOT);
+        List<UUID> ordered = new ArrayList<>(ids.stream().filter(exact::contains).toList());
+        named.stream().filter(record -> !returned.contains(record.recordId()))
+                .sorted(Comparator.comparing(ScopedRecord::name, collator).thenComparing(ScopedRecord::recordId))
+                .forEach(record -> ordered.add(record.recordId()));
+        ids.stream().filter(id -> !exact.contains(id)).forEach(ordered::add);
+        return List.copyOf(ordered.subList(0, Math.min(ordered.size(), Searches.MAX_RESULTS)));
     }
 
     @Override
@@ -131,7 +191,10 @@ public class SearchJobs implements JobHandler {
         });
     }
 
-    /** {@code result.ids}: 0 to {@value Searches#MAX_RESULTS} distinct passage ids; {@link JobResultInvalid} else. */
+    /**
+     * {@code result.ids}: 0 to {@value Searches#MAX_RESULTS} distinct ids (passages or, from Story 4.3 part B,
+     * records); {@link JobResultInvalid} else.
+     */
     private static List<UUID> ids(JsonNode result) {
         JsonNode ids = result == null ? null : result.get("ids");
         if (ids == null || !ids.isArray() || ids.size() > Searches.MAX_RESULTS) {

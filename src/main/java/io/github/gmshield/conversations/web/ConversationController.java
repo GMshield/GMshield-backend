@@ -426,11 +426,15 @@ class ConversationController {
             @Schema(description = "Only this tier's sources; absent or null for every tier on",
                     types = {"string", "null"}, allowableValues = {"campaign", "system", "other"}) String tier,
             @Schema(description = "Only this material's version; absent or null for every material on",
-                    types = {"string", "null"}, format = "uuid") String materialId) {
+                    types = {"string", "null"}, format = "uuid") String materialId,
+            @Schema(description = "Only records of this core record type, and no passage (contract 1.36.0); absent or"
+                    + " null for passages and records of every type", types = {"string", "null"},
+                    allowableValues = {"rule", "spell", "item", "creature",
+                    "character_sheet", "encounter", "dungeon", "note"}) String recordType) {
 
         @Override
         public String toString() {
-            return "NewSearch[tier=" + tier + "]";
+            return "NewSearch[tier=" + tier + ", recordType=" + recordType + "]";
         }
     }
 
@@ -438,24 +442,50 @@ class ConversationController {
     record SearchCreated(@Schema(description = "The search's id", format = "uuid") UUID id) {
     }
 
-    @Schema(name = "SearchResult", requiredProperties = {"passageId", "versionId", "materialName", "sectionPath", "page",
-        "firstWords", "tier"}, description = "A passage found, as it stands in the campaign's current scope")
+    @Schema(name = "SearchResult", requiredProperties = {"kind", "versionId", "materialName", "sectionPath", "page",
+        "tier"}, description = "A passage or (contract 1.36.0) a record found, as it stands in the campaign's current"
+            + " scope. A passage has passageId and firstWords; a record has recordId, name, recordType and passageIds")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     record SearchResultView(
-            @Schema(format = "uuid") UUID passageId,
+            @Schema(description = "passage or record (contract 1.36.0)", allowableValues = {"passage", "record"})
+            String kind,
+            @Schema(description = "The passage's id; only for a passage", format = "uuid") UUID passageId,
+            @Schema(description = "The record's id; only for a record (contract 1.36.0)", format = "uuid")
+            UUID recordId,
             @Schema(description = "Its material version: the source page opens on the ground of the current scope",
                     format = "uuid") UUID versionId,
             @Schema(description = "The material's name") String materialName,
-            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty"),
-                    schema = @Schema(type = "string")) List<String> sectionPath,
-            @Schema(description = "The page", format = "int32", minimum = "1") int page,
+            @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty. For a"
+                    + " record, its first passage's on its first page"), schema = @Schema(type = "string"))
+            List<String> sectionPath,
+            @Schema(description = "The page; for a record, its first page", format = "int32", minimum = "1") int page,
             @Schema(description = "The passage's first 160 code points (its white space made single spaces), cut at a"
-                    + " word boundary") String firstWords,
+                    + " word boundary; only for a passage") String firstWords,
+            @Schema(description = "The record's name, as it was extracted; only for a record (contract 1.36.0)")
+            String name,
+            @Schema(description = "The record's core record type: a client shows its own translation of it; only for a"
+                    + " record (contract 1.36.0)", allowableValues = {"rule", "spell", "item", "creature",
+                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
+            @ArraySchema(arraySchema = @Schema(description = "The ids of the record's passages on its first page, so the"
+                    + " source view marks them; only for a record (contract 1.36.0)"),
+                    schema = @Schema(type = "string", format = "uuid")) List<UUID> passageIds,
             @Schema(description = "The tier of its source in the campaign's current scope",
                     allowableValues = {"campaign", "system", "other"}) String tier) {
+
+        static SearchResultView of(Searches.Result result) {
+            return new SearchResultView(result.kind(), result.passageId(), result.recordId(), result.versionId(),
+                    result.materialName(), result.sectionPath(), result.page(), result.firstWords(), result.name(),
+                    result.recordType(), result.isRecord() ? result.passageIds() : null, result.tier().word());
+        }
+
+        @Override
+        public String toString() {
+            return "SearchResultView[kind=" + kind + ", passageId=" + passageId + ", recordId=" + recordId + "]";
+        }
     }
 
-    @Schema(name = "Search", requiredProperties = {"id", "campaignId", "query", "tier", "materialId", "state",
-        "results"}, description = "A search of the library (contract 1.28.0)")
+    @Schema(name = "Search", requiredProperties = {"id", "campaignId", "query", "tier", "materialId", "recordType",
+        "state", "results"}, description = "A search of the library (contract 1.28.0)")
     record SearchView(
             @Schema(format = "uuid") UUID id,
             @Schema(format = "uuid") UUID campaignId,
@@ -464,6 +494,9 @@ class ConversationController {
                     allowableValues = {"campaign", "system", "other"}) String tier,
             @Schema(description = "The material filter, null for none", types = {"string", "null"}, format = "uuid")
             UUID materialId,
+            @Schema(description = "The record-type filter, a core record type, null for none (contract 1.36.0)",
+                    types = {"string", "null"}, allowableValues = {"rule", "spell", "item", "creature",
+                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
             @Schema(description = "pending until its job ends: done with its results, or failed with a code",
                     allowableValues = {"pending", "done", "failed"}) String state,
             @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -471,15 +504,15 @@ class ConversationController {
                     + " failed") String code,
             @ArraySchema(arraySchema = @Schema(description = "Up to 20 results, best first; empty unless done. Each is"
                     + " re-checked against the campaign's current scope when read: one that left it since is not"
-                    + " listed"), maxItems = 20, schema = @Schema(implementation = SearchResultView.class))
+                    + " listed. From contract 1.36.0 passages and records are mixed by rank, and records whose name"
+                    + " equals the query (case, accents' composition and surrounding space aside) come first"),
+                    maxItems = 20, schema = @Schema(implementation = SearchResultView.class))
             List<SearchResultView> results) {
 
         static SearchView of(Searches.Found found) {
             return new SearchView(found.id(), found.campaignId(), found.query(),
-                    found.tier() == null ? null : found.tier().word(), found.materialId(), found.state(), found.code(),
-                    found.results().stream().map(result -> new SearchResultView(result.passageId(), result.versionId(),
-                            result.materialName(), result.sectionPath(), result.page(), result.firstWords(),
-                            result.tier().word())).toList());
+                    found.tier() == null ? null : found.tier().word(), found.materialId(), found.recordType(),
+                    found.state(), found.code(), found.results().stream().map(SearchResultView::of).toList());
         }
 
         @Override
@@ -975,8 +1008,11 @@ class ConversationController {
             + " search and its job are recorded together, and the search is then read by id until it is done or failed."
             + " Only the campaign's current scope is searched (its tiers and materials switched on, each material's"
             + " ready version, and passages still being prepared for search), narrowed by the filters; a passage that"
-            + " holds the exact query comes first. Only the account's newest 20 searches are kept. request.invalid"
-            + " (400) for a blank query, one past 500 code points, an unknown tier or a malformed material id;"
+            + " holds the exact query comes first. From contract 1.36.0 it also finds the records of the scope's"
+            + " accepted versions once they are indexed, mixed with passages by rank; a record whose name equals the"
+            + " query comes first; a record type filter leaves only records of that type. Only the account's newest 20"
+            + " searches are kept. request.invalid (400) for a blank query, one past 500 code points, an unknown tier,"
+            + " a malformed material id or a record type that is not a core key;"
             + " request.not_found (404) for a campaign that is not the account's; nothing is recorded then",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
@@ -991,7 +1027,7 @@ class ConversationController {
         Tier tier = body.tier() == null ? null : Tier.of(body.tier()).orElseThrow(ConversationProblems::invalid);
         UUID material = body.materialId() == null ? null
                 : parse(body.materialId()).orElseThrow(ConversationProblems::invalid);
-        UUID created = searches.create(campaign, body.query(), tier, material);
+        UUID created = searches.create(campaign, body.query(), tier, material, body.recordType());
         return ResponseEntity.status(HttpStatus.ACCEPTED).cacheControl(CacheControl.noStore())
                 .body(new SearchCreated(created));
     }

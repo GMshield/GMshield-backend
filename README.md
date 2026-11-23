@@ -779,9 +779,10 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     record's id, first page and core type key, its name and fields decrypted through `ExtractedRecords.readRange`, for
     that run only; the line `index.records_opened` logs the count). The worker writes one point per record, its id the
     record's id. The version records its recipe only once its records runs are done too, and the retry sweep moves a
-    failed records run like a passages run (`records` kept). Until Story 4.3, `ScopeReads.pendingPassages`,
-    `indexing` and `failed` read passages runs only, so a pending or failed records run changes neither the keyword
-    fallback nor the GM's notices. V36 is additive (`records boolean not null default false`); rolling back past it
+    failed records run like a passages run (`records` kept). `ScopeReads.pendingPassages`, `indexing` and `failed`
+    read passages runs only, so a pending or failed records run changes neither the keyword fallback nor the GM's
+    notices (records have no keyword fallback; Story 4.3 part B leaves them out of a search by name until their run
+    is indexed, `ScopeReads.unindexedRecordRuns`). V36 is additive (`records boolean not null default false`); rolling back past it
     is safe only while no records row exists, and it leaves record points in Qdrant that an older worker's search
     would return, so each source's removal has to run again. Only a worker of this release reads a records run: an
     older one fails it with `index.input_invalid`, the retry sweep moves it (at most 3 times), and once its retries are
@@ -1327,6 +1328,52 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `knowledge.record_picture`; each says `found` or `served`, a miss included. The four routes are in the
     cross-owner audit.
   - Deploy order: backend → frontend.
+- **Records in library search (`conversations`, `scope`, `knowledge`, Story 4.3 part B, public contract 1.36.0,
+  internal contract 1.18.0, migration V37).** A campaign's search also returns the in-scope records, mixed with
+  passages by the worker's rank, and a record whose name equals the query comes first.
+  - **V37.** `record.name_fingerprint` (nullable): the vault's keyed fingerprint (entity `record`, field `name`) of
+    the name's `Library.uniqueForm` (trimmed, NFC, lower case in the root locale), set on insert by
+    `ExtractedRecordStore`, with an index on `(owner_id, name_fingerprint)`; a record stored before V37 has none and
+    never matches by name (reprocessing its material makes a new version, whose records get one). `search.record_type` (null or a core key). `search_result.record_id`, with `passage_id`
+    now nullable, a check that exactly one is set, and a unique key on `(owner_id, search_id, record_id)`. The
+    previous release reads `passage_id` as never null: rolling back past V37 needs `delete from search_result where
+    record_id is not null` first.
+  - **Create.** `NewSearch` gains `recordType` (absent or null, else one of the eight core keys; anything else is 400
+    `request.invalid`): only records of that type, no passage. It combines with `tier` and `materialId`. `Search`
+    gains `recordType`.
+  - **The job.** `Scopes.searchInput(scope, query, recordType)` adds `recordType` to the input when set (internal
+    1.18.0). `completed` takes passage and record ids (still 0 to 20, distinct): `Scopes.records` reads the records
+    among them within the narrowed scope (through the port `materials.service.ExtractedRecords.located`, which
+    `knowledge` implements: `scope` depends on nothing in `knowledge`), the rest are checked as passages
+    (`Scopes.references`). An id that is neither an allowed record nor an allowed passage, and with a record-type
+    filter any passage or a record of another type, fails the search with `scope.passage_refused`. Then
+    `Scopes.namedRecords` finds the narrowed scope's records whose fingerprint equals the query's
+    (`ExtractedRecords.named`: an equality on a keyed fingerprint, never a text search, AD-19), of the filter's type
+    when set, leaving out those in a records run that has not ended or failed (`ScopeReads.unindexedRecordRuns`), so a
+    record is found by name only once the index can find it too (one the worker returned is kept whatever its run
+    says). The stored order (`SearchJobs.ranked`): the
+    exact-name records the worker returned, in its order; the other exact-name records, by name (root collation) and
+    id; then every other id in the worker's order; at most 20.
+  - **Read.** Each result has `kind` (`passage` or `record`). A passage keeps `passageId` and `firstWords`; a record
+    has `recordId`, `name` (decrypted only for this answer), `recordType` (its core key) and `passageIds` (its
+    passages on its first page, for the source view), with its first page, that page's first passage's section path,
+    its material's name and its tier. Records are re-read within the current narrowed scope on every `GET`
+    (`Scopes.records`), as passages are.
+  - **A record as a campaign shows it.** `GET /api/v1/campaigns/{campaignId}/records/{recordId}`
+    (`getCampaignRecord`, `OntologyController`, schema `Record`): `Records.inCampaign` answers part A's record for a
+    record of a version that is an allowed source of the campaign's current scope (`Scopes.resolveSources` with its
+    stored settings, no filter, any tier switched on), its record type the campaign's system's type of its core key. Anything else
+    (a material switched off, a version that needs review or is superseded, another owner's, an unknown or malformed
+    id, a campaign that is not the account's) is the same 404. Its references open on the scope's ground
+    (`getScopeSourcePage`); there is no new page route. `knowledge` now depends on `scope :: service`. The route is in
+    the cross-owner audit.
+  - Log lines (ids, counts and core keys only): `search.created` gains `recordType`; `search.done` gains `records` and
+    `exactNames`; `search.result_refused` gains `wrongType`; `scope.records_read` (`requested`, `records`, `notRecords`:
+    the ids that are no allowed record, a search's passages among them), `scope.named_records_read` (with
+    `unindexed`), `knowledge.campaign_record_read`.
+  - Deploy order: backend → worker (its minimum backend contract becomes 1.18.0) → frontend. Until the worker is
+    deployed, a search by name still puts the exact-name records first, and a search with a record-type filter fails
+    with `scope.passage_refused` (the older worker returns passages).
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

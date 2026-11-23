@@ -77,7 +77,7 @@ class ScopesTest {
                     jobsAsked.incrementAndGet();
                     return ids.stream().filter(failed::contains).collect(Collectors.toSet());
                 },
-                beans.getBeanProvider(PlatformTransactionManager.class)), vault,
+                beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS, vault,
                 beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
     }

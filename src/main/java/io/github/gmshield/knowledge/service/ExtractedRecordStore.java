@@ -2,6 +2,7 @@ package io.github.gmshield.knowledge.service;
 
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -13,8 +14,11 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -29,7 +33,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * name is encrypted bound to the entity {@value #RECORD}, the field {@value #FIELD_NAME} and the row, and its fields (a
  * JSON array of {@code {name, value}} in order) bound to the field {@value #FIELD_FIELDS}. Its core type key, ordinal
  * and first page stay plain, so the counts by type need no decryption. {@link #readRange} decrypts them for the input of
- * an index job only (Story 4.2 part B). Nothing here logs a name or a field.
+ * an index job only (Story 4.2 part B). From Story 4.3 part B each record also stores its name's keyed fingerprint
+ * (entity {@value #RECORD}, field {@value #FIELD_NAME}, of the name's {@link Library#uniqueForm}), which
+ * {@link #named} compares with a search's query; {@link #names} decrypts names for a search's answer only. Nothing here
+ * logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -62,7 +69,7 @@ public class ExtractedRecordStore implements ExtractedRecords {
             }
             UUID id = Ids.newId();
             rows.add(new RecordRow(id, owner, versionId, ordinal, record.firstPage(), record.type(),
-                    vault.encryptText(name(id, owner), record.name()),
+                    vault.encryptText(name(id, owner), record.name()), nameFingerprint(record.name()),
                     vault.encrypt(fields(id, owner), fieldsJson(record.fields())), record.passageIds(), now));
         }
         store.insert(rows);
@@ -99,6 +106,49 @@ public class ExtractedRecordStore implements ExtractedRecords {
             }
         }
         return List.copyOf(found);
+    }
+
+    @Override
+    public List<Located> located(Collection<UUID> ids) {
+        OwnerContext.require();
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        if (wanted.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, RecordRow> found = new HashMap<>();
+        store.findAll(wanted).forEach(row -> found.put(row.id(), row));
+        return wanted.stream().filter(found::containsKey).map(id -> located(found.get(id))).toList();
+    }
+
+    @Override
+    public List<Located> named(Collection<UUID> versionIds, String name) {
+        OwnerContext.require();
+        if (versionIds.isEmpty() || name == null || name.isBlank()) {
+            return List.of();
+        }
+        return store.named(Set.copyOf(versionIds), nameFingerprint(name)).stream()
+                .map(ExtractedRecordStore::located).toList();
+    }
+
+    @Override
+    public Map<UUID, String> names(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        Map<UUID, String> found = new HashMap<>();
+        if (!wanted.isEmpty()) {
+            store.findAll(wanted).forEach(row -> found.put(row.id(), vault.decryptText(name(row.id(), owner),
+                    row.name())));
+        }
+        return Map.copyOf(found);
+    }
+
+    private static Located located(RecordRow row) {
+        return new Located(row.id(), row.versionId(), row.type(), row.firstPage(), row.passageIds());
+    }
+
+    /** The name's keyed fingerprint: of its unique form, so case, NFC and surrounding space make no difference. */
+    private byte[] nameFingerprint(String name) {
+        return vault.fingerprint(RECORD, FIELD_NAME, Library.uniqueForm(name));
     }
 
     static List<Field> fieldsOf(byte[] json) {

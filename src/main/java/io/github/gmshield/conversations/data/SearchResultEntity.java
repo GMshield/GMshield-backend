@@ -26,8 +26,11 @@ class SearchResultEntity {
     @Column(name = "rank", nullable = false, updatable = false)
     private int resultRank;
 
-    @Column(name = "passage_id", nullable = false, updatable = false)
+    @Column(name = "passage_id", updatable = false)
     private UUID passageId;
+
+    @Column(name = "record_id", updatable = false)
+    private UUID recordId;
 
     @Column(name = "version_id", nullable = false, updatable = false)
     private UUID versionId;
@@ -45,11 +48,12 @@ class SearchResultEntity {
         this.searchId = row.searchId();
         this.resultRank = row.rank();
         this.passageId = row.passageId();
+        this.recordId = row.recordId();
         this.versionId = row.versionId();
         this.tier = row.tier();
     }
 
     SearchResultRow row() {
-        return new SearchResultRow(id, ownerId, searchId, resultRank, passageId, versionId, tier);
+        return new SearchResultRow(id, ownerId, searchId, resultRank, passageId, recordId, versionId, tier);
     }
 }

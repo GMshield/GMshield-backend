@@ -4,6 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
+import io.github.gmshield.conversations.data.SearchResultRow;
+import io.github.gmshield.conversations.data.SearchStore;
+import io.github.gmshield.conversations.service.Searches;
 import io.github.gmshield.jobs.service.CallUsage;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.jobs.service.JobFiles;
@@ -24,6 +27,12 @@ import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.PendingRemovals;
 import io.github.gmshield.materials.data.StepRow;
 import io.github.gmshield.materials.data.VersionFileRow;
+import io.github.gmshield.scope.service.CampaignScopes;
+import io.github.gmshield.scope.service.ResolvedScope;
+import io.github.gmshield.scope.service.ScopeSettings;
+import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.Scopes;
+import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -1640,7 +1649,7 @@ class IngestionIntegrationTest {
         UUID other = Ids.newId();
         UUID foreign = Ids.newId();
         assertThatThrownBy(() -> write(other, () -> recordStore.insert(List.of(new RecordRow(foreign, other,
-                chain.versionId(), 0, 1, "spell", new byte[] {1}, new byte[] {1}, List.of(passageOnThree),
+                chain.versionId(), 0, 1, "spell", new byte[] {1}, null, new byte[] {1}, List.of(passageOnThree),
                 Instant.now().truncatedTo(ChronoUnit.MICROS)))))).isInstanceOf(RuntimeException.class);
         assertThat(jdbc.sql("select count(*) from record where id = ?").param(foreign).query(Long.class).single())
                 .isZero();
@@ -1890,6 +1899,124 @@ class IngestionIntegrationTest {
         assertThat(as(owner, () -> systemRecords.record(otherSystem, bola))).isEmpty();
         assertThat(as(Ids.newId(), () -> systemRecords.record(system, bola))).isEmpty();
         assertThat(as(owner, () -> systemRecords.record(system, Ids.newId()))).isEmpty();
+        freeTheIngestionLane();
+    }
+
+    // --- Story 4.3 part B: records in a campaign's search on Postgres
+
+    @Autowired
+    private Scopes scopes;
+    @Autowired
+    private CampaignScopes campaignScopes;
+    @Autowired
+    private Searches searches;
+    @Autowired
+    private SearchStore searchStore;
+
+    @Test
+    void aRecordsNameFingerprintFindsItsExactNameWithinTheScopeAndASearchStoresAndReadsRecordResultsOnPostgres()
+            throws Exception {
+        UUID owner = Ids.newId();
+        write(owner, () -> library.createStarter(Language.EN));
+        UUID system = jdbc.sql("select id from system where owner_id = ?").param(owner).query(UUID.class).single();
+        UUID campaign = jdbc.sql("select id from campaign where owner_id = ?").param(owner).query(UUID.class).single();
+        Uploads.Details toSystem = new Uploads.Details(null, null, null, List.of(system.toString()));
+        Chain book = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        write(owner, () -> extracted.replaceRange(book.versionId(), 1, 4, List.of(
+                new ExtractedRecords.Extracted("item", "Vorpal Sword", List.of(), List.of(passageOn(book, 3)), 3),
+                new ExtractedRecords.Extracted("spell", "  VORPAL sword", List.of(), List.of(passageOn(book, 1)), 1),
+                new ExtractedRecords.Extracted("item", "Espada Curta", List.of(), List.of(passageOn(book, 1)), 1))));
+        accepted(book);
+        Chain off = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        write(owner, () -> extracted.replaceRange(off.versionId(), 1, 4, List.of(new ExtractedRecords.Extracted(
+                "item", "Vorpal Sword", List.of(), List.of(passageOn(off, 1)), 1))));
+        accepted(off);
+        Chain review = reviewed(completed(owner, pdf(MIB), toSystem), 4, List.of());
+        write(owner, () -> extracted.replaceRange(review.versionId(), 1, 4, List.of(new ExtractedRecords.Extracted(
+                "item", "Vorpal Sword", List.of(), List.of(passageOn(review, 1)), 1))));
+        UUID item = jdbc.sql("select id from record where version_id = ? and ordinal = 0").param(book.versionId())
+                .query(UUID.class).single();
+        UUID spell = jdbc.sql("select id from record where version_id = ? and ordinal = 1").param(book.versionId())
+                .query(UUID.class).single();
+        UUID sword = jdbc.sql("select id from record where version_id = ? and ordinal = 2").param(book.versionId())
+                .query(UUID.class).single();
+
+        // V37: the fingerprint is the vault's of the name's unique form, never the name, and is set on every record.
+        byte[] stored = jdbc.sql("select name_fingerprint from record where id = ?").param(item).query(byte[].class)
+                .single();
+        assertThat(stored).isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm("Vorpal Sword")))
+                .isEqualTo(jdbc.sql("select name_fingerprint from record where id = ?").param(spell)
+                        .query(byte[].class).single());
+        assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContainIgnoringCase("vorpal");
+        assertThat(jdbc.sql("select count(*) from record where name_fingerprint is null and owner_id = ?")
+                .param(owner).query(Long.class).single()).isZero();
+
+        // The exact name: case and surrounding space aside, of the scope's ready versions only, by type when asked.
+        ScopeSettings withoutOff = new ScopeSettings(true, true, false, false, java.util.Set.of(off.materialId()));
+        ResolvedScope scope = as(owner, () -> scopes.resolveSources(campaign, withoutOff));
+        assertThat(as(owner, () -> scopes.namedRecords(scope, " vorpal SWORD ", null, List.of())))
+                .extracting(ScopedRecord::recordId).containsExactlyInAnyOrder(item, spell);
+        List<ScopedRecord> items = as(owner, () -> scopes.namedRecords(scope, "Vorpal Sword", "item", List.of()));
+        assertThat(items).extracting(ScopedRecord::recordId).containsExactly(item);
+        assertThat(items.getFirst().page()).isEqualTo(3);
+        assertThat(items.getFirst().passageIds()).containsExactly(passageOn(book, 3));
+        assertThat(items.getFirst().name()).isEqualTo("Vorpal Sword");
+        assertThat(items.getFirst().tier()).isEqualTo(Tier.SYSTEM);
+        // With the material switched on, its record joins; a version that needs review never does.
+        ResolvedScope everything = as(owner, () -> scopes.resolveSources(campaign, ScopeSettings.STARTING));
+        assertThat(as(owner, () -> scopes.namedRecords(everything, "Vorpal Sword", "item", List.of())))
+                .extracting(ScopedRecord::versionId).containsExactlyInAnyOrder(book.versionId(), off.versionId());
+        assertThat(as(owner, () -> scopes.records(everything, List.of(item, sword, Ids.newId()))))
+                .extracting(ScopedRecord::recordId).containsExactly(item, sword);
+        UUID reviewing = jdbc.sql("select id from record where version_id = ?").param(review.versionId())
+                .query(UUID.class).single();
+        assertThat(as(owner, () -> scopes.records(everything, List.of(reviewing)))).isEmpty();
+
+        // A search with a record-type filter stores it; its record results are stored by id and read back named.
+        UUID searchId = as(owner, () -> searches.create(campaign, "Vorpal Sword", null, null, "item"));
+        assertThat(jdbc.sql("select record_type from search where id = ?").param(searchId).query(String.class)
+                .single()).isEqualTo("item");
+        write(owner, () -> {
+            searchStore.insertResults(List.of(
+                    new SearchResultRow(Ids.newId(), owner, searchId, 1, null, item, book.versionId(), "system"),
+                    new SearchResultRow(Ids.newId(), owner, searchId, 2, null, sword, book.versionId(), "system")));
+            searchStore.endSearch(searchId, "done", null);
+        });
+        Searches.Found found = as(owner, () -> searches.find(searchId)).orElseThrow();
+        assertThat(found.recordType()).isEqualTo("item");
+        assertThat(found.results()).extracting(Searches.Result::kind, Searches.Result::recordId,
+                Searches.Result::name, Searches.Result::recordType)
+                .containsExactly(tuple("record", item, "Vorpal Sword", "item"),
+                        tuple("record", sword, "Espada Curta", "item"));
+        // V37's checks: a result is a passage or a record, never both or neither, and a record once per search; a
+        // record type is a core key.
+        assertThatThrownBy(() -> jdbc.sql("insert into search_result (id, owner_id, search_id, rank, passage_id,"
+                + " record_id, version_id, tier) values (?, ?, ?, 3, null, null, ?, 'system')")
+                .params(Ids.newId(), owner, searchId, book.versionId()).update()).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into search_result (id, owner_id, search_id, rank, passage_id,"
+                + " record_id, version_id, tier) values (?, ?, ?, 3, ?, ?, ?, 'system')")
+                .params(Ids.newId(), owner, searchId, passageOn(book, 1), item, book.versionId()).update())
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into search_result (id, owner_id, search_id, rank, passage_id,"
+                + " record_id, version_id, tier) values (?, ?, ?, 3, null, ?, ?, 'system')")
+                .params(Ids.newId(), owner, searchId, item, book.versionId()).update())
+                .isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> jdbc.sql("update search set record_type = 'dragon' where id = ?").param(searchId)
+                .update()).isInstanceOf(RuntimeException.class);
+
+        // The record as the campaign shows it: in the scope, with the campaign's system's type; switched off, not.
+        Records.Detail detail = as(owner, () -> systemRecords.inCampaign(campaign, item)).orElseThrow();
+        assertThat(detail.name()).isEqualTo("Vorpal Sword");
+        assertThat(detail.recordType().core()).isEqualTo("item");
+        assertThat(detail.references()).extracting(Records.Reference::page).containsExactly(3);
+        assertThat(as(owner, () -> systemRecords.inCampaign(campaign, reviewing))).isEmpty();
+        assertThat(as(Ids.newId(), () -> systemRecords.inCampaign(campaign, item))).isEmpty();
+        UUID offRecord = jdbc.sql("select id from record where version_id = ?").param(off.versionId())
+                .query(UUID.class).single();
+        assertThat(as(owner, () -> systemRecords.inCampaign(campaign, offRecord))).isPresent();
+        as(owner, () -> campaignScopes.change(campaign, new CampaignScopes.Change(0, true, true, false, false,
+                List.of(off.materialId())))).orElseThrow();
+        assertThat(as(owner, () -> systemRecords.inCampaign(campaign, offRecord))).isEmpty();
         freeTheIngestionLane();
     }
 

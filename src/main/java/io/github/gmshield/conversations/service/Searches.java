@@ -10,6 +10,8 @@ import io.github.gmshield.library.service.Library;
 import io.github.gmshield.scope.service.CampaignScopes;
 import io.github.gmshield.scope.service.ResolvedScope;
 import io.github.gmshield.scope.service.ScopeFilter;
+import io.github.gmshield.scope.service.ScopedRecord;
+import io.github.gmshield.scope.service.ScopedResult;
 import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.shared.service.Ids;
@@ -19,7 +21,10 @@ import io.github.gmshield.vault.service.Vault;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -48,7 +53,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       Empty for an unknown search, another owner's, or one whose campaign is not found (deleted since).</li>
  * </ul>
  *
- * The query is never matched in SQL. Lines carry ids, counts and codes, never a query or a passage's text.
+ * <p>Story 4.3 part B: a search may also have a record-type filter (a core key of {@link #RECORD_TYPES}, else
+ * {@code request.invalid}), which leaves only records of that type, and its results may be records: a record result is
+ * re-read within the same narrowed scope ({@link Scopes#records}) and carries its name (decrypted only for the answer),
+ * its core type, its first page's place and the ids of its passages there, instead of first words.
+ *
+ * <p>The query is never matched in SQL. Lines carry ids, counts and codes, never a query or a passage's text.
  */
 @Service
 public class Searches {
@@ -59,6 +69,16 @@ public class Searches {
     public static final int KEPT = 20;
     /** The most results a search stores. */
     public static final int MAX_RESULTS = 20;
+    /**
+     * The core keys a record-type filter may name: records store core keys (Story 4.2), so a filter never names a type
+     * the GM approved. The same eight keys as {@code record_type.core} and {@code record.type} (V34, V35).
+     */
+    public static final List<String> RECORD_TYPES = List.of("rule", "spell", "item", "creature", "character_sheet",
+            "encounter", "dungeon", "note");
+    /** A passage result's kind. */
+    public static final String PASSAGE = "passage";
+    /** A record result's kind (Story 4.3 part B). */
+    public static final String RECORD = "record";
     /** The most code points of a result's first words. */
     public static final int FIRST_WORDS = 160;
     private static final Pattern SPACES = Pattern.compile("\\s+", Pattern.UNICODE_CHARACTER_CLASS);
@@ -85,27 +105,52 @@ public class Searches {
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
-    /** A search's result as the GM reads it. {@code toString} names ids, the page and the tier only. */
-    public record Result(UUID passageId, UUID versionId, String materialName, List<String> sectionPath, int page,
-                         String firstWords, Tier tier) {
+    /**
+     * A search's result as the GM reads it: a passage ({@code kind} {@value #PASSAGE}: its id and first words) or, from
+     * Story 4.3 part B, a record ({@code kind} {@value #RECORD}: its id, name, core type and the ids of its passages on
+     * its first page); both with their version, material name, section path, page and tier. The fields of the other
+     * kind are null (empty for {@code passageIds}). {@code toString} names ids, the kind, the page and the tier only.
+     */
+    public record Result(String kind, UUID passageId, UUID recordId, UUID versionId, String materialName,
+                         List<String> sectionPath, int page, String firstWords, String name, String recordType,
+                         List<UUID> passageIds, Tier tier) {
 
         public Result {
             sectionPath = List.copyOf(sectionPath);
+            passageIds = List.copyOf(passageIds);
+        }
+
+        static Result passage(ScopedResult result) {
+            return new Result(PASSAGE, result.passageId(), null, result.versionId(), result.materialName(),
+                    result.sectionPath(), result.page(), Searches.firstWords(result.text()), null, null, List.of(),
+                    result.tier());
+        }
+
+        static Result record(ScopedRecord record) {
+            return new Result(RECORD, null, record.recordId(), record.versionId(), record.materialName(),
+                    record.sectionPath(), record.page(), null, record.name(), record.recordType(),
+                    record.passageIds(), record.tier());
+        }
+
+        /** Whether the result is a record. */
+        public boolean isRecord() {
+            return RECORD.equals(kind);
         }
 
         @Override
         public String toString() {
-            return "Result[passageId=" + passageId + ", versionId=" + versionId + ", page=" + page + ", tier=" + tier
-                    + "]";
+            return "Result[kind=" + kind + ", passageId=" + passageId + ", recordId=" + recordId + ", versionId="
+                    + versionId + ", page=" + page + ", tier=" + tier + "]";
         }
     }
 
     /**
-     * A search of the owner: its campaign, query, filters (each null when unset), state, code (null unless failed) and
-     * results (empty unless done). {@code toString} names ids, words and counts only.
+     * A search of the owner: its campaign, query, filters (each null when unset; {@code recordType} from Story 4.3 part
+     * B), state, code (null unless failed) and results (empty unless done). {@code toString} names ids, words and
+     * counts only.
      */
-    public record Found(UUID id, UUID campaignId, String query, Tier tier, UUID materialId, String state, String code,
-                        List<Result> results) {
+    public record Found(UUID id, UUID campaignId, String query, Tier tier, UUID materialId, String recordType,
+                        String state, String code, List<Result> results) {
 
         public Found {
             results = List.copyOf(results);
@@ -113,14 +158,20 @@ public class Searches {
 
         @Override
         public String toString() {
-            return "Found[id=" + id + ", campaignId=" + campaignId + ", tier=" + tier + ", state=" + state + ", code="
-                    + code + ", results=" + results.size() + "]";
+            return "Found[id=" + id + ", campaignId=" + campaignId + ", tier=" + tier + ", recordType=" + recordType
+                    + ", state=" + state + ", code=" + code + ", results=" + results.size() + "]";
         }
     }
 
-    /** Records a search of the owner's campaign, as the class says; answers its id. */
+    /** Records a search of the owner's campaign with no record-type filter, as the class says; answers its id. */
     public UUID create(UUID campaignId, String query, Tier tier, UUID materialId) {
-        if (query == null || query.isBlank() || query.codePointCount(0, query.length()) > Scopes.MAX_QUERY) {
+        return create(campaignId, query, tier, materialId, null);
+    }
+
+    /** Records a search of the owner's campaign, as the class says; answers its id. */
+    public UUID create(UUID campaignId, String query, Tier tier, UUID materialId, String recordType) {
+        if (query == null || query.isBlank() || query.codePointCount(0, query.length()) > Scopes.MAX_QUERY
+                || recordType != null && !RECORD_TYPES.contains(recordType)) {
             throw ConversationProblems.invalid();
         }
         UUID owner = OwnerContext.require();
@@ -132,12 +183,13 @@ public class Searches {
             Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
             JobRef job = jobs.create(SearchJobs.KIND, Lane.INTERACTIVE, created -> store.insertSearch(new SearchRow(
                     searchId, owner, campaignId, created.id(), vault.encryptText(query(searchId, owner), query),
-                    tier == null ? null : tier.word(), materialId, SearchRow.PENDING, null, now)));
+                    tier == null ? null : tier.word(), materialId, recordType, SearchRow.PENDING, null, now)));
             int pruned = prune();
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("searchId", searchId).addKeyValue("jobId", job.id())
                     .addKeyValue("tier", tier == null ? "none" : tier.word())
-                    .addKeyValue("material", materialId != null).addKeyValue("pruned", pruned)
+                    .addKeyValue("material", materialId != null)
+                    .addKeyValue("recordType", recordType == null ? "none" : recordType).addKeyValue("pruned", pruned)
                     .addKeyValue("queryLength", query.codePointCount(0, query.length())).log("search.created");
             return searchId;
         });
@@ -169,17 +221,43 @@ public class Searches {
         String query = vault.decryptText(query(search.id(), search.ownerId()), search.query());
         List<Result> results = List.of();
         if (SearchRow.DONE.equals(search.state())) {
-            List<UUID> stored = store.results(search.id()).stream().map(SearchResultRow::passageId).toList();
-            results = stored.isEmpty() ? List.of() : scopes.results(scopeOf(search, false), stored).stream()
-                    .map(result -> new Result(result.passageId(), result.versionId(), result.materialName(),
-                            result.sectionPath(), result.page(), firstWords(result.text()), result.tier())).toList();
+            List<SearchResultRow> stored = store.results(search.id());
+            results = stored.isEmpty() ? List.of() : results(search, stored);
             if (results.size() < stored.size()) {
                 log.atInfo().addKeyValue("searchId", search.id()).addKeyValue("dropped", stored.size() - results.size())
                         .log("search.results_dropped");
             }
         }
         return new Found(search.id(), search.campaignId(), query, Tier.of(search.tier()).orElse(null),
-                search.materialId(), search.state(), search.code(), results);
+                search.materialId(), search.recordType(), search.state(), search.code(), results);
+    }
+
+    /**
+     * The stored results re-read within the search's current narrowed scope, in rank order: passages through
+     * {@link Scopes#results}, records through {@link Scopes#records} (of the search's record type, when it has one); a
+     * result that left the scope is dropped.
+     */
+    private List<Result> results(SearchRow search, List<SearchResultRow> stored) {
+        ResolvedScope scope = scopeOf(search, false);
+        List<UUID> passageIds = stored.stream().filter(row -> !row.record()).map(SearchResultRow::passageId).toList();
+        List<UUID> recordIds = stored.stream().filter(SearchResultRow::record).map(SearchResultRow::recordId).toList();
+        Map<UUID, Result> read = new HashMap<>();
+        if (!passageIds.isEmpty()) {
+            scopes.results(scope, passageIds).forEach(result -> read.put(result.passageId(), Result.passage(result)));
+        }
+        if (!recordIds.isEmpty()) {
+            scopes.records(scope, recordIds).stream().filter(record -> search.recordType() == null
+                    || search.recordType().equals(record.recordType()))
+                    .forEach(record -> read.put(record.recordId(), Result.record(record)));
+        }
+        List<Result> results = new ArrayList<>();
+        for (SearchResultRow row : stored) {
+            Result result = read.get(row.record() ? row.recordId() : row.passageId());
+            if (result != null) {
+                results.add(result);
+            }
+        }
+        return List.copyOf(results);
     }
 
     /**

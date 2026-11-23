@@ -2,6 +2,7 @@ package io.github.gmshield.knowledge.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
@@ -89,10 +90,27 @@ public class InMemoryRecordStore implements RecordStore {
         return find(recordId).map(RecordRow::passageIds).orElse(List.of());
     }
 
+    @Override
+    public List<RecordRow> findAll(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        return ids.stream().distinct().map(records::get).filter(row -> row != null && row.ownerId().equals(owner))
+                .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
+    }
+
+    @Override
+    public List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint) {
+        UUID owner = OwnerContext.require();
+        return records.values().stream().filter(row -> row.ownerId().equals(owner)
+                && versionIds.contains(row.versionId()) && row.nameFingerprint() != null
+                && Arrays.equals(row.nameFingerprint(), nameFingerprint))
+                .sorted(Comparator.comparing(RecordRow::id))
+                .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
+    }
+
     /** The row as the JPA store reads it: its links by passage id, or none for a list. */
     private static RecordRow withLinks(RecordRow row, List<UUID> passageIds) {
         return new RecordRow(row.id(), row.ownerId(), row.versionId(), row.ordinal(), row.firstPage(), row.type(),
-                row.name(), row.fields(), passageIds, row.createdAt());
+                row.name(), row.nameFingerprint(), row.fields(), passageIds, row.createdAt());
     }
 
     private int delete(List<RecordRow> found) {

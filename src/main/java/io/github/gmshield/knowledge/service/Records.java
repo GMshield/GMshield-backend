@@ -8,6 +8,8 @@ import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.ReadyVersions;
 import io.github.gmshield.materials.service.RecordSources;
+import io.github.gmshield.scope.service.CampaignScopes;
+import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
@@ -47,6 +49,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       source references: one per distinct (version, section path, page) of its passages, in page order.</li>
  *   <li>{@link #page} and {@link #picture}: a page of the record's version, which the source view opens at a reference's
  *       page and turns from there.</li>
+ *   <li>Story 4.3 part B, {@link #inCampaign}: one record as a campaign shows it (a search's record result): the same
+ *       answer as {@link #record}, its type the campaign's system's type of its core key, for a record of a version
+ *       that is an allowed source of the campaign's current scope ({@link Scopes#resolveSources}, its stored settings,
+ *       no filter, any tier switched on, so a record of another system's material opens too while the other tier is
+ *       on); anything
+ *       else is not found. Its references open the source view on the ground of the campaign's current scope, so this
+ *       class serves no page for it.</li>
  * </ul>
  *
  * Names, fields and places leave only in these answers; logs carry ids and counts only.
@@ -62,16 +71,21 @@ public class Records {
     private final Library library;
     private final ReadyVersions ready;
     private final RecordSources sources;
+    private final Scopes scopes;
+    private final CampaignScopes campaignScopes;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
     Records(KnowledgeStore types, RecordStore store, Vault vault, Library library, ReadyVersions ready,
-            RecordSources sources, ObjectProvider<PlatformTransactionManager> transactions) {
+            RecordSources sources, Scopes scopes, CampaignScopes campaignScopes,
+            ObjectProvider<PlatformTransactionManager> transactions) {
         this.types = types;
         this.store = store;
         this.vault = vault;
         this.library = library;
         this.ready = ready;
         this.sources = sources;
+        this.scopes = scopes;
+        this.campaignScopes = campaignScopes;
         this.transactions = transactions;
     }
 
@@ -178,6 +192,27 @@ public class Records {
                 .addKeyValue("found", found.isPresent())
                 .addKeyValue("references", found.map(detail -> detail.references().size()).orElse(0))
                 .log("knowledge.record_read");
+        return found;
+    }
+
+    /**
+     * The owner's record {@code recordId} as the campaign {@code campaignId}'s current scope shows it, as the class says
+     * (Story 4.3 part B); else empty.
+     */
+    public Optional<Detail> inCampaign(UUID campaignId, UUID recordId) {
+        UUID owner = OwnerContext.require();
+        Optional<Detail> found = reading(() -> library.campaign(campaignId).flatMap(campaign -> {
+            Set<UUID> allowed = scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
+                    .allowedSources();
+            return store.find(recordId).filter(row -> allowed.contains(row.versionId()))
+                    .flatMap(row -> typeOf(campaign.system().id(), row.type()).map(type -> new Detail(row.id(),
+                            vault.decryptText(ExtractedRecordStore.name(row.id(), owner), row.name()), type,
+                            fields(row, owner), references(row))));
+        }));
+        log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", found.isPresent())
+                .addKeyValue("references", found.map(detail -> detail.references().size()).orElse(0))
+                .log("knowledge.campaign_record_read");
         return found;
     }
 

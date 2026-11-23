@@ -39,6 +39,10 @@ class SearchEntity {
     @Column(name = "material_id", updatable = false)
     private UUID materialId;
 
+    /** The record-type filter, a core key (Story 4.3 part B, V37); null for none. */
+    @Column(name = "record_type", updatable = false, length = 32)
+    private String recordType;
+
     @Column(name = "state", nullable = false, length = 16)
     private String state;
 
@@ -60,6 +64,7 @@ class SearchEntity {
         this.query = row.query();
         this.tier = row.tier();
         this.materialId = row.materialId();
+        this.recordType = row.recordType();
         this.state = row.state();
         this.code = row.code();
         this.createdAt = row.createdAt();
@@ -75,6 +80,7 @@ class SearchEntity {
     }
 
     SearchRow row() {
-        return new SearchRow(id, ownerId, campaignId, jobId, query, tier, materialId, state, code, createdAt);
+        return new SearchRow(id, ownerId, campaignId, jobId, query, tier, materialId, recordType, state, code,
+                createdAt);
     }
 }

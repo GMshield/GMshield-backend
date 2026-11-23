@@ -42,6 +42,10 @@ class RecordEntity {
     @Column(name = "name", nullable = false, updatable = false)
     private byte[] name;
 
+    /** The name's keyed fingerprint (V37); null for a record stored before it. */
+    @Column(name = "name_fingerprint", updatable = false)
+    private byte[] nameFingerprint;
+
     @Column(name = "fields", nullable = false, updatable = false)
     private byte[] fields;
 
@@ -60,6 +64,7 @@ class RecordEntity {
         this.firstPage = row.firstPage();
         this.recordType = row.type();
         this.name = row.name();
+        this.nameFingerprint = row.nameFingerprint();
         this.fields = row.fields();
         this.createdAt = row.createdAt();
     }
@@ -69,7 +74,7 @@ class RecordEntity {
     }
 
     RecordRow row(List<UUID> passageIds) {
-        return new RecordRow(id, ownerId, versionId, ordinal, firstPage, recordType, name, fields, passageIds,
-                createdAt);
+        return new RecordRow(id, ownerId, versionId, ordinal, firstPage, recordType, name, nameFingerprint, fields,
+                passageIds, createdAt);
     }
 }
