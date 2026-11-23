@@ -41,20 +41,19 @@ import org.springframework.transaction.support.TransactionTemplate;
  * transaction that creates the system, and {@link #fillCore} adds the missing ones of a system from before V34
  * ({@link CoreTypeBackfill}, at start). A read never writes. A system that is not the owner's, unknown or being deleted
  * is "not found", and so are its record types. A core type can be neither renamed nor removed
- * ({@code ontology.core_record_type}, 409, nothing changes); a type that is not core (Story 4.4 adds them) is renamed on
- * the version it was read at ({@code request.stale_version}, 409, when it moved) to a name no other type of the system
- * has ({@code ontology.record_type_name_taken}, 409; {@code ontology.record_type_name_invalid}, 400, outside 1 to
- * {@value #NAME_MAX} code points after trimming), and removed while it has no records
+ * ({@code ontology.core_record_type}, 409, nothing changes); a type that is not core (Story 4.4 adds them) is renamed
+ * on the version it was read at ({@code request.stale_version}, 409, when it moved) to a name no other type of the
+ * system has ({@code ontology.record_type_name_taken}, 409; {@code ontology.record_type_name_invalid}, 400, outside 1
+ * to {@value #NAME_MAX} code points after trimming), and removed while it has no records
  * ({@code ontology.record_type_in_use}, 409). From Story 4.2 a record type's record count is the number of records of
- * its core type in the system's {@code ready} versions ({@link ReadyVersions#ofSystem}: the materials attached
- * to the system and those of its campaigns), so a version that needs review counts nowhere; a type that is not core has
- * none yet (records store a core key, and approved types come with Story 4.4). Logs carry ids, counts and versions only.
+ * its core type in the system's {@code ready} versions ({@link ReadyVersions#ofSystem}: the materials attached to the
+ * system and those of its campaigns), so a version that needs review counts nowhere; a type that is not core has none
+ * until Story 4.4 part B, which counts the records of its key. Logs carry ids, counts and versions only.
  *
  * <p>From Story 4.4 a record type also has its {@code key} (a core type's core key, or the stable slug of an approved
  * type's name, which never changes) and its origin: {@code core}, or the proposal that approved it and that proposal's
  * material ({@link Origin}). A rename checks the system's one name space ({@link NameSpace}: types, terms, aliases and
- * the core names in pt-BR and en) under the system's ontology lock. A type that is not core has no records until Story
- * 4.4 part B extracts approved types.
+ * the core names in pt-BR and en) under the system's ontology lock.
  */
 @Service
 public class Ontology {
@@ -68,7 +67,7 @@ public class Ontology {
     public static final int MAX_LIMIT = 50;
     /** The furthest position a list page may start at. */
     public static final int MAX_OFFSET = 100_000;
-    /** How many records a type that is not core types (Story 4.2): none, until Story 4.4 extracts approved types. */
+    /** The record count of a type whose key no record of the system has. */
     static final long NO_RECORDS = 0;
     private static final Logger log = LoggerFactory.getLogger(Ontology.class);
 
@@ -279,16 +278,16 @@ public class Ontology {
     }
 
     /**
-     * The records of the system's {@code ready} versions by core type key (Story 4.2): those of the materials attached
-     * to it and of its campaigns' materials.
+     * The records of the system's {@code ready} versions by type key (Story 4.2; an approved type's key from Story 4.4
+     * part B): those of the materials attached to it and of its campaigns' materials.
      */
     private Map<String, Long> counts(UUID systemId) {
         return ready.ofSystem(systemId).map(records::countsByType).orElse(Map.of());
     }
 
-    /** How many records a record type types: its core key's count; a type that is not core types none yet. */
+    /** How many records a record type types: its key's count (Story 4.4 part B: an approved type's too). */
     private static long records(RecordTypeRow row, Map<String, Long> counts) {
-        return row.core() == null ? NO_RECORDS : counts.getOrDefault(row.core(), 0L);
+        return counts.getOrDefault(row.key(), NO_RECORDS);
     }
 
     /** A record type's name, trimmed, or {@code ontology.record_type_name_invalid}. */

@@ -43,19 +43,20 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@link #records}: a record type's records, alphabetical by name: the names are decrypted and sorted with a
  *       root-locale {@link Collator} at secondary strength (case ignored; accents order only names that are otherwise
  *       equal, the unaccented first), the record id breaking ties, then paged in memory. Each shows as it was
- *       extracted: two records with one name are two rows. A type that is not core types no record yet (records store
- *       a core key, Story 4.2).</li>
- *   <li>{@link #record}: one record's name, the system's record type of its core key, its fields in stored order and its
- *       source references: one per distinct (version, section path, page) of its passages, in page order.</li>
- *   <li>{@link #page} and {@link #picture}: a page of the record's version, which the source view opens at a reference's
+ *       extracted: two records with one name are two rows. From Story 4.4 part B a record stores its type's key, so a
+ *       type the GM approved lists the records of its key.</li>
+ *   <li>{@link #record}: one record's name, the system's record type of its key (none: not found), its fields in
+ *       stored order and its source references: one per distinct (version, section path, page) of its passages, in
+ *       page order.</li>
+ *   <li>{@link #page} and {@link #picture}: a page of the record's version, which the source view opens at a
+ *   reference's
  *       page and turns from there.</li>
  *   <li>Story 4.3 part B, {@link #inCampaign}: one record as a campaign shows it (a search's record result): the same
- *       answer as {@link #record}, its type the campaign's system's type of its core key, for a record of a version
- *       that is an allowed source of the campaign's current scope ({@link Scopes#resolveSources}, its stored settings,
- *       no filter, any tier switched on, so a record of another system's material opens too while the other tier is
- *       on); anything
- *       else is not found. Its references open the source view on the ground of the campaign's current scope, so this
- *       class serves no page for it.</li>
+ *       answer as {@link #record}, its type the campaign's system's type of its key (none: not found), for a record of
+ *       a version that is an allowed source of the campaign's current scope ({@link Scopes#resolveSources}, its stored
+ *       settings, no filter, any tier switched on, so a record of another system's material opens too while the other
+ *       tier is on); anything else is not found. Its references open the source view on the ground of the campaign's
+ *       current scope, so this class serves no page for it.</li>
  * </ul>
  *
  * Names, fields and places leave only in these answers; logs carry ids and counts only.
@@ -101,11 +102,14 @@ public class Records {
     public record SummaryPage(List<Summary> items, long total) {
     }
 
-    /** The system's record type of a record: its id, its core key, and its stored name. */
-    public record TypeOf(UUID id, String core, String name) {
+    /**
+     * The system's record type of a record: its id, its core key (null for a type the GM approved), its key (Story 4.4
+     * part B), and its stored name.
+     */
+    public record TypeOf(UUID id, String core, String key, String name) {
         @Override
         public String toString() {
-            return "TypeOf[id=" + id + ", core=" + core + "]";
+            return "TypeOf[id=" + id + ", core=" + core + ", key=" + key + "]";
         }
     }
 
@@ -163,9 +167,8 @@ public class Records {
         }
         Optional<SummaryPage> found = reading(() -> types.findRecordType(recordTypeId)
                 .filter(type -> library.system(type.systemId()).isPresent()).map(type -> {
-                    Set<UUID> versions = type.core() == null ? Set.of()
-                            : ready.ofSystem(type.systemId()).orElse(Set.of());
-                    List<Named> named = sorted(versions.isEmpty() ? List.of() : store.ofTypeIn(versions, type.core()));
+                    Set<UUID> versions = ready.ofSystem(type.systemId()).orElse(Set.of());
+                    List<Named> named = sorted(versions.isEmpty() ? List.of() : store.ofTypeIn(versions, type.key()));
                     List<Named> shown = named.subList(Math.min(offset, named.size()),
                             Math.min(offset + limit, named.size()));
                     Map<UUID, String> materials = sources.materialNames(shown.stream()
@@ -243,12 +246,14 @@ public class Records {
         return store.find(recordId).filter(row -> versions.contains(row.versionId()));
     }
 
-    /** The system's record type of a core key, its name decrypted. */
-    private Optional<TypeOf> typeOf(UUID systemId, String core) {
-        return types.recordTypes(systemId, 0, CoreRecordTypes.KEYS.size()).stream()
-                .filter(type -> core.equals(type.core())).findFirst()
-                .map(type -> new TypeOf(type.id(), type.core(), vault.decryptText(new Binding(Ontology.RECORD_TYPE,
-                        Ontology.FIELD_NAME, type.id(), type.ownerId()), type.name())));
+    /**
+     * The system's record type of a key, its name decrypted; empty when the system has no type with that key (Story 4.4
+     * part B: a record of a type approved in another system shows nowhere here).
+     */
+    private Optional<TypeOf> typeOf(UUID systemId, String key) {
+        return types.findByKey(systemId, key).map(type -> new TypeOf(type.id(), type.core(), type.key(),
+                vault.decryptText(new Binding(Ontology.RECORD_TYPE, Ontology.FIELD_NAME, type.id(), type.ownerId()),
+                        type.name())));
     }
 
     private List<Field> fields(RecordRow row, UUID owner) {

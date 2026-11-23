@@ -273,17 +273,20 @@ class OntologyController {
                     example = "230") long total) {
     }
 
-    @Schema(name = "RecordTypeOfRecord", requiredProperties = {"id", "core", "name"})
+    @Schema(name = "RecordTypeOfRecord", requiredProperties = {"id", "core", "key", "name"})
     record RecordTypeOfView(
             @Schema(description = "The record type's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000003")
             String id,
-            @Schema(description = "The core key of the record type: a client shows its own translation of it",
+            @Schema(description = "The core key of a core record type: a client shows its own translation of it; null"
+                    + " for a type the GM approved (contract 1.39.0), whose name is shown", types = {"string", "null"},
                     allowableValues = {"rule", "spell", "item", "creature",
                     "character_sheet", "encounter", "dungeon", "note"}, example = "spell") String core,
+            @Schema(description = "The record type's stable key (contract 1.39.0), the one its records store",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$", example = "spell") String key,
             @Schema(description = "The record type's stored name", example = "spell") String name) {
 
         static RecordTypeOfView of(Records.TypeOf type) {
-            return new RecordTypeOfView(type.id().toString(), type.core(), type.name());
+            return new RecordTypeOfView(type.id().toString(), type.core(), type.key(), type.name());
         }
     }
 

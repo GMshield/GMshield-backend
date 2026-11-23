@@ -26,13 +26,14 @@ public final class ResolvedScope {
     private final Map<Tier, List<UUID>> sources = new EnumMap<>(Tier.class);
     private final Map<Tier, List<UUID>> pending = new EnumMap<>(Tier.class);
     private final Map<UUID, UUID> materialOf;
+    private final Set<String> recordTypes;
 
     /**
      * {@code sources} and {@code pending} by tier (a missing tier has none); {@code materialOf} the material of each
-     * allowed source.
+     * allowed source; {@code recordTypes} the record type keys of the campaign's system (Story 4.4 part B).
      */
     ResolvedScope(UUID ownerId, UUID campaignId, ScopeSettings settings, Map<Tier, List<UUID>> sources,
-                  Map<Tier, List<UUID>> pending, Map<UUID, UUID> materialOf) {
+                  Map<Tier, List<UUID>> pending, Map<UUID, UUID> materialOf, Set<String> recordTypes) {
         this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
         this.campaignId = Objects.requireNonNull(campaignId, "campaignId");
         this.settings = Objects.requireNonNull(settings, "settings");
@@ -41,6 +42,15 @@ public final class ResolvedScope {
             this.pending.put(tier, List.copyOf(pending.getOrDefault(tier, List.of())));
         }
         this.materialOf = Map.copyOf(materialOf);
+        this.recordTypes = Set.copyOf(recordTypes);
+    }
+
+    /**
+     * The record type keys of the campaign's system when the scope was resolved (Story 4.4 part B): the scope shows a
+     * record only when its key is one of them, whatever its tier.
+     */
+    public Set<String> recordTypes() {
+        return recordTypes;
     }
 
     /** The owner the scope was resolved for. */
@@ -108,6 +118,7 @@ public final class ResolvedScope {
     public String toString() {
         return "ResolvedScope[ownerId=" + ownerId + ", campaignId=" + campaignId + ", campaignSources="
                 + sources.get(Tier.CAMPAIGN).size() + ", systemSources=" + sources.get(Tier.SYSTEM).size()
-                + ", otherSources=" + sources.get(Tier.OTHER).size() + ", pending=" + pending().size() + "]";
+                + ", otherSources=" + sources.get(Tier.OTHER).size() + ", pending=" + pending().size()
+                + ", recordTypes=" + recordTypes.size() + "]";
     }
 }

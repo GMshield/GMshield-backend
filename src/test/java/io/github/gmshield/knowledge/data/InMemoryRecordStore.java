@@ -8,10 +8,10 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 /**
  * {@code record} and {@code record_passage} in memory (Story 4.2), for tests that run without PostgreSQL. Like
@@ -22,8 +22,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class InMemoryRecordStore implements RecordStore {
 
-    private static final Set<String> TYPES = Set.of("rule", "spell", "item", "creature", "character_sheet", "encounter",
-            "dungeon", "note");
+    /** The type check (V40): a record type key's text, a core key or an approved type's. */
+    private static final Pattern TYPE = Pattern.compile("[a-z][a-z0-9_]{0,31}");
 
     public final Map<UUID, RecordRow> records = new ConcurrentHashMap<>();
 
@@ -31,7 +31,7 @@ public class InMemoryRecordStore implements RecordStore {
     public synchronized void insert(List<RecordRow> rows) {
         UUID owner = OwnerContext.require();
         for (RecordRow row : rows) {
-            if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || !TYPES.contains(row.type())
+            if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || !TYPE.matcher(row.type()).matches()
                     || row.passageIds().isEmpty() || row.firstPage() < 1 || row.ordinal() < 0) {
                 throw new IllegalStateException("key or check refused");
             }

@@ -77,8 +77,8 @@ class ScopesTest {
                     jobsAsked.incrementAndGet();
                     return ids.stream().filter(failed::contains).collect(Collectors.toSet());
                 },
-                beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS, vault,
-                beans.getBeanProvider(PlatformTransactionManager.class));
+                beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS,
+                TestMaterials.CORE_KEYS, vault, beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
     }
 
@@ -789,7 +789,11 @@ class ScopesTest {
 
         JsonNode input = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Qual é o alcance da Espada Vorpal?"));
 
-        assertThat(fieldNames(input)).containsExactly("question", "owner", "modelKnowledge", "tiers", "tokenKey");
+        assertThat(fieldNames(input)).containsExactly("question", "owner", "modelKnowledge", "tiers", "tokenKey",
+                "recordTypes");
+        // Story 4.4 part B: the keys of the campaign's system, sorted.
+        assertThat(input.path("recordTypes").toString()).isEqualTo("[\"character_sheet\",\"creature\",\"dungeon\","
+                + "\"encounter\",\"item\",\"note\",\"rule\",\"spell\"]");
         assertThat(input.path("question").asString()).isEqualTo("Qual é o alcance da Espada Vorpal?");
         assertThat(input.path("modelKnowledge").isBoolean()).isTrue();
         assertThat(input.path("modelKnowledge").asBoolean()).isFalse();
@@ -983,7 +987,8 @@ class ScopesTest {
 
         JsonNode input = as(lib.gm().owner(), () -> scopes.searchInput(scope, "Espada Vorpal"));
 
-        assertThat(fieldNames(input)).containsExactly("query", "owner", "modelKnowledge", "tiers", "tokenKey");
+        assertThat(fieldNames(input)).containsExactly("query", "owner", "modelKnowledge", "tiers", "tokenKey",
+                "recordTypes");
         assertThat(input.path("query").asString()).isEqualTo("Espada Vorpal");
         JsonNode asQuestion = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Espada Vorpal"));
         assertThat(input.path("tiers")).isEqualTo(asQuestion.path("tiers"));

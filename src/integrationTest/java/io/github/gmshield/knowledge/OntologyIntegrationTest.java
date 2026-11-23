@@ -8,9 +8,18 @@ import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.knowledge.service.CoreRecordTypes;
 import io.github.gmshield.knowledge.service.CoreTypeBackfill;
 import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.knowledge.service.Proposals;
+import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
+import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.VersionRow;
+import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.RecordTypeKeys;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -235,7 +244,15 @@ class OntologyIntegrationTest {
     // --- Story 4.4: a core row the release before V39 wrote, with no key
 
     @Autowired
-    private io.github.gmshield.knowledge.service.Proposals proposals;
+    private Proposals proposals;
+    @Autowired
+    private RecordTypeKeys recordTypeKeys;
+    @Autowired
+    private Records records;
+    @Autowired
+    private MaterialStore materials;
+    @Autowired
+    private ExtractedRecords extracted;
 
     @Test
     void aCoreRowWithoutAKeyReadsWithItsCoreKeyAndNoApprovedTypeTakesThatKey() throws Exception {
@@ -250,6 +267,13 @@ class OntologyIntegrationTest {
         assertThat(read.core()).isEqualTo("spell");
         assertThat(read.key()).isEqualTo("spell");
         assertThat(read.origin()).isNull();
+        // Story 4.4 part B: its key is its core key wherever keys are read, and a spell record of the system opens.
+        assertThat(as(a.id(), () -> recordTypeKeys.keysOf(system))).contains("spell").doesNotContainNull();
+        UUID record = spellRecord(a.id(), system);
+        Records.Detail detail = as(a.id(), () -> records.record(system, record)).orElseThrow();
+        assertThat(detail.recordType().id()).isEqualTo(spell);
+        assertThat(detail.recordType().key()).isEqualTo("spell");
+        assertThat(detail.recordType().core()).isEqualTo("spell");
 
         // A pending proposal approved as "Spell!": its slug is the core key, so it takes the next one.
         UUID proposal = Ids.newId();
@@ -338,6 +362,30 @@ class OntologyIntegrationTest {
                         vault.encrypt(new Binding("proposal", "examples", id, owner),
                                 "[]".getBytes(StandardCharsets.UTF_8))).update();
         return id;
+    }
+
+    /**
+     * A ready material of {@code system} with one passage and one spell record read from it (Story 4.4 part B): the
+     * record's id.
+     */
+    private UUID spellRecord(UUID owner, UUID system) throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        UUID passage = Ids.newId();
+        write(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "Livro"), now, "rulebook", null, null));
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner, material, system, now));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            byte[] place = "{\"sectionPath\":[\"Magias\"],\"range\":[0,4]}".getBytes(StandardCharsets.UTF_8);
+            materials.insertPassages(List.of(new PassageRow(passage, owner, version, 0, 1,
+                    vault.encryptText(new Binding("passage", "text", passage, owner), "Luz."),
+                    vault.encrypt(new Binding("passage", "place", passage, owner), place), now)));
+            extracted.replaceRange(version, 1, 1, List.of(new ExtractedRecords.Extracted("spell", "Luz", List.of(),
+                    List.of(passage), 1)));
+        });
+        return jdbc.sql("select id from record where version_id = ?").param(version).query(UUID.class).single();
     }
 
     /** A raw insert, past the application, to prove what the table itself refuses. */

@@ -2127,7 +2127,7 @@ class IngestionIntegrationTest {
                 + " record_id, version_id, tier) values (?, ?, ?, 3, null, ?, ?, 'system')")
                 .params(Ids.newId(), owner, searchId, item, book.versionId()).update())
                 .isInstanceOf(RuntimeException.class);
-        assertThatThrownBy(() -> jdbc.sql("update search set record_type = 'dragon' where id = ?").param(searchId)
+        assertThatThrownBy(() -> jdbc.sql("update search set record_type = 'Dragon' where id = ?").param(searchId)
                 .update()).isInstanceOf(RuntimeException.class);
 
         // The record as the campaign shows it: in the scope, with the campaign's system's type; switched off, not.

@@ -1759,7 +1759,7 @@ class ConversationFlowTest {
         // The claim carries the question input's shape with query in place of question, and no model.
         Claim claim = claimSearch(job.id());
         assertThat(fieldNames(claim.input())).containsExactly("query", "owner", "modelKnowledge", "tiers",
-                "tokenKey");
+                "tokenKey", "recordTypes");
         assertThat(claim.input().path("query").asString()).isEqualTo(QUERY);
         assertThat(strings(claim.input().path("tiers").get(0).path("sources")))
                 .containsExactly(own.versionId().toString());
@@ -1916,7 +1916,7 @@ class ConversationFlowTest {
         assertThat(json(get(gm, searchPath(searchId))).path("recordType").asString()).isEqualTo("spell");
         Claim claim = claimSearch(row.jobId());
         assertThat(fieldNames(claim.input())).containsExactly("query", "owner", "modelKnowledge", "tiers",
-                "tokenKey", "recordType");
+                "tokenKey", "recordTypes", "recordType");
         assertThat(claim.input().path("recordType").asString()).isEqualTo("spell");
         // Only records of that type may come back: a passage of the scope fails the search as a forged id does.
         assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"ids\":[\"" + own.passages().getFirst()
@@ -1967,10 +1967,11 @@ class ConversationFlowTest {
         for (String query : new String[] {"", "   \n\t", longest + "a"}) {
             assertProblem(createSearch(gm, gm.campaign(), query, null, null), 400, "request.invalid");
         }
-        // Story 4.3 part B: a record type that is not a core key (case included) is refused too.
+        // Story 4.3 part B: a record type that is not a key's text (case included) is refused too; from Story 4.4 part
+        // B any key of the pattern is taken.
         for (String body : List.of("{}", "{nope", "null", "{\"query\":\"x\",\"tier\":\"model\"}",
                 "{\"query\":\"x\",\"tier\":\"\"}", "{\"query\":\"x\",\"materialId\":\"nope\"}",
-                "{\"query\":\"x\",\"recordType\":\"dragon\"}", "{\"query\":\"x\",\"recordType\":\"Spell\"}",
+                "{\"query\":\"x\",\"recordType\":\"3dragon\"}", "{\"query\":\"x\",\"recordType\":\"Spell\"}",
                 "{\"query\":\"x\",\"recordType\":\"\"}", "{\"query\":\"x\",\"recordType\":5}")) {
             assertProblem(send(gm, "POST", path, body), 400, "request.invalid");
         }

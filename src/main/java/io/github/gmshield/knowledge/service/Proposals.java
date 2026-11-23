@@ -76,6 +76,8 @@ public class Proposals implements OntologyProposals {
     /** An approved type's key: a slug of at most {@value #KEY_BASE} characters, then a suffix when it is taken. */
     static final int KEY_BASE = 28;
     static final String KEY_FALLBACK = "type";
+    /** What a key whose slug starts with a digit gets in front (Story 4.4 part B): a key starts with a letter. */
+    static final String DIGIT_PREFIX = "t_";
     /** The suffixes a key may take, {@code _2} to {@code _999}: a base of {@value #KEY_BASE} and one stays within 32. */
     private static final int KEY_TRIES = 999;
     private static final Logger log = LoggerFactory.getLogger(Proposals.class);
@@ -398,22 +400,31 @@ public class Proposals implements OntologyProposals {
     }
 
     /**
-     * A name's slug: its letters without their accents, in lower case, and its digits; every other run of characters one
-     * underscore, none at either end; at most {@value #KEY_BASE} characters (a separator is written only with room for
-     * a letter after it), {@value #KEY_FALLBACK} when nothing is left. One pass, no pattern.
+     * A name's slug: its letters without their accents, in lower case, and its digits; every other run of characters
+     * one underscore, none at either end; at most {@value #KEY_BASE} characters (a separator is written only with room
+     * for a letter after it), {@value #KEY_FALLBACK} when nothing is left. One pass, no pattern. From Story 4.4 part B
+     * a key never starts with a digit: a slug that would gets {@value #DIGIT_PREFIX} in front, its own part cut to
+     * leave room for it ("3d6 Tabela" is {@code t_3d6_tabela}).
      */
     static String slug(String name) {
+        String slug = slug(name, KEY_BASE);
+        char first = slug.charAt(0);
+        return first >= '0' && first <= '9' ? DIGIT_PREFIX + slug(name, KEY_BASE - DIGIT_PREFIX.length()) : slug;
+    }
+
+    /** {@link #slug(String)} at most {@code limit} characters long, before the digit rule. */
+    private static String slug(String name, int limit) {
         String plain = Normalizer.normalize(name, Normalizer.Form.NFKD).toLowerCase(Locale.ROOT);
         StringBuilder out = new StringBuilder();
         boolean gap = false;
-        for (int index = 0; index < plain.length() && out.length() < KEY_BASE; index++) {
+        for (int index = 0; index < plain.length() && out.length() < limit; index++) {
             char letter = plain.charAt(index);
             if (Character.getType(letter) == Character.NON_SPACING_MARK) {
                 continue;
             }
             if ((letter >= 'a' && letter <= 'z') || (letter >= '0' && letter <= '9')) {
                 if (gap && !out.isEmpty()) {
-                    if (out.length() + 2 > KEY_BASE) {
+                    if (out.length() + 2 > limit) {
                         break;
                     }
                     out.append('_');

@@ -12,6 +12,7 @@ import io.github.gmshield.jobs.service.JobEvent;
 import io.github.gmshield.jobs.service.JobEventBatch;
 import io.github.gmshield.jobs.service.JobRecord;
 import io.github.gmshield.jobs.service.JobRecordReads;
+import io.github.gmshield.knowledge.service.Proposals;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.data.MaterialRow;
@@ -19,6 +20,7 @@ import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.OntologyProposals;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -31,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
+import org.assertj.core.groups.Tuple;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -39,6 +42,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
  * Story 2.4 against a real PostgreSQL and Redis (test mode): a question recorded with its job in one transaction, the
@@ -108,6 +112,10 @@ class ConversationIntegrationTest {
     private Vault vault;
     @Autowired
     private PlatformTransactionManager transactions;
+    @Autowired
+    private OntologyProposals proposals;
+    @Autowired
+    private Proposals decisions;
 
     @Test
     void aQuestionItsBatchesItsUsageAndItsEndAreStoredOnPostgres() {
@@ -356,11 +364,11 @@ class ConversationIntegrationTest {
         assertThat(jdbc.sql("select count(*) from turn_reference where turn_id = :turn and number = 1 and record_id is"
                 + " null and record_type is null and record_name is null and record_fields is null")
                 .param("turn", asked.turnId()).query(Long.class).single()).isEqualTo(1L);
-        // The four are set together, and the type is a core key.
+        // The four are set together, and the type is a key's text (any key from V40, never upper case).
         assertThatThrownBy(() -> jdbc.sql("update turn_reference set record_name = null where turn_id = :turn and"
                 + " number = 2").param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
                 .hasStackTraceContaining("turn_reference_record_check");
-        assertThatThrownBy(() -> jdbc.sql("update turn_reference set record_type = 'dragon' where turn_id = :turn and"
+        assertThatThrownBy(() -> jdbc.sql("update turn_reference set record_type = 'Dragon' where turn_id = :turn and"
                 + " number = 2").param("turn", asked.turnId()).update()).isInstanceOf(RuntimeException.class)
                 .hasStackTraceContaining("turn_reference_record_type_check");
         // Another owner reads no reference.
@@ -552,6 +560,61 @@ class ConversationIntegrationTest {
                 .single()).isZero();
         assertThat(jdbc.sql("select count(*) from search_result where search_id = :id").param("id", searchId)
                 .query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void aRecordOfAnApprovedTypeIsStoredWithItsKeyAndFoundByASearchFilteredByItOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID[] campaignAndSystem = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            Library.Campaign current = library.currentCampaign().orElseThrow();
+            return new UUID[] {current.id(), current.system().id()};
+        });
+        UUID campaign = campaignAndSystem[0];
+        UUID system = campaignAndSystem[1];
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        UUID passage = Ids.newId();
+        as(owner, () -> {
+            materials.insertMaterial(new MaterialRow(material, owner, vault.encryptText(new Binding("material", "name",
+                    material, owner), "Livro"), now, "rulebook", null, campaign));
+            materials.insertVersion(new VersionRow(version, owner, material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(owner, version, passage, 0, 4)));
+            return proposals.store(material, version, List.of(system), List.of(new OntologyProposals.Proposed(
+                    "record_type", "Talento", null, List.of(new OntologyProposals.Example(4, "Fire Bolt")))));
+        });
+        UUID proposal = jdbc.sql("select id from proposal where owner_id = :owner").param("owner", owner)
+                .query(UUID.class).single();
+        OwnerContext.callAs(owner, () -> decisions.approve(proposal, 0, null)).orElseThrow();
+        assertThat(jdbc.sql("select key from record_type where owner_id = :owner and core is null")
+                .param("owner", owner).query(String.class).single()).isEqualTo("talento");
+        as(owner, () -> extracted.replaceRange(version, 1, 9, List.of(new ExtractedRecords.Extracted("talento",
+                "Ataque Poderoso", List.of(new ExtractedRecords.Field("Custo", "1 PM")), List.of(passage), 4))));
+        UUID record = jdbc.sql("select id from record where version_id = :version and type = 'talento'")
+                .param("version", version).query(UUID.class).single();
+
+        UUID searchId = OwnerContext.callAs(owner, () -> searches.create(campaign, "Golpe", null, null, "talento"));
+        assertThat(jdbc.sql("select record_type from search where id = :id").param("id", searchId).query(String.class)
+                .single()).isEqualTo("talento");
+        UUID jobId = jdbc.sql("select job_id from search where id = :id").param("id", searchId).query(UUID.class)
+                .single();
+        JobClaims.Claim claim = claims.claim(jobId, null, List.of());
+        assertThat(claim.input().path("recordType").asString()).isEqualTo("talento");
+        assertThat(claim.input().path("recordTypes").toString()).contains("\"talento\"").contains("\"spell\"");
+        claims.report(jobId, claim.claimId(), claim.grant(), "done", null, JsonNodeFactory.instance.objectNode()
+                .set("ids", JsonNodeFactory.instance.arrayNode().add(record.toString())));
+
+        Searches.Found found = as(owner, () -> searches.find(searchId)).orElseThrow();
+        assertThat(found.state()).isEqualTo("done");
+        assertThat(found.recordType()).isEqualTo("talento");
+        assertThat(found.results()).extracting(Searches.Result::recordId, Searches.Result::recordType,
+                Searches.Result::name).containsExactly(Tuple.tuple(record, "talento", "Ataque Poderoso"));
+        assertThat(jdbc.sql("select record_id from search_result where search_id = :id").param("id", searchId)
+                .query(UUID.class).single()).isEqualTo(record);
+        // The record's type is a key's text; anything else is refused by V40's check.
+        assertThatThrownBy(() -> jdbc.sql("update record set type = 'Talento' where id = :id").param("id", record)
+                .update()).isInstanceOf(RuntimeException.class).hasStackTraceContaining("record_type_check");
     }
 
     @Test

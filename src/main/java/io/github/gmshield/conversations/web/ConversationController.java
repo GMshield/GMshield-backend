@@ -402,9 +402,10 @@ class ConversationController {
             List<UUID> passageIds,
             @Schema(description = "The cited record's id; only for a record (contract 1.37.0)", format = "uuid")
             UUID recordId,
-            @Schema(description = "The record's core record type: a client shows its own translation of it; only for a"
-                    + " record (contract 1.37.0)", allowableValues = {"rule", "spell", "item", "creature",
-                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
+            @Schema(description = "The record's type key; only for a record (contract 1.37.0). A client shows its own"
+                    + " translation of a core key, and from contract 1.39.0 the name of the campaign system's record"
+                    + " type with that key (the key itself when none matches)", pattern = "^[a-z][a-z0-9_]{0,31}$")
+            String recordType,
             @Schema(description = "The record's name, as it was when the answer was written; only for a record"
                     + " (contract 1.37.0)") String name,
             @ArraySchema(arraySchema = @Schema(description = "The record's fields in order, as they were when the"
@@ -452,10 +453,11 @@ class ConversationController {
                     types = {"string", "null"}, allowableValues = {"campaign", "system", "other"}) String tier,
             @Schema(description = "Only this material's version; absent or null for every material on",
                     types = {"string", "null"}, format = "uuid") String materialId,
-            @Schema(description = "Only records of this core record type, and no passage (contract 1.36.0); absent or"
-                    + " null for passages and records of every type", types = {"string", "null"},
-                    allowableValues = {"rule", "spell", "item", "creature",
-                    "character_sheet", "encounter", "dungeon", "note"}) String recordType) {
+            @Schema(description = "Only records of this record type key, and no passage (contract 1.36.0). From"
+                    + " contract 1.39.0 any key of the pattern is accepted; one the campaign's system has no record"
+                    + " type for finds nothing. Absent or null for passages and records of every type",
+                    types = {"string", "null"}, pattern = "^[a-z][a-z0-9_]{0,31}$")
+            String recordType) {
 
         @Override
         public String toString() {
@@ -488,9 +490,10 @@ class ConversationController {
                     + " word boundary; only for a passage") String firstWords,
             @Schema(description = "The record's name, as it was extracted; only for a record (contract 1.36.0)")
             String name,
-            @Schema(description = "The record's core record type: a client shows its own translation of it; only for a"
-                    + " record (contract 1.36.0)", allowableValues = {"rule", "spell", "item", "creature",
-                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
+            @Schema(description = "The record's type key; only for a record (contract 1.36.0). A client shows its own"
+                    + " translation of a core key, and from contract 1.39.0 the name of the campaign system's record"
+                    + " type with that key (the key itself when none matches)", pattern = "^[a-z][a-z0-9_]{0,31}$")
+            String recordType,
             @ArraySchema(arraySchema = @Schema(description = "The ids of the record's passages on its first page, so the"
                     + " source view marks them; only for a record (contract 1.36.0)"),
                     schema = @Schema(type = "string", format = "uuid")) List<UUID> passageIds,
@@ -519,9 +522,9 @@ class ConversationController {
                     allowableValues = {"campaign", "system", "other"}) String tier,
             @Schema(description = "The material filter, null for none", types = {"string", "null"}, format = "uuid")
             UUID materialId,
-            @Schema(description = "The record-type filter, a core record type, null for none (contract 1.36.0)",
-                    types = {"string", "null"}, allowableValues = {"rule", "spell", "item", "creature",
-                    "character_sheet", "encounter", "dungeon", "note"}) String recordType,
+            @Schema(description = "The record-type filter, a record type key (any key from contract 1.39.0), null for"
+                    + " none (contract 1.36.0)", types = {"string", "null"}, pattern = "^[a-z][a-z0-9_]{0,31}$")
+            String recordType,
             @Schema(description = "pending until its job ends: done with its results, or failed with a code",
                     allowableValues = {"pending", "done", "failed"}) String state,
             @JsonInclude(JsonInclude.Include.NON_NULL)

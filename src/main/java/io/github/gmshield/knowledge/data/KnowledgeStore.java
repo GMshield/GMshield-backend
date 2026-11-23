@@ -61,4 +61,19 @@ public interface KnowledgeStore {
 
     /** Whether a record type of the current owner's system {@code systemId} has this key (Story 4.4). */
     boolean keyTaken(UUID systemId, String key);
+
+    /**
+     * Every record type key of the current owner's system {@code systemId} (Story 4.4 part B): its core keys (a core
+     * row the release before V39 wrote without a key reads as its core key) and its approved types' keys.
+     */
+    Set<String> keys(UUID systemId);
+
+    /**
+     * The current owner's record type of the system {@code systemId} with this key (Story 4.4 part B), a core row
+     * without a stored key found by its core key; empty when the system has none.
+     */
+    Optional<RecordTypeRow> findByKey(UUID systemId, String key);
+
+    /** The current owner's record types of the system {@code systemId} that are not core, oldest first (Story 4.4). */
+    List<RecordTypeRow> approvedRecordTypes(UUID systemId);
 }
