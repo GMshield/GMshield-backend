@@ -136,6 +136,22 @@ public class InMemoryKnowledgeStore implements KnowledgeStore {
         return ofSystem(systemId).anyMatch(row -> row.key().equals(key));
     }
 
+    @Override
+    public Set<String> keys(UUID systemId) {
+        return ofSystem(systemId).map(RecordTypeRow::key).collect(Collectors.toSet());
+    }
+
+    @Override
+    public Optional<RecordTypeRow> findByKey(UUID systemId, String key) {
+        return ofSystem(systemId).filter(row -> row.key().equals(key)).findFirst();
+    }
+
+    @Override
+    public List<RecordTypeRow> approvedRecordTypes(UUID systemId) {
+        return ofSystem(systemId).filter(row -> row.core() == null).sorted(Comparator.comparing(RecordTypeRow::id))
+                .toList();
+    }
+
     /** The current owner's rows of the system. */
     private Stream<RecordTypeRow> ofSystem(UUID systemId) {
         UUID owner = OwnerContext.require();

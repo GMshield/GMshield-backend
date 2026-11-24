@@ -91,6 +91,27 @@ public final class TestMaterials {
         }
     };
 
+    /**
+     * Record type keys for the tests that build the services by hand (Story 4.4 part B): every system has the core keys
+     * only, and a records step extracts rule, spell and item.
+     */
+    public static final RecordTypeKeys CORE_KEYS = new RecordTypeKeys() {
+        @Override
+        public List<Named> extraction(Collection<UUID> systemIds) {
+            return List.of(new Named("rule", "rule"), new Named("spell", "spell"), new Named("item", "item"));
+        }
+
+        @Override
+        public List<String> extractionKeys(Collection<UUID> systemIds) {
+            return List.of("rule", "spell", "item");
+        }
+
+        @Override
+        public Set<String> keysOf(UUID systemId) {
+            return Set.copyOf(CORE);
+        }
+    };
+
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */
     public static Optional<Materials.Passage> passage(Materials materials, UUID id) {
         return materials.passage(id);

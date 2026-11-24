@@ -63,7 +63,7 @@ class ScopeTiersTest {
         scopes = new Scopes(library, TestMaterials.scopeReads(materials, index, vault,
                 ids -> ids.stream().filter(unended::contains).collect(java.util.stream.Collectors.toSet()),
                 ids -> Set.of(), beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS,
-                vault, beans.getBeanProvider(PlatformTransactionManager.class));
+                TestMaterials.CORE_KEYS, vault, beans.getBeanProvider(PlatformTransactionManager.class));
         campaignScopes = new CampaignScopes(store, scopes, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);

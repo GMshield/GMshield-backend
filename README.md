@@ -1270,7 +1270,8 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - The chain: a report that carries passages may name next steps `{stage: "records", firstPage, lastPage, input:
     "passages"}` (the worker asks one per 10 pages that hold passages); the input `passages` belongs to that stage only
     (`ingestion.next_input_unknown`). Each gets its job at once, so the version needs review only once they have all
-    ended. Its claim input names `input: "passages"` and `recordTypes: ["rule", "spell", "item"]`; `GET
+    ended. Its claim input names `input: "passages"` and `recordTypes: ["rule", "spell", "item"]` (from Story 4.4 part
+    B, internal contract 1.21.0, followed by the keys approved in the material's systems, with `recordTypeNames`); `GET
     .../inputs/passages` streams the passages of its pages as JSON Lines `{id, page, sectionPath, text}`, decrypted in
     the input's read transaction. Its report carries `records` (at most 1,000), each a `type` of those, a non-blank
     `name` (at most 200 code points), `fields` (at most 64 `{name, value}`, each non-blank, at most 200 and 8,000 code
@@ -1456,11 +1457,41 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     detaches the approved ones, whose origin then has no material. A system's deletion removes its aliases, terms,
     record types and proposals, in that order.
   - **V39.** `proposal`, `term`, `term_alias`; `record_type.key` (backfilled from `core`; null in a core row the previous
-    release writes, read as its core key) and `record_type.proposal_id` (null exactly for a core type). Approved types
-    have no records until part B extracts them.
+    release writes, read as its core key) and `record_type.proposal_id` (null exactly for a core type). Part B extracts
+    approved types.
   - Log lines (ids and counts only): `knowledge.proposal_approved`, `knowledge.proposal_merged`,
     `knowledge.proposal_rejected`. Deploy order: backend → worker (pipeline 9) → frontend (minimum public contract
     1.38.0).
+
+- **Approved record types are extracted (`knowledge`, `materials`, `scope`, `conversations`, Story 4.4 part B, public
+  contract 1.39.0, internal contract 1.21.0, migration V40).** A record stores its type's key: a core key, or the key of
+  a type the GM approved. Every check that took only core keys takes the key pattern `^[a-z][a-z0-9_]{0,31}$`
+  (`materials.service.RecordTypeKeys.KEY`).
+  - **Extraction.** The port `materials.service.RecordTypeKeys` (implemented by `knowledge.service.RecordTypeKeyStore`)
+    answers the types a records step extracts: `rule`, `spell` and `item`, then every key approved in the systems the
+    material counts under, each once, named by the first system that has it. The claim input carries them in
+    `recordTypes` and each key's name in `recordTypeNames` (`{key: name}`; the model reads the names as data). The other
+    core types are never extracted. When the report is recorded, with the version locked, the keys are worked out
+    again: a record whose key is no longer among them (its type was deleted, the material left its system) is dropped
+    and counted (`dropped` on `ingestion.records_recorded`), never refused; a `type` that is not a key's text still
+    refuses the report. The log line counts `rule`, `spell` and `item` by name and every approved key as `approved`.
+  - **Per system.** A system lists, counts, opens, searches and cites a record only when it has a type with the
+    record's key (`KnowledgeStore.findByKey`, which also replaces the read of the first eight types): in a system that
+    never approved the type, the record stays passages. `ResolvedScope.recordTypes` holds the campaign's system's keys,
+    and `Scopes` keeps only records of those keys in every read (`records`, `namedRecords`, `recordContents`,
+    `citedRecords`); a worker that returns another refuses the search, and an answer's read of one is refused whole
+    (`scope.passage_refused`). A question's and a `library.search` input carry those keys as `recordTypes` (sorted),
+    and the worker filters the index's record points to them. A search's `recordType` filter takes any key.
+  - **Contracts.** `RecordTypeOfRecord.core` is null for an approved type and gains `key`; record types in search
+    results, references, the quality report (`ReportRecordCount`, the core types first, then the other keys
+    alphabetically) and the worker's `JobRecord` are keys of the pattern. No contract field carries a type's name: a
+    client names a key from the system's record types (the frontend shows the key when none matches). An approved name
+    whose slug would start with a digit gets `t_` in front (`3d6 Tabela` → `t_3d6_tabela`).
+  - **V40.** `record_type_check`, `search_record_type_check` and `turn_reference_record_type_check` become the key
+    pattern. A rollback past V40 is safe: the previous release reads a record of another key as passages.
+  - Deploy order: worker (it reads `recordTypeNames` and `recordTypes`), then frontend (it names any key; its minimum
+    public contract stays 1.38.0), then backend. This is an exception to the usual backend-first order (part A was
+    backend → worker → frontend): only the backend writes the new keys, so the apps that read them go first. The worker's and the frontend's minimum contracts stay where they are.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

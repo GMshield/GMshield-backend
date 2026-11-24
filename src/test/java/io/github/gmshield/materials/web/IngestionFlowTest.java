@@ -2841,6 +2841,8 @@ class IngestionFlowTest {
             assertThat(input.path("stage").asString()).isEqualTo("records");
             assertThat(input.path("input").asString()).isEqualTo("passages");
             assertThat(input.path("recordTypes").toString()).isEqualTo("[\"rule\",\"spell\",\"item\"]");
+            assertThat(input.path("recordTypeNames").toString())
+                    .isEqualTo("{\"rule\":\"rule\",\"spell\":\"spell\",\"item\":\"item\"}");
             assertThat(input.path("firstPage").asInt()).isEqualTo(step.firstPage());
             assertThat(input.path("lastPage").asInt()).isEqualTo(step.lastPage());
             assertThat(input.has("inputFileId")).isFalse();
@@ -2984,8 +2986,9 @@ class IngestionFlowTest {
         JsonNode claim = claimWithModel(step.jobId());
         UUID own = step.firstPage() == 1 ? stored.get(0).id() : stored.get(1).id();
         UUID otherRun = step.firstPage() == 1 ? stored.get(1).id() : stored.get(0).id();
-        // Matrix row "Bad output": an unknown type, a blank name, a passage id that was not given, a bad field.
-        for (String bad : List.of(record("creature", "Goblin", own), record("monster", "Goblin", own),
+        // Matrix row "Bad output": a type that is no key's text (Story 4.4 part B: a key the step may not extract is
+        // dropped, not refused), a blank name, a passage id that was not given, a bad field.
+        for (String bad : List.of(record("Monster", "Goblin", own), record("3d6", "Goblin", own),
                 record("spell", "  ", own), record("spell", "Fireball", otherRun),
                 record("spell", "Fireball", UUID.randomUUID()), record("spell", "Fireball", own, "Level", " "),
                 "{\"type\":\"spell\",\"name\":\"Fireball\",\"fields\":[],\"passageIds\":[]}",
@@ -3247,7 +3250,9 @@ class IngestionFlowTest {
 
         JsonNode tab = json(get(gm, "/api/v1/systems/" + system + "/proposals"));
         assertThat(tab.path("total").asLong()).isEqualTo(2);
-        JsonNode type = tab.path("items").get(0);
+        // Both were stored in one millisecond, and ids of one millisecond sort randomly (Ids): pick each by its kind.
+        boolean typeFirst = tab.path("items").get(0).path("kind").asString().equals("record_type");
+        JsonNode type = tab.path("items").get(typeFirst ? 0 : 1);
         assertThat(type.path("kind").asString()).isEqualTo("record_type");
         assertThat(type.path("name").asString()).isEqualTo("Talento");
         assertThat(type.path("definition").isNull()).isTrue();
@@ -3257,7 +3262,7 @@ class IngestionFlowTest {
         assertThat(type.path("materialName").asString()).isEqualTo("Livro.pdf");
         assertThat(type.path("examples").toString()).isEqualTo("[{\"page\":1,\"quote\":\"Talentos são habilidades\"},"
                 + "{\"page\":1,\"quote\":\"um   personagem aprende. Pontos\"}]");
-        JsonNode term = tab.path("items").get(1);
+        JsonNode term = tab.path("items").get(typeFirst ? 1 : 0);
         assertThat(term.path("kind").asString()).isEqualTo("term");
         assertThat(term.path("definition").asString()).isEqualTo("Pontos de Vida (PV): medem a saúde do personagem.");
         assertThat(json(get(gm, "/api/v1/materials/" + uploaded.materialId() + "/proposals"))).isEqualTo(tab);
@@ -3657,6 +3662,159 @@ class IngestionFlowTest {
         assertThat(pendingNamed(gm, system, "Talento").path("examples")).extracting(item -> item.path("quote")
                 .asString()).containsExactly("Talentos são");
         assertThat(ontology.proposals.get(moved.id()).versionId()).isEqualTo(replacement.versionId());
+    }
+
+    // --- Story 4.4 (part B): approved record types are extracted
+
+    @Test
+    void anApprovedTypeIsOfferedByNameAtTheNextIngestionAndItsRecordsAreStoredReportedAndCounted() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded first = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, first, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")) + "," + proposal("record_type", "Perícia", "",
+                example(passage, "Perícia")));
+        String talent = approve(gm, pending(gm, system, "Talento"), "{\"version\":0}").path("resultId").asString();
+        assertThat(json(get(gm, "/api/v1/record-types/" + talent)).path("key").asString()).isEqualTo("talento");
+        approve(gm, pending(gm, system, "Perícia"), "{\"version\":0,\"name\":\"Vantagem\"}");
+        endEveryUnendedJob();
+
+        // Matrix row "Approved, then ingested": the next material's records step offers the key with its name.
+        Uploaded second = uploadTo(gm, "Bestiario.pdf", system);
+        StepRow step = recordsStepOf(gm, second);
+        JsonNode claim = claimWithModel(step.jobId());
+        assertThat(claim.path("input").path("recordTypes").toString())
+                .isEqualTo("[\"rule\",\"spell\",\"item\",\"talento\",\"vantagem\"]");
+        assertThat(claim.path("input").path("recordTypeNames").toString()).isEqualTo("{\"rule\":\"rule\","
+                + "\"spell\":\"spell\",\"item\":\"item\",\"talento\":\"Talento\",\"vantagem\":\"Vantagem\"}");
+        UUID passage = passages(second.versionId()).getFirst().id();
+        report(step, claim, recordsReport(record("vantagem", "Sortudo de Verdade", passage),
+                record("talento", "Ataque Poderoso", passage, "Custo", "1 PM"), record("spell", "Luz", passage),
+                record("talento", "Sortudo", passage)));
+        assertThat(recordsOf(second.versionId())).extracting(RecordRow::type)
+                .containsExactly("vantagem", "talento", "spell", "talento");
+        // Matrix row "Report names": the core types first, then the other keys alphabetically, whatever their order.
+        assertThat(json(get(gm, "/api/v1/materials/" + second.materialId() + "/report")).path("records").toString())
+                .isEqualTo("[{\"type\":\"spell\",\"count\":1},{\"type\":\"talento\",\"count\":2},"
+                        + "{\"type\":\"vantagem\",\"count\":1}]");
+        accept(gm, second);
+        assertThat(json(get(gm, "/api/v1/record-types/" + talent)).path("records").asLong()).isEqualTo(2);
+        assertThat(json(get(gm, "/api/v1/record-types/" + talent + "/records")).path("items"))
+                .extracting(item -> item.path("name").asString()).containsExactly("Ataque Poderoso", "Sortudo");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.records_recorded")
+                && hasPair(event, "approved", 3) && hasPair(event, "spell", 1) && hasPair(event, "dropped", 0));
+        // A log line names a core key, never an approved one.
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().contains("talento")
+                || String.valueOf(event.getKeyValuePairs()).contains("talento")
+                || String.valueOf(event.getKeyValuePairs()).contains("Ataque"));
+        // Matrix row "Delete in use".
+        HttpResponse<String> inUse = send("DELETE", "/api/v1/record-types/" + talent, null, session(gm));
+        assertThat(inUse.statusCode()).as(inUse.body()).isEqualTo(409);
+        assertThat(code(inUse)).isEqualTo("ontology.record_type_in_use");
+    }
+
+    @Test
+    void aKeyGoneBeforeTheReportOrNeverExtractedIsDroppedAndCountedNeverRefused() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded first = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, first, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")));
+        String talent = approve(gm, pending(gm, system, "Talento"), "{\"version\":0}").path("resultId").asString();
+        endEveryUnendedJob();
+        Uploaded second = uploadTo(gm, "Bestiario.pdf", system);
+        StepRow step = recordsStepOf(gm, second);
+        JsonNode claim = claimWithModel(step.jobId());
+        assertThat(claim.path("input").path("recordTypes").toString()).contains("talento");
+
+        // Matrix row "Key gone at report": the type is deleted between the claim and the report.
+        HttpResponse<String> deleted = send("DELETE", "/api/v1/record-types/" + talent, null, session(gm));
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        UUID passage = passages(second.versionId()).getFirst().id();
+        // A core type a step never extracts (creature) and an unknown key are dropped the same way.
+        report(step, claim, recordsReport(record("talento", "Ataque Poderoso", passage), record("spell", "Luz",
+                passage), record("creature", "Goblin", passage), record("monster", "Goblin", passage)));
+        assertThat(recordsOf(second.versionId())).extracting(RecordRow::type).containsExactly("spell");
+        assertThat(state(gm, second)).isEqualTo("needs_review");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.records_recorded")
+                && hasPair(event, "records", 1) && hasPair(event, "dropped", 3) && hasPair(event, "approved", 0));
+    }
+
+    @Test
+    void aMaterialMovedToAnotherSystemBeforeTheReportDropsTheRecordsOfKeysItLeftBehind() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        UUID other = UUID.fromString(json(send("POST", "/api/v1/systems", "{\"name\":\"Pathfinder\"}"
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json")).path("id")
+                .asString());
+        Uploaded first = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, first, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")));
+        approve(gm, pending(gm, system, "Talento"), "{\"version\":0}");
+        endEveryUnendedJob();
+        Uploaded second = uploadTo(gm, "Bestiario.pdf", system);
+        StepRow step = recordsStepOf(gm, second);
+        JsonNode claim = claimWithModel(step.jobId());
+        assertThat(claim.path("input").path("recordTypes").toString()).contains("talento");
+
+        // The material leaves the system that approved `talento` between the claim and the report.
+        HttpResponse<String> moved = send("PATCH", "/api/v1/materials/" + second.materialId(), ("{\"version\":0,"
+                + "\"belonging\":{\"systems\":[\"" + other + "\"]}}").getBytes(StandardCharsets.UTF_8), session(gm),
+                "Content-Type", "application/json");
+        assertThat(moved.statusCode()).as(moved.body()).isEqualTo(200);
+        UUID passage = passages(second.versionId()).getFirst().id();
+        report(step, claim, recordsReport(record("talento", "Ataque Poderoso", passage), record("spell", "Luz",
+                passage)));
+        assertThat(recordsOf(second.versionId())).extracting(RecordRow::type).containsExactly("spell");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("ingestion.records_recorded")
+                && hasPair(event, "records", 1) && hasPair(event, "dropped", 1) && hasPair(event, "approved", 0));
+    }
+
+    @Test
+    void aMaterialInTwoSystemsExtractsTheKeysOfBothNamedByTheFirstThatHasEach() throws Exception {
+        Gm gm = signUp();
+        UUID first = starterSystem(gm);
+        UUID second = UUID.fromString(json(send("POST", "/api/v1/systems", "{\"name\":\"Pathfinder\"}"
+                .getBytes(StandardCharsets.UTF_8), session(gm), "Content-Type", "application/json")).path("id")
+                .asString());
+        Uploaded both = upload(gm, pdf(MIB), "Livro.pdf", null, "filename " + Base64.getEncoder().encodeToString(
+                "Livro.pdf".getBytes(StandardCharsets.UTF_8)) + ",systems " + Base64.getEncoder().encodeToString(
+                (first + "," + second).getBytes(StandardCharsets.UTF_8)));
+        withProposals(gm, both, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")) + "," + proposal("record_type", "Perícia", "",
+                example(passage, "Perícia")));
+        // Only the second system approves "Talento"; both approve "Perícia", under two names with one key.
+        approve(gm, pending(gm, second, "Talento"), "{\"version\":0}");
+        approve(gm, pending(gm, first, "Perícia"), "{\"version\":0}");
+        approve(gm, pending(gm, second, "Perícia"), "{\"version\":0,\"name\":\"Pericia\"}");
+        endEveryUnendedJob();
+
+        Uploaded next = upload(gm, pdf(MIB), "Outro.pdf", null, "filename " + Base64.getEncoder().encodeToString(
+                "Outro.pdf".getBytes(StandardCharsets.UTF_8)) + ",systems " + Base64.getEncoder().encodeToString(
+                (first + "," + second).getBytes(StandardCharsets.UTF_8)));
+        StepRow step = recordsStepOf(gm, next);
+        JsonNode input = claimWithModel(step.jobId()).path("input");
+        List<String> keys = new ArrayList<>();
+        input.path("recordTypes").forEach(key -> keys.add(key.asString()));
+        assertThat(keys).containsExactlyInAnyOrder("rule", "spell", "item", "pericia", "talento");
+        assertThat(keys.subList(0, 3)).containsExactly("rule", "spell", "item");
+        assertThat(input.path("recordTypeNames").path("talento").asString()).isEqualTo("Talento");
+        // One key approved in both systems is offered once, named by the first system that has it.
+        assertThat(input.path("recordTypeNames").path("pericia").asString()).isIn("Perícia", "Pericia");
+        assertThat(input.path("recordTypeNames").size()).isEqualTo(5);
+    }
+
+    @Test
+    void anApprovedNameWhoseSlugStartsWithADigitGetsAKeyThatStartsWithALetter() throws Exception {
+        Gm gm = signUp();
+        UUID system = starterSystem(gm);
+        Uploaded uploaded = uploadTo(gm, "Livro.pdf", system);
+        withProposals(gm, uploaded, TALENTS, passage -> proposal("record_type", "Talento", "",
+                example(passage, "Talentos são")));
+        // Matrix row "Digit slug".
+        String type = approve(gm, pending(gm, system, "Talento"), "{\"version\":0,\"name\":\"3d6 Tabela\"}")
+                .path("resultId").asString();
+        assertThat(json(get(gm, "/api/v1/record-types/" + type)).path("key").asString()).isEqualTo("t_3d6_tabela");
     }
 
     /** A PDF upload attached to {@code system}. */

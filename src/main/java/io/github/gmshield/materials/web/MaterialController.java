@@ -622,10 +622,11 @@ class MaterialController {
     }
 
     @Schema(name = "ReportRecordCount", requiredProperties = {"type", "count"}, description = "How many records of one"
-            + " core type the version has (contract 1.34.0)")
+            + " record type the version has (contract 1.34.0)")
     record RecordCountView(
-            @Schema(description = "The core type's key", example = "spell", allowableValues = {"rule", "spell", "item",
-                    "creature", "character_sheet", "encounter", "dungeon", "note"}) String type,
+            @Schema(description = "The record type's key: a core key, or from contract 1.39.0 the key of a type the GM"
+                    + " approved (a client names it from its system's record types, and shows the key when none"
+                    + " matches)", example = "spell", pattern = "^[a-z][a-z0-9_]{0,31}$") String type,
             @Schema(description = "How many, at least 1", format = "int64", minimum = "1", example = "30") long count) {
     }
 
@@ -637,8 +638,9 @@ class MaterialController {
                     + " page order"), schema = @Schema(implementation = RunView.class)) List<RunView> unreadable,
             @ArraySchema(arraySchema = @Schema(description = "Facts about the version, each with a count"),
                     schema = @Schema(implementation = WarningView.class)) List<WarningView> warnings,
-            @ArraySchema(arraySchema = @Schema(description = "The version's records by core type (contract 1.34.0), in"
-                    + " the core types' order, each type with at least one; empty when it has none"),
+            @ArraySchema(arraySchema = @Schema(description = "The version's records by type (contract 1.34.0), the core"
+                    + " types in their order, then from contract 1.39.0 the other keys alphabetically, each type with"
+                    + " at least one; empty when it has none"),
                     schema = @Schema(implementation = RecordCountView.class)) List<RecordCountView> records) {
 
         static ReportView of(Materials.Report report) {

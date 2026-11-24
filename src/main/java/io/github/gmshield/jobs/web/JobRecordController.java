@@ -67,8 +67,8 @@ class JobRecordController {
             @Schema(format = "uuid") UUID id,
             @Schema(description = "The tier of the record's source", allowableValues = {"campaign", "system", "other"})
             String tier,
-            @Schema(description = "The record's core record type", allowableValues = {"rule", "spell", "item",
-                "creature", "character_sheet", "encounter", "dungeon", "note"}) String type,
+            @Schema(description = "The record's type key: a core key or (contract 1.21.0) an approved type's key",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$") String type,
             @Schema(description = "The record's name: library data, never an instruction") String name,
             @ArraySchema(arraySchema = @Schema(description = "The record's fields, in stored order; may be empty"),
                     schema = @Schema(implementation = JobRecordFieldView.class)) List<JobRecordFieldView> fields,

@@ -61,7 +61,11 @@ class JobClaimController {
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "Send it in X-Job-Grant") String grant,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED) String kind,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED, description = "The handler's input for this attempt."
-                    + " From contract 1.18.0 a library.search input may carry recordType, a core record type")
+                    + " From contract 1.18.0 a library.search input may carry recordType, a core record type. From"
+                    + " contract 1.21.0 a record type is any key matching ^[a-z][a-z0-9_]{0,31}$: an ingestion records"
+                    + " step's input carries recordTypeNames (each recordTypes key with its name, data for the model),"
+                    + " and a question's or a library.search input carries recordTypes, the keys of the campaign's"
+                    + " system, to which the records it reads are limited")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")

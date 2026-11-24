@@ -21,6 +21,7 @@ import io.github.gmshield.vault.service.Vault;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -525,11 +526,16 @@ public class Materials {
                 }));
     }
 
-    /** A version's records by type (Story 4.2), in the core types' order; a type with none is left out. */
+    /** A version's records by type (Story 4.2), in the core types' order, then the other keys; none: left out. */
     private List<RecordCount> recordCounts(UUID versionId) {
         Map<String, Long> counts = records.countsByType(List.of(versionId));
-        return CORE_ORDER.stream().filter(type -> counts.getOrDefault(type, 0L) > 0)
-                .map(type -> new RecordCount(type, counts.get(type))).toList();
+        // The core types in their fixed order, then (Story 4.4 part B) the other keys alphabetically.
+        List<RecordCount> found = new ArrayList<>(CORE_ORDER.stream()
+                .filter(type -> counts.getOrDefault(type, 0L) > 0).map(type -> new RecordCount(type, counts.get(type)))
+                .toList());
+        counts.keySet().stream().filter(type -> !CORE_ORDER.contains(type) && counts.get(type) > 0).sorted()
+                .forEach(type -> found.add(new RecordCount(type, counts.get(type))));
+        return List.copyOf(found);
     }
 
     /** The states whose report and pages the GM reads (Story 1.20). */
