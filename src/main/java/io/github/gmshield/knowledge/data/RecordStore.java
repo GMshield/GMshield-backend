@@ -151,6 +151,13 @@ public interface RecordStore {
     Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id);
 
     /**
+     * Gives the current owner's artifact {@code id} the type key {@code type} (Story 5.2: an edit or a restore, whose
+     * newest version has that type), with its row locked for the caller's transaction, which must exist; answers the row
+     * as changed, or empty for an extracted record's id, an unknown one or another owner's. Never a correction.
+     */
+    Optional<ArtifactRow> retypeArtifact(UUID id, String type);
+
+    /**
      * The current owner's artifacts with these ids, of any campaign, by id (Story 5.1 part B: an artifact's index jobs
      * check its campaign); an extracted record's id, an unknown one or another owner's is left out.
      */

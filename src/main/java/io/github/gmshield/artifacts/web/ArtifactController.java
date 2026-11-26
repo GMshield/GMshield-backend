@@ -19,6 +19,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -34,6 +35,11 @@ import org.springframework.web.bind.annotation.RestController;
  * malformed id and a campaign being deleted are the same {@code request.not_found} (404). A value outside its limits is
  * {@code request.invalid} (400) with {@code params.field} naming it; a malformed body, limit, offset, cursor or type is
  * {@code request.invalid} (400) without one. Every answer is {@code no-store}.
+ *
+ * <p>Story 5.2 part A (contract 1.44.0): an edit ({@code PATCH}) and a restore of an earlier version each store the next
+ * version and name the newest version the GM saw; a stale one is {@code request.stale_version} (409). The versions list
+ * newest first, and one version opens by its number (a reference that cited it). A version number that is malformed or
+ * that the artifact does not have is {@code request.not_found} too.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -41,6 +47,11 @@ class ArtifactController {
 
     static final String ARTIFACTS = "/api/v1/campaigns/{campaignId}/artifacts";
     static final String ARTIFACT = "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}";
+    static final String VERSIONS = ARTIFACT + "/versions";
+    static final String VERSION = VERSIONS + "/{number}";
+    static final String RESTORE = VERSION + "/restore";
+    /** A version's number: 1 to 999,999,999, no leading zero. */
+    private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
@@ -56,6 +67,11 @@ class ArtifactController {
             + " approved), name (1 to 200 code points after trimming), fields (at most 64), fieldName or fieldValue"
             + " (with index, from 0: a name of 1 to 200, a value of 1 to 8,000, after trimming) or content (at most"
             + " 20,000 after trimming); request.invalid (400) without a field for a malformed body;";
+    private static final String STALE = " request.stale_version (409) when version is not the artifact's newest (it"
+            + " changed elsewhere, as in another tab); nothing is stored then;";
+    private static final String NOT_FOUND = " request.not_found (404) for a campaign that is not the account's, and for"
+            + " an artifact that is not this campaign's (unknown, another account's, another campaign's or malformed);"
+            + " none is told apart;";
 
     private final Artifacts artifacts;
 
@@ -76,33 +92,70 @@ class ArtifactController {
     }
 
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
-        "version", "createdAt"}, description = "An artifact with its newest version (contract 1.42.0)")
+        "version", "currentVersion", "createdAt"}, description = "An artifact with its newest version, or one of its"
+            + " versions when asked by number (contract 1.42.0; currentVersion and versions from 1.44.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
             String campaignId,
-            @Schema(description = "The key of its record type, one of its campaign's system's (core or approved)",
+            @Schema(description = "The key of the version's record type, one of its campaign's system's (core or"
+                    + " approved); each version keeps its own (contract 1.44.0)",
                     pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item") String recordType,
-            @Schema(description = "Its name", example = "Espada de Kael") String name,
-            @ArraySchema(arraySchema = @Schema(description = "Its fields, in the order written; empty for none"),
-                    schema = @Schema(implementation = FieldView.class)) List<FieldView> fields,
-            @Schema(description = "Its free text, as written (trimmed); null for none", types = {"string", "null"},
-                    example = "Forjada nas montanhas do norte.") String content,
+            @Schema(description = "The version's name", example = "Espada de Kael") String name,
+            @ArraySchema(arraySchema = @Schema(description = "The version's fields, in the order written; empty for"
+                    + " none"), schema = @Schema(implementation = FieldView.class)) List<FieldView> fields,
+            @Schema(description = "The version's free text, as written (trimmed); null for none",
+                    types = {"string", "null"}, example = "Forjada nas montanhas do norte.") String content,
             @Schema(description = "The number of the version shown, from 1", format = "int32", minimum = "1",
                     example = "1") int version,
-            @Schema(description = "When it was written", format = "date-time") String createdAt) {
+            @Schema(description = "The number of the artifact's newest version (contract 1.44.0): the same as version"
+                    + " unless an earlier version is shown", format = "int32", minimum = "1", example = "1")
+            int currentVersion,
+            @Schema(description = "When the artifact was written", format = "date-time") String createdAt) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
                     artifact.name(), artifact.fields().stream().map(field -> new FieldView(field.name(), field.value()))
-                    .toList(), artifact.content(), artifact.version(), artifact.createdAt().toString());
+                    .toList(), artifact.content(), artifact.version(), artifact.currentVersion(),
+                    artifact.createdAt().toString());
         }
 
         @Override
         public String toString() {
             return "ArtifactView[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
-                    + version + "]";
+                    + version + ", currentVersion=" + currentVersion + "]";
         }
+    }
+
+    @Schema(name = "ArtifactVersionSummary", requiredProperties = {"number", "recordType", "name", "createdAt"},
+            description = "One version of an artifact in its versions list (contract 1.44.0)")
+    record VersionSummaryView(
+            @Schema(description = "The version's number, from 1", format = "int32", minimum = "1", example = "2")
+            int number,
+            @Schema(description = "The key of the version's record type", pattern = "^[a-z][a-z0-9_]{0,31}$",
+                    example = "weapon") String recordType,
+            @Schema(description = "The version's name", example = "Espada de Kael") String name,
+            @Schema(description = "When the version was written", format = "date-time") String createdAt) {
+
+        static VersionSummaryView of(Artifacts.VersionSummary summary) {
+            return new VersionSummaryView(summary.number(), summary.recordType(), summary.name(),
+                    summary.createdAt().toString());
+        }
+
+        @Override
+        public String toString() {
+            return "VersionSummaryView[number=" + number + ", recordType=" + recordType + "]";
+        }
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "ArtifactVersionPage", requiredProperties = {"items", "total"})
+    record VersionPageView(
+            @ArraySchema(schema = @Schema(implementation = VersionSummaryView.class)) List<VersionSummaryView> items,
+            @Schema(description = "The cursor of the next page (the last number shown); absent on the last",
+                    format = "int32", minimum = "1", example = "3") Integer nextCursor,
+            @Schema(description = "How many versions the artifact has, whatever the page", format = "int64",
+                    minimum = "1", example = "3") long total) {
     }
 
     @Schema(name = "ArtifactSummary", requiredProperties = {"id", "recordType", "name", "version", "createdAt"},
@@ -188,6 +241,43 @@ class ArtifactController {
                     .map(field -> field == null ? new Artifacts.Field(null, null)
                             : new Artifacts.Field(field.name(), field.value())).toList(), content);
         }
+    }
+
+    @Schema(name = "ArtifactEdit", requiredProperties = {"version", "recordType", "name", "fields"})
+    record ArtifactEdit(
+            @Schema(description = "The number of the artifact's newest version, as the GM last saw it", format = "int32",
+                    minimum = "1", example = "1") Integer version,
+            @Schema(description = "The key of one of the campaign's system's record types, core or approved",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$", example = "weapon") String recordType,
+            @Schema(description = "The artifact's name: 1 to 200 code points after trimming", minLength = 1,
+                    maxLength = 200, example = "Espada de Kael") String name,
+            @ArraySchema(arraySchema = @Schema(description = "The artifact's fields in order, at most 64"),
+                    maxItems = 64, schema = @Schema(implementation = FieldBody.class)) List<FieldBody> fields,
+            @Schema(description = "The artifact's free text: at most 20,000 code points after trimming; absent, null"
+                    + " or blank for none", types = {"string", "null"}, maxLength = 20000,
+                    example = "Forjada nas montanhas do norte.") String content) {
+
+        @Override
+        public String toString() {
+            return "ArtifactEdit[version=" + version + ", recordType=" + recordType + ", fields="
+                    + (fields == null ? 0 : fields.size()) + "]";
+        }
+
+        /** The newest version the GM saw, or {@code request.invalid} for none. */
+        int seen() {
+            return checkedVersion(version);
+        }
+
+        /** What the GM wrote, as a new artifact's body says it. */
+        Artifacts.Written written() {
+            return new NewArtifact(recordType, name, fields, content).written();
+        }
+    }
+
+    @Schema(name = "ArtifactRestore", requiredProperties = {"version"})
+    record ArtifactRestore(
+            @Schema(description = "The number of the artifact's newest version, as the GM last saw it", format = "int32",
+                    minimum = "1", example = "3") Integer version) {
     }
 
     @PostMapping(path = ARTIFACTS, consumes = MediaType.APPLICATION_JSON_VALUE,
@@ -277,6 +367,138 @@ class ArtifactController {
                 .body(ArtifactView.of(found))).orElseThrow(ArtifactController::notFound);
     }
 
+    @GetMapping(path = VERSION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getArtifactVersion", summary = "One version of one of the account's campaigns' artifacts,"
+            + " by its number (contract 1.44.0), as a reference that cited it opens it; currentVersion names the newest."
+            + NOT_FOUND + " request.not_found (404) too for a number the artifact does not have, or a malformed one;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> getArtifactVersion(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @Parameter(description = "The version's number, from 1",
+                    schema = @Schema(type = "integer", format = "int32", minimum = "1"))
+            @PathVariable("number") String number) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        int version = number(number).orElseThrow(ArtifactController::notFound);
+        return artifacts.get(campaign, artifact, version).map(found -> ResponseEntity.ok()
+                .cacheControl(CacheControl.noStore()).body(ArtifactView.of(found)))
+                .orElseThrow(ArtifactController::notFound);
+    }
+
+    @GetMapping(path = VERSIONS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listArtifactVersions", summary = "The versions of one of the account's campaigns'"
+            + " artifacts (contract 1.44.0), newest first, each with its number, record type, name and time; nothing is"
+            + " ever deleted. A page starts after a cursor (the previous page's nextCursor) or at an offset (a numbered"
+            + " page), and names the total." + NOT_FOUND + " request.invalid (400) for a limit outside 1 to 50, a"
+            + " malformed cursor, an offset outside 0 to 100000 or a cursor together with an offset above 0;"
+            + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "cursor", in = ParameterIn.QUERY, description = "The nextCursor of the previous page",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the newest to skip, 0 to"
+                        + " 100000, for a numbered page; not together with cursor",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
+    ResponseEntity<VersionPageView> listArtifactVersions(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        int size = limit(limit);
+        Integer before = cursor == null ? null : number(cursor).orElseThrow(ArtifactController::invalid);
+        int from = offset(offset, before);
+        Artifacts.VersionPage page = artifacts.versions(campaign, artifact, before, from, size)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new VersionPageView(
+                page.items().stream().map(VersionSummaryView::of).toList(), page.nextCursor(), page.total()));
+    }
+
+    @PatchMapping(path = ARTIFACT, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "updateArtifact", summary = "The GM's edit of one of the account's campaigns' artifacts"
+            + " (contract 1.44.0): its record type, name, fields and optional content become its next version, and every"
+            + " earlier version is kept. The edit applies from the next question (the new version is indexed). version"
+            + " names the newest version the GM saw." + LIMITS + STALE + NOT_FOUND + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> updateArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody ArtifactEdit body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        int seen = body.seen();
+        Artifacts.Artifact updated = artifacts.update(campaign, artifact, seen, body.written())
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(updated));
+    }
+
+    @PostMapping(path = RESTORE, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "restoreArtifactVersion", summary = "The GM's restore of an earlier version of one of the"
+            + " account's campaigns' artifacts (contract 1.44.0): its record type, name, fields and content are copied"
+            + " as the artifact's next version; nothing is deleted. version names the newest version the GM saw."
+            + " request.invalid (400) with params.field recordType when the version's record type is no longer one of"
+            + " the system's; request.invalid (400) without a field for a malformed body;" + STALE + NOT_FOUND
+            + " request.not_found (404) too for a number the artifact does not have, or a malformed one;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> restoreArtifactVersion(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @Parameter(description = "The number of the version to restore, from 1",
+                    schema = @Schema(type = "integer", format = "int32", minimum = "1"))
+            @PathVariable("number") String number,
+            @RequestBody ArtifactRestore body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        int restored = number(number).orElseThrow(ArtifactController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        int seen = checkedVersion(body.version());
+        Artifacts.Artifact created = artifacts.restore(campaign, artifact, restored, seen)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(created));
+    }
+
+    /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */
+    private static Optional<Integer> number(String text) {
+        return text != null && NUMBER.matcher(text).matches() ? Optional.of(Integer.parseInt(text))
+                : Optional.empty();
+    }
+
+    /** The newest version the GM saw, from a body: 1 or more, or {@code request.invalid}. */
+    private static int checkedVersion(Integer version) {
+        if (version == null || version < 1) {
+            throw invalid();
+        }
+        return version;
+    }
+
     /** A malformed id is no different from an unknown one. */
     private static Optional<UUID> parse(String id) {
         return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
@@ -297,7 +519,7 @@ class ArtifactController {
      * The position a page starts at: 0 without one, else 0 to {@value Artifacts#MAX_OFFSET}; {@code request.invalid}
      * for anything else, and for a position above 0 together with a cursor (a page starts at one or the other).
      */
-    private static int offset(String offset, UUID cursor) {
+    private static int offset(String offset, Object cursor) {
         if (offset == null) {
             return 0;
         }

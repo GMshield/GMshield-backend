@@ -5,8 +5,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.GmshieldApplication;
 import io.github.gmshield.artifacts.data.ArtifactIndexStore;
+import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.artifacts.data.StaleArtifacts;
+import io.github.gmshield.artifacts.data.VersionTaken;
 import io.github.gmshield.artifacts.service.ArtifactIndexReconcile;
 import io.github.gmshield.artifacts.service.ArtifactIndexRetrySweep;
 import io.github.gmshield.artifacts.service.Artifacts;
@@ -40,6 +42,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.support.BeanDefinitionRegistry;
@@ -73,6 +80,12 @@ import tools.jackson.databind.json.JsonMapper;
  * an artifact's {@code turn_reference} round-trips by value (no material column, its version kept) and the table's check
  * refuses a row of both kinds; a campaign's deletion cancels the artifacts' index jobs, removes their rows before the
  * versions and records one {@code index.artifact_removal} per artifact.
+ *
+ * <p>Story 5.2 part A (V45): V45's statement fills a version's type from its record and the column is then required;
+ * an edit round-trips (version 2 stored only encrypted beside version 1, the identity retyped, version 2's index job
+ * committed and version 1's cancelled), and a restore and the versions page (by offset and cursor) work on PostgreSQL;
+ * a number the record already has is the store's {@code VersionTaken}, and two edits of the same version store one and
+ * refuse the other as stale.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
@@ -275,12 +288,22 @@ class ArtifactsIntegrationTest {
                 + " (?, ?, ?, 'item', now())").params(Ids.newId(), b.id(), a.campaign()).update())
                 .isInstanceOf(DataIntegrityViolationException.class);
         // A version of another owner's record, and a second version 1.
+        assertThatThrownBy(() -> jdbc.sql("insert into record_version (record_id, owner_id, number, record_type, name,"
+                + " fields, created_at) values (?, ?, 2, 'item', ?, ?, now())")
+                .params(artifact, b.id(), new byte[] {1}, new byte[] {1}).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record_version (record_id, owner_id, number, record_type, name,"
+                + " fields, created_at) values (?, ?, 1, 'item', ?, ?, now())")
+                .params(artifact, a.id(), new byte[] {1}, new byte[] {1}).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        // Story 5.2 (V45): a version without a type, or with a type that is not a key's text.
         assertThatThrownBy(() -> jdbc.sql("insert into record_version (record_id, owner_id, number, name, fields,"
-                + " created_at) values (?, ?, 2, ?, ?, now())").params(artifact, b.id(), new byte[] {1}, new byte[] {1})
+                + " created_at) values (?, ?, 2, ?, ?, now())").params(artifact, a.id(), new byte[] {1}, new byte[] {1})
                 .update()).isInstanceOf(DataIntegrityViolationException.class);
-        assertThatThrownBy(() -> jdbc.sql("insert into record_version (record_id, owner_id, number, name, fields,"
-                + " created_at) values (?, ?, 1, ?, ?, now())").params(artifact, a.id(), new byte[] {1}, new byte[] {1})
-                .update()).isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record_version (record_id, owner_id, number, record_type, name,"
+                + " fields, created_at) values (?, ?, 2, 'Item!', ?, ?, now())")
+                .params(artifact, a.id(), new byte[] {1}, new byte[] {1}).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
@@ -563,6 +586,163 @@ class ArtifactsIntegrationTest {
         assertThat((String) again.get("state")).isIn("waiting", "offered");
         // The reconcile visited every owner: the jobs it gave other tests' artifacts are ended here.
         freeTheIngestionLane();
+    }
+
+    // --- Story 5.2
+
+    @Test
+    void v45FillsEachVersionsTypeFromItsRecordAndThenRequiresIt() throws Exception {
+        Owner a = owner();
+        UUID created = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        assertThat(jdbc.sql("select record_type from record_version where record_id = ?").param(created).query()
+                .singleRow()).containsEntry("record_type", "item");
+        String fill = migration("V45__artifact_versions.sql").lines().filter(line -> line.startsWith("update "))
+                .findFirst().orElseThrow();
+
+        // The migration's own statement, run again on a version as the previous release wrote it (no type), in a
+        // transaction rolled back: DDL is transactional on PostgreSQL.
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            jdbc.sql("alter table record_version alter column record_type drop not null").update();
+            jdbc.sql("update record_version set record_type = null where record_id = ?").param(created).update();
+            jdbc.sql("update record set type = 'note' where id = ?").param(created).update();
+            jdbc.sql(fill.replaceAll(";\\s*$", "")).update();
+            assertThat(jdbc.sql("select record_type from record_version where record_id = ?").param(created).query()
+                    .singleRow()).containsEntry("record_type", "note");
+            jdbc.sql("alter table record_version alter column record_type set not null").update();
+            status.setRollbackOnly();
+            return null;
+        }));
+        assertThat(jdbc.sql("select is_nullable from information_schema.columns where table_name = 'record_version'"
+                + " and column_name = 'record_type'").query(String.class).single()).isEqualTo("NO");
+        assertThat(jdbc.sql("select type from record where id = ?").param(created).query(String.class).single())
+                .isEqualTo("item");
+    }
+
+    @Test
+    void anEditRoundTripsEncryptedARestoreCopiesAnEarlierVersionAndTheVersionsPageOnPostgres() throws Exception {
+        Owner a = owner();
+        freeTheIngestionLane();
+        UUID id = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        UUID firstJob = (UUID) jdbc.sql("select job_id from artifact_index where record_id = ? and number = 1")
+                .param(id).query().singleRow().get("job_id");
+
+        Artifacts.Artifact edited = as(a.id(), () -> artifacts.update(a.campaign(), id, 1, new Artifacts.Written(
+                "note", "Espada lembrada", List.of(new Artifacts.Field("Onde", "Torre")), "Guardada na torre.")))
+                .orElseThrow();
+
+        assertThat(edited.version()).isEqualTo(2);
+        assertThat(edited.currentVersion()).isEqualTo(2);
+        List<Map<String, Object>> rows = jdbc.sql("select number, record_type, name, fields, content from"
+                + " record_version where record_id = ? order by number").param(id).query().listOfRows();
+        assertThat(rows).extracting(row -> row.get("number")).containsExactly(1, 2);
+        assertThat(rows).extracting(row -> row.get("record_type")).containsExactly("item", "note");
+        for (String column : List.of("name", "fields", "content")) {
+            String stored = new String((byte[]) rows.get(1).get(column), StandardCharsets.ISO_8859_1);
+            assertThat(stored).doesNotContain("lembrada").doesNotContain("Torre").doesNotContain("torre");
+        }
+        assertThat(vault.decryptText(new Binding("record_version", "content", id, a.id()),
+                (byte[]) rows.get(1).get("content"))).isEqualTo("Guardada na torre.");
+        assertThat(jdbc.sql("select type from record where id = ?").param(id).query(String.class).single())
+                .isEqualTo("note");
+        // Version 2's index job committed with it; version 1's unended job was cancelled.
+        Map<String, Object> second = jdbc.sql("select i.job_id, j.kind, j.state from artifact_index i join job j"
+                + " on j.id = i.job_id where i.record_id = ? and i.number = 2").param(id).query().singleRow();
+        assertThat(second).containsEntry("kind", "index.artifact");
+        assertThat((String) second.get("state")).isIn("waiting", "offered");
+        assertThat(jdbc.sql("select state from job where id = ?").param(firstJob).query(String.class).single())
+                .isEqualTo("cancelled");
+
+        // A restore copies version 1 as version 3; the page reads every version, newest first.
+        Artifacts.Artifact restored = as(a.id(), () -> artifacts.restore(a.campaign(), id, 1, 2)).orElseThrow();
+        assertThat(restored.version()).isEqualTo(3);
+        assertThat(restored.recordType()).isEqualTo("item");
+        assertThat(restored.name()).isEqualTo(KAEL);
+        assertThat(restored.fields()).isEqualTo(kael().fields());
+        assertThat(restored.content()).isEqualTo(kael().content());
+        assertThat(jdbc.sql("select type from record where id = ?").param(id).query(String.class).single())
+                .isEqualTo("item");
+        Artifacts.VersionPage page = as(a.id(), () -> artifacts.versions(a.campaign(), id, null, 0, 2))
+                .orElseThrow();
+        assertThat(page.items()).extracting(Artifacts.VersionSummary::number).containsExactly(3, 2);
+        assertThat(page.items()).extracting(Artifacts.VersionSummary::name).containsExactly(KAEL, "Espada lembrada");
+        assertThat(page.nextCursor()).isEqualTo(2);
+        assertThat(page.total()).isEqualTo(3);
+        Artifacts.VersionPage after = as(a.id(), () -> artifacts.versions(a.campaign(), id, 2, 0, 2)).orElseThrow();
+        assertThat(after.items()).extracting(Artifacts.VersionSummary::number).containsExactly(1);
+        assertThat(after.nextCursor()).isNull();
+        Artifacts.VersionPage numbered = as(a.id(), () -> artifacts.versions(a.campaign(), id, null, 1, 1))
+                .orElseThrow();
+        assertThat(numbered.items()).extracting(Artifacts.VersionSummary::recordType).containsExactly("note");
+        // The cited version reads as it was, beside the newest number; an unknown one is none.
+        Artifacts.Artifact cited = as(a.id(), () -> artifacts.get(a.campaign(), id, 2)).orElseThrow();
+        assertThat(cited.version()).isEqualTo(2);
+        assertThat(cited.currentVersion()).isEqualTo(3);
+        assertThat(cited.content()).isEqualTo("Guardada na torre.");
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), id, 9))).isEmpty();
+        // Another owner reads and writes nothing of it.
+        Owner b = owner();
+        assertThat(as(b.id(), () -> artifacts.versions(a.campaign(), id, null, 0, 20))).isEmpty();
+        assertThat(as(b.id(), () -> artifacts.restore(b.campaign(), id, 1, 3))).isEmpty();
+        assertThat(count("record_version", "record_id = ?", id)).isEqualTo(3);
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void aTakenNumberIsVersionTakenAndTwoEditsOfTheSameVersionStoreOneAndRefuseTheOther() throws Exception {
+        Owner a = owner();
+        freeTheIngestionLane();
+        UUID id = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+
+        // The key on (record, number): the store answers a taken number as VersionTaken.
+        assertThatThrownBy(() -> as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            versions.insert(new ArtifactVersionRow(id, a.id(), 1, "item", new byte[] {1}, new byte[] {1}, null,
+                    Instant.now().truncatedTo(ChronoUnit.MICROS)));
+            return null;
+        }))).isInstanceOf(VersionTaken.class);
+
+        // Tab A's edit holds its transaction open; tab B's edit of the same version waits, then is stale.
+        CountDownLatch saved = new CountDownLatch(1);
+        CountDownLatch commit = new CountDownLatch(1);
+        ExecutorService tabs = Executors.newFixedThreadPool(2);
+        try {
+            Future<Artifacts.Artifact> tabA = tabs.submit(() -> as(a.id(), () -> new TransactionTemplate(transactions)
+                    .execute(status -> {
+                        Artifacts.Artifact edited = artifacts.update(a.campaign(), id, 1, new Artifacts.Written(
+                                "item", "Aba A", List.of(), null)).orElseThrow();
+                        saved.countDown();
+                        try {
+                            assertThat(commit.await(20, TimeUnit.SECONDS)).isTrue();
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException(interrupted);
+                        }
+                        return edited;
+                    })));
+            assertThat(saved.await(20, TimeUnit.SECONDS)).isTrue();
+            Future<Artifacts.Artifact> tabB = tabs.submit(() -> as(a.id(), () -> artifacts.update(a.campaign(), id, 1,
+                    new Artifacts.Written("note", "Aba B", List.of(), null)).orElseThrow()));
+            Thread.sleep(500);
+            commit.countDown();
+
+            assertThat(tabA.get(30, TimeUnit.SECONDS).version()).isEqualTo(2);
+            assertThatThrownBy(() -> tabB.get(30, TimeUnit.SECONDS)).hasCauseInstanceOf(ApiException.class)
+                    .cause().satisfies(refused -> assertThat(((ApiException) refused).problem().code())
+                            .isEqualTo("request.stale_version"));
+        } finally {
+            tabs.shutdownNow();
+        }
+        assertThat(count("record_version", "record_id = ?", id)).isEqualTo(2);
+        assertThat(jdbc.sql("select type from record where id = ?").param(id).query(String.class).single())
+                .isEqualTo("item");
+        freeTheIngestionLane();
+    }
+
+    /** A migration's text, as the application's classpath holds it. */
+    private static String migration(String name) throws Exception {
+        try (var in = ArtifactsIntegrationTest.class.getResourceAsStream("/db/migration/" + name)) {
+            assertThat(in).as(name).isNotNull();
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
     }
 
     /** One ingestion job at a time: whatever another test left open would hold this test's jobs back. */

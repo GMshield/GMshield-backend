@@ -1713,6 +1713,40 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.deletion_prepared`, and `artifacts` on `scope.resolved` and `scope.question_input`. Deploy order: worker (it runs the two new kinds), then backend, then
     frontend (minimum public contract 1.43.0). An older frontend skips an artifact's reference.
 
+- **Edit an artifact and keep its versions (`artifacts`, `knowledge`, Story 5.2 part A, public contract 1.44.0,
+  internal contract unchanged, migration V45).** The GM edits an artifact in place, every earlier version is kept, and
+  an earlier version can be restored as the newest; nothing is deleted.
+  - **Routes.** `PATCH /api/v1/campaigns/{campaignId}/artifacts/{artifactId}` (`updateArtifact`, body `{version,
+    recordType, name, fields, content?}`) and `POST …/artifacts/{artifactId}/versions/{number}/restore`
+    (`restoreArtifactVersion`, body `{version}`) each answer 200 with the new version as an `Artifact`; `GET
+    …/artifacts/{artifactId}/versions` (`listArtifactVersions`, `?cursor&offset&limit`) answers `{items, nextCursor,
+    total}`, newest first, each item `{number, recordType, name, createdAt}` (the cursor is the last number shown); `GET
+    …/artifacts/{artifactId}/versions/{number}` (`getArtifactVersion`) answers that version as an `Artifact`, as a
+    reference that cited it opens it. `Artifact` gains `currentVersion`, the newest number (equal to `version` unless an
+    earlier version is read). All `no-store`. The four routes join the cross-owner audit.
+  - **Checks.** An edit keeps create's limits and type check (`ArtifactRecords.checked`/`checkedType`): `request.invalid`
+    (400) naming the field, and nothing is stored. A restore of a version whose record type the system no longer has is
+    `request.invalid` with `params.field` `recordType`. `version` names the newest version the GM saw: any other number,
+    or a number another write took first (the key on record and number, the store's `VersionTaken`), is
+    `request.stale_version` (409). Another owner's or another campaign's artifact, and a version number the artifact does
+    not have (or a malformed one), are `request.not_found` (404).
+  - **Write.** In one transaction the edit or restore locks the artifact's unended index jobs, then its newest version
+    (the order a job's completion takes them), reads the newest number again, inserts the next version (its own record
+    type, name, fields and content, encrypted as version 1's), gives the identity the new type
+    (`ArtifactRecords.retype`, `RecordStore.retypeArtifact`, the row locked; never the extracted records' correction) and
+    creates the new version's `index.artifact` job. `record.type` therefore always mirrors the newest version, and every
+    reader (the artifacts tab, "Personagens", scope, the type-in-use guard) keeps reading it.
+  - **Index order.** `ArtifactIndexing.start` cancels the unended jobs of the artifact's older versions before it
+    creates the new one, since the worker keeps one point per artifact; `retryFailed` retries only a row of the newest
+    version, and `reconcile` already reads only the newest.
+  - **V45.** `record_version.record_type`, filled from each version's record, then NOT NULL, with V40's key check.
+    Rolling back past V45 is safe once the NOT NULL is dropped (`alter table record_version alter column record_type
+    drop not null;`), since the previous release inserts versions without it; the migration's comment gives the
+    statements that fill those rows before this release is deployed again.
+  - Log lines (ids and counts only): `artifacts.updated`, `artifacts.restored`, `artifacts.versions_listed`,
+    `artifacts.index_superseded`, and `version` on `artifacts.read`. Deploy order: backend, then frontend (minimum
+    public contract 1.44.0); the previous frontend keeps working, since the change is additive.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

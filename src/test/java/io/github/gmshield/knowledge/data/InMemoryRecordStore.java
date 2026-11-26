@@ -259,6 +259,22 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
+    public synchronized Optional<ArtifactRow> retypeArtifact(UUID id, String type) {
+        UUID owner = OwnerContext.require();
+        ArtifactRow row = artifacts.get(id);
+        if (row == null || !row.ownerId().equals(owner)) {
+            return Optional.empty();
+        }
+        if (!TYPE.matcher(type).matches()) {
+            throw new IllegalStateException("check refused");
+        }
+        ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt());
+        artifacts.put(id, changed);
+        RollbackUndo.onRollback(() -> artifacts.put(id, row));
+        return Optional.of(changed);
+    }
+
+    @Override
     public List<ArtifactRow> findArtifacts(Collection<UUID> ids) {
         UUID owner = OwnerContext.require();
         return ids.stream().distinct().map(artifacts::get)

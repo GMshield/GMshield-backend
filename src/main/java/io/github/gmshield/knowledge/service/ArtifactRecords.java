@@ -22,10 +22,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 /**
  * The identity of the artifacts (Story 5.1), for the {@code artifacts} module: an artifact is a record of its campaign,
  * a row of {@code record} with the campaign instead of a material version, its id minted here and its record type's key
- * plain. This class owns that row (it stores, lists, finds and, with its campaign, deletes it); the artifact's content
- * is the {@code artifacts} module's, in its versions. Everything runs as the owner of the work ({@link OwnerContext}),
- * in the caller's transaction, and within one campaign: another campaign's artifact, another owner's or an unknown id
- * is never found. No read of a system's records reaches an artifact ({@code RecordStore}).
+ * plain. This class owns that row (it stores, lists, finds, retypes and, with its campaign, deletes it); the artifact's
+ * content is the {@code artifacts} module's, in its versions. Everything runs as the owner of the work
+ * ({@link OwnerContext}), in the caller's transaction, and within one campaign: another campaign's artifact, another
+ * owner's or an unknown id is never found. No read of a system's records reaches an artifact ({@code RecordStore}).
  *
  * <p>The checks of what the GM wrote keep the limits of an extracted record ({@link ExtractedRecords#MAX_NAME} and the
  * others, shared with the GM's correction since Story 4.5): a name of 1 to 200 code points and at most 64 fields, each
@@ -143,6 +143,21 @@ public class ArtifactRecords {
         ArtifactRow row = new ArtifactRow(Ids.newId(), owner, campaignId, recordType, at);
         store.insertArtifact(row);
         return identity(row);
+    }
+
+    /**
+     * Gives the owner's artifact {@code id} the type key {@code recordType} (Story 5.2: an edit's or a restore's newest
+     * version has it, and the identity always mirrors the newest version), which {@link #checkedType} answered for the
+     * artifact's campaign's system in the same transaction; with the row locked, in the caller's transaction, which must
+     * exist. Answers the identity as changed, or empty for any id that is not one of the owner's artifacts. It never
+     * goes through a record's correction.
+     */
+    public Optional<Identity> retype(UUID id, String recordType) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("knowledge.transaction_required");
+        }
+        OwnerContext.require();
+        return store.retypeArtifact(id, recordType).map(ArtifactRecords::identity);
     }
 
     /** The owner's artifact {@code id} of the campaign {@code campaignId}; empty for any other id. */

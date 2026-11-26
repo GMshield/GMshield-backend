@@ -2410,6 +2410,76 @@ class RecordsFlowTest {
         assertThat(read.toString()).doesNotContain(kael);
     }
 
+    // --- Story 5.2 part A: an edited artifact answers with its new version
+
+    @Test
+    void anArtifactEditedToVersionTwoAndIndexedIsReadAndCitedAsVersionTwoUnderCampanha() throws Exception {
+        Gm gm = signUp();
+        endIngestion();
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        UUID first = indexed(gm);
+        Map<String, Object> edit = new LinkedHashMap<>();
+        edit.put("version", 1);
+        edit.put("recordType", "item");
+        edit.put("name", "Espada Rubra de Kael");
+        edit.put("fields", List.of(Map.of("name", "Dano", "value", "2d6 fogo")));
+        edit.put("content", "Reforjada no vulcão.");
+        JsonNode edited = ok(send("PATCH", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael, gm.session(),
+                edit));
+        assertThat(edited.path("version").asInt()).isEqualTo(2);
+        UUID second = indexed(gm);
+        assertThat(second).isNotEqualTo(first);
+        endIngestion();
+
+        Answer answer = asked(gm, "O que faz a Espada Rubra de Kael?");
+
+        // The campaign tier lists the artifact, and its read is version 2's: its name, fields and content, not 1's.
+        assertThat(strings(answer.claim().path("input").path("tiers").get(0).path("sources"))).contains(kael);
+        JsonNode record = ok(readRecords(answer, List.of(kael))).path("records").get(0);
+        assertThat(record.path("id").asString()).isEqualTo(kael);
+        assertThat(record.path("tier").asString()).isEqualTo("campaign");
+        assertThat(record.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+        assertThat(record.path("fields")).extracting(field -> field.path("name").asString() + "="
+                + field.path("value").asString()).containsExactly("Dano=2d6 fogo", "content=Reforjada no vulcão.");
+        assertThat(record.toString()).doesNotContain("1d8 cortante").doesNotContain("Forjada nas montanhas");
+
+        events(answer, List.of(delta("Causa 2d6 de fogo."), recordCitation(kael, 5)));
+        done(answer);
+
+        // Cited by value as version 2, under "Campanha".
+        JsonNode references = references(gm, answer);
+        assertThat(references).hasSize(1);
+        JsonNode reference = references.get(0);
+        assertThat(reference.path("kind").asString()).isEqualTo("artifact");
+        assertThat(reference.path("artifactId").asString()).isEqualTo(kael);
+        assertThat(reference.path("artifactVersion").asInt()).isEqualTo(2);
+        assertThat(reference.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+        assertThat(reference.path("tier").asString()).isEqualTo("campaign");
+        TurnReferenceRow row = turnReferences.anyOfTurn(answer.turnId()).getFirst();
+        assertThat(row.artifact()).isTrue();
+        assertThat(row.record().artifactVersion()).isEqualTo(2);
+        // The cited version opens as the reference names it.
+        JsonNode cited = ok(get("/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael + "/versions/2",
+                gm.session()));
+        assertThat(cited.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+    }
+
+    /**
+     * The owner's one open {@code index.artifact} job, offered if it waits, claimed and done under recipe "2", as the
+     * worker would; its id.
+     */
+    private UUID indexed(Gm gm) throws Exception {
+        List<UUID> open = jobs.rows.values().stream().filter(row -> row.ownerId().equals(gm.id())
+                && row.kind().equals("index.artifact") && OPEN.contains(row.state())).map(row -> row.id()).toList();
+        assertThat(open).as("the open index.artifact jobs of %s", gm.id()).hasSize(1);
+        UUID jobId = open.getFirst();
+        jobs.rows.computeIfPresent(jobId, (id, row) -> row.state().equals("waiting") ? row.offered(row.updatedAt())
+                : row);
+        report(jobId, claim(jobId), "{\"indexRecipe\":\"2\"}");
+        assertThat(jobs.rows.get(jobId).state()).isEqualTo("done");
+        return jobId;
+    }
+
     /** A new artifact of the campaign, written through the public API; its id. */
     private String artifact(Gm gm, UUID campaign, Map<String, Object> body) throws Exception {
         HttpResponse<String> created = send("POST", "/api/v1/campaigns/" + campaign + "/artifacts", gm.session(),

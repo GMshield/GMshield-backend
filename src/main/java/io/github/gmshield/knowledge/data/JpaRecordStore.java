@@ -84,6 +84,8 @@ class JpaRecordStore implements RecordStore {
             + " order by r.id";
     private static final String ARTIFACTS_FOUND = "select r from Record r where r.id in :ids"
             + " and r.campaignId is not null order by r.id";
+    /** One artifact by id, of any campaign (Story 5.2: its retype locks it). */
+    private static final String ARTIFACT_BY_ID = "select r from Record r where r.id = :id and r.campaignId is not null";
     private static final String ARTIFACTS_BY_IDS = "select r from Record r where r.id in :ids"
             + " and r.campaignId is not null";
 
@@ -328,6 +330,24 @@ class JpaRecordStore implements RecordStore {
     public Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id) {
         return em().createQuery(ARTIFACT, RecordEntity.class).setParameter("campaign", campaignId)
                 .setParameter("id", id).getResultList().stream().findFirst().map(RecordEntity::artifact);
+    }
+
+    @Override
+    public Optional<ArtifactRow> retypeArtifact(UUID id, String type) {
+        Optional<RecordEntity> found;
+        try {
+            EntityManager em = em();
+            found = em.createQuery(ARTIFACT_BY_ID, RecordEntity.class).setParameter("id", id)
+                    .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst();
+            found.ifPresent(entity -> em.refresh(entity, LockModeType.PESSIMISTIC_WRITE));
+        } catch (RuntimeException refused) {
+            throw JpaKnowledgeStore.conflictOf(refused).orElseThrow(() -> refused);
+        }
+        found.ifPresent(entity -> {
+            entity.retype(type);
+            flushChecked();
+        });
+        return found.map(RecordEntity::artifact);
     }
 
     @Override
