@@ -94,6 +94,23 @@ public interface OntologyStore {
     /** The current owner's aliases of these terms, oldest first. */
     List<TermAliasRow> aliasesOf(Collection<UUID> termIds);
 
+    /**
+     * The current owner's terms with these ids (Story 4.6), oldest first (ascending id); unknown ids are left out.
+     */
+    List<TermRow> findTerms(Collection<UUID> ids);
+
+    /**
+     * The current owner's terms of the system whose name fingerprint is one of {@code nameFingerprints} (Story 4.6: a
+     * fingerprint-IN equality, never a text search), oldest first.
+     */
+    List<TermRow> termsNamed(UUID systemId, Collection<byte[]> nameFingerprints);
+
+    /**
+     * The current owner's aliases of the system whose name fingerprint is one of {@code nameFingerprints} (Story 4.6),
+     * oldest first.
+     */
+    List<TermAliasRow> aliasesNamed(UUID systemId, Collection<byte[]> nameFingerprints);
+
     /** Whether a term or an alias of the current owner's system has this name fingerprint. */
     boolean termNameTaken(UUID systemId, byte[] nameFingerprint);
 

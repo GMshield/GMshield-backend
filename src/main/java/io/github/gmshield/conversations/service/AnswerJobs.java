@@ -13,9 +13,11 @@ import io.github.gmshield.jobs.service.JobPassage;
 import io.github.gmshield.jobs.service.JobProblems;
 import io.github.gmshield.jobs.service.JobRecord;
 import io.github.gmshield.jobs.service.JobRef;
+import io.github.gmshield.jobs.service.JobTerms;
 import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.scope.service.CitedPlace;
 import io.github.gmshield.scope.service.ResolvedScope;
+import io.github.gmshield.scope.service.ResolvedTerms;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.ScopedRecord;
 import io.github.gmshield.scope.service.ScopedRecordContent;
@@ -73,6 +75,9 @@ import tools.jackson.databind.node.ObjectNode;
  *       becomes a reference of its own, numbered with the others by first citation
  *       and stored by value: its id, core type, name and fields (the last two encrypted), its first page, that page's
  *       first passage's section path, its passages there, its material's name and its tier.</li>
+ *   <li>Story 4.6 (internal contract 1.23.0): the job resolves its question's terms ({@link #terms}, within the turn's
+ *       frozen scope, {@link Scopes#resolveTerms}): the record type keys, term names and aliases, and in-scope records
+ *       its words name, which the worker's search uses.</li>
  *   <li>A {@code tier} marker (Story 3.7) is stored with the batch's events only when its tier has a source in the
  *       turn's frozen scope; one with no source is dropped, never relayed. A {@code model} marker (Story 3.8) is
  *       stored only when the turn's frozen model-knowledge switch is on.</li>
@@ -161,6 +166,19 @@ public class AnswerJobs implements JobHandler {
                     content.fields().stream().map(field -> new JobRecord.Field(field.name(), field.value())).toList(),
                     record.page(), record.sectionPath());
         }).toList();
+    }
+
+    /**
+     * The terms of the turn's question resolved within its frozen scope (Story 4.6, internal contract 1.23.0,
+     * {@link Scopes#resolveTerms}): the backend reads the question the turn holds, so the worker sends none back, and the
+     * grant ties the read to this turn.
+     */
+    @Override
+    public JobTerms terms(JobRef job) {
+        TurnRow turn = turnOf(job);
+        String question = vault.decryptText(Conversations.question(turn.id(), turn.ownerId()), turn.question());
+        ResolvedTerms resolved = scopes.resolveTerms(scopeOf(turn, false), question);
+        return new JobTerms(resolved.recordTypes(), resolved.names(), resolved.records());
     }
 
     @Override

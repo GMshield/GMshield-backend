@@ -193,6 +193,26 @@ public class InMemoryOntologyStore implements OntologyStore {
     }
 
     @Override
+    public List<TermRow> findTerms(Collection<UUID> ids) {
+        return mine(terms.values().stream(), TermRow::ownerId).filter(row -> ids.contains(row.id()))
+                .sorted(Comparator.comparing(TermRow::id)).toList();
+    }
+
+    @Override
+    public List<TermRow> termsNamed(UUID systemId, Collection<byte[]> nameFingerprints) {
+        return mine(terms.values().stream(), TermRow::ownerId).filter(row -> row.systemId().equals(systemId)
+                        && nameFingerprints.stream().anyMatch(one -> Arrays.equals(one, row.nameFingerprint())))
+                .sorted(Comparator.comparing(TermRow::id)).toList();
+    }
+
+    @Override
+    public List<TermAliasRow> aliasesNamed(UUID systemId, Collection<byte[]> nameFingerprints) {
+        return mine(aliases.values().stream(), TermAliasRow::ownerId).filter(row -> row.systemId().equals(systemId)
+                        && nameFingerprints.stream().anyMatch(one -> Arrays.equals(one, row.nameFingerprint())))
+                .sorted(Comparator.comparing(TermAliasRow::id)).toList();
+    }
+
+    @Override
     public boolean termNameTaken(UUID systemId, byte[] nameFingerprint) {
         return mine(terms.values().stream(), TermRow::ownerId).anyMatch(row -> row.systemId().equals(systemId)
                 && Arrays.equals(row.nameFingerprint(), nameFingerprint))

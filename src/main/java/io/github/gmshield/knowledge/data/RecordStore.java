@@ -95,6 +95,14 @@ public interface RecordStore {
     List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint);
 
     /**
+     * The current owner's live records of the versions with these ids, of one of these type keys, whose name
+     * fingerprint is one of {@code nameFingerprints} (Story 4.6: a fingerprint-IN equality, never a text search), each
+     * with its passage ids in order, by id, at most {@code limit}. A record without a fingerprint never matches.
+     */
+    List<RecordRow> namedAny(Collection<UUID> versionIds, Collection<String> recordTypes,
+                             Collection<byte[]> nameFingerprints, int limit);
+
+    /**
      * Writes the GM's correction (Story 4.5) of the current owner's record {@code id}, made on its row version
      * {@code version}: its type key, name, name fingerprint and fields become the correction's, and its last correction
      * time; on its first correction, the type key and fingerprint it had are kept as its extracted match key. Its id,

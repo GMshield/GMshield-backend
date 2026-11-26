@@ -131,6 +131,18 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
+    public List<RecordRow> namedAny(Collection<UUID> versionIds, Collection<String> recordTypes,
+                                    Collection<byte[]> nameFingerprints, int limit) {
+        UUID owner = OwnerContext.require();
+        return records.values().stream().filter(row -> row.ownerId().equals(owner)
+                        && versionIds.contains(row.versionId()) && recordTypes.contains(row.type()) && !row.deleted()
+                        && row.nameFingerprint() != null
+                        && nameFingerprints.stream().anyMatch(one -> Arrays.equals(one, row.nameFingerprint())))
+                .sorted(Comparator.comparing(RecordRow::id)).limit(Math.max(limit, 0))
+                .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
+    }
+
+    @Override
     public synchronized Optional<RecordRow> correct(UUID id, long version, RecordCorrection correction) {
         UUID owner = OwnerContext.require();
         RecordRow before = records.get(id);

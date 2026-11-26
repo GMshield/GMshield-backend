@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.orm.jpa.SharedEntityManagerCreator;
@@ -48,6 +49,10 @@ class JpaRecordStore implements RecordStore {
     private static final String DELETED_BY_IDS = BY_IDS + " and r.deletedAt is not null and r.pointRemovedAt is null";
     private static final String NAMED = "select r from Record r where r.versionId in :versions"
             + " and r.nameFingerprint = :fingerprint" + LIVE + " order by r.id";
+    private static final String NAMED_ANY = "select r from Record r where r.versionId in :versions"
+            + " and r.recordType in :types and r.nameFingerprint in :fingerprints" + LIVE + " order by r.id";
+    /** The most fingerprints one fingerprint-IN query binds (Story 4.6); more are asked in several queries. */
+    static final int FINGERPRINTS_PER_QUERY = 500;
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
             + LIVE + " group by r.recordType order by r.recordType";
 
@@ -155,6 +160,23 @@ class JpaRecordStore implements RecordStore {
         }
         return withLinks(em().createQuery(NAMED, RecordEntity.class).setParameter("versions", versionIds)
                 .setParameter("fingerprint", nameFingerprint).getResultList());
+    }
+
+    @Override
+    public List<RecordRow> namedAny(Collection<UUID> versionIds, Collection<String> recordTypes,
+                                    Collection<byte[]> nameFingerprints, int limit) {
+        if (versionIds.isEmpty() || recordTypes.isEmpty() || nameFingerprints.isEmpty() || limit < 1) {
+            return List.of();
+        }
+        List<byte[]> fingerprints = List.copyOf(nameFingerprints);
+        Map<UUID, RecordEntity> found = new TreeMap<>();
+        for (int from = 0; from < fingerprints.size(); from += FINGERPRINTS_PER_QUERY) {
+            List<byte[]> chunk = fingerprints.subList(from, Math.min(fingerprints.size(), from + FINGERPRINTS_PER_QUERY));
+            em().createQuery(NAMED_ANY, RecordEntity.class).setParameter("versions", versionIds)
+                    .setParameter("types", recordTypes).setParameter("fingerprints", chunk).setMaxResults(limit)
+                    .getResultList().forEach(entity -> found.putIfAbsent(entity.id(), entity));
+        }
+        return withLinks(found.values().stream().limit(limit).toList());
     }
 
     @Override

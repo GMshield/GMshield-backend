@@ -57,12 +57,7 @@ class JobClaimReads {
 
     /** The items with these ids for the claimed job, in the order asked, each once. */
     <T> List<T> read(UUID jobId, UUID claimId, String grant, List<UUID> ids, Kind<T> kind) {
-        byte[] presented = JobClaims.hashOf(vault, grant);
-        JobRow job = storage.joined().find(jobId).orElse(null);
-        if (job == null || !JobClaims.grantMatches(job, claimId, presented, clock.now())) {
-            JobClaims.refusedGrant(jobId);
-            throw JobProblems.grantRefused();
-        }
+        JobRow job = granted(jobId, claimId, grant);
         if (ids == null || ids.isEmpty() || ids.size() > MAX_IDS || ids.stream().anyMatch(Objects::isNull)) {
             ApiException invalid = kind.invalid().get();
             JobTrace.run(job.traceId(), () -> log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
@@ -87,5 +82,42 @@ class JobClaimReads {
                 throw refused;
             }
         });
+    }
+
+    /**
+     * The terms of the claimed job's question (Story 4.6, {@link JobTermReads}): the live claim's grant first
+     * ({@code job.grant_refused}, 403), then the job's handler ({@link JobHandler#terms}) as the job's owner, in a read
+     * transaction of its own; a kind without one, or whose handler keeps the default, is {@code job.terms_refused}
+     * (403). The line {@code job.terms_read} carries counts only.
+     */
+    JobTerms terms(UUID jobId, UUID claimId, String grant) {
+        JobRow job = granted(jobId, claimId, grant);
+        Optional<JobHandler> handler = handlers.find(job.kind());
+        return JobTrace.call(job.traceId(), () -> {
+            try {
+                JobTerms terms = owners.read(job.ownerId(), () -> handler.orElseThrow(JobProblems::termsRefused)
+                        .terms(JobClaims.ref(job)));
+                log.atInfo().addKeyValue("jobId", jobId).addKeyValue("claimId", claimId)
+                        .addKeyValue("recordTypes", terms.recordTypes().size())
+                        .addKeyValue("names", terms.names().size()).addKeyValue("records", terms.records().size())
+                        .log("job.terms_read");
+                return terms;
+            } catch (ApiException refused) {
+                log.atInfo().addKeyValue("jobId", jobId).addKeyValue("kind", job.kind())
+                        .addKeyValue("reason", refused.problem().code()).log("request.refused");
+                throw refused;
+            }
+        });
+    }
+
+    /** The job whose live claim {@code claimId} holds {@code grant}, else {@code job.grant_refused} (403). */
+    private JobRow granted(UUID jobId, UUID claimId, String grant) {
+        byte[] presented = JobClaims.hashOf(vault, grant);
+        JobRow job = storage.joined().find(jobId).orElse(null);
+        if (job == null || !JobClaims.grantMatches(job, claimId, presented, clock.now())) {
+            JobClaims.refusedGrant(jobId);
+            throw JobProblems.grantRefused();
+        }
+        return job;
     }
 }

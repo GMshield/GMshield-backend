@@ -1579,6 +1579,34 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     worker (it runs the new kind), then backend, then frontend (minimum public contract 1.41.0). Until the backend
     creates the new kind, a new worker changes nothing.
 
+- **Questions understand the system's terms (`scope`, `knowledge`, `conversations`, `jobs`, Story 4.6, internal
+  contract 1.23.0, no migration).** Before it searches, an answer's worker asks the backend to resolve the question's
+  terms; the backend reads the turn's question itself, so the worker sends no text back.
+  - **Route.** `POST /internal/v1/jobs/{jobId}/claims/{claimId}/terms` (`resolveJobTerms`, `JobTermController`) has no
+    body and answers `{recordTypes, names, records}` (`no-store`) under the worker's credential and the live claim's
+    grant (`job.grant_refused`, 403, also once the job's campaign is deleted, which ends its claim).
+    `JobHandler.terms` refuses by default (`job.terms_refused`, 403): only `question.answer` (`AnswerJobs.terms`)
+    resolves, within the turn's frozen scope. Lines: `job.terms_read` and
+    `scope.terms_resolved` (counts only).
+  - **Matching (`Scopes.resolveTerms`).** The question's spans of 1 to 6 words (`TermSpans`: the question in NFC, words
+    split between white space by a loop over code points, joined by one space, each as written and without the
+    punctuation at its end, at its start or both, in `Library.uniqueForm`, at most 200 code points, with a letter or
+    digit; at most `TermSpans.MAX_SPANS` = 1,000 per question, in its order) are fingerprinted with the existing keyed HMACs and compared by
+    equality only (fingerprint-IN queries of at most 500 fingerprints each): the `record_type` subkey against the
+    system's record types, terms and aliases (`KnowledgeStore.recordTypesNamed`, `OntologyStore.termsNamed`,
+    `aliasesNamed`), and the `record` subkey against the live records of the scope's allowed sources and type keys
+    (`RecordStore.namedAny`). The core types also match their pt-BR and en names, singular and plural
+    (`CoreRecordTypes.keyAsked`, a fixed list: "Quais magias…" names `spell`); nothing else is folded. The ontology and
+    record matches come through the new port `materials.service.TermMatches`, implemented in `knowledge`
+    (`TermMatchStore`).
+  - **Answer.** `recordTypes`: the matched keys the campaign's system has, sorted. `names`: each matched term's name and
+    all its aliases, then the matched records' names, each once (decrypted for the matched rows only; a definition is
+    never read). `records`: the matched records placed within the scope as every scoped read places them, campaign tier
+    first, then by id, at most `Scopes.MAX_TERM_RECORDS` (100); a deleted record or one of a material switched off, in
+    review, of another owner or of a type the system lacks is never named.
+  - Deploy order: the backend, then the worker (an older worker never calls the route; a new worker against an older
+    backend gets a 404 and searches as before). The public contract does not change.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

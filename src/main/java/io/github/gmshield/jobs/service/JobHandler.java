@@ -65,6 +65,16 @@ public interface JobHandler {
     }
 
     /**
+     * The terms of the job's question resolved within its scope (Story 4.6, internal contract 1.23.0), for the job's
+     * live claim, served to the worker by {@code POST .../terms}, which sends no body: the handler reads the question
+     * itself. Runs as the owner, in a read transaction of its own. A kind whose jobs resolve no term keeps this default:
+     * {@code job.terms_refused} (403).
+     */
+    default JobTerms terms(JobRef job) {
+        throw JobProblems.termsRefused();
+    }
+
+    /**
      * A numbered batch of answer events of the job's live claim (Story 2.4), posted by the worker to
      * {@code POST .../events}: the handler stores it once, or accepts a batch it already stored (a repeated number of
      * the same claim) without storing it again, and refuses a gap with {@link JobProblems#batchOutOfOrder()}. Runs as

@@ -83,6 +83,13 @@ public class InMemoryKnowledgeStore implements KnowledgeStore {
     }
 
     @Override
+    public List<RecordTypeRow> recordTypesNamed(UUID systemId, java.util.Collection<byte[]> nameFingerprints) {
+        return ofSystem(systemId).filter(row -> nameFingerprints.stream()
+                .anyMatch(one -> Arrays.equals(one, row.nameFingerprint())))
+                .sorted(Comparator.comparing(RecordTypeRow::id)).toList();
+    }
+
+    @Override
     public boolean nameTaken(UUID systemId, byte[] nameFingerprint, UUID except) {
         return ofSystem(systemId).anyMatch(row -> !row.id().equals(except)
                 && Arrays.equals(row.nameFingerprint(), nameFingerprint));
