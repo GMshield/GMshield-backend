@@ -10,6 +10,7 @@ import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -130,6 +131,8 @@ class ArtifactsFlowTest {
     private InMemoryKnowledgeStore knowledge;
     @Autowired
     private InMemoryArtifactVersionStore versions;
+    @Autowired
+    private InMemoryArtifactIndexStore index;
     @Autowired
     private InMemoryLibraryStore library;
     @Autowired
@@ -520,6 +523,31 @@ class ArtifactsFlowTest {
         }
         assertThat(versionsOf(id)).isEqualTo(2);
         assertThat(records.artifacts.get(UUID.fromString(id)).type()).isEqualTo("weapon");
+    }
+
+    @Test
+    void anEditThatChangesNothingAnswersTheNewestVersionAndStoresNoVersionAndNoIndexJob() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        JsonNode before = json(get(gm, artifacts(gm.campaign()) + "/" + id));
+        String same = "{\"version\":1,\"recordType\":\"item\",\"name\":\"Espada de Kael \",\"fields\":["
+                + "{\"name\":\" Dano\",\"value\":\"1d8 cortante\"},{\"name\":\"Peso\",\"value\":\"1,5 kg \"}],"
+                + "\"content\":\" Forjada nas montanhas do norte.\\nBrilha perto de orcs. \"}";
+
+        HttpResponse<String> unchanged = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same);
+
+        // The same type, name, fields and content after trimming: version 1 as it is, nothing stored, no new job.
+        assertThat(unchanged.statusCode()).as(unchanged.body()).isEqualTo(200);
+        assertThat(json(unchanged)).isEqualTo(before);
+        assertThat(versionsOf(id)).isEqualTo(1);
+        assertThat(index.rows.values()).filteredOn(row -> row.recordId().toString().equals(id)).hasSize(1);
+        // A stale version is still refused, and a real change still stores version 2.
+        assertThat(send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same.replace("\"version\":1",
+                "\"version\":2")).statusCode()).isEqualTo(409);
+        assertThat(send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same.replace("Kael ", "Kael, a Rubra"))
+                .statusCode()).isEqualTo(200);
+        assertThat(versionsOf(id)).isEqualTo(2);
+        assertThat(index.rows.values()).filteredOn(row -> row.recordId().toString().equals(id)).hasSize(2);
     }
 
     @Test

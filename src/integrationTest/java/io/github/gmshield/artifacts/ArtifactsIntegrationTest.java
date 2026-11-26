@@ -28,6 +28,7 @@ import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
+import io.github.gmshield.scope.service.CampaignArtifacts;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
@@ -145,6 +146,8 @@ class ArtifactsIntegrationTest {
     private ArtifactIndexRetrySweep retrySweep;
     @Autowired
     private ArtifactIndexReconcile reconcile;
+    @Autowired
+    private CampaignArtifacts campaignArtifacts;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID system, UUID campaign) {
@@ -651,6 +654,22 @@ class ArtifactsIntegrationTest {
         assertThat((String) second.get("state")).isIn("waiting", "offered");
         assertThat(jdbc.sql("select state from job where id = ?").param(firstJob).query(String.class).single())
                 .isEqualTo("cancelled");
+        // The newest-version reads with two versions: the list and the question sources read version 2 only.
+        assertNewest(a, id, 2, "Espada lembrada");
+        // The backfill's candidates are newest versions only: version 2 under a recipe no row reports, never version 1;
+        // once version 2 reports it, the owner has no candidate left, though version 1 never did.
+        String recipe = "it-5-2-" + Ids.newId().toString().substring(0, 8);
+        UUID secondJob = (UUID) second.get("job_id");
+        assertThat(stale.owners(recipe)).contains(a.id());
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(index.notIndexedUnder(recipe)).contains(new ArtifactIndexStore.VersionKey(id, 2))
+                    .doesNotContain(new ArtifactIndexStore.VersionKey(id, 1));
+            assertThat(index.recordRecipe(secondJob, recipe)).isTrue();
+            assertThat(index.notIndexedUnder(recipe)).doesNotContain(new ArtifactIndexStore.VersionKey(id, 2),
+                    new ArtifactIndexStore.VersionKey(id, 1));
+            return null;
+        }));
+        assertThat(stale.owners(recipe)).doesNotContain(a.id());
 
         // A restore copies version 1 as version 3; the page reads every version, newest first.
         Artifacts.Artifact restored = as(a.id(), () -> artifacts.restore(a.campaign(), id, 1, 2)).orElseThrow();
@@ -661,6 +680,7 @@ class ArtifactsIntegrationTest {
         assertThat(restored.content()).isEqualTo(kael().content());
         assertThat(jdbc.sql("select type from record where id = ?").param(id).query(String.class).single())
                 .isEqualTo("item");
+        assertNewest(a, id, 3, KAEL);
         Artifacts.VersionPage page = as(a.id(), () -> artifacts.versions(a.campaign(), id, null, 0, 2))
                 .orElseThrow();
         assertThat(page.items()).extracting(Artifacts.VersionSummary::number).containsExactly(3, 2);
@@ -735,6 +755,25 @@ class ArtifactsIntegrationTest {
         assertThat(jdbc.sql("select type from record where id = ?").param(id).query(String.class).single())
                 .isEqualTo("item");
         freeTheIngestionLane();
+    }
+
+    /**
+     * The newest-version reads on PostgreSQL (Story 5.2): the campaign's list shows the artifact once, at version
+     * {@code number} with its name, and the question sources' read gives that version's name and number.
+     */
+    private void assertNewest(Owner owner, UUID id, int number, String name) throws Exception {
+        Artifacts.Page page = as(owner.id(), () -> artifacts.list(owner.campaign(), null, null, 0, 20)).orElseThrow();
+        assertThat(page.items()).filteredOn(item -> item.id().equals(id)).singleElement().satisfies(item -> {
+            assertThat(item.version()).isEqualTo(number);
+            assertThat(item.name()).isEqualTo(name);
+        });
+        assertThat(page.total()).isOne();
+        List<CampaignArtifacts.Artifact> read = as(owner.id(), () -> campaignArtifacts.read(owner.campaign(),
+                List.of(id)));
+        assertThat(read).singleElement().satisfies(artifact -> {
+            assertThat(artifact.version()).isEqualTo(number);
+            assertThat(artifact.name()).isEqualTo(name);
+        });
     }
 
     /** A migration's text, as the application's classpath holds it. */

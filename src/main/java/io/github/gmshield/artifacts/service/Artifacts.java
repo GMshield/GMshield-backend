@@ -54,7 +54,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       check of {@link #create}. It names the newest version the GM saw; it stores the next number, gives the identity
  *       the new version's type ({@link ArtifactRecords#retype}) and creates the new version's index job, all in one
  *       transaction, and every earlier version is kept. A version that is not the newest, or a number another write took
- *       first, is {@code request.stale_version} (409), and nothing is stored.</li>
+ *       first, is {@code request.stale_version} (409), and nothing is stored. An edit that changes nothing (the same
+ *       type, name, fields and content as the newest version it names) answers that version and stores nothing.</li>
  *   <li>{@link #restore} (Story 5.2): the same write, with the type, name, fields and content of an earlier version; a
  *       version whose type the system no longer has is {@code request.invalid} naming the record type.</li>
  *   <li>{@link #versions} (Story 5.2): the artifact's versions newest first, a page at a time, with the total.</li>
@@ -303,8 +304,18 @@ public class Artifacts {
                             .stream().map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
                     List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
                             .toList();
-                    return next(identity, owner, version, recordType, checked.name(), fields,
-                            content(written.content()));
+                    String content = content(written.content());
+                    ArtifactVersionRow newest = versions.latest(identity.id())
+                            .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+                    if (newest.number() == version) {
+                        // Nothing changed: the newest version stays, with no new version and no index job.
+                        Artifact current = open(vault, identity, newest, owner);
+                        if (current.recordType().equals(recordType) && current.name().equals(checked.name())
+                                && current.fields().equals(fields) && Objects.equals(current.content(), content)) {
+                            return current;
+                        }
+                    }
+                    return next(identity, owner, version, recordType, checked.name(), fields, content);
                 })));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("artifactId", artifactId).addKeyValue("seen", version)

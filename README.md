@@ -1728,8 +1728,10 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     (400) naming the field, and nothing is stored. A restore of a version whose record type the system no longer has is
     `request.invalid` with `params.field` `recordType`. `version` names the newest version the GM saw: any other number,
     or a number another write took first (the key on record and number, the store's `VersionTaken`), is
-    `request.stale_version` (409). Another owner's or another campaign's artifact, and a version number the artifact does
-    not have (or a malformed one), are `request.not_found` (404).
+    `request.stale_version` (409). An edit that changes nothing (the same type, name, fields and content as the newest
+    version it names) answers that version and stores no version and no index job. Another owner's or another
+    campaign's artifact, and a version number the artifact does not have (or a malformed one), are
+    `request.not_found` (404).
   - **Write.** In one transaction the edit or restore locks the artifact's unended index jobs, then its newest version
     (the order a job's completion takes them), reads the newest number again, inserts the next version (its own record
     type, name, fields and content, encrypted as version 1's), gives the identity the new type

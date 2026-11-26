@@ -14,9 +14,10 @@ import java.util.stream.Stream;
 
 /**
  * {@code record_version} in memory (Story 5.1), for tests that run without PostgreSQL. Like Hibernate's
- * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without one; like the
- * table, its key is the record and the number (a number taken is {@link VersionTaken}, Story 5.2). A write undoes itself when its transaction rolls back. The key on the
- * record is PostgreSQL's alone ({@code ArtifactsIntegrationTest}).
+ * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without one; like
+ * the table, its key is the record and the number (a number taken is {@link VersionTaken}, Story 5.2). A write undoes
+ * itself when its transaction rolls back. The key on the record is PostgreSQL's alone
+ * ({@code ArtifactsIntegrationTest}).
  */
 public class InMemoryArtifactVersionStore implements ArtifactVersionStore {
 

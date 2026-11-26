@@ -149,7 +149,8 @@ class ArtifactController {
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(name = "ArtifactVersionPage", requiredProperties = {"items", "total"})
+    @Schema(name = "ArtifactVersionPage", requiredProperties = {"items", "total"},
+            description = "A page of an artifact's versions, newest first (contract 1.44.0)")
     record VersionPageView(
             @ArraySchema(schema = @Schema(implementation = VersionSummaryView.class)) List<VersionSummaryView> items,
             @Schema(description = "The cursor of the next page (the last number shown); absent on the last",
@@ -433,7 +434,9 @@ class ArtifactController {
     @Operation(operationId = "updateArtifact", summary = "The GM's edit of one of the account's campaigns' artifacts"
             + " (contract 1.44.0): its record type, name, fields and optional content become its next version, and every"
             + " earlier version is kept. The edit applies from the next question (the new version is indexed). version"
-            + " names the newest version the GM saw." + LIMITS + STALE + NOT_FOUND + SESSION_SUMMARY,
+            + " names the newest version the GM saw. An edit that changes nothing (the same record type, name, fields"
+            + " and content, after trimming) answers that version as it is and stores nothing." + LIMITS + STALE
+            + NOT_FOUND + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")))
     ResponseEntity<ArtifactView> updateArtifact(

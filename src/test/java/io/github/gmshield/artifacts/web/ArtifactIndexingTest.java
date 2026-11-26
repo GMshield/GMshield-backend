@@ -253,6 +253,37 @@ class ArtifactIndexingTest {
     }
 
     @Test
+    void aNewRecipeIndexesOnlyTheNewestVersionAgainAndLeavesTheOlderVersionsRowAndJobAlone() throws Exception {
+        Gm gm = signUp();
+        UUID id = created(gm, gm.campaign(), KAEL);
+        UUID first = onlyRow(id).jobId();
+        offer(first);
+        JsonNode firstClaim = claim(first);
+        assertThat(outcome(first, firstClaim, "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\"}}")
+                .statusCode()).isEqualTo(204);
+        edited(gm, id, 1, "Espada de Kael, a Rubra");
+        UUID second = rowOf(id, 2).jobId();
+        offer(second);
+        JsonNode secondClaim = claim(second);
+        assertThat(outcome(second, secondClaim, "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\"}}")
+                .statusCode()).isEqualTo(204);
+
+        // Under "2" nothing is stale; under "3" only version 2 gets a new job.
+        reconcile.reconcile("2");
+        assertThat(rowOf(id, 2).jobId()).isEqualTo(second);
+        reconcile.reconcile("3");
+
+        ArtifactIndexRow again = rowOf(id, 2);
+        assertThat(again.jobId()).isNotEqualTo(second);
+        assertThat(again.recipe()).isNull();
+        assertThat(OPEN).contains(jobs.rows.get(again.jobId()).state());
+        ArtifactIndexRow kept = rowOf(id, 1);
+        assertThat(kept.jobId()).isEqualTo(first);
+        assertThat(kept.recipe()).isEqualTo("2");
+        assertThat(jobs.rows.get(first).state()).isEqualTo("done");
+    }
+
+    @Test
     void aFailedRowOfAnOlderVersionIsNotRetried() throws Exception {
         Gm gm = signUp();
         UUID id = created(gm, gm.campaign(), KAEL);

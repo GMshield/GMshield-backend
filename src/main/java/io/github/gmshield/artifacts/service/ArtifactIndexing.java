@@ -60,10 +60,12 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #reconcile} (the backfill, {@link ArtifactIndexReconcile}): in the caller's transaction, as one owner,
  *       each newest version that no row reports under the stated recipe, of a campaign still readable and with no
  *       unended job, gets a new job, with the version locked (its earlier rows go). So the artifacts saved before part B
- *       are indexed the first time the worker states its recipe, and all of them again under a new one.</li>
+ *       are indexed the first time the worker states its recipe, and all of them again under a new one. From Story 5.2
+ *       a version that is no longer the newest once locked (an edit committed meanwhile) is skipped.</li>
  *   <li>{@link #retryFailed} ({@link ArtifactIndexRetrySweep}): each of the owner's rows whose job ended
  *       {@code failed}, with fewer than {@link ArtifactIndexRow#MAX_RETRIES} retries, of its artifact's newest version
- *       (Story 5.2: an older version is never indexed again) and of a campaign still readable, gets a new job; the row moves to it and counts one more retry. A failed job stays as history.</li>
+ *       (Story 5.2: an older version is never indexed again) and of a campaign still readable, gets a new job; the
+ *       row moves to it and counts one more retry. A failed job stays as history.</li>
  *   <li>{@link #cancel} (a campaign's or a system's deletion): the unended jobs of these artifacts are cancelled.</li>
  * </ul>
  *
@@ -149,7 +151,8 @@ public class ArtifactIndexing implements JobHandler {
         for (ArtifactIndexStore.VersionKey key : index.notIndexedUnder(recipe)) {
             // The lock orders this with the version's completion, a retry and another reconcile; read again after it.
             Optional<ArtifactVersionRow> locked = versions.lock(key.recordId(), key.number());
-            if (locked.isEmpty() || !readable(key.recordId())) {
+            // Story 5.2: an edit may have committed since the read; only the newest version is ever indexed.
+            if (locked.isEmpty() || !newest(key.recordId(), key.number()) || !readable(key.recordId())) {
                 continue;
             }
             List<ArtifactIndexRow> rows = index.ofVersion(key.recordId(), key.number());
@@ -203,8 +206,13 @@ public class ArtifactIndexing implements JobHandler {
 
     /** Whether the row's version is its artifact's newest (Story 5.2: an older one is never indexed again). */
     private boolean newest(ArtifactIndexRow row) {
-        return versions.latest(row.recordId()).map(ArtifactVersionRow::number)
-                .filter(number -> number == row.number()).isPresent();
+        return newest(row.recordId(), row.number());
+    }
+
+    /** Whether the version {@code number} is its artifact's newest (Story 5.2). */
+    private boolean newest(UUID recordId, int number) {
+        return versions.latest(recordId).map(ArtifactVersionRow::number).filter(latest -> latest == number)
+                .isPresent();
     }
 
     /** Whether the owner's artifact's campaign is still readable: not being deleted, nor of a system being deleted. */
