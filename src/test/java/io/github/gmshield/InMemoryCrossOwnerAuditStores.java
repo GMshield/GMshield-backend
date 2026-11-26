@@ -138,6 +138,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
         tables.put("upload", copy(twins.uploads().rows));
         tables.put("index change", copy(twins.index().changes));
         tables.put("index removal", copy(twins.index().removals));
+        tables.put("record removal", copy(twins.index().recordRemovals));
         tables.put("conversation", copy(twins.conversations().conversations));
         tables.put("conversation deleting", copy(twins.conversations().deleting));
         tables.put("turn", copy(twins.conversations().turns));

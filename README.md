@@ -479,8 +479,10 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
       with `gmshield.materials.index-retry-sweep.enabled=false`, the index retry sweep's own switch, so that setting
       stops the retries of failed index changes too) visits each owner with a failed `index.removal` job
       and gives each failed job that still has its `index_removal` row a new job with the same input (owner, source);
-      the row moves to it (`IndexStore.moveRemoval`), so the failed job, kept as history, is never retried twice.
-      Logs: `index.removal_retried`.
+      the row moves to it (`IndexStore.moveRemoval`), so the failed job, kept as history, is never retried twice. From
+      Story 4.5 part B it does the same for failed `index.record_removal` jobs and their `record_removal` rows
+      (`IndexStore.moveRecordRemoval`), each kind in its own pass. Logs: `index.removal_retried`,
+      `index.record_removal_retried`.
     - Logs: `library.material_deleting`/`library.version_deleting`, then `library.material_deleted`/
       `library.version_deleted`; `material.delete`, `material.version_remove` (ids and times only).
     - `V26__material_deletion.sql` lets `deletion.kind` be `material` or `version`. Additive. Rolling back while one
@@ -1532,6 +1534,50 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `index.records_page_started`, `material.corrections_carried` (`matched`, `copied`, `dropped`). Deploy order:
     backend, then frontend (minimum public contract 1.40.0); the old frontend keeps reading records, since `version` is
     additive.
+
+- **Delete a record (`knowledge`, `materials`, `scope`, `conversations`, Story 4.5 part B, public contract 1.41.0,
+  internal contract 1.22.0, migration V42).** The GM deletes a record that should not exist (a misread entry, a
+  duplicate, text the model took for a record). There is no undo.
+  - **Routes.** `DELETE /api/v1/systems/{systemId}/records/{recordId}` (`deleteRecord`) and `DELETE
+    /api/v1/campaigns/{campaignId}/records/{recordId}` (`deleteCampaignRecord`) answer 204 (no body, `no-store`) under
+    the visibility of the record's read and correction: anything else is 404 `request.not_found`. No version is sent.
+    Both routes join the cross-owner audit.
+  - **Tombstone.** The row stays (`RecordStore.delete`, the row locked after the version's lock): `deleted_at` is set
+    and its name and fields stay encrypted, never read again. Every public read leaves it out (`find`, `ofTypeIn`,
+    `countsByType`, `named`, so the type list, the counts, both record pages, PATCH, the exact-name search and the
+    record type's in-use check), and so do the index inputs (`ofVersion`, behind `firstPages` and `readRange`: version
+    runs, page runs and reconciles), so its point is never written again. `findAll` takes a `Reach`: `LIVE` or `ALL`.
+  - **Point removal.** The delete creates a job of the new kind `index.record_removal` (`materials.service.
+    RecordRemovals`, through `RecordIndexing.removePoint`) in the same transaction. Its input row is
+    `record_removal` (job, owner, version, record; no reference, so it outlives both) and its claim input is `{owner,
+    source, ids}`. The worker deletes those points by id within the owner's source; the completion sets
+    `point_removed_at` (`ExtractedRecords.pointsRemoved`). A failed attempt is offered again, and a job that failed
+    after its attempts gets a new one from the `IndexRemovalRetrySweep`, which now also sweeps this kind. A new kind
+    rather than ids on `index.removal`: an older worker would ignore `ids` and delete the whole source.
+  - **Internal reads.** An answer's records read (`Scopes.recordContents`) still serves a deleted record whatever its
+    point (`Reach.ALL`), so an answer whose search found its point (just before the removal ended, or a point written
+    back later) does not fail; its stored citations drop it
+    (`Scopes.citedRecords` reads live records only). A library search's completion drops the owner's deleted record
+    ids it could not place as records (`Scopes.deletedRecords`) before it checks the passages, instead of failing. Stored answer turns are not
+    changed: they keep the record by value.
+  - **Carry-over.** At the acceptance of a version reprocessing made, after the corrections, each tombstone of the
+    replaced version matches a new record no correction took, by its extracted key first (its own key when it was never
+    corrected), then by its own key, the nearest first page winning, then the nearest ordinal: the new record is deleted
+    too, its point counted as
+    removed at once (it was never indexed). A tombstone that matches nothing is copied in with its keys, no passage and
+    an empty name, so a later reprocess still finds it. `material.corrections_carried` gains `deleted` and
+    `tombstoned`.
+  - **V42.** `record.deleted_at`, `record.point_removed_at` (a check: it needs `deleted_at`), and the table
+    `record_removal`. No partial index: every read already goes through the owner and version or id keys. Rolling back
+    past V42 is not safe while a tombstone exists (the previous release reads it as a live record and cannot run
+    `index.record_removal`): first wait until every tombstone has `point_removed_at` (or remove its version's points
+    from the index) and end any waiting or running `index.record_removal` job, then remove the tombstone rows (links
+    first) and the `record_removal` rows.
+  - Log lines (ids and counts only): `knowledge.record_deleted`, `knowledge.campaign_record_deleted`,
+    `index.record_removal_created`, `index.record_removal_done` (`marked`), `index.record_removal_failed`,
+    `index.record_removal_retried`, `scope.deleted_records_read`, and `deletedRecords` on `search.done`. Deploy order:
+    worker (it runs the new kind), then backend, then frontend (minimum public contract 1.41.0). Until the backend
+    creates the new kind, a new worker changes nothing.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

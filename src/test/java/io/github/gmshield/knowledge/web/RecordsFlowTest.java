@@ -33,10 +33,12 @@ import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.MaterialTestStores;
 import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.RecordRemovalRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.ExtractedRecords.Extracted;
 import io.github.gmshield.materials.service.ExtractedRecords.Field;
+import io.github.gmshield.materials.service.IndexRemovalRetrySweep;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.data.DataKeyStore;
@@ -122,6 +124,16 @@ import tools.jackson.databind.json.JsonMapper;
  * page does not show change nothing; a type approved in one system shows there only. A version reprocessing made takes
  * over the corrections at its acceptance (the nearest matching record, else a copy on the same pages, else dropped and
  * counted); a replacement upload takes over none.
+ *
+ * <p>Story 4.5 part B, delete a record: each row of the story's I/O matrix. A delete leaves the list, the counts, both
+ * record pages and the exact-name search at once and creates its point's removal job; an answer started before the
+ * removal still reads it but cites it not, and none reads it once the job completed; a failed removal is retried; a
+ * search that finds it completes without it; no index input takes it; a deleted record is not found by PATCH or
+ * DELETE; a reprocess that reads it again deletes the new record at acceptance, or copies the tombstone in; a type
+ * whose records are all deleted can be deleted; and another owner's or an out-of-scope record is not found. Besides the
+ * matrix: an answer's read still serves a deleted record whose point is removed (a point written back), a stored search
+ * read after a delete leaves the record out, a reprocess deletes the same-name record nearest the deleted one's ordinal,
+ * and a record of a superseded version is not found.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -197,6 +209,8 @@ class RecordsFlowTest {
     private InMemoryIndexStore index;
     @Autowired
     private Vault vault;
+    @Autowired
+    private IndexRemovalRetrySweep removalRetry;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -1593,6 +1607,436 @@ class RecordsFlowTest {
         assertThat(recordsOfVersion(second.versionId()).values()).noneMatch(RecordRow::corrected)
                 .extracting(this::nameOf).containsExactly("Fire Boll");
         assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().equals("material.corrections_carried"));
+    }
+
+    // --- Story 4.5 part B: delete a record
+
+    @Test
+    void aDeletedRecordLeavesTheListCountsPagesAndSearchAtOnceAndItsPointGoesByAJob() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                spells("Fire Boll", "Luz"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String system = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        String campaign = "/api/v1/campaigns/" + gm.campaign() + "/records/" + id;
+        String spell = typeId(gm, gm.system(), "spell");
+        assertThat(ok(get("/api/v1/record-types/" + spell, gm.session())).path("records").asLong()).isEqualTo(2);
+        RecordRow live = records.records.get(UUID.fromString(id));
+
+        // Matrix row "Delete".
+        HttpResponse<String> deleted = send("DELETE", system, gm.session(), null);
+
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        assertThat(deleted.body()).isEmpty();
+        assertThat(deleted.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(ids(gm, spell)).containsOnlyKeys("Luz");
+        assertThat(ok(get("/api/v1/record-types/" + spell, gm.session())).path("records").asLong()).isEqualTo(1);
+        Map<String, Object> unknown = withoutTraceId(assertProblem(get("/api/v1/systems/" + gm.system()
+                + "/records/" + UUID.randomUUID(), gm.session()), 404, "request.not_found"));
+        assertThat(withoutTraceId(assertProblem(get(system, gm.session()), 404, "request.not_found")))
+                .isEqualTo(unknown);
+        assertProblem(get(campaign, gm.session()), 404, "request.not_found");
+        assertProblem(get(system + "/pages/1", gm.session()), 404, "request.not_found");
+        // The row stays as a tombstone: its links, name and fields where they were.
+        RecordRow tombstone = records.records.get(UUID.fromString(id));
+        assertThat(tombstone.deleted()).isTrue();
+        assertThat(tombstone.pointRemovedAt()).isNull();
+        assertThat(tombstone.passageIds()).isEqualTo(live.passageIds());
+        assertThat(tombstone.name()).isEqualTo(live.name());
+        // A removal job for its id: the worker deletes its point by id within its owner's source.
+        RecordRemovalRow removal = removalOf(id);
+        assertThat(removal.versionId()).isEqualTo(book.versionId());
+        assertThat(removal.ownerId()).isEqualTo(gm.id());
+        assertThat(jobs.rows.get(removal.jobId()).kind()).isEqualTo("index.record_removal");
+        assertThat(jobs.rows.get(removal.jobId()).lane()).isEqualTo("ingestion");
+        JsonNode claim = claim(removal.jobId());
+        JsonNode input = claim.path("input");
+        assertThat(input.propertyNames()).containsExactlyInAnyOrder("owner", "source", "ids");
+        assertThat(input.path("owner").asString()).isEqualTo(gm.id().toString());
+        assertThat(input.path("source").asString()).isEqualTo(book.versionId().toString());
+        assertThat(strings(input.path("ids"))).containsExactly(id);
+
+        // Matrix row "Correct a deleted one": PATCH and DELETE again, on both routes, are not found.
+        for (String path : List.of(system, campaign)) {
+            assertThat(withoutTraceId(assertProblem(correct(path, gm.session(), 0, "Fire Bolt", "spell", List.of()),
+                    404, "request.not_found"))).isEqualTo(unknown);
+            assertThat(withoutTraceId(assertProblem(send("DELETE", path, gm.session(), null), 404,
+                    "request.not_found"))).isEqualTo(unknown);
+        }
+        assertThat(records.records.get(UUID.fromString(id))).isEqualTo(tombstone);
+        assertThat(index.recordRemovals.values()).filteredOn(row -> row.recordId().toString().equals(id)).hasSize(1);
+        // The exact-name search no longer adds it.
+        Search search = search(gm, Map.of("query", "Fire Boll"));
+        report(search.jobId(), search.claim(), "{\"ids\":[]}");
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).isEmpty();
+
+        // Matrix row "After removal": the job completes and the point is marked gone.
+        report(removal.jobId(), claim, "{}");
+        assertThat(records.records.get(UUID.fromString(id)).pointRemovedAt()).isNotNull();
+        // A search that still found its point (just before the removal, or a point written back later) does not fail
+        // the answer's read, and the answer cites nothing deleted.
+        Answer answer = asked(gm, "O que é Fire Boll?");
+        assertThat(ok(readRecords(answer, List.of(id))).path("records")).extracting(record -> record.path("id")
+                .asString()).containsExactly(id);
+        events(answer, List.of(delta("Fire Boll."), recordCitation(id, 0)));
+        done(answer);
+        assertThat(references(gm, answer)).isEmpty();
+        assertNoLineNames("Fire Boll");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.record_deleted")
+                && hasPair(event, "found", true) && hasPair(event, "recordId", UUID.fromString(id)));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.record_deleted")
+                && hasPair(event, "found", false));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("index.record_removal_done")
+                && hasPair(event, "marked", 1));
+    }
+
+    @Test
+    void anAnswerStartedBeforeThePointIsRemovedStillReadsTheRecordButCitesItNot() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                spells("Fire Boll", "Luz"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String light = recordOf(book.versionId(), "Luz");
+        Answer answer = asked(gm, "O que é Fire Boll?");
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + id, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+
+        // Matrix row "Before removal ends": the search still finds its point, and the read does not fail.
+        JsonNode read = ok(readRecords(answer, List.of(id, light))).path("records");
+        assertThat(read).extracting(record -> record.path("id").asString()).containsExactly(id, light);
+        events(answer, List.of(delta("Fire Boll e Luz."), recordCitation(id, 0), recordCitation(light, 13)));
+        done(answer);
+
+        // The stored citations drop it.
+        assertThat(references(gm, answer)).extracting(reference -> reference.path("recordId").asString())
+                .containsExactly(light);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("conversation.references_stored")
+                && hasPair(event, "citedRecords", 2) && hasPair(event, "droppedRecords", 1));
+        assertNoLineNames("Fire Boll");
+    }
+
+    @Test
+    void aFailedRemovalIsRetriedAndTheRecordStaysHiddenMeanwhile() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Fire Boll"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String system = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        assertThat(send("DELETE", system, gm.session(), null).statusCode()).isEqualTo(204);
+        UUID failed = removalOf(id).jobId();
+
+        // Matrix row "After removal", its error handling: the job fails after its attempts.
+        jobs.rows.computeIfPresent(failed, (key, row) -> row.released("failed", "index.store_unavailable",
+                row.updatedAt()));
+        removalRetry.sweep();
+
+        RecordRemovalRow moved = removalOf(id);
+        assertThat(moved.jobId()).isNotEqualTo(failed);
+        assertThat(moved.versionId()).isEqualTo(book.versionId());
+        assertThat(jobs.rows.get(moved.jobId()).kind()).isEqualTo("index.record_removal");
+        assertThat(jobs.rows.get(moved.jobId()).state()).isIn("waiting", "offered");
+        assertThat(jobs.rows.get(failed).state()).isEqualTo("failed");
+        assertThat(records.records.get(UUID.fromString(id)).pointRemovedAt()).isNull();
+        assertProblem(get(system, gm.session()), 404, "request.not_found");
+        assertThat(ids(gm, typeId(gm, gm.system(), "spell"))).isEmpty();
+        // The failed job has no row any more: it is never retried twice.
+        removalRetry.sweep();
+        assertThat(removalOf(id).jobId()).isEqualTo(moved.jobId());
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("index.record_removal_retried")
+                && hasPair(event, "failedJobId", failed));
+        endIngestion();
+    }
+
+    @Test
+    void aSearchFinishingWithADeletedRecordCompletesWithoutIt() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                spells("Fire Boll", "Luz"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String light = recordOf(book.versionId(), "Luz");
+        UUID passage = book.passages().getFirst();
+        Search search = search(gm, Map.of("query", "fogo"));
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + id, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+
+        // Matrix row "Search in flight".
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + id + "\",\"" + passage + "\",\"" + light + "\"]}");
+
+        JsonNode read = ok(get("/api/v1/searches/" + search.id(), gm.session()));
+        assertThat(read.path("state").asString()).isEqualTo("done");
+        assertThat(read.path("results")).extracting(result -> result.path("recordId").asString("")
+                + result.path("passageId").asString("")).containsExactly(passage.toString(), light);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("search.done")
+                && hasPair(event, "deletedRecords", 1) && hasPair(event, "results", 2));
+        // Another owner's deleted record is still refused: only the owner's own deleted records are dropped.
+        endIngestion();
+        Gm them = signUp();
+        Ingested theirs = accepted(them, metadata("Deles.pdf", "system", them.system().toString()), spells("Deles"));
+        String another = recordOf(theirs.versionId(), "Deles");
+        assertThat(send("DELETE", "/api/v1/systems/" + them.system() + "/records/" + another, them.session(), null)
+                .statusCode()).isEqualTo(204);
+        Search forged = search(gm, Map.of("query", "fogo"));
+        report(forged.jobId(), forged.claim(), "{\"ids\":[\"" + passage + "\",\"" + another + "\"]}");
+        JsonNode refused = ok(get("/api/v1/searches/" + forged.id(), gm.session()));
+        assertThat(refused.path("state").asString()).isEqualTo("failed");
+        assertThat(refused.path("code").asString()).isEqualTo("scope.passage_refused");
+        endIngestion();
+    }
+
+    @Test
+    void aStoredSearchReadAfterADeleteLeavesTheRecordOut() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                spells("Fire Boll", "Luz"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String light = recordOf(book.versionId(), "Luz");
+        UUID passage = book.passages().getFirst();
+        Search search = search(gm, Map.of("query", "fogo"));
+        report(search.jobId(), search.claim(), "{\"ids\":[\"" + id + "\",\"" + passage + "\",\"" + light + "\"]}");
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results")).hasSize(3);
+
+        // The page a search's record page goes back to after its delete.
+        assertThat(send("DELETE", "/api/v1/campaigns/" + gm.campaign() + "/records/" + id, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+
+        assertThat(ok(get("/api/v1/searches/" + search.id(), gm.session())).path("results"))
+                .extracting(result -> result.path("recordId").asString("") + result.path("passageId").asString(""))
+                .containsExactly(passage.toString(), light);
+        endIngestion();
+    }
+
+    @Test
+    void aSameNameRecordTheGmKeptIsNotTheOneAReprocessDeletes() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        // Two "Escudo" on page 1: the GM keeps the first and deletes the duplicate after it.
+        store(gm, first, List.of(new Extracted("spell", "Escudo", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Escudo", List.of(), List.of(p.get(0)), 1)));
+        accept(gm, first);
+        RecordRow duplicate = recordsOfVersion(first.versionId()).values().stream().filter(row -> row.ordinal() == 1)
+                .findFirst().orElseThrow();
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + duplicate.id(), gm.session(), null)
+                .statusCode()).isEqualTo(204);
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        store(gm, second, List.of(new Extracted("spell", "Escudo", List.of(), List.of(q.get(0)), 1),
+                new Extracted("spell", "Escudo", List.of(), List.of(q.get(0)), 1)));
+        accept(gm, second);
+
+        // The same page ties: the new record nearest the deleted one's ordinal goes, the kept one's stays.
+        Map<Integer, RecordRow> byOrdinal = new LinkedHashMap<>();
+        recordsOfVersion(second.versionId()).values().forEach(row -> byOrdinal.put(row.ordinal(), row));
+        assertThat(byOrdinal).containsOnlyKeys(0, 1);
+        assertThat(byOrdinal.get(0).deleted()).isFalse();
+        assertThat(byOrdinal.get(1).deleted()).isTrue();
+        assertThat(ids(gm, typeId(gm, gm.system(), "spell"))).containsOnlyKeys("Escudo");
+    }
+
+    @Test
+    void aRecordOfASupersededVersionIsNotDeleted() throws Exception {
+        Gm gm = signUp();
+        Ingested first = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Luz"));
+        String old = recordOf(first.versionId(), "Luz");
+        endIngestion();
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        store(gm, second, spells("Luz"));
+        accept(gm, second);
+        assertThat(materials.versions.get(first.versionId()).state()).isEqualTo("superseded");
+        RecordRow before = records.records.get(UUID.fromString(old));
+        int removals = index.recordRemovals.size();
+
+        for (String path : List.of("/api/v1/systems/" + gm.system() + "/records/" + old,
+                "/api/v1/campaigns/" + gm.campaign() + "/records/" + old)) {
+            assertProblem(send("DELETE", path, gm.session(), null), 404, "request.not_found");
+        }
+
+        assertThat(records.records.get(UUID.fromString(old))).isEqualTo(before);
+        assertThat(index.recordRemovals).hasSize(removals);
+        endIngestion();
+    }
+
+    @Test
+    void noIndexRunTakesADeletedRecord() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                spells("Fire Boll", "Luz"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String light = recordOf(book.versionId(), "Luz");
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        assertThat(send("DELETE", system + id, gm.session(), null).statusCode()).isEqualTo(204);
+        endIngestion();
+        List<IndexChangeRow> runsBefore = recordsRuns(book.versionId());
+
+        // Matrix row "Index run": a page run of its page (a correction of the other record on it) leaves it out.
+        ok(correct(system + light, gm.session(), 0, "Luz Divina", "spell", List.of()));
+        IndexChangeRow run = recordsRuns(book.versionId()).stream().filter(row -> !runsBefore.contains(row))
+                .findFirst().orElseThrow();
+        String lines = new String(input(run.jobId(), claim(run.jobId()), "records").body(), StandardCharsets.UTF_8);
+        assertThat(lines.lines()).hasSize(1).allMatch(line -> line.contains("\"id\":\"" + light + "\""));
+        // A whole set (an accept's or a reconcile's) cuts its runs from the live records only.
+        List<Integer> pages = OwnerContext.callAs(gm.id(), () -> extracted.firstPages(book.versionId()));
+        assertThat(pages).containsExactly(1);
+        assertThat(indexInput(gm, book.versionId())).containsExactly(UUID.fromString(light));
+        endIngestion();
+    }
+
+    @Test
+    void aReprocessThatReadsADeletedRecordAgainDeletesItAtAcceptanceOrCopiesTheTombstone() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Fire Boll", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Escudo Arcanoo", List.of(), List.of(p.get(3)), 2),
+                new Extracted("spell", "Sombra", List.of(), List.of(p.get(1)), 3),
+                new Extracted("spell", "Luz", List.of(), List.of(p.get(1)), 3)));
+        accept(gm, first);
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String spell = typeId(gm, gm.system(), "spell");
+        // "Fire Boll" deleted as it was read; "Escudo Arcanoo" corrected first, then deleted; "Sombra" deleted.
+        String shield = recordOf(first.versionId(), "Escudo Arcanoo");
+        ok(correct(system + shield, gm.session(), 0, "Escudo Arcano", "spell", List.of()));
+        for (String name : List.of("Fire Boll", "Sombra")) {
+            assertThat(send("DELETE", system + recordOf(first.versionId(), name), gm.session(), null).statusCode())
+                    .isEqualTo(204);
+        }
+        assertThat(send("DELETE", system + shield, gm.session(), null).statusCode()).isEqualTo(204);
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        // It reads "Fire Boll" and the misread "Escudo Arcanoo" again, and "Luz"; not "Sombra".
+        store(gm, second, List.of(
+                new Extracted("spell", "Fire Boll", List.of(), List.of(q.get(0)), 1),
+                new Extracted("spell", "Escudo Arcanoo", List.of(), List.of(q.get(3)), 2),
+                new Extracted("spell", "Luz", List.of(), List.of(q.get(1)), 3)));
+
+        // Matrix row "Reprocess".
+        acceptHoldingRuns(gm, second);
+
+        // The new records read again are tombstones at once, never listed or indexed.
+        Map<String, RecordRow> byName = new LinkedHashMap<>();
+        recordsOfVersion(second.versionId()).values().forEach(row -> byName.put(nameOf(row), row));
+        assertThat(byName.get("Fire Boll").deleted()).isTrue();
+        assertThat(byName.get("Fire Boll").pointRemovedAt()).isNotNull();
+        assertThat(byName.get("Escudo Arcanoo").deleted()).isTrue();
+        assertThat(byName.get("Luz").deleted()).isFalse();
+        assertThat(ids(gm, spell)).containsOnlyKeys("Luz");
+        assertThat(ok(get("/api/v1/record-types/" + spell, gm.session())).path("records").asLong()).isEqualTo(1);
+        for (String name : List.of("Fire Boll", "Escudo Arcanoo")) {
+            assertProblem(get(system + byName.get(name).id(), gm.session()), 404, "request.not_found");
+        }
+        assertThat(recordsRuns(second.versionId())).extracting(IndexChangeRow::firstOrdinal,
+                IndexChangeRow::lastOrdinal).containsExactly(tuple(3, 3));
+        assertThat(indexInput(gm, second.versionId())).containsExactly(byName.get("Luz").id());
+        assertThat(index.recordRemovals.values()).noneMatch(row -> row.versionId().equals(second.versionId()));
+        // "Sombra", which nothing matched, is copied in as a tombstone with its key and no passage.
+        RecordRow copied = records.records.values().stream().filter(row -> row.versionId().equals(second.versionId())
+                && row.deleted() && row.passageIds().isEmpty()).findFirst().orElseThrow();
+        assertThat(copied.nameFingerprint()).isEqualTo(fingerprint("Sombra"));
+        assertThat(copied.pointRemovedAt()).isNotNull();
+        assertThat(copied.firstPage()).isEqualTo(3);
+        assertThat(nameOf(copied)).isEmpty();
+        assertThat(recordsOfVersion(second.versionId())).hasSize(4);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "matched", 0) && hasPair(event, "deleted", 2) && hasPair(event, "tombstoned", 1));
+        endIngestion();
+
+        // A later reprocess still finds the copied tombstone: "Sombra" read again is deleted at acceptance.
+        Ingested third = reprocessed(gm, second, STANDARD_PASSAGES);
+        store(gm, third, List.of(new Extracted("spell", "Sombra", List.of(), List.of(third.passages().get(1)), 3),
+                new Extracted("spell", "Fire Boll", List.of(), List.of(third.passages().get(0)), 1)));
+        accept(gm, third);
+        assertThat(recordsOfVersion(third.versionId()).values()).filteredOn(row -> !row.passageIds().isEmpty())
+                .hasSize(2).allMatch(RecordRow::deleted);
+        assertThat(ids(gm, spell)).isEmpty();
+        assertNoLineNames("Fire Boll", "Sombra", "Escudo Arcano");
+    }
+
+    @Test
+    void aTypeWhoseOnlyRecordsAreDeletedCanBeDeleted() throws Exception {
+        Gm gm = signUp();
+        UUID talent = approvedType(gm, gm.system(), "Talento", "talento");
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("talento", "Alerta", 1, List.of())));
+        assertProblem(send("DELETE", "/api/v1/record-types/" + talent, gm.session(), null), 409,
+                "ontology.record_type_in_use");
+
+        // Matrix row "Type in use".
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + recordOf(book.versionId(),
+                "Alerta"), gm.session(), null).statusCode()).isEqualTo(204);
+
+        assertThat(ok(get("/api/v1/record-types/" + talent, gm.session())).path("records").asLong()).isZero();
+        assertThat(send("DELETE", "/api/v1/record-types/" + talent, gm.session(), null).statusCode()).isEqualTo(204);
+        endIngestion();
+    }
+
+    @Test
+    void aDeleteOfARecordThePageDoesNotShowIsNotFoundAndTheCampaignDeletesWithinItsScope() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "campaign", gm.campaign().toString()), spells("Luz"));
+        UUID otherSystem = createSystem(gm, "Outro");
+        Ingested elsewhere = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()), spells("Sombra"));
+        Ingested review = ingested(gm, metadata("Rascunho.pdf", "system", gm.system().toString()));
+        store(gm, review, spells("Pendente"));
+        String light = recordOf(book.versionId(), "Luz");
+        String shadow = recordOf(elsewhere.versionId(), "Sombra");
+        String pending = recordOf(review.versionId(), "Pendente");
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String campaign = "/api/v1/campaigns/" + gm.campaign() + "/records/";
+        Map<UUID, RecordRow> before = Map.copyOf(records.records);
+        int removals = index.recordRemovals.size();
+
+        // Matrix row "Cross-owner", and every record the page does not show.
+        Map<String, Object> unknown = withoutTraceId(assertProblem(send("DELETE", system + UUID.randomUUID(),
+                gm.session(), null), 404, "request.not_found"));
+        List<String[]> refused = List.of(
+                new String[] {them.session(), system + light},
+                new String[] {them.session(), "/api/v1/systems/" + them.system() + "/records/" + light},
+                new String[] {them.session(), "/api/v1/campaigns/" + them.campaign() + "/records/" + light},
+                new String[] {gm.session(), system + pending},
+                new String[] {gm.session(), system + shadow},
+                new String[] {gm.session(), system + "not-an-id"},
+                new String[] {gm.session(), campaign + shadow},
+                new String[] {gm.session(), campaign + pending},
+                new String[] {gm.session(), "/api/v1/campaigns/" + UUID.randomUUID() + "/records/" + light},
+                new String[] {gm.session(), "/api/v1/systems/not-an-id/records/" + light});
+        for (String[] request : refused) {
+            HttpResponse<String> answer = send("DELETE", request[1], request[0], null);
+            assertThat(withoutTraceId(assertProblem(answer, 404, "request.not_found"))).as(request[1])
+                    .isEqualTo(unknown);
+            assertThat(answer.body()).doesNotContain("Luz").doesNotContain("Sombra").doesNotContain("Pendente");
+        }
+        assertThat(send("DELETE", system + light, null, null).statusCode()).isEqualTo(401);
+        assertThat(records.records).isEqualTo(before);
+        assertThat(index.recordRemovals).hasSize(removals);
+
+        // In the campaign's scope it is deleted there; then neither page shows it.
+        HttpResponse<String> deleted = send("DELETE", campaign + light, gm.session(), null);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        assertProblem(get(system + light, gm.session()), 404, "request.not_found");
+        assertProblem(get(campaign + light, gm.session()), 404, "request.not_found");
+        assertThat(removalOf(light).versionId()).isEqualTo(book.versionId());
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage()
+                .equals("knowledge.campaign_record_deleted") && hasPair(event, "found", true));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage()
+                .equals("knowledge.campaign_record_deleted") && hasPair(event, "found", false));
+        endIngestion();
+    }
+
+    /** The ids of the records a records run of the version's pages 1 to 3 would index, in order. */
+    private List<UUID> indexInput(Gm gm, UUID versionId) {
+        List<ExtractedRecords.Stored> stored = OwnerContext.callAs(gm.id(), () -> extracted.readRange(versionId, 1, 3));
+        return stored.stream().map(ExtractedRecords.Stored::id).toList();
+    }
+
+    /** The removal input of the record with this id. */
+    private RecordRemovalRow removalOf(String recordId) {
+        return index.recordRemovals.values().stream().filter(row -> row.recordId().toString().equals(recordId))
+                .findFirst().orElseThrow();
     }
 
     private HttpResponse<String> correct(String path, String session, long version, String name, String recordType,

@@ -6,7 +6,8 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * {@code index_change} and {@code index_removal} (Story 2.1), always within the owner of the work, like
+ * {@code index_change} and {@code index_removal} (Story 2.1), and {@code record_removal} (Story 4.5 part B), always
+ * within the owner of the work, like
  * {@link MaterialStore}: every read sees that owner's rows only, and a write for another owner is refused. Writes join
  * the caller's transaction, which must exist.
  */
@@ -71,4 +72,20 @@ public interface IndexStore {
      * when the current owner has no such row; otherwise the new row.
      */
     Optional<IndexRemovalRow> moveRemoval(UUID jobId, UUID newJobId);
+
+    /** Records the input of an {@code index.record_removal} job of the current owner (Story 4.5 part B). */
+    void insertRecordRemoval(RecordRemovalRow row);
+
+    /** The current owner's {@code index.record_removal} input of this job; empty for an unknown job or another owner's. */
+    Optional<RecordRemovalRow> findRecordRemoval(UUID jobId);
+
+    /** The current owner's {@code index.record_removal} inputs of these jobs, by job (the removal retry sweep). */
+    List<RecordRemovalRow> recordRemovals(Collection<UUID> jobIds);
+
+    /**
+     * Moves the current owner's {@code index.record_removal} input of job {@code jobId} to job {@code newJobId} (the
+     * removal retry sweep): the row is replaced by one keyed by the new job, with the same version and record. Empty when
+     * the current owner has no such row; otherwise the new row.
+     */
+    Optional<RecordRemovalRow> moveRecordRemoval(UUID jobId, UUID newJobId);
 }

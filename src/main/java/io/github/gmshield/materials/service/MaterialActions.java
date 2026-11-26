@@ -31,8 +31,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@value Materials#ACCEPT}: {@code needs_review} becomes {@code ready}, and a {@code ready} version of the same
  *       material before it becomes {@code superseded} (it keeps its points); from Story 2.1 the version's passages get
  *       their index changes ({@link IndexChanges#start}) in the same transaction; from Story 4.5, before those start,
- *       a version that reprocessing made from an accepted one takes over that version's corrections
- *       ({@link ExtractedRecords#carryCorrections});</li>
+ *       a version that reprocessing made from an accepted one takes over that version's corrections, and from Story
+ *       4.5 part B its deletions ({@link ExtractedRecords#carryCorrections});</li>
  *   <li>{@value Materials#REPROCESS}: the unreadable pages of a {@code needs_review} version are read again
  *       ({@link IngestionSteps#reprocess}); from Story 3.4, a {@code ready} version is read again as a new version of
  *       its material, from a copy of its cleaned original ({@link IngestionSteps#reprocessAccepted}), after the check
@@ -149,7 +149,8 @@ public class MaterialActions {
 
     /**
      * The corrections of the version {@code from} carried over to {@code version}, which reprocessing made from it
-     * (Story 4.5; never for a replacement upload, which names no version). Logs the counts only.
+     * (Story 4.5; never for a replacement upload, which names no version), and from part B its deleted records. Logs
+     * the counts only.
      */
     private void carryCorrections(UUID from, VersionRow version) {
         // A correction locks its version first (RecordIndexing): with this lock, none of the replaced version's runs
@@ -159,7 +160,8 @@ public class MaterialActions {
                 new PassageRemap(materials, vault, OwnerContext.require(), version.id()));
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("fromVersionId", from)
                 .addKeyValue("matched", carried.matched()).addKeyValue("copied", carried.copied())
-                .addKeyValue("dropped", carried.dropped()).log("material.corrections_carried");
+                .addKeyValue("dropped", carried.dropped()).addKeyValue("deleted", carried.deleted())
+                .addKeyValue("tombstoned", carried.tombstoned()).log("material.corrections_carried");
     }
 
     /** In place while the version needs review; as a new version while it is ready (Story 3.4). */

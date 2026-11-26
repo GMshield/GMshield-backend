@@ -572,6 +572,52 @@ class OntologyController {
         return found(records.correctInCampaign(campaign, record, body.correction()).map(RecordView::of));
     }
 
+    private static final String DELETION_SUMMARY = " The record stays deleted: there is no undo. From then on it leaves"
+            + " the type's list, the counts, the record pages, corrections and searches at once, and leaves answers once"
+            + " its index point is removed by a job; an answer already stored keeps it as it was cited. A reprocessed"
+            + " version that reads it again deletes it too when accepted. No version is sent.";
+
+    @DeleteMapping(path = SYSTEM_RECORD)
+    @Operation(operationId = "deleteRecord", summary = "Deletes one record as one of the account's systems shows it"
+            + " (contract 1.41.0; 204, no body)." + DELETION_SUMMARY + RECORD_SUMMARY + " nothing changes then;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The record was deleted"))
+    ResponseEntity<Void> deleteRecord(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("systemId") String systemId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId) {
+        UUID system = parse(systemId).orElseThrow(OntologyController::notFound);
+        UUID record = parse(recordId).orElseThrow(OntologyController::notFound);
+        if (!records.delete(system, record)) {
+            throw notFound();
+        }
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = CAMPAIGN_RECORD)
+    @Operation(operationId = "deleteCampaignRecord", summary = "Deletes one record as one of the account's campaigns"
+            + " shows it (contract 1.41.0, a search's record result; 204, no body)." + DELETION_SUMMARY
+            + " request.not_found (404) for a campaign that is not the account's, and for a record that"
+            + " getCampaignRecord does not answer; none is told apart, and nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The record was deleted"))
+    ResponseEntity<Void> deleteCampaignRecord(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId) {
+        UUID campaign = parse(campaignId).orElseThrow(OntologyController::notFound);
+        UUID record = parse(recordId).orElseThrow(OntologyController::notFound);
+        if (!records.deleteInCampaign(campaign, record)) {
+            throw notFound();
+        }
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
     @GetMapping(path = SYSTEM_RECORD_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getRecordSourcePage", summary = "One page of the version a record was read from, as one"
             + " of the account's systems shows the record (contract 1.35.0): the same shape as MaterialPageView, for the"

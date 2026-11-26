@@ -76,6 +76,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * first page joins its version's index changes ({@link RecordIndexing}) in the same transaction, which locks the
  * version first, so a correction never crosses the acceptance of a version that replaces it.
  *
+ * <p>Story 4.5 part B, {@link #delete} and {@link #deleteInCampaign}: the GM deletes a record under the same visibility
+ * as a correction (anything else is not found). The row stays as a tombstone ({@link RecordStore#delete}): from then
+ * on every public read leaves it out, and its point's removal ({@link RecordIndexing#removePoint}, a job) is created in
+ * the same transaction, which locks the version first. There is no undo.
+ *
  * Names, fields and places leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -264,8 +269,7 @@ public class Records {
      */
     public Optional<Detail> correct(UUID systemId, UUID recordId, Correction correction) {
         Checked checked = checked(correction);
-        Optional<Detail> corrected = writing(() -> store.find(recordId)
-                .filter(row -> indexing.lockReady(row.versionId()))
+        Optional<Detail> corrected = writing(() -> lockedLive(recordId)
                 .filter(row -> library.system(systemId).isPresent()
                         && ready.ofSystem(systemId).orElse(Set.of()).contains(row.versionId()))
                 .flatMap(row -> write(systemId, row, checked)));
@@ -283,7 +287,7 @@ public class Records {
     public Optional<Detail> correctInCampaign(UUID campaignId, UUID recordId, Correction correction) {
         Checked checked = checked(correction);
         Optional<Detail> corrected = writing(() -> library.campaign(campaignId).flatMap(campaign ->
-                store.find(recordId).filter(row -> indexing.lockReady(row.versionId()))
+                lockedLive(recordId)
                         .filter(row -> scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
                                 .allowedSources().contains(row.versionId()))
                         .flatMap(row -> write(campaign.system().id(), row, checked))));
@@ -292,6 +296,60 @@ public class Records {
                 .addKeyValue("version", corrected.map(Detail::version).orElse(-1L))
                 .addKeyValue("fields", checked.fields().size()).log("knowledge.campaign_record_corrected");
         return corrected;
+    }
+
+    /**
+     * Deletes the owner's record {@code recordId} as the system {@code systemId} shows it, as the class says; false when
+     * the system does not show it.
+     */
+    public boolean delete(UUID systemId, UUID recordId) {
+        boolean deleted = Boolean.TRUE.equals(writing(() -> lockedLive(recordId)
+                .filter(row -> library.system(systemId).isPresent()
+                        && ready.ofSystem(systemId).orElse(Set.of()).contains(row.versionId()))
+                .map(row -> remove(systemId, row)).orElse(false)));
+        log.atInfo().addKeyValue("systemId", systemId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", deleted).log("knowledge.record_deleted");
+        return deleted;
+    }
+
+    /**
+     * Deletes the owner's record {@code recordId} as the campaign {@code campaignId}'s current scope shows it, as the
+     * class says; false when the campaign does not show it.
+     */
+    public boolean deleteInCampaign(UUID campaignId, UUID recordId) {
+        boolean deleted = Boolean.TRUE.equals(writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                lockedLive(recordId)
+                        .filter(row -> scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
+                                .allowedSources().contains(row.versionId()))
+                        .map(row -> remove(campaign.system().id(), row))).orElse(false)));
+        log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", deleted).log("knowledge.campaign_record_deleted");
+        return deleted;
+    }
+
+    /**
+     * Deletes the visible row, in the caller's transaction, with its version locked and {@code ready}: false when the
+     * system has no type of the record's key (it does not show it) or the row was deleted meanwhile; else the removal of
+     * its point is created.
+     */
+    private boolean remove(UUID systemId, RecordRow row) {
+        if (typeOf(systemId, row.type()).isEmpty()
+                || !store.delete(row.id(), clock.instant().truncatedTo(ChronoUnit.MICROS), false)) {
+            return false;
+        }
+        if (!indexing.removePoint(row.versionId(), row.id())) {
+            throw new IllegalStateException("knowledge.record_version_not_ready");
+        }
+        return true;
+    }
+
+    /**
+     * The owner's live record, read only once its version is locked (a correction or a delete; its version id is read
+     * first without loading the row): one deleted meanwhile is not found, and one corrected meanwhile reads at its new
+     * version.
+     */
+    private Optional<RecordRow> lockedLive(UUID recordId) {
+        return store.versionOf(recordId).filter(indexing::lockReady).flatMap(version -> store.find(recordId));
     }
 
     /** A correction's values, trimmed and within their limits. */
@@ -356,17 +414,20 @@ public class Records {
                 vault.encrypt(ExtractedRecordStore.fields(row.id(), owner),
                         ExtractedRecordStore.fieldsJson(checked.fields())),
                 clock.instant().truncatedTo(ChronoUnit.MICROS));
-        RecordRow stored;
+        Optional<RecordRow> stored;
         try {
-            stored = store.correct(row.id(), checked.version(), values)
-                    .orElseThrow(() -> new IllegalStateException("knowledge.record_vanished"));
+            stored = store.correct(row.id(), checked.version(), values);
         } catch (KnowledgeConflict conflict) {
             throw new ApiException(KnowledgeProblems.STALE_VERSION);
+        }
+        if (stored.isEmpty()) {
+            // Deleted meanwhile (Story 4.5 part B): it is not found, like any record the page does not show.
+            return Optional.empty();
         }
         if (!indexing.reindexPage(row.versionId(), row.firstPage())) {
             throw new IllegalStateException("knowledge.record_version_not_ready");
         }
-        return Optional.of(detail(stored, type, owner));
+        return Optional.of(detail(stored.get(), type, owner));
     }
 
     private Detail detail(RecordRow row, TypeOf type, UUID owner) {

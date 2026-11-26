@@ -3,6 +3,7 @@ package io.github.gmshield.knowledge.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.LockModeType;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -18,28 +19,37 @@ import org.springframework.stereotype.Repository;
  * {@code record} and {@code record_passage} through JPA (Story 4.2), as the library's stores: every read is JPQL, which
  * Hibernate filters by the owner of the work ({@code @TenantId}), and nothing is written by a bulk statement (a delete
  * loads the rows and removes them, links first). From Story 4.5 a correction locks its row and writes it through its
- * entity; a row whose version moved is a {@link KnowledgeConflict}, never the database's message. The entity manager is looked up on first use, so the unit tests, which
- * start without a database, can still create the application.
+ * entity; a row whose version moved is a {@link KnowledgeConflict}, never the database's message. From Story 4.5 part B
+ * every read leaves a deleted record (a tombstone) out, as {@link RecordStore} says, and a delete locks the row and marks
+ * it through its entity. The entity manager is looked up on first use, so the unit tests, which start without a
+ * database, can still create the application.
  */
 @Repository
 class JpaRecordStore implements RecordStore {
 
-    private static final String OF_VERSION = "select r from Record r where r.versionId = :version"
+    private static final String LIVE = " and r.deletedAt is null";
+    private static final String OF_VERSION = "select r from Record r where r.versionId = :version" + LIVE
             + " order by r.firstPage, r.ordinal, r.id";
+    private static final String ALL_OF_VERSION = "select r from Record r where r.versionId = :version";
+    private static final String TOMBSTONES = "select r from Record r where r.versionId = :version"
+            + " and r.deletedAt is not null order by r.firstPage, r.ordinal, r.id";
     private static final String IN_RANGE = "select r from Record r where r.versionId = :version"
             + " and r.firstPage between :first and :last";
     private static final String LINKS = "select l from RecordPassage l where l.recordId in :records"
             + " order by l.recordId, l.passageId";
     private static final String BY_ID = "select r from Record r where r.id = :id";
+    private static final String LIVE_BY_ID = BY_ID + LIVE;
+    private static final String VERSION_OF = "select r.versionId from Record r where r.id = :id" + LIVE;
     private static final String OF_TYPE = "select r from Record r where r.versionId in :versions"
-            + " and r.recordType = :type";
+            + " and r.recordType = :type" + LIVE;
     private static final String LINKS_OF = "select l.passageId from RecordPassage l where l.recordId = :record"
             + " order by l.passageId";
     private static final String BY_IDS = "select r from Record r where r.id in :ids";
+    private static final String DELETED_BY_IDS = BY_IDS + " and r.deletedAt is not null and r.pointRemovedAt is null";
     private static final String NAMED = "select r from Record r where r.versionId in :versions"
-            + " and r.nameFingerprint = :fingerprint order by r.id";
+            + " and r.nameFingerprint = :fingerprint" + LIVE + " order by r.id";
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
-            + " group by r.recordType order by r.recordType";
+            + LIVE + " group by r.recordType order by r.recordType";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -69,6 +79,12 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
+    public List<RecordRow> tombstones(UUID versionId) {
+        return withLinks(em().createQuery(TOMBSTONES, RecordEntity.class).setParameter("version", versionId)
+                .getResultList());
+    }
+
+    @Override
     public int deleteRange(UUID versionId, int firstPage, int lastPage) {
         return delete(em().createQuery(IN_RANGE, RecordEntity.class).setParameter("version", versionId)
                 .setParameter("first", firstPage).setParameter("last", lastPage).getResultList());
@@ -76,7 +92,7 @@ class JpaRecordStore implements RecordStore {
 
     @Override
     public int deleteOfVersion(UUID versionId) {
-        return delete(em().createQuery(OF_VERSION, RecordEntity.class).setParameter("version", versionId)
+        return delete(em().createQuery(ALL_OF_VERSION, RecordEntity.class).setParameter("version", versionId)
                 .getResultList());
     }
 
@@ -92,8 +108,14 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
+    public Optional<UUID> versionOf(UUID id) {
+        return em().createQuery(VERSION_OF, UUID.class).setParameter("id", id).getResultList().stream().findFirst();
+    }
+
+    @Override
     public Optional<RecordRow> find(UUID id) {
-        List<RecordEntity> found = em().createQuery(BY_ID, RecordEntity.class).setParameter("id", id).getResultList();
+        List<RecordEntity> found = em().createQuery(LIVE_BY_ID, RecordEntity.class).setParameter("id", id)
+                .getResultList();
         if (found.isEmpty()) {
             return Optional.empty();
         }
@@ -115,11 +137,15 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public List<RecordRow> findAll(Collection<UUID> ids) {
+    public List<RecordRow> findAll(Collection<UUID> ids, Reach reach) {
         if (ids.isEmpty()) {
             return List.of();
         }
-        return withLinks(em().createQuery(BY_IDS, RecordEntity.class).setParameter("ids", ids).getResultList());
+        String query = switch (reach) {
+            case LIVE -> BY_IDS + LIVE;
+            case ALL -> BY_IDS;
+        };
+        return withLinks(em().createQuery(query, RecordEntity.class).setParameter("ids", ids).getResultList());
     }
 
     @Override
@@ -138,6 +164,9 @@ class JpaRecordStore implements RecordStore {
             return Optional.empty();
         }
         RecordEntity entity = found.get();
+        if (entity.deleted()) {
+            return Optional.empty();
+        }
         if (entity.rowVersion() != version) {
             throw new KnowledgeConflict(KnowledgeConflict.Reason.STALE_VERSION);
         }
@@ -154,6 +183,28 @@ class JpaRecordStore implements RecordStore {
             flushChecked();
         });
         return found.isPresent();
+    }
+
+    @Override
+    public boolean delete(UUID id, Instant at, boolean pointRemoved) {
+        Optional<RecordEntity> found = locked(id).filter(entity -> !entity.deleted());
+        found.ifPresent(entity -> {
+            entity.delete(at, pointRemoved);
+            flushChecked();
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public int pointsRemoved(Collection<UUID> ids, Instant at) {
+        if (ids.isEmpty()) {
+            return 0;
+        }
+        List<RecordEntity> found = em().createQuery(DELETED_BY_IDS, RecordEntity.class).setParameter("ids", ids)
+                .getResultList();
+        found.forEach(entity -> entity.pointRemoved(at));
+        flushChecked();
+        return found.size();
     }
 
     /**

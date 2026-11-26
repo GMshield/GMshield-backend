@@ -3,6 +3,8 @@ package io.github.gmshield.knowledge;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.gmshield.jobs.service.JobRef;
+import io.github.gmshield.jobs.service.Lane;
 import io.github.gmshield.knowledge.data.KnowledgeStore;
 import io.github.gmshield.knowledge.data.RecordCorrection;
 import io.github.gmshield.knowledge.data.RecordStore;
@@ -21,8 +23,10 @@ import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.IndexRemovalRetrySweep;
 import io.github.gmshield.materials.service.MaterialActions;
 import io.github.gmshield.materials.service.RecordIndexing;
+import io.github.gmshield.materials.service.RecordRemovals;
 import io.github.gmshield.materials.service.RecordTypeKeys;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
@@ -35,6 +39,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -53,6 +58,8 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
  * Story 4.1 against a real PostgreSQL and Redis (test mode): V34 and the core vocabulary. A new system (the starter one
@@ -64,7 +71,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * nor removed, a type that is not core is renamed on its version and removed; another owner reads nothing; and a
  * system's deletion removes its record types before its row. Story 4.5: a correction is stored in place, encrypted, with
  * its version, time and extracted match key, and a records run of its page; and the acceptance of a version reprocessing
- * made takes the corrections over (a matched record, and a copy on the same page).
+ * made takes the corrections over (a matched record, and a copy on the same page). Story 4.5 part B: a deleted record
+ * stays as a marked row with its links and a removal job, every public read and the index inputs leave it out, the
+ * answer read serves it until its point is removed, the table refuses a removed point on a live record, a reprocessed
+ * version's acceptance deletes the record read again and copies an unmatched tombstone in, and a version's removal
+ * takes its tombstones.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the two share one application context.
@@ -464,6 +475,215 @@ class OntologyIntegrationTest {
         // Only the stored correction added a records run of the page.
         assertThat(count("index_change", "version_id = ? and records and first_ordinal = 1 and last_ordinal = 1",
                 version)).isZero();
+    }
+
+    // --- Story 4.5 part B: delete a record
+
+    @Test
+    void aDeletedRecordIsATombstoneWithItsRemovalJobAndAReprocessedVersionDeletesItAgainOnPostgres()
+            throws Exception {
+        Owner a = owner();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID first = Ids.newId();
+        List<UUID> oldPassages = List.of(Ids.newId(), Ids.newId());
+        write(a.id(), () -> {
+            materials.insertMaterial(new MaterialRow(material, a.id(), vault.encryptText(new Binding("material", "name",
+                    material, a.id()), "Livro"), now, "rulebook", null, null));
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), a.id(), material, a.system(), now));
+            materials.insertVersion(new VersionRow(first, a.id(), material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(a.id(), first, oldPassages.get(0), 0, 1, "Magias"),
+                    passage(a.id(), first, oldPassages.get(1), 1, 2, "Magias")));
+            extracted.replaceRange(first, 1, 2, List.of(
+                    new ExtractedRecords.Extracted("spell", "Luz", List.of(), List.of(oldPassages.get(0)), 1),
+                    new ExtractedRecords.Extracted("spell", "Sombra", List.of(), List.of(oldPassages.get(1)), 2),
+                    new ExtractedRecords.Extracted("spell", "Escudo", List.of(), List.of(oldPassages.get(1)), 2)));
+        });
+        UUID light = recordNamed(first, a.id(), "Luz");
+        UUID shadow = recordNamed(first, a.id(), "Sombra");
+        UUID shield = recordNamed(first, a.id(), "Escudo");
+
+        assertThat(as(a.id(), () -> records.delete(a.system(), light))).isTrue();
+        assertThat(as(a.id(), () -> records.delete(a.system(), shadow))).isTrue();
+
+        // The row stays, marked; its links stay; a removal job names it.
+        Map<String, Object> row = jdbc.sql("select deleted_at, point_removed_at, version from record where id = ?")
+                .param(light).query().singleRow();
+        assertThat(row.get("deleted_at")).isNotNull();
+        assertThat(row.get("point_removed_at")).isNull();
+        assertThat(count("record_passage", "record_id = ?", light)).isOne();
+        UUID job = jdbc.sql("select job_id from record_removal where record_id = ? and version_id = ?")
+                .params(light, first).query(UUID.class).single();
+        assertThat(jdbc.sql("select kind from job where id = ?").param(job).query(String.class).single())
+                .isEqualTo("index.record_removal");
+        // Every public read leaves it out; a second delete and a correction find nothing.
+        assertThat(as(a.id(), () -> records.delete(a.system(), light))).isFalse();
+        assertThat(as(a.id(), () -> records.record(a.system(), light))).isEmpty();
+        assertThat(as(a.id(), () -> records.correct(a.system(), light, new Records.Correction(1, "Luz", "spell",
+                List.of())))).isEmpty();
+        assertThat(count("record_removal", "record_id = ?", light)).isOne();
+        assertThat(as(a.id(), () -> extracted.countsByType(List.of(first)))).containsExactly(Map.entry("spell", 1L));
+        assertThat(as(a.id(), () -> extracted.firstPages(first))).containsExactly(2);
+        assertThat(as(a.id(), () -> extracted.named(List.of(first), "luz"))).isEmpty();
+        UUID spellType = as(a.id(), () -> store.findByKey(a.system(), "spell")).orElseThrow().id();
+        Records.SummaryPage listed = as(a.id(), () -> records.records(spellType, 0, 50)).orElseThrow();
+        assertThat(listed.items()).extracting(Records.Summary::id).containsExactly(shield);
+        assertThat(listed.total()).isOne();
+        // An answer's read of what its search found still serves it, its point removed or not; a live read never.
+        assertThat(as(a.id(), () -> extracted.located(List.of(light, shield)))).extracting(ExtractedRecords.Located::id)
+                .containsExactly(shield);
+        assertThat(as(a.id(), () -> extracted.read(List.of(light, shield), ExtractedRecords.Reach.ALL)))
+                .extracting(ExtractedRecords.Content::id).containsExactly(light, shield);
+        assertThat(as(a.id(), () -> extracted.deleted(List.of(light, shield)))).containsExactly(light);
+        Integer marked = as(a.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.pointsRemoved(List.of(light, shield))));
+        assertThat(marked).isOne();
+        assertThat(jdbc.sql("select point_removed_at from record where id = ?").param(light).query(Instant.class)
+                .single()).isNotNull();
+        assertThat(as(a.id(), () -> extracted.located(List.of(light), ExtractedRecords.Reach.ALL)))
+                .extracting(ExtractedRecords.Located::id).containsExactly(light);
+        assertThat(as(a.id(), () -> extracted.located(List.of(light)))).isEmpty();
+        // The table refuses a removed point on a live record.
+        assertThatThrownBy(() -> jdbc.sql("update record set point_removed_at = now() where id = ?").param(shield)
+                .update()).isInstanceOf(DataIntegrityViolationException.class);
+
+        // A version reprocessing made from it reads "Luz" again, and not "Sombra".
+        UUID second = Ids.newId();
+        List<UUID> newPassages = List.of(Ids.newId(), Ids.newId());
+        write(a.id(), () -> {
+            materials.insertVersion(new VersionRow(second, a.id(), material, "needs_review", "pdf", 1000L, now, now),
+                    first);
+            materials.insertPassages(List.of(passage(a.id(), second, newPassages.get(0), 0, 1, "Magias"),
+                    passage(a.id(), second, newPassages.get(1), 1, 2, "Magias")));
+            extracted.replaceRange(second, 1, 2, List.of(
+                    new ExtractedRecords.Extracted("spell", "Luz", List.of(), List.of(newPassages.get(0)), 1),
+                    new ExtractedRecords.Extracted("spell", "Escudo", List.of(), List.of(newPassages.get(1)), 2)));
+        });
+
+        as(a.id(), () -> actions.act(material, "accept"));
+
+        UUID again = recordNamed(second, a.id(), "Luz");
+        Map<String, Object> tombstoned = jdbc.sql("select deleted_at, point_removed_at from record where id = ?")
+                .param(again).query().singleRow();
+        assertThat(tombstoned.get("deleted_at")).isNotNull();
+        assertThat(tombstoned.get("point_removed_at")).isNotNull();
+        assertThat(count("record_removal", "version_id = ?", second)).isZero();
+        // "Sombra" matched nothing: copied in as a tombstone with its key, no passage and an empty name.
+        UUID copied = recordNamed(second, a.id(), "");
+        assertThat(count("record_passage", "record_id = ?", copied)).isZero();
+        Map<String, Object> copy = jdbc.sql("select first_page, name_fingerprint, deleted_at, point_removed_at from"
+                + " record where id = ?").param(copied).query().singleRow();
+        assertThat(copy.get("first_page")).isEqualTo(2);
+        assertThat((byte[]) copy.get("name_fingerprint"))
+                .isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm("Sombra")));
+        assertThat(copy.get("deleted_at")).isNotNull();
+        assertThat(copy.get("point_removed_at")).isNotNull();
+        // Only "Escudo" is indexed: one records run of its page.
+        assertThat(jdbc.sql("select first_ordinal from index_change where version_id = ? and records").param(second)
+                .query(Integer.class).list()).containsExactly(2);
+        assertThat(as(a.id(), () -> extracted.countsByType(List.of(second)))).containsExactly(Map.entry("spell", 1L));
+
+        // Removing the version removes its tombstones with its other records, links first.
+        write(a.id(), () -> assertThat(extracted.removeVersion(second)).isEqualTo(3));
+        assertThat(count("record", "version_id = ?", second)).isZero();
+    }
+
+    @Autowired
+    private RecordRemovals recordRemovals;
+    @Autowired
+    private IndexRemovalRetrySweep removalRetry;
+
+    @Test
+    void aFailedRecordRemovalGetsANewJobWithTheSameInputAndItsRowMovesOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID record = spellRecord(a.id(), a.system());
+        UUID version = jdbc.sql("select version_id from record where id = ?").param(record).query(UUID.class).single();
+        assertThat(as(a.id(), () -> records.delete(a.system(), record))).isTrue();
+        UUID failed = jdbc.sql("select job_id from record_removal where record_id = ?").param(record)
+                .query(UUID.class).single();
+        jdbc.sql("update job set state = 'failed', outcome_code = 'job.attempts_exhausted' where id = ?").param(failed)
+                .update();
+
+        assertThat(removalRetry.sweep()).isPositive();
+
+        UUID moved = jdbc.sql("select job_id from record_removal where record_id = ?").param(record)
+                .query(UUID.class).single();
+        assertThat(moved).isNotEqualTo(failed);
+        assertThat(jdbc.sql("select owner_id from record_removal where job_id = ?").param(moved).query(UUID.class)
+                .single()).isEqualTo(a.id());
+        assertThat(jdbc.sql("select kind from job where id = ?").param(moved).query(String.class).single())
+                .isEqualTo("index.record_removal");
+        assertThat(jdbc.sql("select state from job where id = ?").param(moved).query(String.class).single())
+                .isIn("waiting", "offered");
+        assertThat(count("record_removal", "job_id = ?", failed)).isZero();
+        JobRef job = new JobRef(moved, a.id(), RecordRemovals.KIND, Lane.INGESTION, 1, null);
+        JsonNode input = as(a.id(), () -> new TransactionTemplate(transactions)
+                .execute(status -> recordRemovals.input(job)));
+        assertThat(input.propertyNames()).containsExactlyInAnyOrder("owner", "source", "ids");
+        assertThat(input.path("owner").asString()).isEqualTo(a.id().toString());
+        assertThat(input.path("source").asString()).isEqualTo(version.toString());
+        assertThat(input.path("ids")).extracting(JsonNode::asString).containsExactly(record.toString());
+        // Its completion records that the point is gone.
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            recordRemovals.completed(job, JsonNodeFactory.instance.objectNode());
+            return null;
+        }));
+        assertThat(jdbc.sql("select point_removed_at from record where id = ?").param(record).query(Instant.class)
+                .single()).isNotNull();
+
+        // The failed job, kept as history, has no row: it is never started twice.
+        removalRetry.sweep();
+        assertThat(count("record_removal", "record_id = ?", record)).isOne();
+    }
+
+    @Test
+    void aCorrectionWaitingOnADeleteIsNotFoundOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID record = spellRecord(a.id(), a.system());
+        UUID version = jdbc.sql("select version_id from record where id = ?").param(record).query(UUID.class).single();
+        long runsBefore = count("index_change", "version_id = ? and records", version);
+        CountDownLatch written = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            // The delete holds the version's lock and its write, not committed yet.
+            Future<Boolean> delete = pool.submit(() -> as(a.id(), () -> new TransactionTemplate(transactions).execute(
+                    status -> {
+                        assertThat(recordIndexing.lockReady(version)).isTrue();
+                        boolean done = recordStore.delete(record, Instant.now(), false);
+                        written.countDown();
+                        try {
+                            release.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException stopped) {
+                            Thread.currentThread().interrupt();
+                        }
+                        return done;
+                    })));
+            assertThat(written.await(30, TimeUnit.SECONDS)).isTrue();
+            // The correction reads the record live, then waits for the version's lock.
+            Future<Optional<Records.Detail>> correction = pool.submit(() -> as(a.id(), () -> records.correct(
+                    a.system(), record, new Records.Correction(0, "Luz Segunda", "spell", List.of()))));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (jdbc.sql("select count(*) from pg_stat_activity where wait_event_type = 'Lock'").query(Long.class)
+                    .single() == 0) {
+                assertThat(System.nanoTime()).as("the correction waits for the version").isLessThan(deadline);
+                Thread.sleep(20);
+            }
+            release.countDown();
+
+            assertThat(delete.get(30, TimeUnit.SECONDS)).isTrue();
+            // Not found: neither stale nor a failure.
+            assertThat(correction.get(30, TimeUnit.SECONDS)).isEmpty();
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+        Map<String, Object> row = jdbc.sql("select deleted_at, name from record where id = ?").param(record).query()
+                .singleRow();
+        assertThat(row.get("deleted_at")).isNotNull();
+        assertThat(vault.decryptText(new Binding("record", "name", record, a.id()), (byte[]) row.get("name")))
+                .isEqualTo("Luz");
+        assertThat(count("index_change", "version_id = ? and records", version)).isEqualTo(runsBefore);
     }
 
     private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page, String section) {

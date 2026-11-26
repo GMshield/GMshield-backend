@@ -65,7 +65,9 @@ class JobClaimController {
                     + " contract 1.21.0 a record type is any key matching ^[a-z][a-z0-9_]{0,31}$: an ingestion records"
                     + " step's input carries recordTypeNames (each recordTypes key with its name, data for the model),"
                     + " and a question's or a library.search input carries recordTypes, the keys of the campaign's"
-                    + " system, to which the records it reads are limited")
+                    + " system, to which the records it reads are limited. From contract 1.22.0 a job of kind"
+                    + " index.record_removal has the input {owner, source, ids}: the ids of records the GM deleted,"
+                    + " whose points go from that owner's source (by id, never the whole source)")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")

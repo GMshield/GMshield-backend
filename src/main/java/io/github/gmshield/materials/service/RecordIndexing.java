@@ -15,7 +15,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * its point keeps its id (the record's) and gets the new text and record type. Both calls act for the owner of the work
  * ({@link OwnerContext}) in the caller's transaction, which must exist, and lock the version until it ends: a correction
  * and an acceptance of a version that replaces it (which carries corrections over, {@link MaterialActions}) run one
- * after the other. Another owner's version reads as an unknown one.
+ * after the other. Another owner's version reads as an unknown one. From Story 4.5 part B a deleted record's point goes
+ * by a job of its own ({@link #removePoint}, {@link RecordRemovals}).
  */
 @Service
 @NamedInterface("service")
@@ -23,10 +24,12 @@ public class RecordIndexing {
 
     private final MaterialStore materials;
     private final IndexChanges changes;
+    private final RecordRemovals removals;
 
-    RecordIndexing(MaterialStore materials, IndexChanges changes) {
+    RecordIndexing(MaterialStore materials, IndexChanges changes, RecordRemovals removals) {
         this.materials = materials;
         this.changes = changes;
+        this.removals = removals;
     }
 
     /** Locks the owner's version {@code versionId}; true when it is {@code ready} (only its records are corrected). */
@@ -43,6 +46,18 @@ public class RecordIndexing {
         requireTransaction();
         Optional<VersionRow> version = ready(versionId);
         version.ifPresent(found -> changes.startPage(found, page));
+        return version.isPresent();
+    }
+
+    /**
+     * Creates the removal of the point of the owner's record {@code recordId}, which the GM deleted, from its
+     * {@code ready} version {@code versionId}'s points (Story 4.5 part B), as {@link RecordRemovals} says; false, and
+     * nothing created, when the version is not the owner's or not {@code ready}.
+     */
+    public boolean removePoint(UUID versionId, UUID recordId) {
+        requireTransaction();
+        Optional<VersionRow> version = ready(versionId);
+        version.ifPresent(found -> removals.start(found.id(), recordId));
         return version.isPresent();
     }
 

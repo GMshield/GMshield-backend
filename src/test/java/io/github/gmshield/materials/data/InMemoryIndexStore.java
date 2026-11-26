@@ -13,15 +13,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
- * {@code index_change} and {@code index_removal} in memory, for tests that run without PostgreSQL. Like Hibernate's
- * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only; like the tables, an index change keeps
- * its (owner, version) reference into the {@link InMemoryMaterialStore}. A write undoes itself when its transaction
- * rolls back.
+ * {@code index_change}, {@code index_removal} and (Story 4.5 part B) {@code record_removal} in memory, for tests that
+ * run without PostgreSQL. Like Hibernate's {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner
+ * only; like the tables, an index change keeps its (owner, version) reference into the {@link InMemoryMaterialStore}. A
+ * write undoes itself when its transaction rolls back.
  */
 public class InMemoryIndexStore implements IndexStore {
 
     public final Map<UUID, IndexChangeRow> changes = new ConcurrentHashMap<>();
     public final Map<UUID, IndexRemovalRow> removals = new ConcurrentHashMap<>();
+    public final Map<UUID, RecordRemovalRow> recordRemovals = new ConcurrentHashMap<>();
     /** The jobs whose index change a move refuses, as a failing database would (the retry sweep's isolation). */
     public final Set<UUID> refusedMoves = ConcurrentHashMap.newKeySet();
     /** The jobs whose index removal a move refuses, as a failing database would (the removal retry sweep's isolation). */
@@ -184,5 +185,49 @@ public class InMemoryIndexStore implements IndexStore {
         UUID owner = OwnerContext.require();
         return removals.values().stream().anyMatch(row -> row.ownerId().equals(owner)
                 && row.versionId().equals(versionId));
+    }
+
+    @Override
+    public synchronized void insertRecordRemoval(RecordRemovalRow row) {
+        ownerFor(row.ownerId());
+        if (recordRemovals.putIfAbsent(row.jobId(), row) != null) {
+            throw new IllegalStateException("key refused");
+        }
+        RollbackUndo.onRollback(() -> recordRemovals.remove(row.jobId()));
+    }
+
+    @Override
+    public Optional<RecordRemovalRow> findRecordRemoval(UUID jobId) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(recordRemovals.get(jobId)).filter(row -> row.ownerId().equals(owner));
+    }
+
+    @Override
+    public List<RecordRemovalRow> recordRemovals(Collection<UUID> jobIds) {
+        UUID owner = OwnerContext.require();
+        return recordRemovals.values().stream().filter(row -> row.ownerId().equals(owner)
+                && jobIds.contains(row.jobId())).sorted(Comparator.comparing(RecordRemovalRow::jobId)).toList();
+    }
+
+    @Override
+    public synchronized Optional<RecordRemovalRow> moveRecordRemoval(UUID jobId, UUID newJobId) {
+        Optional<RecordRemovalRow> found = findRecordRemoval(jobId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        RecordRemovalRow before = found.get();
+        ownerFor(before.ownerId());
+        if (recordRemovals.containsKey(newJobId)) {
+            throw new IllegalStateException("key refused");
+        }
+        RecordRemovalRow moved = new RecordRemovalRow(newJobId, before.ownerId(), before.versionId(),
+                before.recordId());
+        recordRemovals.remove(jobId);
+        recordRemovals.put(newJobId, moved);
+        RollbackUndo.onRollback(() -> {
+            recordRemovals.remove(newJobId);
+            recordRemovals.put(jobId, before);
+        });
+        return Optional.of(moved);
     }
 }
