@@ -1,25 +1,32 @@
 package io.github.gmshield.knowledge.service;
 
+import io.github.gmshield.knowledge.data.KnowledgeConflict;
 import io.github.gmshield.knowledge.data.KnowledgeStore;
+import io.github.gmshield.knowledge.data.RecordCorrection;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.ReadyVersions;
+import io.github.gmshield.materials.service.RecordIndexing;
 import io.github.gmshield.materials.service.RecordSources;
 import io.github.gmshield.scope.service.CampaignScopes;
 import io.github.gmshield.scope.service.Scopes;
+import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
 import java.text.Collator;
+import java.time.Clock;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -59,6 +66,16 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       current scope, so this class serves no page for it.</li>
  * </ul>
  *
+ * <p>Story 4.5, {@link #correct} and {@link #correctInCampaign}: the GM corrects a record's name, type and fields on the
+ * record's version (its row version, {@link Detail#version}), under the same visibility as the reads, so anything else
+ * is not found. The name and each field's name and value are trimmed and keep the extraction's limits
+ * ({@link ExtractedRecords#MAX_NAME} and the others); the type is a key of the page's system's record types (the
+ * campaign's system on the campaign's page), core or approved. A stale version is {@code request.stale_version}. The
+ * correction keeps the record's id, source references, ordinal and first page; its name and fields are encrypted again
+ * bound to the row and its fingerprint worked out again, so the next question and search read it. The records run of its
+ * first page joins its version's index changes ({@link RecordIndexing}) in the same transaction, which locks the
+ * version first, so a correction never crosses the acceptance of a version that replaces it.
+ *
  * Names, fields and places leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -74,11 +91,13 @@ public class Records {
     private final RecordSources sources;
     private final Scopes scopes;
     private final CampaignScopes campaignScopes;
+    private final RecordIndexing indexing;
     private final ObjectProvider<PlatformTransactionManager> transactions;
+    private final Clock clock;
 
     Records(KnowledgeStore types, RecordStore store, Vault vault, Library library, ReadyVersions ready,
-            RecordSources sources, Scopes scopes, CampaignScopes campaignScopes,
-            ObjectProvider<PlatformTransactionManager> transactions) {
+            RecordSources sources, Scopes scopes, CampaignScopes campaignScopes, RecordIndexing indexing,
+            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.types = types;
         this.store = store;
         this.vault = vault;
@@ -87,7 +106,9 @@ public class Records {
         this.sources = sources;
         this.scopes = scopes;
         this.campaignScopes = campaignScopes;
+        this.indexing = indexing;
         this.transactions = transactions;
+        this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
     /** A record as its type's list shows it: its id, name, its material's name and its first page. */
@@ -139,8 +160,12 @@ public class Records {
         }
     }
 
-    /** One record as its page shows it. {@code toString} names ids and counts only. */
-    public record Detail(UUID id, String name, TypeOf recordType, List<Field> fields, List<Reference> references) {
+    /**
+     * One record as its page shows it, with its row version (Story 4.5: a correction names it). {@code toString} names
+     * ids and counts only.
+     */
+    public record Detail(UUID id, String name, TypeOf recordType, List<Field> fields, List<Reference> references,
+                         long version) {
         public Detail {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
@@ -149,7 +174,24 @@ public class Records {
         @Override
         public String toString() {
             return "Detail[id=" + id + ", recordType=" + recordType.id() + ", fields=" + fields.size()
-                    + ", references=" + references.size() + "]";
+                    + ", references=" + references.size() + ", version=" + version + "]";
+        }
+    }
+
+    /**
+     * The GM's correction of a record (Story 4.5): the row version it was made on, the new name, the new type's key and
+     * the new fields in order. {@code toString} names the version, the type and the count only.
+     */
+    public record Correction(long version, String name, String recordType, List<Field> fields) {
+        public Correction {
+            Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(recordType, "recordType");
+            fields = List.copyOf(fields);
+        }
+
+        @Override
+        public String toString() {
+            return "Correction[version=" + version + ", recordType=" + recordType + ", fields=" + fields.size() + "]";
         }
     }
 
@@ -189,8 +231,7 @@ public class Records {
     public Optional<Detail> record(UUID systemId, UUID recordId) {
         UUID owner = OwnerContext.require();
         Optional<Detail> found = reading(() -> visible(systemId, recordId).flatMap(row -> typeOf(systemId, row.type())
-                .map(type -> new Detail(row.id(), vault.decryptText(ExtractedRecordStore.name(row.id(), owner),
-                        row.name()), type, fields(row, owner), references(row)))));
+                .map(type -> detail(row, type, owner))));
         log.atInfo().addKeyValue("systemId", systemId).addKeyValue("recordId", recordId)
                 .addKeyValue("found", found.isPresent())
                 .addKeyValue("references", found.map(detail -> detail.references().size()).orElse(0))
@@ -208,15 +249,135 @@ public class Records {
             Set<UUID> allowed = scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
                     .allowedSources();
             return store.find(recordId).filter(row -> allowed.contains(row.versionId()))
-                    .flatMap(row -> typeOf(campaign.system().id(), row.type()).map(type -> new Detail(row.id(),
-                            vault.decryptText(ExtractedRecordStore.name(row.id(), owner), row.name()), type,
-                            fields(row, owner), references(row))));
+                    .flatMap(row -> typeOf(campaign.system().id(), row.type()).map(type -> detail(row, type, owner)));
         }));
         log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("recordId", recordId)
                 .addKeyValue("found", found.isPresent())
                 .addKeyValue("references", found.map(detail -> detail.references().size()).orElse(0))
                 .log("knowledge.campaign_record_read");
         return found;
+    }
+
+    /**
+     * Corrects the owner's record {@code recordId} as the system {@code systemId} shows it, as the class says; answers it
+     * as stored, its version raised by one, or empty when the system does not show it.
+     */
+    public Optional<Detail> correct(UUID systemId, UUID recordId, Correction correction) {
+        Checked checked = checked(correction);
+        Optional<Detail> corrected = writing(() -> store.find(recordId)
+                .filter(row -> indexing.lockReady(row.versionId()))
+                .filter(row -> library.system(systemId).isPresent()
+                        && ready.ofSystem(systemId).orElse(Set.of()).contains(row.versionId()))
+                .flatMap(row -> write(systemId, row, checked)));
+        log.atInfo().addKeyValue("systemId", systemId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", corrected.isPresent())
+                .addKeyValue("version", corrected.map(Detail::version).orElse(-1L))
+                .addKeyValue("fields", checked.fields().size()).log("knowledge.record_corrected");
+        return corrected;
+    }
+
+    /**
+     * Corrects the owner's record {@code recordId} as the campaign {@code campaignId}'s current scope shows it, as the
+     * class says; answers it as stored, or empty when the campaign does not show it.
+     */
+    public Optional<Detail> correctInCampaign(UUID campaignId, UUID recordId, Correction correction) {
+        Checked checked = checked(correction);
+        Optional<Detail> corrected = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                store.find(recordId).filter(row -> indexing.lockReady(row.versionId()))
+                        .filter(row -> scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
+                                .allowedSources().contains(row.versionId()))
+                        .flatMap(row -> write(campaign.system().id(), row, checked))));
+        log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", corrected.isPresent())
+                .addKeyValue("version", corrected.map(Detail::version).orElse(-1L))
+                .addKeyValue("fields", checked.fields().size()).log("knowledge.campaign_record_corrected");
+        return corrected;
+    }
+
+    /** A correction's values, trimmed and within their limits. */
+    private record Checked(long version, String name, String recordType, List<ExtractedRecords.Field> fields) {
+        @Override
+        public String toString() {
+            return "Checked[version=" + version + ", fields=" + fields.size() + "]";
+        }
+    }
+
+    /** The correction's values trimmed, or the problem of the first one outside its limits. */
+    private static Checked checked(Correction correction) {
+        String name = correction.name().strip();
+        if (!within(name, ExtractedRecords.MAX_NAME)) {
+            throw new ApiException(KnowledgeProblems.RECORD_NAME_INVALID);
+        }
+        if (correction.fields().size() > ExtractedRecords.MAX_FIELDS) {
+            throw new ApiException(KnowledgeProblems.RECORD_FIELDS_INVALID);
+        }
+        List<ExtractedRecords.Field> fields = new ArrayList<>(correction.fields().size());
+        for (int index = 0; index < correction.fields().size(); index++) {
+            Field field = correction.fields().get(index);
+            String fieldName = field.name() == null ? "" : field.name().strip();
+            String value = field.value() == null ? "" : field.value().strip();
+            if (!within(fieldName, ExtractedRecords.MAX_FIELD_NAME)) {
+                throw new ApiException(KnowledgeProblems.RECORD_FIELD_NAME_INVALID.withParams(Map.of("min", 1,
+                        "max", ExtractedRecords.MAX_FIELD_NAME, "index", index)));
+            }
+            if (!within(value, ExtractedRecords.MAX_FIELD_VALUE)) {
+                throw new ApiException(KnowledgeProblems.RECORD_FIELD_VALUE_INVALID.withParams(Map.of("min", 1,
+                        "max", ExtractedRecords.MAX_FIELD_VALUE, "index", index)));
+            }
+            fields.add(new ExtractedRecords.Field(fieldName, value));
+        }
+        return new Checked(correction.version(), name, correction.recordType(), List.copyOf(fields));
+    }
+
+    /** Whether a trimmed text has 1 to {@code max} code points. */
+    private static boolean within(String text, int max) {
+        int points = text.codePointCount(0, text.length());
+        return points >= 1 && points <= max;
+    }
+
+    /**
+     * Writes the checked correction over the visible row, in the caller's transaction, with its version locked and
+     * {@code ready}: empty when the system has no type of the record's current key (it does not show it), else the
+     * record as stored. Its first page's records run joins its version's index changes.
+     */
+    private Optional<Detail> write(UUID systemId, RecordRow row, Checked checked) {
+        if (typeOf(systemId, row.type()).isEmpty()) {
+            return Optional.empty();
+        }
+        TypeOf type = typeOf(systemId, checked.recordType())
+                .orElseThrow(() -> new ApiException(KnowledgeProblems.RECORD_TYPE_INVALID));
+        if (row.version() != checked.version()) {
+            throw new ApiException(KnowledgeProblems.STALE_VERSION);
+        }
+        UUID owner = row.ownerId();
+        RecordCorrection values = new RecordCorrection(type.key(),
+                vault.encryptText(ExtractedRecordStore.name(row.id(), owner), checked.name()),
+                ExtractedRecordStore.nameFingerprint(vault, checked.name()),
+                vault.encrypt(ExtractedRecordStore.fields(row.id(), owner),
+                        ExtractedRecordStore.fieldsJson(checked.fields())),
+                clock.instant().truncatedTo(ChronoUnit.MICROS));
+        RecordRow stored;
+        try {
+            stored = store.correct(row.id(), checked.version(), values)
+                    .orElseThrow(() -> new IllegalStateException("knowledge.record_vanished"));
+        } catch (KnowledgeConflict conflict) {
+            throw new ApiException(KnowledgeProblems.STALE_VERSION);
+        }
+        if (!indexing.reindexPage(row.versionId(), row.firstPage())) {
+            throw new IllegalStateException("knowledge.record_version_not_ready");
+        }
+        return Optional.of(detail(stored, type, owner));
+    }
+
+    private Detail detail(RecordRow row, TypeOf type, UUID owner) {
+        return new Detail(row.id(), vault.decryptText(ExtractedRecordStore.name(row.id(), owner), row.name()), type,
+                fields(row, owner), references(row), row.version());
+    }
+
+    /** One transaction for a correction and its checks: a problem thrown inside rolls everything back. */
+    private <T> T writing(Supplier<T> write) {
+        OwnerContext.require();
+        return new TransactionTemplate(transactions.getObject()).execute(status -> write.get());
     }
 
     /** Page {@code page} of the version of the record {@code recordId} as the system shows it; else empty. */

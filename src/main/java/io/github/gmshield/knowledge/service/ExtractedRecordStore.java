@@ -1,5 +1,6 @@
 package io.github.gmshield.knowledge.service;
 
+import io.github.gmshield.knowledge.data.RecordCorrection;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.library.service.Library;
@@ -14,12 +15,15 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -37,7 +41,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * (entity {@value #RECORD}, field {@value #FIELD_NAME}, of the name's {@link Library#uniqueForm}), which
  * {@link #named} compares with a search's query; {@link #names} decrypts names for a search's answer only. From Story
  * 4.3 part C {@link #read} decrypts names and fields for an answer (the records handed to the model, and those it
- * cited, stored by value with the turn). Nothing here logs a name or a field.
+ * cited, stored by value with the turn). From Story 4.5 {@link #carryCorrections} carries a replaced version's
+ * corrections over to the version reprocessing made from it, each value encrypted again bound to its new row. Nothing
+ * here logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -157,12 +163,92 @@ public class ExtractedRecordStore implements ExtractedRecords {
                 fieldsOf(vault.decrypt(fields(row.id(), owner), row.fields())))).toList();
     }
 
+    @Override
+    public Carried carryCorrections(UUID fromVersionId, UUID toVersionId,
+                                    Function<List<UUID>, Optional<Remapped>> remap) {
+        UUID owner = requireTransaction();
+        List<RecordRow> corrections = store.ofVersion(fromVersionId).stream().filter(RecordRow::corrected).toList();
+        if (corrections.isEmpty()) {
+            return new Carried(0, 0, 0);
+        }
+        List<RecordRow> fresh = new ArrayList<>(store.ofVersion(toVersionId).stream()
+                .filter(row -> !row.corrected()).toList());
+        int nextOrdinal = store.ofVersion(toVersionId).stream().mapToInt(RecordRow::ordinal).max().orElse(-1) + 1;
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        int matched = 0;
+        int dropped = 0;
+        List<RecordRow> copies = new ArrayList<>();
+        for (RecordRow correction : corrections) {
+            Optional<RecordRow> match = match(correction, fresh);
+            if (match.isPresent()) {
+                RecordRow target = match.get();
+                fresh.remove(target);
+                store.carry(target.id(), reencrypted(correction, target.id(), owner), correction.extractedType(),
+                        correction.extractedNameFingerprint());
+                matched++;
+                continue;
+            }
+            Optional<Remapped> remapped = remap.apply(correction.passageIds());
+            if (remapped.isEmpty() || remapped.get().passageIds().isEmpty()) {
+                dropped++;
+                continue;
+            }
+            UUID id = Ids.newId();
+            RecordCorrection values = reencrypted(correction, id, owner);
+            copies.add(new RecordRow(id, owner, toVersionId, nextOrdinal++, remapped.get().firstPage(), values.type(),
+                    values.name(), values.nameFingerprint(), values.fields(), remapped.get().passageIds(), now, 0,
+                    correction.correctedAt(), correction.extractedType(), correction.extractedNameFingerprint()));
+        }
+        store.insert(copies);
+        return new Carried(matched, copies.size(), dropped);
+    }
+
+    /**
+     * The record of the new version a correction matches, as {@link #carryCorrections} says: first among those whose
+     * (type, fingerprint) equals the correction's extracted key (the misread record read again), and only when none does
+     * among those that equal its corrected key; within each, the nearest first page wins, then the lowest ordinal.
+     */
+    private static Optional<RecordRow> match(RecordRow correction, List<RecordRow> fresh) {
+        Optional<RecordRow> extracted = nearest(correction, fresh.stream().filter(row ->
+                sameKey(row, correction.extractedType(), correction.extractedNameFingerprint())).toList());
+        return extracted.isPresent() ? extracted : nearest(correction, fresh.stream().filter(row ->
+                sameKey(row, correction.type(), correction.nameFingerprint())).toList());
+    }
+
+    private static Optional<RecordRow> nearest(RecordRow correction, List<RecordRow> candidates) {
+        return candidates.stream().min(Comparator.<RecordRow>comparingInt(row ->
+                        Math.abs(row.firstPage() - correction.firstPage()))
+                .thenComparingInt(RecordRow::ordinal).thenComparing(RecordRow::id));
+    }
+
+    private static boolean sameKey(RecordRow row, String type, byte[] fingerprint) {
+        return fingerprint != null && row.nameFingerprint() != null && row.type().equals(type)
+                && Arrays.equals(row.nameFingerprint(), fingerprint);
+    }
+
+    /** A corrected record's values, decrypted and encrypted again bound to the row {@code rowId} they are written to. */
+    private RecordCorrection reencrypted(RecordRow correction, UUID rowId, UUID owner) {
+        String plainName = vault.decryptText(name(correction.id(), owner), correction.name());
+        byte[] plainFields = vault.decrypt(fields(correction.id(), owner), correction.fields());
+        try {
+            return new RecordCorrection(correction.type(), vault.encryptText(name(rowId, owner), plainName),
+                    nameFingerprint(plainName), vault.encrypt(fields(rowId, owner), plainFields), correction.correctedAt());
+        } finally {
+            Arrays.fill(plainFields, (byte) 0);
+        }
+    }
+
     private static Located located(RecordRow row) {
         return new Located(row.id(), row.versionId(), row.type(), row.firstPage(), row.passageIds());
     }
 
     /** The name's keyed fingerprint: of its unique form, so case, NFC and surrounding space make no difference. */
     private byte[] nameFingerprint(String name) {
+        return nameFingerprint(vault, name);
+    }
+
+    /** A record name's keyed fingerprint, as {@link #nameFingerprint(String)} (a correction's, Story 4.5). */
+    static byte[] nameFingerprint(Vault vault, String name) {
         return vault.fingerprint(RECORD, FIELD_NAME, Library.uniqueForm(name));
     }
 

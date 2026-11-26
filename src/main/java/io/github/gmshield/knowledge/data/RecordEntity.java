@@ -4,6 +4,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -11,8 +12,10 @@ import org.hibernate.annotations.TenantId;
 
 /**
  * {@code record} (Story 4.2, V35): Hibernate fills {@code owner_id} from the owner of the work and filters every query
- * by it. The version is a plain id: the database's key on (owner, version) keeps it within the same owner. Written
- * once; a step reported again replaces its records with new rows.
+ * by it. The version is a plain id: the database's key on (owner, version) keeps it within the same owner. A step
+ * reported again replaces its records with new rows. From Story 4.5 (V41) a correction rewrites its type, name, name
+ * fingerprint and fields in place; its id, version id, ordinal, first page and links never change. Its {@code version}
+ * is Hibernate's: each correction raises it, and an update of a row whose version moved meanwhile fails.
  */
 @Entity(name = "Record")
 @Table(name = "record")
@@ -35,22 +38,35 @@ class RecordEntity {
     @Column(name = "first_page", nullable = false, updatable = false)
     private int firstPage;
 
-    /** The core type's key: a JPQL path names it {@code recordType}, never the keyword {@code type}. */
-    @Column(name = "type", nullable = false, updatable = false)
+    /** The type's key: a JPQL path names it {@code recordType}, never the keyword {@code type}. */
+    @Column(name = "type", nullable = false)
     private String recordType;
 
-    @Column(name = "name", nullable = false, updatable = false)
+    @Column(name = "name", nullable = false)
     private byte[] name;
 
-    /** The name's keyed fingerprint (V37); null for a record stored before it. */
-    @Column(name = "name_fingerprint", updatable = false)
+    /** The name's keyed fingerprint (V37); null for a record stored before it and never corrected. */
+    @Column(name = "name_fingerprint")
     private byte[] nameFingerprint;
 
-    @Column(name = "fields", nullable = false, updatable = false)
+    @Column(name = "fields", nullable = false)
     private byte[] fields;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
+
+    @Version
+    @Column(name = "version", nullable = false)
+    private long rowVersion;
+
+    @Column(name = "corrected_at")
+    private Instant correctedAt;
+
+    @Column(name = "extracted_type")
+    private String extractedType;
+
+    @Column(name = "extracted_name_fingerprint")
+    private byte[] extractedNameFingerprint;
 
     protected RecordEntity() {
         // for Hibernate
@@ -67,14 +83,49 @@ class RecordEntity {
         this.nameFingerprint = row.nameFingerprint();
         this.fields = row.fields();
         this.createdAt = row.createdAt();
+        this.rowVersion = row.version();
+        this.correctedAt = row.correctedAt();
+        this.extractedType = row.extractedType();
+        this.extractedNameFingerprint = row.extractedNameFingerprint();
     }
 
     UUID id() {
         return id;
     }
 
+    long rowVersion() {
+        return rowVersion;
+    }
+
+    /**
+     * The GM's correction (Story 4.5): on the first one, the type and fingerprint the extraction produced are kept as
+     * the extracted match key; then the corrected values replace them. Hibernate raises the version when it writes them.
+     */
+    void correct(RecordCorrection correction) {
+        if (correctedAt == null) {
+            this.extractedType = recordType;
+            this.extractedNameFingerprint = nameFingerprint == null ? null : nameFingerprint.clone();
+        }
+        write(correction);
+    }
+
+    /** A correction carried over from an earlier version's record (Story 4.5), with that record's extracted key. */
+    void carry(RecordCorrection correction, String keptType, byte[] keptFingerprint) {
+        this.extractedType = keptType;
+        this.extractedNameFingerprint = keptFingerprint == null ? null : keptFingerprint.clone();
+        write(correction);
+    }
+
+    private void write(RecordCorrection correction) {
+        this.recordType = correction.type();
+        this.name = correction.name();
+        this.nameFingerprint = correction.nameFingerprint();
+        this.fields = correction.fields();
+        this.correctedAt = correction.correctedAt();
+    }
+
     RecordRow row(List<UUID> passageIds) {
         return new RecordRow(id, ownerId, versionId, ordinal, firstPage, recordType, name, nameFingerprint, fields,
-                passageIds, createdAt);
+                passageIds, createdAt, rowVersion, correctedAt, extractedType, extractedNameFingerprint);
     }
 }

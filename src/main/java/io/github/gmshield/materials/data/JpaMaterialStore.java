@@ -53,6 +53,20 @@ class JpaMaterialStore implements MaterialStore {
     }
 
     @Override
+    public void insertVersion(VersionRow row, UUID reprocessedFrom) {
+        EntityManager em = em();
+        em.persist(new MaterialVersionEntity(row, reprocessedFrom));
+        em.flush();
+    }
+
+    @Override
+    public Optional<UUID> reprocessedFrom(UUID id) {
+        // A projection, never the entity: a link the database cleared (its version deleted) reads as it is now.
+        return em().createQuery("select v.reprocessedFrom from MaterialVersion v where v.id = :id", UUID.class)
+                .setParameter("id", id).getResultList().stream().filter(java.util.Objects::nonNull).findFirst();
+    }
+
+    @Override
     public void insertMaterialSystem(MaterialSystemRow row) {
         EntityManager em = em();
         em.persist(new MaterialSystemEntity(row));

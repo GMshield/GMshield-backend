@@ -54,6 +54,10 @@ class MaterialVersionEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    /** The accepted version reprocessing read again to make this one (Story 4.5, V41); set at the insert only. */
+    @Column(name = "reprocessed_from", updatable = false)
+    private UUID reprocessedFrom;
+
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
@@ -75,6 +79,16 @@ class MaterialVersionEntity {
         this.indexRecipe = row.indexRecipe();
         this.createdAt = row.createdAt();
         this.updatedAt = row.updatedAt();
+    }
+
+    /** A version that reprocessing made from the accepted version {@code from} (Story 4.5). */
+    MaterialVersionEntity(VersionRow row, UUID from) {
+        this(row);
+        this.reprocessedFrom = from;
+    }
+
+    UUID reprocessedFrom() {
+        return reprocessedFrom;
     }
 
     void change(String newState, String newFormat, Long newSize, Instant now) {

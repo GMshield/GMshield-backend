@@ -71,6 +71,12 @@ public final class TestMaterials {
         public List<Content> read(Collection<UUID> ids) {
             return List.of();
         }
+
+        @Override
+        public Carried carryCorrections(UUID fromVersionId, UUID toVersionId,
+                                        java.util.function.Function<List<UUID>, java.util.Optional<Remapped>> remap) {
+            return new Carried(0, 0, 0);
+        }
     };
 
     /** Proposals that are never stored (Story 4.4), for the tests that build the services by hand. */

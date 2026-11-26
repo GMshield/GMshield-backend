@@ -51,6 +51,10 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 4.3 part B: one record as a campaign shows it (a search's record result), the same answer, for a record of a
  * version in the campaign's current scope; its references open the source view on the ground of that scope, whose
  * pages the conversations module serves.
+ *
+ * <p>Story 4.5: a record is corrected on either route ({@code PATCH}), under the same visibility as its read: its name,
+ * type and fields, on the version it names ({@code request.stale_version}, 409, when it moved); anything the read would
+ * not answer is the same {@code request.not_found}.
  */
 @RestController
 @Tag(name = "ontology")
@@ -327,11 +331,12 @@ class OntologyController {
         }
     }
 
-    @Schema(name = "Record", requiredProperties = {"id", "name", "recordType", "fields", "references"})
+    @Schema(name = "Record", requiredProperties = {"id", "name", "recordType", "fields", "references", "version"})
     record RecordView(
             @Schema(description = "The record's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000010")
             String id,
-            @Schema(description = "The record's name, as it was extracted", example = "Fire Bolt") String name,
+            @Schema(description = "The record's name, as it was extracted or as the GM corrected it", example = "Fire Bolt")
+            String name,
             @Schema(description = "The system's record type of the record") RecordTypeOfView recordType,
             @ArraySchema(arraySchema = @Schema(description = "The record's fields, in stored order; empty for a record"
                     + " without fields"), schema = @Schema(implementation = RecordFieldView.class))
@@ -339,17 +344,65 @@ class OntologyController {
             @ArraySchema(arraySchema = @Schema(description = "Where the record was read from: one reference per"
                     + " distinct version, section path and page, in page order"),
                     schema = @Schema(implementation = RecordReferenceView.class))
-            List<RecordReferenceView> references) {
+            List<RecordReferenceView> references,
+            @Schema(description = "The record's version (contract 1.40.0): a correction names it and raises it by one",
+                    format = "int64", minimum = "0", example = "0") long version) {
 
         static RecordView of(Records.Detail detail) {
             return new RecordView(detail.id().toString(), detail.name(), RecordTypeOfView.of(detail.recordType()),
                     detail.fields().stream().map(field -> new RecordFieldView(field.name(), field.value())).toList(),
-                    detail.references().stream().map(RecordReferenceView::of).toList());
+                    detail.references().stream().map(RecordReferenceView::of).toList(), detail.version());
         }
 
         @Override
         public String toString() {
-            return "RecordView[id=" + id + ", fields=" + fields.size() + ", references=" + references.size() + "]";
+            return "RecordView[id=" + id + ", fields=" + fields.size() + ", references=" + references.size()
+                    + ", version=" + version + "]";
+        }
+    }
+
+    @Schema(name = "RecordCorrectionField", requiredProperties = {"name", "value"})
+    record RecordCorrectionFieldBody(
+            @Schema(description = "The field's name: 1 to 200 code points after trimming", minLength = 1,
+                    maxLength = 200, example = "Alcance") String name,
+            @Schema(description = "The field's value: 1 to 8,000 code points after trimming", minLength = 1,
+                    maxLength = 8000, example = "36 metros") String value) {
+
+        @Override
+        public String toString() {
+            return "RecordCorrectionFieldBody";
+        }
+    }
+
+    @Schema(name = "RecordCorrection", requiredProperties = {"version", "name", "recordType", "fields"})
+    record RecordCorrectionBody(
+            @Schema(description = "The version the correction was made on, as the record was read", format = "int64",
+                    minimum = "0", example = "0") Long version,
+            @Schema(description = "The record's name: 1 to 200 code points after trimming", minLength = 1,
+                    maxLength = 200, example = "Fire Bolt") String name,
+            @Schema(description = "The key of one of the system's record types, core or approved (the campaign's"
+                    + " system's on a campaign's route)", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "spell")
+            String recordType,
+            @ArraySchema(arraySchema = @Schema(description = "The record's fields in order, at most 64; each replaces"
+                    + " the stored ones, so a field left out is removed"), maxItems = 64,
+                    schema = @Schema(implementation = RecordCorrectionFieldBody.class))
+            List<RecordCorrectionFieldBody> fields) {
+
+        @Override
+        public String toString() {
+            return "RecordCorrectionBody[version=" + version + ", recordType=" + recordType + ", fields="
+                    + (fields == null ? 0 : fields.size()) + "]";
+        }
+
+        /** The correction, or {@code request.invalid} for a body without a version, name, type or fields. */
+        Records.Correction correction() {
+            if (version == null || version < 0 || name == null || recordType == null || fields == null
+                    || fields.stream().anyMatch(field -> field == null || field.name() == null
+                    || field.value() == null)) {
+                throw invalid();
+            }
+            return new Records.Correction(version, name, recordType, fields.stream()
+                    .map(field -> new Records.Field(field.name(), field.value())).toList());
         }
     }
 
@@ -461,6 +514,62 @@ class OntologyController {
             @PathVariable("recordId") String recordId) {
         return found(parse(campaignId).flatMap(campaign -> parse(recordId)
                 .flatMap(record -> records.inCampaign(campaign, record))).map(RecordView::of));
+    }
+
+    private static final String CORRECTION_SUMMARY = " The name, the type and the fields are replaced together: the"
+            + " name and each field's name and value are trimmed. The record keeps its id and its source references; the"
+            + " next question reads the correction, and its page is indexed again by a job. request.stale_version (409)"
+            + " when the record has left that version; record.name_invalid (400) for a name outside 1 to 200 code points;"
+            + " record.fields_invalid (400) for more than 64 fields; record.field_name_invalid and"
+            + " record.field_value_invalid (400, params min, max and index, the field's position from 0) for a field's"
+            + " name outside 1 to 200 or value outside 1 to 8,000 code points; record.type_invalid (400) for a key that"
+            + " is not one of the system's record types; request.invalid (400) without a version, a name, a type or the"
+            + " fields, or for a malformed body; nothing changes then.";
+
+    @PatchMapping(path = SYSTEM_RECORD, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "correctRecord", summary = "Corrects one record as one of the account's systems shows it"
+            + " (contract 1.40.0), on the version it names: the record as stored, as getRecord answers it, its version"
+            + " raised by one. The type is a key of the system's record types." + CORRECTION_SUMMARY + RECORD_SUMMARY
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<RecordView> correctRecord(
+            @Parameter(description = "The system's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("systemId") String systemId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId,
+            @RequestBody RecordCorrectionBody body) {
+        UUID system = parse(systemId).orElseThrow(OntologyController::notFound);
+        UUID record = parse(recordId).orElseThrow(OntologyController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        return found(records.correct(system, record, body.correction()).map(RecordView::of));
+    }
+
+    @PatchMapping(path = CAMPAIGN_RECORD, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "correctCampaignRecord", summary = "Corrects one record as one of the account's campaigns"
+            + " shows it (contract 1.40.0, a search's record result), on the version it names: the record as stored, as"
+            + " getCampaignRecord answers it, its version raised by one. The type is a key of the campaign's system's"
+            + " record types." + CORRECTION_SUMMARY + " request.not_found (404) for a campaign that is not the"
+            + " account's, and for a record that getCampaignRecord does not answer; none is told apart;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<RecordView> correctCampaignRecord(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId,
+            @RequestBody RecordCorrectionBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(OntologyController::notFound);
+        UUID record = parse(recordId).orElseThrow(OntologyController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        return found(records.correctInCampaign(campaign, record, body.correction()).map(RecordView::of));
     }
 
     @GetMapping(path = SYSTEM_RECORD_PAGE, produces = MediaType.APPLICATION_JSON_VALUE)

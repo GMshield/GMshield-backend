@@ -117,6 +117,9 @@ class CrossOwnerAuditFlowTest {
     private static final String QUESTION = "Quanto dano causa Fire Bolt?";
     private static final String SCOPE_CHANGE = "{\"version\":{scopeVersion},\"campaignTier\":false,\"systemTier\":false,"
             + "\"otherTier\":true,\"modelKnowledge\":true,\"materialsOff\":[]}";
+    /** A record's correction (Story 4.5): valid, so only the record's owner and scope decide the answer. */
+    private static final String RECORD_CORRECTION = "{\"version\":{recordVersion},\"name\":\"Tomado\","
+            + "\"recordType\":\"spell\",\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}]}";
 
     /**
      * One public route that names a library item by id, as the public OpenAPI document writes it. {@code params} are
@@ -188,6 +191,9 @@ class CrossOwnerAuditFlowTest {
             route("GET", "/api/v1/record-types/{id}/records", "id", "recordType"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}", "systemId", "system", "recordId", "record")
                     .own("systemId"),
+            // a record corrected as its system shows it (Story 4.5)
+            route("PATCH", "/api/v1/systems/{systemId}/records/{recordId}", "systemId", "system", "recordId", "record")
+                    .json(RECORD_CORRECTION).own("systemId"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}", "systemId", "system",
                     "recordId", "record", "page", "1").own("systemId"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}/picture", "systemId", "system",
@@ -222,6 +228,9 @@ class CrossOwnerAuditFlowTest {
             // a record as a campaign shows it, for a search's record result (Story 4.3 part B)
             route("GET", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign", "recordId",
                     "record").own("campaignId"),
+            // a record corrected as a campaign shows it (Story 4.5)
+            route("PATCH", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign", "recordId",
+                    "record").json(RECORD_CORRECTION).own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -674,6 +683,7 @@ class CrossOwnerAuditFlowTest {
 
         items.put("systemVersion", version(gm, "/api/v1/systems/" + system));
         items.put("recordTypeVersion", version(gm, "/api/v1/record-types/" + items.get("recordType")));
+        items.put("recordVersion", version(gm, "/api/v1/systems/" + system + "/records/" + items.get("record")));
         items.put("proposalVersion", proposal(gm, system, "record_type").path("version").asString());
         items.put("campaignVersion", version(gm, "/api/v1/campaigns/" + gm.campaign()));
         items.put("scopeVersion", version(gm, "/api/v1/campaigns/" + gm.campaign() + "/scope"));

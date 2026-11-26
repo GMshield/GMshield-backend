@@ -57,4 +57,23 @@ public interface RecordStore {
      * by id. A record without a fingerprint (stored before V37) never matches.
      */
     List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint);
+
+    /**
+     * Writes the GM's correction (Story 4.5) of the current owner's record {@code id}, made on its row version
+     * {@code version}: its type key, name, name fingerprint and fields become the correction's, and its last correction
+     * time; on its first correction, the type key and fingerprint it had are kept as its extracted match key. Its id,
+     * links, ordinal and first page stay. Answers the row as stored, its version raised by one, with its passage ids in
+     * order; empty for an unknown id or another owner's. Throws {@link KnowledgeConflict} {@code STALE_VERSION} when the
+     * row is not at {@code version}, or its version moved meanwhile (nothing is written).
+     */
+    Optional<RecordRow> correct(UUID id, long version, RecordCorrection correction);
+
+    /**
+     * Carries an earlier version's correction over to the current owner's record {@code id} (Story 4.5, at a new
+     * version's acceptance): its type key, name, name fingerprint and fields become the correction's, with its time, and
+     * its extracted match key becomes {@code extractedType} and {@code extractedNameFingerprint} (the corrected record's,
+     * kept from its first correction on). Its id, links, ordinal and first page stay. False for an unknown id or another
+     * owner's.
+     */
+    boolean carry(UUID id, RecordCorrection correction, String extractedType, byte[] extractedNameFingerprint);
 }

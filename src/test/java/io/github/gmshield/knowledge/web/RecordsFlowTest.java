@@ -24,6 +24,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
+import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.library.service.Library;
@@ -32,6 +33,7 @@ import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
 import io.github.gmshield.materials.data.MaterialTestStores;
 import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.ExtractedRecords.Extracted;
 import io.github.gmshield.materials.service.ExtractedRecords.Field;
@@ -113,6 +115,13 @@ import tools.jackson.databind.json.JsonMapper;
  * type of their key, and stay passages in a system that has none (not listed, not opened, not found by a search or an
  * answer of its campaigns, and a worker returning one is refused); a search and a question carry the campaign's
  * system's keys; a type with records cannot be deleted.
+ *
+ * <p>Story 4.5 part A, correct a record: each row of the story's I/O matrix. A correction keeps the record's id and
+ * references, the next question reads it, and a records run of its first page indexes it again; a stale one is refused
+ * and the GM's edits save again on the current version; input outside the limits, a key the system lacks and a record the
+ * page does not show change nothing; a type approved in one system shows there only. A version reprocessing made takes
+ * over the corrections at its acceptance (the nearest matching record, else a copy on the same pages, else dropped and
+ * counted); a replacement upload takes over none.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -124,6 +133,9 @@ class RecordsFlowTest {
     private static final String TUS = "1.0.0";
     private static final int MIB = 1024 * 1024;
     private static final Set<String> OPEN = Set.of("offered", "running", "waiting");
+    /** The passages {@link #ingested} cuts: page 1 under "Magias", two on page 3 under "Magias › Fogo", page 2. */
+    private static final String STANDARD_PASSAGES = passage(1, "\"Magias\"") + "," + passage(3, "\"Magias\",\"Fogo\"")
+            + "," + passage(3, "\"Magias\",\"Fogo\"") + "," + passage(2, "\"Magias\"");
 
     @TestConfiguration
     @Import({LibraryTestStores.class, MaterialTestStores.class, JobMemoryStores.class, ConversationTestStores.class})
@@ -318,7 +330,8 @@ class RecordsFlowTest {
                 gm.session()));
 
         assertThat(read.propertyNames()).containsExactlyInAnyOrder("id", "name", "recordType", "fields",
-                "references");
+                "references", "version");
+        assertThat(read.path("version").asLong()).isZero();
         assertThat(read.path("id").asString()).isEqualTo(ids.get("Bola de Fogo"));
         assertThat(read.path("name").asString()).isEqualTo("Bola de Fogo");
         assertThat(read.path("recordType").path("id").asString()).isEqualTo(typeId(gm, gm.system(), "spell"));
@@ -1160,6 +1173,491 @@ class RecordsFlowTest {
         assertNoLineNames("Ataque Poderoso", "Sortudo", "1 PM", "talento", "vantagem");
     }
 
+    // --- Story 4.5 part A: correct a record
+
+    @Test
+    void aCorrectionKeepsTheRecordsIdAndReferencesIsReadByTheNextQuestionAndIndexesItsPageAgain() throws Exception {
+        Gm gm = signUp();
+        Ingested book = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = book.passages();
+        store(gm, book, List.of(new Extracted("spell", "Fire Boll", List.of(new Field("Alcance", "45 m"),
+                new Field("Nível", "1")), List.of(p.get(0), p.get(3)), 1),
+                new Extracted("spell", "Luz", List.of(), List.of(p.get(0)), 1)));
+        accept(gm, book);
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String path = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        JsonNode before = ok(get(path, gm.session()));
+        RecordRow stored = records.records.get(UUID.fromString(id));
+        List<IndexChangeRow> runsBefore = recordsRuns(book.versionId());
+
+        // Matrix row "Correct": a misread name, one field instead of two, the same type; trimmed.
+        JsonNode corrected = ok(correct(path, gm.session(), 0, "  Fire Bolt ", "spell",
+                List.of(new Field("Alcance", " 36 m "))));
+
+        assertThat(corrected.path("id").asString()).isEqualTo(id);
+        assertThat(corrected.path("version").asLong()).isEqualTo(1);
+        assertThat(corrected.path("name").asString()).isEqualTo("Fire Bolt");
+        assertThat(fieldsOf(corrected)).containsExactly("Alcance=36 m");
+        assertThat(corrected.path("recordType")).isEqualTo(before.path("recordType"));
+        assertThat(corrected.path("references")).isEqualTo(before.path("references"));
+        assertThat(ok(get(path, gm.session()))).isEqualTo(corrected);
+        // Stored in place: the same id, links, ordinal and first page; the name encrypted, its fingerprint worked out
+        // again, and the extracted match key kept.
+        RecordRow row = records.records.get(UUID.fromString(id));
+        assertThat(row.passageIds()).containsExactlyInAnyOrderElementsOf(stored.passageIds());
+        assertThat(row.ordinal()).isEqualTo(stored.ordinal());
+        assertThat(row.firstPage()).isEqualTo(1);
+        assertThat(row.version()).isEqualTo(1);
+        assertThat(row.correctedAt()).isNotNull();
+        assertThat(row.nameFingerprint()).isEqualTo(fingerprint("fire bolt"));
+        assertThat(row.extractedType()).isEqualTo("spell");
+        assertThat(row.extractedNameFingerprint()).isEqualTo(fingerprint("Fire Boll"));
+        assertThat(new String(row.name(), StandardCharsets.UTF_8)).doesNotContain("Fire Bolt");
+        assertThat(new String(row.fields(), StandardCharsets.UTF_8)).doesNotContain("36 m");
+        assertThat(ids(gm, typeId(gm, gm.system(), "spell"))).containsOnlyKeys("Fire Bolt", "Luz");
+
+        // Matrix row "Next question": the answer reads the corrected name and fields, and its reference shows them.
+        Answer answer = asked(gm, "Qual o alcance de Fire Bolt?");
+        JsonNode read = ok(readRecords(answer, List.of(id))).path("records").get(0);
+        assertThat(read.path("name").asString()).isEqualTo("Fire Bolt");
+        assertThat(fieldsOf(read)).containsExactly("Alcance=36 m");
+        events(answer, List.of(delta("O alcance é 36 m."), recordCitation(id, 16)));
+        done(answer);
+        assertThat(fieldsOf(references(gm, answer).get(0))).containsExactly("Alcance=36 m");
+
+        // A records run of its first page joined the version's set: it indexes the page's records with their new text
+        // and type, under the record's own id.
+        List<IndexChangeRow> added = recordsRuns(book.versionId()).stream().filter(run -> !runsBefore.contains(run))
+                .toList();
+        assertThat(added).extracting(IndexChangeRow::firstOrdinal, IndexChangeRow::lastOrdinal, IndexChangeRow::records)
+                .containsExactly(tuple(1, 1, true));
+        JsonNode runClaim = claim(added.getFirst().jobId());
+        String lines = new String(input(added.getFirst().jobId(), runClaim, "records").body(), StandardCharsets.UTF_8);
+        assertThat(lines.lines()).hasSize(2).anyMatch(line -> line.contains("\"id\":\"" + id + "\"")
+                && line.contains("\"name\":\"Fire Bolt\"") && line.contains("\"type\":\"spell\"")
+                && line.contains("36 m"));
+        assertThat(lines).doesNotContain("Fire Boll\"").doesNotContain("45 m");
+        endIngestion();
+        assertNoLineNames("Fire Bolt", "Fire Boll", "36 m");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.record_corrected")
+                && hasPair(event, "found", true) && hasPair(event, "version", 1L) && hasPair(event, "fields", 1));
+    }
+
+    @Test
+    void aStaleCorrectionIsRefusedAndTheGmsEditsSaveAgainOnTheCurrentVersion() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Fire Boll"));
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String path = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        // Tab A saves first.
+        ok(correct(path, gm.session(), 0, "Fire Bolt", "spell", List.of(new Field("Nível", "1"))));
+        RecordRow afterA = records.records.get(UUID.fromString(id));
+        int runs = recordsRuns(book.versionId()).size();
+
+        // Matrix row "Stale save": tab B saves on the version it read.
+        assertProblem(correct(path, gm.session(), 0, "Raio de Fogo", "spell", List.of()), 409,
+                "request.stale_version");
+        assertThat(records.records.get(UUID.fromString(id))).isEqualTo(afterA);
+        assertThat(recordsRuns(book.versionId())).hasSize(runs);
+        // "Ver a versão atual": the record as tab A left it.
+        JsonNode current = ok(get(path, gm.session()));
+        assertThat(current.path("version").asLong()).isEqualTo(1);
+        assertThat(current.path("name").asString()).isEqualTo("Fire Bolt");
+        // "Manter a minha como nova versão": B's edits again, on the current version; the campaign shows the same.
+        JsonNode kept = ok(correct(path, gm.session(), 1, "Raio de Fogo", "spell", List.of()));
+        assertThat(kept.path("version").asLong()).isEqualTo(2);
+        assertThat(kept.path("name").asString()).isEqualTo("Raio de Fogo");
+        assertThat(kept.path("fields")).isEmpty();
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + id, gm.session()))).isEqualTo(kept);
+        // The extracted match key is the first correction's still.
+        assertThat(records.records.get(UUID.fromString(id)).extractedNameFingerprint())
+                .isEqualTo(fingerprint("Fire Boll"));
+        endIngestion();
+    }
+
+    @Test
+    void aCorrectionOutsideTheLimitsOrWithAKeyThatIsNotTheSystemsIsRefusedAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), spells("Fire Boll"));
+        UUID other = createSystem(gm, "Outro");
+        approvedType(gm, other, "Talento", "talento");
+        String id = recordOf(book.versionId(), "Fire Boll");
+        String path = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        RecordRow before = records.records.get(UUID.fromString(id));
+        int changes = index.changes.size();
+        List<Field> tooMany = new ArrayList<>();
+        for (int i = 0; i < 65; i++) {
+            tooMany.add(new Field("Campo " + i, "Valor"));
+        }
+
+        // Matrix row "Bad input": each is refused with the field it names.
+        JsonNode blank = assertProblem(correct(path, gm.session(), 0, "   ", "spell", List.of()), 400,
+                "record.name_invalid");
+        assertThat(blank.path("params").path("min").asInt()).isEqualTo(1);
+        assertThat(blank.path("params").path("max").asInt()).isEqualTo(200);
+        assertProblem(correct(path, gm.session(), 0, "x".repeat(201), "spell", List.of()), 400,
+                "record.name_invalid");
+        JsonNode many = assertProblem(correct(path, gm.session(), 0, "Fire Bolt", "spell", tooMany), 400,
+                "record.fields_invalid");
+        assertThat(many.path("params").path("max").asInt()).isEqualTo(64);
+        JsonNode fieldName = assertProblem(correct(path, gm.session(), 0, "Fire Bolt", "spell",
+                List.of(new Field("Nível", "1"), new Field(" ", "2"))), 400, "record.field_name_invalid");
+        assertThat(fieldName.path("params").path("index").asInt()).isEqualTo(1);
+        assertThat(fieldName.path("params").path("max").asInt()).isEqualTo(200);
+        JsonNode value = assertProblem(correct(path, gm.session(), 0, "Fire Bolt", "spell",
+                List.of(new Field("Nota", "x".repeat(8001)))), 400, "record.field_value_invalid");
+        assertThat(value.path("params").path("index").asInt()).isZero();
+        assertThat(value.path("params").path("max").asInt()).isEqualTo(8000);
+        assertProblem(correct(path, gm.session(), 0, "Fire Bolt", "spell", List.of(new Field("Nota", "  "))), 400,
+                "record.field_value_invalid");
+        // A key the system has no type of: approved only in another system, unknown, or not a key's text.
+        for (String key : List.of("talento", "vehicle", "Spell", "")) {
+            assertProblem(correct(path, gm.session(), 0, "Fire Bolt", key, List.of()), 400, "record.type_invalid");
+        }
+        // A body without a version, a name, a type or the fields, a field without a value, or malformed.
+        for (String body : List.of("{\"name\":\"Fire Bolt\",\"recordType\":\"spell\",\"fields\":[]}",
+                "{\"version\":-1,\"name\":\"Fire Bolt\",\"recordType\":\"spell\",\"fields\":[]}",
+                "{\"version\":0,\"recordType\":\"spell\",\"fields\":[]}",
+                "{\"version\":0,\"name\":\"Fire Bolt\",\"fields\":[]}",
+                "{\"version\":0,\"name\":\"Fire Bolt\",\"recordType\":\"spell\"}",
+                "{\"version\":0,\"name\":\"Fire Bolt\",\"recordType\":\"spell\",\"fields\":[{\"name\":\"Nota\"}]}",
+                "{\"version\":0,\"name\":\"Fire Bolt\",\"recordType\":\"spell\",\"fields\":[null]}",
+                "{\"version\":0,")) {
+            assertProblem(sendText("PATCH", path, gm.session(), body), 400, "request.invalid");
+        }
+        assertThat(records.records.get(UUID.fromString(id))).isEqualTo(before);
+        assertThat(index.changes).hasSize(changes);
+
+        // The limits themselves are accepted: 200 code points (400 UTF-16 units) and 64 fields.
+        String longest = "𝔸".repeat(200);
+        JsonNode edge = ok(correct(path, gm.session(), 0, longest, "spell", tooMany.subList(0, 64)));
+        assertThat(edge.path("name").asString()).isEqualTo(longest);
+        assertThat(edge.path("fields")).hasSize(64);
+        endIngestion();
+    }
+
+    @Test
+    void aCorrectionOfARecordThePageDoesNotShowIsNotFoundLikeAnUnknownOneAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "campaign", gm.campaign().toString()), spells("Luz"));
+        UUID otherSystem = createSystem(gm, "Outro");
+        Ingested elsewhere = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()), spells("Sombra"));
+        Ingested review = ingested(gm, metadata("Rascunho.pdf", "system", gm.system().toString()));
+        store(gm, review, spells("Pendente"));
+        String light = recordOf(book.versionId(), "Luz");
+        String shadow = recordOf(elsewhere.versionId(), "Sombra");
+        String pending = recordOf(review.versionId(), "Pendente");
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String campaign = "/api/v1/campaigns/" + gm.campaign() + "/records/";
+        Map<UUID, RecordRow> before = Map.copyOf(records.records);
+        int changes = index.changes.size();
+
+        // Matrix row "Out of scope": another owner's, needing review, another system's, the other tier while off.
+        Map<String, Object> unknown = withoutTraceId(assertProblem(correct(system + UUID.randomUUID(), gm.session(), 0,
+                "X", "spell", List.of()), 404, "request.not_found"));
+        List<String[]> refused = List.of(
+                new String[] {them.session(), system + light},
+                new String[] {them.session(), "/api/v1/systems/" + them.system() + "/records/" + light},
+                new String[] {them.session(), "/api/v1/campaigns/" + them.campaign() + "/records/" + light},
+                new String[] {gm.session(), system + pending},
+                new String[] {gm.session(), system + shadow},
+                new String[] {gm.session(), system + "not-an-id"},
+                new String[] {gm.session(), campaign + shadow},
+                new String[] {gm.session(), campaign + pending},
+                new String[] {gm.session(), "/api/v1/campaigns/" + UUID.randomUUID() + "/records/" + light},
+                new String[] {gm.session(), "/api/v1/systems/not-an-id/records/" + light});
+        for (String[] request : refused) {
+            HttpResponse<String> answer = correct(request[1], request[0], 0, "X", "spell", List.of());
+            assertThat(withoutTraceId(assertProblem(answer, 404, "request.not_found"))).as(request[1])
+                    .isEqualTo(unknown);
+            assertThat(answer.body()).doesNotContain("Luz").doesNotContain("Sombra").doesNotContain("Pendente");
+        }
+        assertThat(correct(system + light, null, 0, "X", "spell", List.of()).statusCode()).isEqualTo(401);
+        assertThat(records.records).isEqualTo(before);
+        assertThat(index.changes).hasSize(changes);
+
+        // In the campaign's scope it is corrected there, with the campaign's system's types; the other tier once on.
+        JsonNode corrected = ok(correct(campaign + light, gm.session(), 0, "Luz Divina", "spell", List.of()));
+        assertThat(corrected).isEqualTo(ok(get(system + light, gm.session())));
+        scope(gm, true, List.of());
+        assertThat(ok(correct(campaign + shadow, gm.session(), 0, "Sombra Viva", "spell", List.of()))
+                .path("recordType").path("id").asString()).isEqualTo(typeId(gm, gm.system(), "spell"));
+        // Switched off, it is not found again.
+        scope(gm, true, List.of(UUID.fromString(book.materialId())));
+        assertThat(withoutTraceId(assertProblem(correct(campaign + light, gm.session(), 1, "X", "spell", List.of()),
+                404, "request.not_found"))).isEqualTo(unknown);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage()
+                .equals("knowledge.campaign_record_corrected") && hasPair(event, "found", false));
+        endIngestion();
+    }
+
+    @Test
+    void aRecordCorrectedToATypeApprovedInOneSystemShowsThereAndNotInTheOther() throws Exception {
+        Gm gm = signUp();
+        UUID other = createSystem(gm, "Outro");
+        UUID talent = approvedType(gm, gm.system(), "Talento", "talento");
+        Ingested book = accepted(gm, metadata("Livro.pdf", "systems", gm.system() + "," + other), spells("Alerta"));
+        String id = recordOf(book.versionId(), "Alerta");
+        String here = "/api/v1/systems/" + gm.system() + "/records/" + id;
+        String there = "/api/v1/systems/" + other + "/records/" + id;
+        ok(get(there, gm.session()));
+
+        // Matrix row "Type moved".
+        JsonNode moved = ok(correct(here, gm.session(), 0, "Alerta", "talento",
+                List.of(new Field("Pré-requisito", "Nenhum"))));
+
+        assertThat(moved.path("recordType").path("id").asString()).isEqualTo(talent.toString());
+        assertThat(moved.path("recordType").path("key").asString()).isEqualTo("talento");
+        assertThat(moved.path("recordType").path("core").isNull()).isTrue();
+        assertThat(moved.path("recordType").path("name").asString()).isEqualTo("Talento");
+        assertProblem(get(there, gm.session()), 404, "request.not_found");
+        assertProblem(correct(there, gm.session(), 1, "Alerta", "spell", List.of()), 404, "request.not_found");
+        assertThat(ids(gm, talent.toString())).containsOnlyKeys("Alerta");
+        assertThat(ids(gm, typeId(gm, gm.system(), "spell"))).isEmpty();
+        assertThat(ids(gm, typeId(gm, other, "spell"))).isEmpty();
+        // Moved back to a core type, the other system shows it again.
+        ok(correct(here, gm.session(), 1, "Alerta", "spell", List.of()));
+        assertThat(ok(get(there, gm.session())).path("version").asLong()).isEqualTo(2);
+        endIngestion();
+    }
+
+    @Test
+    void aReprocessedVersionTakesOverTheCorrectionsAtItsAcceptanceOnTheNearestMatchingRecord() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Fire Boll", List.of(new Field("Alcance", "45 m")), List.of(p.get(0)), 1),
+                new Extracted("spell", "Escudo", List.of(), List.of(p.get(3)), 2),
+                new Extracted("item", "Corda", List.of(), List.of(p.get(1)), 3)));
+        accept(gm, first);
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String oldBolt = recordOf(first.versionId(), "Fire Boll");
+        ok(correct(system + oldBolt, gm.session(), 0, "Fire Bolt", "spell", List.of(new Field("Alcance", "36 m"))));
+        ok(correct(system + recordOf(first.versionId(), "Escudo"), gm.session(), 0, "Escudo Arcano", "spell",
+                List.of(new Field("Nível", "1"))));
+        Instant correctedAt = records.records.get(UUID.fromString(oldBolt)).correctedAt();
+        Map<UUID, RecordRow> firstRecords = recordsOfVersion(first.versionId());
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        // The new extraction reads the name right this time; "Escudo" twice, on pages 3 and 2.
+        store(gm, second, List.of(
+                new Extracted("spell", "Fire Bolt", List.of(new Field("Alcance", "45 m")), List.of(q.get(0)), 1),
+                new Extracted("spell", "Escudo", List.of(), List.of(q.get(1)), 3),
+                new Extracted("spell", "Escudo", List.of(), List.of(q.get(3)), 2),
+                new Extracted("item", "Corda", List.of(), List.of(q.get(1)), 3)));
+        // While it is in review, nothing is carried over.
+        assertThat(recordsOfVersion(second.versionId()).values()).noneMatch(RecordRow::corrected);
+
+        // Matrix row "Reprocess, match".
+        accept(gm, second);
+
+        String newBolt = recordOf(second.versionId(), "Fire Bolt");
+        assertThat(newBolt).isNotEqualTo(oldBolt);
+        JsonNode bolt = ok(get(system + newBolt, gm.session()));
+        assertThat(fieldsOf(bolt)).containsExactly("Alcance=36 m");
+        assertThat(bolt.path("references")).extracting(reference -> reference.path("versionId").asString())
+                .containsOnly(second.versionId().toString());
+        assertThat(strings(bolt.path("references").get(0).path("passageIds"))).containsExactly(q.get(0).toString());
+        RecordRow carried = records.records.get(UUID.fromString(newBolt));
+        assertThat(carried.correctedAt()).isEqualTo(correctedAt);
+        assertThat(carried.extractedNameFingerprint()).isEqualTo(fingerprint("Fire Boll"));
+        // Of the two "Escudo", the one nearest the corrected record's page took the correction.
+        Map<Integer, String> shields = new LinkedHashMap<>();
+        recordsOfVersion(second.versionId()).values().stream().filter(row -> row.type().equals("spell")
+                && row.firstPage() > 1).forEach(row -> shields.put(row.firstPage(), nameOf(row)));
+        assertThat(shields).containsOnly(Map.entry(2, "Escudo Arcano"), Map.entry(3, "Escudo"));
+        assertThat(recordsOfVersion(second.versionId())).hasSize(4);
+        assertThat(nameOf(records.records.get(UUID.fromString(recordOf(second.versionId(), "Corda")))))
+                .isEqualTo("Corda");
+        // The replaced version's records stay as they were.
+        assertThat(recordsOfVersion(first.versionId())).isEqualTo(firstRecords);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "matched", 2) && hasPair(event, "copied", 0) && hasPair(event, "dropped", 0));
+        assertNoLineNames("Fire Bolt", "Escudo Arcano", "36 m");
+    }
+
+    @Test
+    void theMisreadRecordReadAgainTakesTheCorrectionBeforeANearerRecordWithTheCorrectedName() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        store(gm, first, List.of(new Extracted("spell", "Escudo Arcanoo", List.of(), List.of(first.passages().get(0)),
+                1)));
+        accept(gm, first);
+        ok(correct("/api/v1/systems/" + gm.system() + "/records/" + recordOf(first.versionId(), "Escudo Arcanoo"),
+                gm.session(), 0, "Escudo Arcano", "spell", List.of(new Field("Nível", "1"))));
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        // A record already named as corrected stands on the corrected record's own page; the misread one is read again
+        // two pages further.
+        store(gm, second, List.of(
+                new Extracted("spell", "Escudo Arcano", List.of(), List.of(q.get(0)), 1),
+                new Extracted("spell", "Escudo Arcanoo", List.of(), List.of(q.get(1)), 3)));
+
+        accept(gm, second);
+
+        Map<Integer, RecordRow> byPage = new LinkedHashMap<>();
+        recordsOfVersion(second.versionId()).values().forEach(row -> byPage.put(row.firstPage(), row));
+        assertThat(byPage).containsOnlyKeys(1, 3);
+        // The extracted key wins: the page-3 record takes the correction; the page-1 record is left as it was read.
+        assertThat(nameOf(byPage.get(3))).isEqualTo("Escudo Arcano");
+        assertThat(byPage.get(3).corrected()).isTrue();
+        assertThat(nameOf(byPage.get(1))).isEqualTo("Escudo Arcano");
+        assertThat(byPage.get(1).corrected()).isFalse();
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "matched", 1) && hasPair(event, "copied", 0));
+    }
+
+    @Test
+    void aCorrectionNoNewRecordMatchesIsCopiedOntoTheSamePagesOrDroppedWhenTheyHaveNoPassage() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Raio", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Sombra", List.of(), List.of(p.get(3)), 2),
+                new Extracted("spell", "Luz", List.of(), List.of(p.get(1), p.get(2)), 3)));
+        accept(gm, first);
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String oldRay = recordOf(first.versionId(), "Raio");
+        ok(correct(system + oldRay, gm.session(), 0, "Raio Arcano", "spell", List.of(new Field("Dano", "1d10"))));
+        ok(correct(system + recordOf(first.versionId(), "Sombra"), gm.session(), 0, "Sombra Viva", "spell",
+                List.of()));
+        ok(correct(system + recordOf(first.versionId(), "Luz"), gm.session(), 0, "Luz Eterna", "spell", List.of()));
+        endIngestion();
+
+        // The new version cuts page 1 into a passage under "Magias" and one under "Outro", page 2 under "Outro" only,
+        // and nothing on page 3; it extracts none of the three.
+        Ingested second = reprocessed(gm, first, passage(1, "\"Magias\"") + "," + passage(1, "\"Outro\"") + ","
+                + passage(2, "\"Outro\""));
+        List<UUID> q = second.passages();
+        store(gm, second, List.of(new Extracted("item", "Corda", List.of(), List.of(q.get(0)), 1)));
+
+        // Matrix row "Reprocess, no match".
+        accept(gm, second);
+
+        Map<UUID, RecordRow> fresh = recordsOfVersion(second.versionId());
+        assertThat(fresh.values()).extracting(this::nameOf).containsExactlyInAnyOrder("Corda", "Raio Arcano",
+                "Sombra Viva");
+        String ray = recordOf(second.versionId(), "Raio Arcano");
+        assertThat(ray).isNotEqualTo(oldRay);
+        // Same page and section path first: only the page-1 passage under "Magias".
+        JsonNode copied = ok(get(system + ray, gm.session()));
+        assertThat(copied.path("version").asLong()).isZero();
+        assertThat(fieldsOf(copied)).containsExactly("Dano=1d10");
+        assertThat(copied.path("references")).hasSize(1);
+        assertThat(copied.path("references").get(0).path("versionId").asString())
+                .isEqualTo(second.versionId().toString());
+        assertThat(copied.path("references").get(0).path("page").asInt()).isEqualTo(1);
+        assertThat(strings(copied.path("references").get(0).path("sectionPath"))).containsExactly("Magias");
+        assertThat(strings(copied.path("references").get(0).path("passageIds"))).containsExactly(q.get(0).toString());
+        // Otherwise every passage on the same page.
+        JsonNode shadow = ok(get(system + recordOf(second.versionId(), "Sombra Viva"), gm.session()));
+        assertThat(strings(shadow.path("references").get(0).path("passageIds"))).containsExactly(q.get(2).toString());
+        assertThat(shadow.path("references").get(0).path("page").asInt()).isEqualTo(2);
+        RecordRow copy = records.records.get(UUID.fromString(ray));
+        assertThat(copy.firstPage()).isEqualTo(1);
+        assertThat(copy.corrected()).isTrue();
+        assertThat(copy.extractedNameFingerprint()).isEqualTo(fingerprint("Raio"));
+        assertThat(copy.ordinal()).isGreaterThan(records.records.get(UUID.fromString(recordOf(second.versionId(),
+                "Corda"))).ordinal());
+        // The copies are indexed with the new version's records.
+        assertThat(recordsRuns(second.versionId())).extracting(IndexChangeRow::firstOrdinal,
+                IndexChangeRow::lastOrdinal).containsExactly(tuple(1, 2));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "matched", 0) && hasPair(event, "copied", 2) && hasPair(event, "dropped", 1));
+    }
+
+    @Test
+    void aReplacementUploadTakesOverNoCorrection() throws Exception {
+        Gm gm = signUp();
+        Ingested first = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Fire Boll", 1, List.of(new Field("Alcance", "45 m")))));
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        ok(correct(system + recordOf(first.versionId(), "Fire Boll"), gm.session(), 0, "Fire Bolt", "spell",
+                List.of()));
+        endIngestion();
+
+        // Matrix row "Replace upload".
+        String[] uploaded = upload(gm, pdf(MIB + 5), metadata("Livro 2.pdf", "material", first.materialId()));
+        Ingested second = read(uploaded[0], UUID.fromString(uploaded[1]), STANDARD_PASSAGES);
+        assertThat(materials.reprocessedLinks).doesNotContainKey(second.versionId());
+        store(gm, second, List.of(record("spell", "Fire Boll", 1, List.of(new Field("Alcance", "45 m")))));
+        accept(gm, second);
+
+        assertThat(recordsOfVersion(second.versionId()).values()).noneMatch(RecordRow::corrected)
+                .extracting(this::nameOf).containsExactly("Fire Boll");
+        assertThat(logged.list).noneMatch(event -> event.getFormattedMessage().equals("material.corrections_carried"));
+    }
+
+    private HttpResponse<String> correct(String path, String session, long version, String name, String recordType,
+                                         List<Field> fields) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("version", version);
+        body.put("name", name);
+        body.put("recordType", recordType);
+        body.put("fields", fields.stream().map(field -> Map.of("name", field.name(), "value", field.value()))
+                .toList());
+        return send("PATCH", path, session, body);
+    }
+
+    /** A record's fields as {@code name=value}, in order. */
+    private static List<String> fieldsOf(JsonNode record) {
+        List<String> found = new ArrayList<>();
+        record.path("fields").forEach(field -> found.add(field.path("name").asString() + "="
+                + field.path("value").asString()));
+        return found;
+    }
+
+    private byte[] fingerprint(String name) {
+        return vault.fingerprint("record", "name", Library.uniqueForm(name));
+    }
+
+    private String nameOf(RecordRow row) {
+        return vault.decryptText(new Binding("record", "name", row.id(), row.ownerId()), row.name());
+    }
+
+    private Map<UUID, RecordRow> recordsOfVersion(UUID versionId) {
+        Map<UUID, RecordRow> found = new LinkedHashMap<>();
+        records.records.values().stream().filter(row -> row.versionId().equals(versionId))
+                .forEach(row -> found.put(row.id(), row));
+        return found;
+    }
+
+    /** The accepted version reprocessed (Story 3.4): its new version read through, cut into {@code passages}. */
+    private Ingested reprocessed(Gm gm, Ingested accepted, String passages) throws Exception {
+        HttpResponse<String> answer = send("POST", "/api/v1/materials/" + accepted.materialId() + "/reprocess",
+                gm.session(), null);
+        assertThat(answer.statusCode()).as(answer.body()).isEqualTo(200);
+        UUID fresh = materials.versions.values().stream().filter(version -> version.materialId().toString()
+                .equals(accepted.materialId()) && version.state().equals("waiting")).map(VersionRow::id).findFirst()
+                .orElseThrow();
+        assertThat(materials.reprocessedLinks).containsEntry(fresh, accepted.versionId());
+        return read(accepted.materialId(), fresh, passages);
+    }
+
+    private HttpResponse<byte[]> input(UUID jobId, JsonNode claim, String name) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(uri("/internal/v1/jobs/" + jobId + "/claims/"
+                        + claim.path("claimId").asString() + "/inputs/" + name))
+                .header("Authorization", "Bearer " + WORKER_CREDENTIAL)
+                .header("X-Job-Grant", claim.path("grant").asString()).GET().build();
+        return client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private HttpResponse<String> sendText(String method, String path, String session, String body) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(uri(path)).header("Authorization", "Bearer " + CREDENTIAL)
+                .header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofString(body));
+        if (session != null) {
+            request.header("X-Session-Token", session);
+        }
+        return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
     // --- helpers: answers
 
     /** A question of the GM's current campaign, its turn's conversation, and its answer job claimed as the worker. */
@@ -1439,7 +1937,17 @@ class RecordsFlowTest {
      */
     private Ingested ingested(Gm gm, String metadata) throws Exception {
         String[] uploaded = upload(gm, pdf(MIB), metadata);
-        UUID versionId = UUID.fromString(uploaded[1]);
+        Ingested ingested = read(uploaded[0], UUID.fromString(uploaded[1]), STANDARD_PASSAGES);
+        assertThat(ingested.passages()).hasSize(4);
+        return ingested;
+    }
+
+    /**
+     * The version {@code versionId} of the material, waiting with its first step (a clean step) offered, read through
+     * the worker's internal API as {@link #ingested} says, cut into {@code passages} (a JSON list's items). It needs
+     * review.
+     */
+    private Ingested read(String materialId, UUID versionId, String passages) throws Exception {
         UUID clean = offeredJob(versionId);
         JsonNode claim = claim(clean);
         UUID original = output(clean, claim, pdf(4000));
@@ -1468,16 +1976,14 @@ class RecordsFlowTest {
                 + "\"outcome\":\"read_directly\"}],\"texts\":[{\"fileId\":\"" + text + "\",\"firstPage\":1,"
                 + "\"lastPage\":3}],\"pageViews\":[" + views + "],\"next\":[]}");
 
-        UUID passages = offeredJob(versionId);
-        report(passages, claim(passages), "{\"pipelineVersion\":\"2\",\"passages\":["
-                + passage(1, "\"Magias\"") + "," + passage(3, "\"Magias\",\"Fogo\"") + ","
-                + passage(3, "\"Magias\",\"Fogo\"") + "," + passage(2, "\"Magias\"") + "],\"outline\":[{\"level\":1,"
-                + "\"title\":\"Magias\",\"page\":1},{\"level\":2,\"title\":\"Fogo\",\"page\":3}],\"next\":[]}");
+        UUID cut = offeredJob(versionId);
+        report(cut, claim(cut), "{\"pipelineVersion\":\"2\",\"passages\":[" + passages + "],\"outline\":[{"
+                + "\"level\":1,\"title\":\"Magias\",\"page\":1},{\"level\":2,\"title\":\"Fogo\",\"page\":3}],"
+                + "\"next\":[]}");
         assertThat(materials.versions.get(versionId).state()).isEqualTo("needs_review");
         List<UUID> stored = materials.passages.values().stream().filter(row -> row.versionId().equals(versionId))
                 .sorted(Comparator.comparingInt(PassageRow::ordinal)).map(PassageRow::id).toList();
-        assertThat(stored).hasSize(4);
-        return new Ingested(uploaded[0], versionId, stored);
+        return new Ingested(materialId, versionId, stored);
     }
 
     /**

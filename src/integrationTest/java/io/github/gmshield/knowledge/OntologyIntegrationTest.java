@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.knowledge.data.KnowledgeStore;
+import io.github.gmshield.knowledge.data.RecordCorrection;
+import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.knowledge.service.CoreRecordTypes;
 import io.github.gmshield.knowledge.service.CoreTypeBackfill;
@@ -19,6 +21,8 @@ import io.github.gmshield.materials.data.MaterialSystemRow;
 import io.github.gmshield.materials.data.PassageRow;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
+import io.github.gmshield.materials.service.MaterialActions;
+import io.github.gmshield.materials.service.RecordIndexing;
 import io.github.gmshield.materials.service.RecordTypeKeys;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
@@ -33,6 +37,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
@@ -53,7 +62,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ready event; the table refuses an unknown core
  * key, a second core type of a key, a name the system has and another owner's system; a core type is neither renamed
  * nor removed, a type that is not core is renamed on its version and removed; another owner reads nothing; and a
- * system's deletion removes its record types before its row.
+ * system's deletion removes its record types before its row. Story 4.5: a correction is stored in place, encrypted, with
+ * its version, time and extracted match key, and a records run of its page; and the acceptance of a version reprocessing
+ * made takes the corrections over (a matched record, and a copy on the same page).
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the two share one application context.
@@ -286,6 +297,188 @@ class OntologyIntegrationTest {
         UUID approved = as(a.id(), () -> proposals.approve(proposal, 0, null)).orElseThrow().resultId();
         assertThat(jdbc.sql("select key from record_type where id = ?").param(approved).query(String.class).single())
                 .isEqualTo("spell_2");
+    }
+
+    // --- Story 4.5: correct a record, and carry corrections over to a reprocessed version
+
+    @Autowired
+    private MaterialActions actions;
+
+    @Test
+    void aCorrectionIsStoredInPlaceEncryptedAndAReprocessedVersionTakesItOverAtAcceptanceOnPostgres() throws Exception {
+        Owner a = owner();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID first = Ids.newId();
+        List<UUID> oldPassages = List.of(Ids.newId(), Ids.newId());
+        write(a.id(), () -> {
+            materials.insertMaterial(new MaterialRow(material, a.id(), vault.encryptText(new Binding("material", "name",
+                    material, a.id()), "Livro"), now, "rulebook", null, null));
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), a.id(), material, a.system(), now));
+            materials.insertVersion(new VersionRow(first, a.id(), material, "ready", "pdf", 1000L, now, now));
+            materials.insertPassages(List.of(passage(a.id(), first, oldPassages.get(0), 0, 1, "Magias"),
+                    passage(a.id(), first, oldPassages.get(1), 1, 2, "Magias")));
+            extracted.replaceRange(first, 1, 2, List.of(
+                    new ExtractedRecords.Extracted("spell", "Luz", List.of(), List.of(oldPassages.get(0)), 1),
+                    new ExtractedRecords.Extracted("spell", "Sombra", List.of(), List.of(oldPassages.get(1)), 2)));
+        });
+        UUID light = recordNamed(first, a.id(), "Luz");
+        UUID shadow = recordNamed(first, a.id(), "Sombra");
+
+        Records.Detail corrected = as(a.id(), () -> records.correct(a.system(), light, new Records.Correction(0,
+                "Luz Divina", "spell", List.of(new Records.Field("Alcance", "Toque"))))).orElseThrow();
+        as(a.id(), () -> records.correct(a.system(), shadow, new Records.Correction(0, "Sombra Viva", "spell",
+                List.of())));
+
+        assertThat(corrected.version()).isEqualTo(1);
+        Map<String, Object> row = jdbc.sql("select version, corrected_at, type, extracted_type, name,"
+                + " name_fingerprint, extracted_name_fingerprint, first_page from record where id = ?").param(light)
+                .query().singleRow();
+        assertThat(row.get("version")).isEqualTo(1L);
+        assertThat(row.get("corrected_at")).isNotNull();
+        assertThat(row.get("extracted_type")).isEqualTo("spell");
+        assertThat((byte[]) row.get("extracted_name_fingerprint"))
+                .isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm("Luz")));
+        assertThat((byte[]) row.get("name_fingerprint"))
+                .isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm("Luz Divina")));
+        assertThat(new String((byte[]) row.get("name"), StandardCharsets.ISO_8859_1)).doesNotContain("Luz Divina");
+        assertThat(vault.decryptText(new Binding("record", "name", light, a.id()), (byte[]) row.get("name")))
+                .isEqualTo("Luz Divina");
+        assertThat(count("record_passage", "record_id = ? and passage_id = ?", light, oldPassages.get(0))).isOne();
+        // A records run of each corrected record's first page joined the version's set.
+        assertThat(jdbc.sql("select first_ordinal from index_change where version_id = ? and records"
+                + " and first_ordinal = last_ordinal order by first_ordinal").param(first).query(Integer.class).list())
+                .containsExactly(1, 2);
+        // A stale version is refused and changes nothing.
+        assertThat(code(() -> as(a.id(), () -> records.correct(a.system(), light, new Records.Correction(0,
+                "Outra", "spell", List.of()))))).isEqualTo("request.stale_version");
+        assertThat(count("record", "id = ? and version = 1", light)).isOne();
+        // A second correction on the current version keeps the extracted key of the first.
+        assertThat(as(a.id(), () -> records.correct(a.system(), light, new Records.Correction(1, "Luz Divina", "spell",
+                List.of(new Records.Field("Alcance", "Toque"), new Records.Field("Duração", "1 hora"))))).orElseThrow()
+                .version()).isEqualTo(2);
+        Map<String, Object> again = jdbc.sql("select version, extracted_type, extracted_name_fingerprint from record"
+                + " where id = ?").param(light).query().singleRow();
+        assertThat(again.get("version")).isEqualTo(2L);
+        assertThat(again.get("extracted_type")).isEqualTo("spell");
+        assertThat((byte[]) again.get("extracted_name_fingerprint"))
+                .isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm("Luz")));
+
+        // A version reprocessing made from it, in review: "Luz" read again on page 1, nothing on page 2's "Sombra".
+        UUID second = Ids.newId();
+        List<UUID> newPassages = List.of(Ids.newId(), Ids.newId());
+        write(a.id(), () -> {
+            materials.insertVersion(new VersionRow(second, a.id(), material, "needs_review", "pdf", 1000L, now, now),
+                    first);
+            materials.insertPassages(List.of(passage(a.id(), second, newPassages.get(0), 0, 1, "Magias"),
+                    passage(a.id(), second, newPassages.get(1), 1, 2, "Outro")));
+            extracted.replaceRange(second, 1, 2, List.of(new ExtractedRecords.Extracted("spell", "Luz", List.of(),
+                    List.of(newPassages.get(0)), 1)));
+        });
+        assertThat(jdbc.sql("select reprocessed_from from material_version where id = ?").param(second)
+                .query(UUID.class).single()).isEqualTo(first);
+
+        as(a.id(), () -> actions.act(material, "accept"));
+
+        UUID matched = recordNamed(second, a.id(), "Luz Divina");
+        UUID copied = recordNamed(second, a.id(), "Sombra Viva");
+        assertThat(jdbc.sql("select extracted_type from record where id = ?").param(matched).query(String.class)
+                .single()).isEqualTo("spell");
+        assertThat(jdbc.sql("select passage_id from record_passage where record_id = ?").param(matched)
+                .query(UUID.class).list()).containsExactly(newPassages.get(0));
+        assertThat(jdbc.sql("select passage_id from record_passage where record_id = ?").param(copied)
+                .query(UUID.class).list()).containsExactly(newPassages.get(1));
+        assertThat(jdbc.sql("select first_page from record where id = ?").param(copied).query(Integer.class)
+                .single()).isEqualTo(2);
+        assertThat(as(a.id(), () -> records.record(a.system(), matched)).orElseThrow().fields())
+                .extracting(Records.Field::name).containsExactly("Alcance", "Duração");
+        // Both keep the corrected record's time and extracted key.
+        for (Object[] carried : List.of(new Object[] {matched, "Luz"}, new Object[] {copied, "Sombra"})) {
+            Map<String, Object> stored = jdbc.sql("select corrected_at, extracted_type, extracted_name_fingerprint"
+                    + " from record where id = ?").param(carried[0]).query().singleRow();
+            assertThat(stored.get("corrected_at")).as("%s", carried[1]).isNotNull();
+            assertThat(stored.get("extracted_type")).as("%s", carried[1]).isEqualTo("spell");
+            assertThat((byte[]) stored.get("extracted_name_fingerprint")).as("%s", carried[1])
+                    .isEqualTo(vault.fingerprint("record", "name", Library.uniqueForm((String) carried[1])));
+        }
+        // The replaced version's records stay.
+        assertThat(count("record", "version_id = ?", first)).isEqualTo(2);
+        assertThat(count("record", "version_id = ?", second)).isEqualTo(2);
+    }
+
+    @Autowired
+    private RecordIndexing recordIndexing;
+    @Autowired
+    private RecordStore recordStore;
+
+    @Test
+    void twoOverlappingCorrectionsOnOneVersionStoreOneAndRefuseTheOtherAsStaleOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID record = spellRecord(a.id(), a.system());
+        UUID version = jdbc.sql("select version_id from record where id = ?").param(record).query(UUID.class).single();
+        CountDownLatch written = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            // The first correction holds the version's lock and its write, not committed yet.
+            Future<Long> first = pool.submit(() -> as(a.id(), () -> new TransactionTemplate(transactions).execute(
+                    status -> {
+                        assertThat(recordIndexing.lockReady(version)).isTrue();
+                        long stored = recordStore.correct(record, 0, new RecordCorrection("spell",
+                                vault.encryptText(new Binding("record", "name", record, a.id()), "Luz Primeira"),
+                                vault.fingerprint("record", "name", Library.uniqueForm("Luz Primeira")),
+                                vault.encrypt(new Binding("record", "fields", record, a.id()),
+                                        "[]".getBytes(StandardCharsets.UTF_8)), Instant.now()))
+                                .orElseThrow().version();
+                        written.countDown();
+                        try {
+                            release.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException stopped) {
+                            Thread.currentThread().interrupt();
+                        }
+                        return stored;
+                    })));
+            assertThat(written.await(30, TimeUnit.SECONDS)).isTrue();
+            // The second reads the record at version 0, then waits for the version's lock.
+            Future<String> second = pool.submit(() -> code(() -> as(a.id(), () -> records.correct(a.system(), record,
+                    new Records.Correction(0, "Luz Segunda", "spell", List.of())))));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (jdbc.sql("select count(*) from pg_stat_activity where wait_event_type = 'Lock'").query(Long.class)
+                    .single() == 0) {
+                assertThat(System.nanoTime()).as("the second correction waits for the version").isLessThan(deadline);
+                Thread.sleep(20);
+            }
+            release.countDown();
+
+            assertThat(first.get(30, TimeUnit.SECONDS)).isEqualTo(1L);
+            assertThat(second.get(30, TimeUnit.SECONDS)).isEqualTo("request.stale_version");
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+        Map<String, Object> row = jdbc.sql("select version, name from record where id = ?").param(record).query()
+                .singleRow();
+        assertThat(row.get("version")).isEqualTo(1L);
+        assertThat(vault.decryptText(new Binding("record", "name", record, a.id()), (byte[]) row.get("name")))
+                .isEqualTo("Luz Primeira");
+        // Only the stored correction added a records run of the page.
+        assertThat(count("index_change", "version_id = ? and records and first_ordinal = 1 and last_ordinal = 1",
+                version)).isZero();
+    }
+
+    private PassageRow passage(UUID owner, UUID version, UUID id, int ordinal, int page, String section) {
+        byte[] place = ("{\"sectionPath\":[\"" + section + "\"],\"range\":[0,4]}").getBytes(StandardCharsets.UTF_8);
+        return new PassageRow(id, owner, version, ordinal, page, vault.encryptText(new Binding("passage", "text", id,
+                owner), "Texto."), vault.encrypt(new Binding("passage", "place", id, owner), place),
+                Instant.now().truncatedTo(ChronoUnit.MICROS));
+    }
+
+    /** The id of the version's record with this name, its name decrypted. */
+    private UUID recordNamed(UUID version, UUID owner, String name) {
+        return jdbc.sql("select id, name from record where version_id = ?").param(version).query().listOfRows()
+                .stream().filter(row -> name.equals(vault.decryptText(new Binding("record", "name",
+                        (UUID) row.get("id"), owner), (byte[]) row.get("name"))))
+                .map(row -> (UUID) row.get("id")).findFirst().orElseThrow();
     }
 
     // --- deletion

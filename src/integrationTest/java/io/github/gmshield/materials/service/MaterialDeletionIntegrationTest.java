@@ -45,7 +45,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * removal waits for a running claim and takes a replacement whose upload completed during the wait; a failed
  * {@code index.removal} gets a new job and its row moves to it. Story 4.2: a material's deletion and a system's
  * take the records of their versions with them (no reference cascades), even when an earlier pass already ran a
- * version's removal and left its records.
+ * version's removal and left its records. Story 4.5: a version that later versions name as the one reprocessing read
+ * again goes, and they forget it ({@code reprocessed_from} cleared), and the material then goes with all of them.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so both share one application context (and its
@@ -300,6 +301,36 @@ class MaterialDeletionIntegrationTest {
     }
 
     @Test
+    void aVersionReprocessingReadAgainGoesAndTheVersionsThatNameItForgetItThenTheMaterialGoesOnPostgres()
+            throws Exception {
+        Owner a = owner();
+        UUID material = materialWith(a.id(), a.campaign(), null);
+        UUID first = versionWithPage(a.id(), material, "superseded", Instant.now().minusSeconds(120));
+        // Story 4.5: two reprocesses, each version naming the one it was read again from.
+        UUID second = reprocessedVersion(a.id(), material, "superseded", first, Instant.now().minusSeconds(60));
+        UUID third = reprocessedVersion(a.id(), material, "ready", second, Instant.now());
+        assertThat(as(a.id(), () -> store.reprocessedFrom(second))).contains(first);
+
+        assertThat(as(a.id(), () -> materialDeletions.removeVersion(material, first))).isTrue();
+        UUID removal = jdbc.sql("select id from deletion where target_id = ? and kind = 'version'").param(first)
+                .query(UUID.class).single();
+        assertThat(deletion.run(a.id(), removal)).isTrue();
+
+        assertThat(count("material_version", "id = ?", first)).isZero();
+        assertThat(count("material_version", "id = ? and reprocessed_from is null", second)).isOne();
+        assertThat(as(a.id(), () -> store.reprocessedFrom(second))).isEmpty();
+        assertThat(as(a.id(), () -> store.reprocessedFrom(third))).contains(second);
+
+        assertThat(as(a.id(), () -> materialDeletions.delete(material))).isTrue();
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(material).query(UUID.class)
+                .single();
+        assertThat(deletion.run(a.id(), deletionId)).isTrue();
+
+        assertThat(count("material", "id = ?", material)).isZero();
+        assertThat(count("material_version", "material_id = ?", material)).isZero();
+    }
+
+    @Test
     void aMaterialsRemovalWaitsForARunningClaimAndTakesAReplacementCompletedDuringTheWaitOnPostgres()
             throws Exception {
         Owner b = owner();
@@ -440,6 +471,21 @@ class MaterialDeletionIntegrationTest {
         write(owner, () -> {
             store.insertVersion(new VersionRow(version, owner, material, state, "pdf", 10L, created, created, 1, "5",
                     null));
+            UUID view = Ids.newId();
+            store.insertPageView(new PageViewRow(view, owner, version, 1, null, null, null,
+                    vault.encrypt(PageViews.content(view, owner), PageViews.contentJson(new PageViews.Content(
+                            List.of(), "Texto"))), created));
+        });
+        return version;
+    }
+
+    /** A version of the material that reprocessing read again from {@code from} (Story 4.5), with one text page. */
+    private UUID reprocessedVersion(UUID owner, UUID material, String state, UUID from, Instant at) throws Exception {
+        UUID version = Ids.newId();
+        Instant created = at.truncatedTo(ChronoUnit.MICROS);
+        write(owner, () -> {
+            store.insertVersion(new VersionRow(version, owner, material, state, "pdf", 10L, created, created, 1, "5",
+                    null), from);
             UUID view = Ids.newId();
             store.insertPageView(new PageViewRow(view, owner, version, 1, null, null, null,
                     vault.encrypt(PageViews.content(view, owner), PageViews.contentJson(new PageViews.Content(

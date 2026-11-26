@@ -107,10 +107,51 @@ public class InMemoryRecordStore implements RecordStore {
                 .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
     }
 
+    @Override
+    public synchronized Optional<RecordRow> correct(UUID id, long version, RecordCorrection correction) {
+        UUID owner = OwnerContext.require();
+        RecordRow before = records.get(id);
+        if (before == null || !before.ownerId().equals(owner)) {
+            return Optional.empty();
+        }
+        if (before.version() != version) {
+            throw new KnowledgeConflict(KnowledgeConflict.Reason.STALE_VERSION);
+        }
+        String keptType = before.corrected() ? before.extractedType() : before.type();
+        byte[] keptFingerprint = before.corrected() ? before.extractedNameFingerprint() : before.nameFingerprint();
+        RecordRow after = written(before, correction, keptType, keptFingerprint);
+        return Optional.of(withLinks(after, after.passageIds().stream().sorted().toList()));
+    }
+
+    @Override
+    public synchronized boolean carry(UUID id, RecordCorrection correction, String extractedType,
+                                      byte[] extractedNameFingerprint) {
+        UUID owner = OwnerContext.require();
+        RecordRow before = records.get(id);
+        if (before == null || !before.ownerId().equals(owner)) {
+            return false;
+        }
+        written(before, correction, extractedType, extractedNameFingerprint);
+        return true;
+    }
+
+    /** Writes the correction over the row, its version raised by one, as the table's update does. */
+    private RecordRow written(RecordRow before, RecordCorrection correction, String keptType, byte[] keptFingerprint) {
+        if (!TYPE.matcher(correction.type()).matches() || keptType == null) {
+            throw new IllegalStateException("check refused");
+        }
+        RecordRow after = new RecordRow(before.id(), before.ownerId(), before.versionId(), before.ordinal(),
+                before.firstPage(), correction.type(), correction.name(), correction.nameFingerprint(),
+                correction.fields(), before.passageIds(), before.createdAt(), before.version() + 1,
+                correction.correctedAt(), keptType, keptFingerprint);
+        records.put(after.id(), after);
+        RollbackUndo.onRollback(() -> records.put(before.id(), before));
+        return after;
+    }
+
     /** The row as the JPA store reads it: its links by passage id, or none for a list. */
     private static RecordRow withLinks(RecordRow row, List<UUID> passageIds) {
-        return new RecordRow(row.id(), row.ownerId(), row.versionId(), row.ordinal(), row.firstPage(), row.type(),
-                row.name(), row.nameFingerprint(), row.fields(), passageIds, row.createdAt());
+        return row.withPassages(passageIds);
     }
 
     private int delete(List<RecordRow> found) {

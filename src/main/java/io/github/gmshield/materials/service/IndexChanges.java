@@ -164,6 +164,19 @@ public class IndexChanges implements JobHandler {
         return recordJobs;
     }
 
+    /**
+     * Adds a records run of one page to the version's set (Story 4.5: a corrected record's page is indexed again), in the
+     * caller's transaction, with the version locked and {@code ready}: its points keep their ids and get the new text and
+     * record type. The version's recipe stays: the run reports the same one.
+     */
+    void startPage(VersionRow version, int page) {
+        UUID owner = OwnerContext.require();
+        JobRef job = jobs.create(KIND, created -> index.insertChange(new IndexChangeRow(created.id(), owner,
+                version.id(), page, page, null, 0, true)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("versionId", version.id()).addKeyValue("page", page)
+                .addKeyValue("jobId", job.id()).log("index.records_page_started");
+    }
+
     /** Creates a records run's job for each of {@link #recordRuns}, in page order; answers how many. */
     private int startRecords(UUID owner, UUID versionId, List<Integer> pages) {
         int created = 0;
