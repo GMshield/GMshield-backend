@@ -53,6 +53,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * other conversations or of the searches goes, and a conversation already gone (its campaign's or system's deletion
  * took it) is nothing to do. {@link #count} counts {@code ready} conversations only, so a deleting one leaves its
  * campaign's counts at once.
+ *
+ * <p>Story 5.2 part B: an artifact's deletion ({@link Going#ofOneArtifact}) takes nothing here: a turn's reference to
+ * it is stored by value, and reads as a removed source once the artifact is deleting or gone.
  */
 @Service
 class SystemConversationsDeletion implements SystemDeletionHandler {
@@ -89,7 +92,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public Optional<Instant> prepare(Going going) {
-        if (going.ofMaterials()) {
+        if (going.ofMaterials() || going.ofOneArtifact()) {
             return Optional.empty();
         }
         if (going.ofOneConversation()) {
@@ -109,7 +112,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public void remove(Going going) {
-        if (going.ofMaterials()) {
+        if (going.ofMaterials() || going.ofOneArtifact()) {
             return;
         }
         UUID owner = OwnerContext.require();

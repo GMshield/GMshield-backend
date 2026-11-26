@@ -33,6 +33,10 @@ class ArtifactVersionEntity {
     @Column(name = "owner_id", nullable = false, updatable = false)
     private UUID ownerId;
 
+    /** The version's record type key (Story 5.2, V45). */
+    @Column(name = "record_type", nullable = false, updatable = false)
+    private String recordType;
+
     @Column(name = "name", nullable = false, updatable = false)
     private byte[] name;
 
@@ -53,6 +57,7 @@ class ArtifactVersionEntity {
         this.recordId = row.recordId();
         this.number = row.number();
         this.ownerId = row.ownerId();
+        this.recordType = row.recordType();
         this.name = row.name();
         this.fields = row.fields();
         this.content = row.content();
@@ -60,7 +65,7 @@ class ArtifactVersionEntity {
     }
 
     ArtifactVersionRow row() {
-        return new ArtifactVersionRow(recordId, ownerId, number, name, fields, content, createdAt);
+        return new ArtifactVersionRow(recordId, ownerId, number, recordType, name, fields, content, createdAt);
     }
 
     /** The version's identity: its record and its number. */

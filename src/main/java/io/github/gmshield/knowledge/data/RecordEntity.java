@@ -176,6 +176,25 @@ class RecordEntity {
         this.correctedAt = correction.correctedAt();
     }
 
+    /** An artifact's type key, as its newest version's (Story 5.2); only an artifact's retype calls it. */
+    void retype(String type) {
+        if (campaignId == null) {
+            throw new IllegalStateException("knowledge.not_an_artifact");
+        }
+        this.recordType = type;
+    }
+
+    /**
+     * The GM's delete of an artifact (Story 5.2 part B): the row is deleting from {@code at} until its deletion's pass
+     * removes it; no point time is set. Hibernate raises the version when it writes it.
+     */
+    void markDeleting(Instant at) {
+        if (campaignId == null) {
+            throw new IllegalStateException("knowledge.not_an_artifact");
+        }
+        this.deletedAt = at;
+    }
+
     /** The row of an artifact (Story 5.1); only an artifact read calls it, and only on a row with a campaign. */
     ArtifactRow artifact() {
         if (campaignId == null) {

@@ -101,7 +101,9 @@ class JobRecordController {
             + " an id that is not a UUID, before the grant is checked; 403 job.grant_refused; 400 job.records_invalid"
             + " for no id, more than 100 or a null one; 403 job.records_refused for a job whose kind reads no record;"
             + " 404 request.not_found when the job's campaign is gone; 403 scope.passage_refused, with nothing read,"
-            + " when any id is not a record within the job's scope, whatever the reason)")
+            + " when any id is not a record within the job's scope, whatever the reason, except that an id of an"
+            + " artifact the GM deleted (being deleted or gone) is left out with 200 and fewer records than asked;"
+            + " the worker then fails the attempt for a retry, whose scope no longer holds the artifact)")
     ResponseEntity<JobRecordsView> records(@PathVariable UUID jobId, @PathVariable UUID claimId,
                                            @Parameter(in = ParameterIn.HEADER, name = JobClaimController.GRANT_HEADER,
                                                    required = true, description = "The claim's grant")

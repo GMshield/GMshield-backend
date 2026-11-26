@@ -44,7 +44,11 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code artifact_index} row keyed by the job, which names the version and records the recipe its result reported.
  *
  * <ul>
- *   <li>{@link #start}: in the caller's transaction (an artifact's save), a job for the version.</li>
+ *   <li>{@link #start}: in the caller's transaction (an artifact's save, edit or restore), a job for the version. From
+ *       Story 5.2 it first cancels the unended jobs of the artifact's older versions: the worker keeps one point per
+ *       artifact, so an older version's job must never finish after the newer one's and leave its text searchable.
+ *       {@link #lockUnended} takes those jobs' locks before the writer locks the version, in the order a job's
+ *       completion takes them (its job, then its version).</li>
  *   <li>{@link #input}: at the claim, the input of a records run of one record: {@code source} (the artifact's id),
  *       {@code owner}, {@code kind} {@value #ARTIFACT_KIND}, {@code language} null, {@code tokenKey} (Base64 of
  *       {@link Vault#ownerTokenKey}, never logged or stored) and {@code records}, the name of its input.</li>
@@ -56,10 +60,12 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>{@link #reconcile} (the backfill, {@link ArtifactIndexReconcile}): in the caller's transaction, as one owner,
  *       each newest version that no row reports under the stated recipe, of a campaign still readable and with no
  *       unended job, gets a new job, with the version locked (its earlier rows go). So the artifacts saved before part B
- *       are indexed the first time the worker states its recipe, and all of them again under a new one.</li>
+ *       are indexed the first time the worker states its recipe, and all of them again under a new one. From Story 5.2
+ *       a version that is no longer the newest once locked (an edit committed meanwhile) is skipped.</li>
  *   <li>{@link #retryFailed} ({@link ArtifactIndexRetrySweep}): each of the owner's rows whose job ended
- *       {@code failed}, with fewer than {@link ArtifactIndexRow#MAX_RETRIES} retries, of a campaign still readable,
- *       gets a new job; the row moves to it and counts one more retry. A failed job stays as history.</li>
+ *       {@code failed}, with fewer than {@link ArtifactIndexRow#MAX_RETRIES} retries, of its artifact's newest version
+ *       (Story 5.2: an older version is never indexed again) and of a campaign still readable, gets a new job; the
+ *       row moves to it and counts one more retry. A failed job stays as history.</li>
  *   <li>{@link #cancel} (a campaign's or a system's deletion): the unended jobs of these artifacts are cancelled.</li>
  * </ul>
  *
@@ -99,14 +105,40 @@ public class ArtifactIndexing implements JobHandler {
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
-    /** Creates the index job of the owner's artifact version, in the caller's transaction; answers its job's id. */
+    /**
+     * Creates the index job of the owner's artifact version, in the caller's transaction, after cancelling the unended
+     * jobs of the artifact's older versions (Story 5.2); answers its job's id.
+     */
     UUID start(UUID recordId, int number, Instant at) {
         UUID owner = OwnerContext.require();
+        List<UUID> older = index.ofRecords(List.of(recordId)).stream().filter(row -> row.number() < number)
+                .map(ArtifactIndexRow::jobId).toList();
+        int cancelled = 0;
+        for (UUID jobId : jobs.unended(older).stream().sorted().toList()) {
+            cancelled += jobs.cancel(jobId) ? 1 : 0;
+        }
+        if (cancelled > 0) {
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("artifactId", recordId)
+                    .addKeyValue("version", number).addKeyValue("cancelled", cancelled)
+                    .log("artifacts.index_superseded");
+        }
         UUID jobId = jobs.create(KIND, job -> index.insert(new ArtifactIndexRow(job.id(), owner, recordId, number, null,
                 0, at))).id();
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("artifactId", recordId).addKeyValue("version", number)
                 .addKeyValue("jobId", jobId).log("artifacts.index_created");
         return jobId;
+    }
+
+    /**
+     * Locks the owner's unended index jobs of the artifact {@code recordId}, every version, in one order, in the
+     * caller's transaction (Story 5.2): an edit or a restore takes them before it locks the artifact's newest version,
+     * as a job's completion takes its job before its version, so the two never wait on each other.
+     */
+    void lockUnended(UUID recordId) {
+        OwnerContext.require();
+        for (UUID jobId : jobs.unended(jobsOf(List.of(recordId))).stream().sorted().toList()) {
+            jobs.lock(jobId);
+        }
     }
 
     /**
@@ -119,7 +151,8 @@ public class ArtifactIndexing implements JobHandler {
         for (ArtifactIndexStore.VersionKey key : index.notIndexedUnder(recipe)) {
             // The lock orders this with the version's completion, a retry and another reconcile; read again after it.
             Optional<ArtifactVersionRow> locked = versions.lock(key.recordId(), key.number());
-            if (locked.isEmpty() || !readable(key.recordId())) {
+            // Story 5.2: an edit may have committed since the read; only the newest version is ever indexed.
+            if (locked.isEmpty() || !newest(key.recordId(), key.number()) || !readable(key.recordId())) {
                 continue;
             }
             List<ArtifactIndexRow> rows = index.ofVersion(key.recordId(), key.number());
@@ -144,7 +177,7 @@ public class ArtifactIndexing implements JobHandler {
         int retried = 0;
         for (ArtifactIndexRow row : candidates) {
             boolean present = versions.lock(row.recordId(), row.number()).isPresent();
-            if (!present || index.find(row.jobId()).isEmpty() || !readable(row.recordId())) {
+            if (!present || index.find(row.jobId()).isEmpty() || !newest(row) || !readable(row.recordId())) {
                 continue;
             }
             JobRef job = jobs.create(KIND, created -> index.move(row.jobId(), created.id())
@@ -169,6 +202,17 @@ public class ArtifactIndexing implements JobHandler {
             cancelled += jobs.cancel(jobId) ? 1 : 0;
         }
         return cancelled;
+    }
+
+    /** Whether the row's version is its artifact's newest (Story 5.2: an older one is never indexed again). */
+    private boolean newest(ArtifactIndexRow row) {
+        return newest(row.recordId(), row.number());
+    }
+
+    /** Whether the version {@code number} is its artifact's newest (Story 5.2). */
+    private boolean newest(UUID recordId, int number) {
+        return versions.latest(recordId).map(ArtifactVersionRow::number).filter(latest -> latest == number)
+                .isPresent();
     }
 
     /** Whether the owner's artifact's campaign is still readable: not being deleted, nor of a system being deleted. */

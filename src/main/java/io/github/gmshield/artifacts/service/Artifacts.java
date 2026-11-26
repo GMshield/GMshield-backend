@@ -2,8 +2,10 @@ package io.github.gmshield.artifacts.service;
 
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
+import io.github.gmshield.artifacts.data.VersionTaken;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -47,7 +49,22 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       ({@link ArtifactIndexing#start}): a rollback leaves neither.</li>
  *   <li>{@link #list}: the campaign's artifacts newest first (by id, a UUIDv7), of one type key or all, a page at a time
  *       (after a cursor, or at an offset), with the total and the type keys in use with their counts.</li>
- *   <li>{@link #get}: one artifact with its newest version.</li>
+ *   <li>{@link #get}: one artifact with its newest version, or (Story 5.2) with one of its versions by number, as a
+ *       reference that cited it opens it.</li>
+ *   <li>{@link #update} (Story 5.2): the GM's edit of the name, type, fields and content, with the limits and the type
+ *       check of {@link #create}. It names the newest version the GM saw; it stores the next number, gives the identity
+ *       the new version's type ({@link ArtifactRecords#retype}) and creates the new version's index job, all in one
+ *       transaction, and every earlier version is kept. A version that is not the newest, or a number another write took
+ *       first, is {@code request.stale_version} (409), and nothing is stored. An edit that changes nothing (the same
+ *       type, name, fields and content as the newest version it names) answers that version and stores nothing.</li>
+ *   <li>{@link #restore} (Story 5.2): the same write, with the type, name, fields and content of an earlier version; a
+ *       version whose type the system no longer has is {@code request.invalid} naming the record type.</li>
+ *   <li>{@link #versions} (Story 5.2): the artifact's versions newest first, a page at a time, with the total.</li>
+ *   <li>{@link #delete} (Story 5.2 part B): in one transaction, the artifact's unended index jobs are locked (as an
+ *       edit takes them), then its newest version, then its identity is marked deleting
+ *       ({@link ArtifactRecords#markDeleting}) and its deletion recorded ({@link SystemDeletion#deleteArtifact}, whose
+ *       handler cancels those jobs). From the commit every call here answers it as not found; the recorded, resumable
+ *       deletion then removes its versions, index rows and identity, and its points through one removal job.</li>
  * </ul>
  *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
@@ -68,6 +85,9 @@ public class Artifacts {
     public static final int MAX_LIMIT = 50;
     public static final int MAX_OFFSET = 100_000;
     private static final int FIRST_VERSION = 1;
+    /** An edit or a restore names a version the artifact has left (Story 5.2): someone changed it elsewhere. */
+    public static final ApiProblem STALE_VERSION =
+            ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final Logger log = LoggerFactory.getLogger(Artifacts.class);
 
@@ -76,17 +96,19 @@ public class Artifacts {
     private final Library library;
     private final Vault vault;
     private final ArtifactIndexing indexing;
+    private final ObjectProvider<SystemDeletion> deletions;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
     Artifacts(ArtifactRecords records, ArtifactVersionStore versions, Library library, Vault vault,
-              ArtifactIndexing indexing, ObjectProvider<PlatformTransactionManager> transactions,
-              ObjectProvider<Clock> clock) {
+              ArtifactIndexing indexing, ObjectProvider<SystemDeletion> deletions,
+              ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.records = records;
         this.versions = versions;
         this.library = library;
         this.vault = vault;
         this.indexing = indexing;
+        this.deletions = deletions;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -115,11 +137,13 @@ public class Artifacts {
     }
 
     /**
-     * One artifact with its newest version: its id, its campaign, its type key, its name, its fields, its content (null
-     * for none), the version's number and when the artifact was written. {@code toString} names ids and counts only.
+     * One artifact with one of its versions, the newest unless an earlier one was asked for: its id, its campaign, the
+     * version's type key, name, fields and content (null for none), the version's number, the number of the artifact's
+     * newest version (Story 5.2; the same as {@code version} unless an earlier one is read) and when the artifact was
+     * written. {@code toString} names ids and counts only.
      */
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
-                           String content, int version, Instant createdAt) {
+                           String content, int version, int currentVersion, Instant createdAt) {
         public Artifact {
             fields = List.copyOf(fields);
         }
@@ -127,7 +151,7 @@ public class Artifacts {
         @Override
         public String toString() {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
-                    + version + "]";
+                    + version + ", currentVersion=" + currentVersion + "]";
         }
     }
 
@@ -136,6 +160,24 @@ public class Artifacts {
         @Override
         public String toString() {
             return "Summary[id=" + id + ", recordType=" + recordType + "]";
+        }
+    }
+
+    /** One version of an artifact as its versions list shows it (Story 5.2): its number, type key, name and time. */
+    public record VersionSummary(int number, String recordType, String name, Instant createdAt) {
+        @Override
+        public String toString() {
+            return "VersionSummary[number=" + number + ", recordType=" + recordType + "]";
+        }
+    }
+
+    /**
+     * One page of an artifact's versions, newest first (Story 5.2): its rows, the cursor of the next page (the last
+     * number shown; null on the last page) and how many versions the artifact has.
+     */
+    public record VersionPage(List<VersionSummary> items, Integer nextCursor, long total) {
+        public VersionPage {
+            items = List.copyOf(items);
         }
     }
 
@@ -170,13 +212,11 @@ public class Artifacts {
             List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
                     .toList();
             UUID id = identity.id();
-            versions.insert(new ArtifactVersionRow(id, owner, FIRST_VERSION,
-                    vault.encryptText(binding(FIELD_NAME, id, owner), checked.name()),
-                    vault.encrypt(binding(FIELD_FIELDS, id, owner), fieldsJson(fields)),
-                    content == null ? null : vault.encryptText(binding(FIELD_CONTENT, id, owner), content), now));
+            versions.insert(sealed(id, owner, FIRST_VERSION, recordType, checked.name(), fields, content, now));
             // Story 5.1 part B: its index job, in the same transaction.
             indexing.start(id, FIRST_VERSION, now);
-            return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION, now);
+            return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION,
+                    FIRST_VERSION, now);
         }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("found", created.isPresent())
@@ -234,29 +274,226 @@ public class Artifacts {
      * other id, or when the campaign is not the owner's or not readable.
      */
     public Optional<Artifact> get(UUID campaignId, UUID artifactId) {
+        return get(campaignId, artifactId, null);
+    }
+
+    /**
+     * {@link #get(UUID, UUID)}, with the version {@code number} instead of the newest when it is not null (Story 5.2: a
+     * reference that cited it); empty too for a number the artifact does not have.
+     */
+    public Optional<Artifact> get(UUID campaignId, UUID artifactId, Integer number) {
         UUID owner = OwnerContext.require();
         Optional<Artifact> found = reading(() -> library.campaign(campaignId)
                 .flatMap(campaign -> records.find(campaign.id(), artifactId))
-                .map(identity -> {
-                    ArtifactVersionRow version = versions.latest(identity.id())
+                .flatMap(identity -> {
+                    ArtifactVersionRow newest = versions.latest(identity.id())
                             .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
-                    return open(vault, identity, version, owner);
+                    Optional<ArtifactVersionRow> shown = number == null || number == newest.number()
+                            ? Optional.of(newest) : versions.find(identity.id(), number);
+                    return shown.map(version -> open(vault, identity, version, newest.number(), owner));
                 }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
-                .addKeyValue("artifactId", artifactId).addKeyValue("found", found.isPresent())
-                .log("artifacts.read");
+                .addKeyValue("artifactId", artifactId).addKeyValue("version", number)
+                .addKeyValue("found", found.isPresent()).log("artifacts.read");
         return found;
     }
 
-    /** An artifact's identity and one of its versions, decrypted (Story 5.1 part B: its index input and its sources). */
+    /**
+     * The GM's edit of the owner's artifact {@code artifactId} of the campaign {@code campaignId}, as the class says:
+     * {@code version} is the newest version the GM saw. Answers the new version, or empty when the campaign is not the
+     * owner's or not readable, or the artifact is not the campaign's (nothing is stored then).
+     */
+    public Optional<Artifact> update(UUID campaignId, UUID artifactId, int version, Written written) {
+        UUID owner = OwnerContext.require();
+        Optional<Artifact> updated = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                records.find(campaign.id(), artifactId).flatMap(identity -> {
+                    String recordType = records.checkedType(campaign.system().id(), written.recordType());
+                    ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields()
+                            .stream().map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
+                    List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
+                            .toList();
+                    String content = content(written.content());
+                    ArtifactVersionRow newest = versions.latest(identity.id())
+                            .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+                    if (newest.number() == version) {
+                        // Nothing changed: the newest version stays, with no new version and no index job.
+                        Artifact current = open(vault, identity, newest, owner);
+                        if (current.recordType().equals(recordType) && current.name().equals(checked.name())
+                                && current.fields().equals(fields) && Objects.equals(current.content(), content)) {
+                            return Optional.of(current);
+                        }
+                    }
+                    return next(identity, owner, version, recordType, checked.name(), fields, content);
+                })));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("seen", version)
+                .addKeyValue("found", updated.isPresent())
+                .addKeyValue("version", updated.map(Artifact::version).orElse(null))
+                .addKeyValue("fields", updated.map(artifact -> artifact.fields().size()).orElse(0))
+                .addKeyValue("content", updated.map(artifact -> artifact.content() != null).orElse(false))
+                .log("artifacts.updated");
+        return updated;
+    }
+
+    /**
+     * The GM's restore of the version {@code number} of the owner's artifact {@code artifactId} of the campaign
+     * {@code campaignId}, as the class says: {@code version} is the newest version the GM saw. Answers the new version,
+     * or empty for anything {@link #update} answers empty for, and for a number the artifact does not have.
+     */
+    public Optional<Artifact> restore(UUID campaignId, UUID artifactId, int number, int version) {
+        UUID owner = OwnerContext.require();
+        Optional<Artifact> restored = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                records.find(campaign.id(), artifactId).flatMap(identity -> versions.find(identity.id(), number)
+                        .flatMap(earlier -> {
+                            Artifact copied = open(vault, identity, earlier, earlier.number(), owner);
+                            String recordType = records.checkedType(campaign.system().id(), earlier.recordType());
+                            return next(identity, owner, version, recordType, copied.name(), copied.fields(),
+                                    copied.content());
+                        }))));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("restored", number).addKeyValue("seen", version)
+                .addKeyValue("found", restored.isPresent())
+                .addKeyValue("version", restored.map(Artifact::version).orElse(null)).log("artifacts.restored");
+        return restored;
+    }
+
+    /**
+     * A page of the versions of the owner's artifact {@code artifactId} of the campaign {@code campaignId}, newest first:
+     * those below the number {@code cursor} (the previous page's last) or the {@code offset} first skipped (0 to
+     * {@value #MAX_OFFSET}), at most {@code limit} (1 to {@value #MAX_LIMIT}). Empty when the campaign is not the
+     * owner's or not readable, or the artifact is not the campaign's.
+     */
+    public Optional<VersionPage> versions(UUID campaignId, UUID artifactId, Integer cursor, int offset, int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new IllegalArgumentException("artifacts.limit_invalid");
+        }
+        if (offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("artifacts.offset_invalid");
+        }
+        UUID owner = OwnerContext.require();
+        Optional<VersionPage> found = reading(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .map(identity -> {
+                    UUID id = identity.id();
+                    // One row past the page tells whether a next page exists.
+                    List<ArtifactVersionRow> rows = versions.page(id, cursor, offset, limit + 1);
+                    List<ArtifactVersionRow> shown = rows.subList(0, Math.min(limit, rows.size()));
+                    List<VersionSummary> items = shown.stream().map(row -> new VersionSummary(row.number(),
+                            row.recordType(), vault.decryptText(binding(FIELD_NAME, id, owner), row.name()),
+                            row.createdAt())).toList();
+                    Integer next = rows.size() > limit ? shown.getLast().number() : null;
+                    return new VersionPage(items, next, versions.count(id));
+                }));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("offset", offset).addKeyValue("limit", limit)
+                .addKeyValue("found", found.isPresent())
+                .addKeyValue("shown", found.map(page -> page.items().size()).orElse(0))
+                .addKeyValue("total", found.map(VersionPage::total).orElse(0L)).log("artifacts.versions_listed");
+        return found;
+    }
+
+    /**
+     * Starts the deletion of the owner's artifact {@code artifactId} of the campaign {@code campaignId} (Story 5.2 part
+     * B), as the class says; true when it was recorded now. False (nothing changes) when the campaign is not the
+     * owner's or not readable, or the artifact is not the campaign's, a deleting one included.
+     */
+    public boolean delete(UUID campaignId, UUID artifactId) {
+        UUID owner = OwnerContext.require();
+        boolean recorded = Boolean.TRUE.equals(writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .map(identity -> {
+                    UUID id = identity.id();
+                    // The order an edit takes: its unended index jobs, then its newest version, then its identity.
+                    indexing.lockUnended(id);
+                    Optional<ArtifactVersionRow> newest = versions.latest(id);
+                    // A second delete that waited on the first's locks may find its versions gone: not found.
+                    if (newest.isEmpty()) {
+                        return false;
+                    }
+                    versions.lock(id, newest.get().number());
+                    Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+                    // A second delete that waited on those locks finds it deleting: nothing changes.
+                    if (!records.markDeleting(id, now)) {
+                        return false;
+                    }
+                    if (!deletions.getObject().deleteArtifact(id)) {
+                        // Marked but not recorded, no pass would ever remove it: the mark rolls back.
+                        throw new IllegalStateException("artifacts.deletion_not_recorded");
+                    }
+                    return true;
+                }).orElse(false)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("recorded", recorded).log("artifacts.delete");
+        return recorded;
+    }
+
+    /**
+     * The next version of the artifact {@code identity} (Story 5.2), in the caller's transaction: {@code seen} must be
+     * its newest number, read again once that version is locked (behind its unended index jobs' locks, as
+     * {@link ArtifactIndexing#lockUnended} says); a number taken first by another write is stale too. Then the version,
+     * the identity's type and the version's index job. Empty (Story 5.2 part B) when the artifact turned deleting while
+     * the write waited on those locks: nothing is stored then.
+     */
+    private Optional<Artifact> next(ArtifactRecords.Identity identity, UUID owner, int seen, String recordType,
+                                    String name, List<Field> fields, String content) {
+        UUID id = identity.id();
+        if (newestNumber(id) != seen) {
+            throw new ApiException(STALE_VERSION);
+        }
+        indexing.lockUnended(id);
+        Optional<ArtifactVersionRow> locked = versions.lock(id, seen);
+        // Story 5.2 part B: a delete that committed while this write waited (its pass may have removed the versions
+        // too) makes the artifact not found, never stale.
+        if (records.find(identity.campaignId(), id).isEmpty()) {
+            return Optional.empty();
+        }
+        if (locked.isEmpty() || newestNumber(id) != seen) {
+            throw new ApiException(STALE_VERSION);
+        }
+        int number = seen + 1;
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        try {
+            versions.insert(sealed(id, owner, number, recordType, name, fields, content, now));
+        } catch (VersionTaken taken) {
+            throw new ApiException(STALE_VERSION);
+        }
+        records.retype(id, recordType).orElseThrow(() -> new IllegalStateException("artifacts.identity_missing"));
+        indexing.start(id, number, now);
+        return Optional.of(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number, number,
+                identity.createdAt()));
+    }
+
+    private int newestNumber(UUID id) {
+        return versions.latest(id).map(ArtifactVersionRow::number)
+                .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+    }
+
+    /** A version's row: its name, fields and content encrypted, each bound to its field, the artifact and the owner. */
+    private ArtifactVersionRow sealed(UUID id, UUID owner, int number, String recordType, String name,
+                                      List<Field> fields, String content, Instant at) {
+        return new ArtifactVersionRow(id, owner, number, recordType,
+                vault.encryptText(binding(FIELD_NAME, id, owner), name),
+                vault.encrypt(binding(FIELD_FIELDS, id, owner), fieldsJson(fields)),
+                content == null ? null : vault.encryptText(binding(FIELD_CONTENT, id, owner), content), at);
+    }
+
+    /**
+     * An artifact's identity and one of its versions, decrypted, as the newest (Story 5.1 part B: its index input and
+     * its sources). The type is the version's own (Story 5.2).
+     */
     static Artifact open(Vault vault, ArtifactRecords.Identity identity, ArtifactVersionRow version, UUID owner) {
+        return open(vault, identity, version, version.number(), owner);
+    }
+
+    private static Artifact open(Vault vault, ArtifactRecords.Identity identity, ArtifactVersionRow version,
+                                 int currentVersion, UUID owner) {
         UUID id = identity.id();
         byte[] stored = version.content();
-        return new Artifact(id, identity.campaignId(), identity.recordType(),
+        return new Artifact(id, identity.campaignId(), version.recordType(),
                 vault.decryptText(binding(FIELD_NAME, id, owner), version.name()),
                 fieldsOf(vault.decrypt(binding(FIELD_FIELDS, id, owner), version.fields())),
                 stored == null ? null : vault.decryptText(binding(FIELD_CONTENT, id, owner), stored),
-                version.number(), identity.createdAt());
+                version.number(), currentVersion, identity.createdAt());
     }
 
     /** The content trimmed, null when blank or absent, or {@code request.invalid} naming it when it is too long. */

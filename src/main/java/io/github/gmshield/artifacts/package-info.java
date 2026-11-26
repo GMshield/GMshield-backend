@@ -9,7 +9,8 @@
  * private to its owner: another owner's, another campaign's or an unknown one is "not found". Story 5.1 part B indexes
  * each version through a job ({@code jobs}: {@code index.artifact}, and {@code index.artifact_removal} when its campaign
  * goes) and implements the {@code scope} module's {@code CampaignArtifacts} port, so a campaign's artifacts are
- * campaign-tier sources of its questions. Edits and later versions come with later stories.
+ * campaign-tier sources of its questions. Story 5.2 part A edits an artifact as its next version, keeps every earlier
+ * version, restores one as the newest and opens a cited one by its number.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Artifacts",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "knowledge :: service",

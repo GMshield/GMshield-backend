@@ -32,6 +32,7 @@ import io.github.gmshield.knowledge.data.TermAliasRow;
 import io.github.gmshield.knowledge.data.TermRow;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.materials.data.IndexChangeRow;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.InMemoryMaterialStore;
@@ -139,6 +140,10 @@ import tools.jackson.databind.json.JsonMapper;
  * matrix: an answer's read still serves a deleted record whose point is removed (a point written back), a stored search
  * read after a delete leaves the record out, a reprocess deletes the same-name record nearest the deleted one's ordinal,
  * and a record of a superseded version is not found.
+ *
+ * <p>Story 5.2 part B, a deleted artifact: an answer running when the GM deletes an artifact leaves it out of its
+ * records read and its citations and completes; a stored reference to it reads removed once it is deleting, worked out
+ * when it is read.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -218,6 +223,8 @@ class RecordsFlowTest {
     private Vault vault;
     @Autowired
     private IndexRemovalRetrySweep removalRetry;
+    @Autowired
+    private SystemDeletion deletion;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
@@ -2408,6 +2415,138 @@ class RecordsFlowTest {
         JsonNode read = ok(get("/api/v1/searches/" + search.id(), gm.session()));
         assertThat(read.path("state").asString()).isEqualTo("done");
         assertThat(read.toString()).doesNotContain(kael);
+    }
+
+    // --- Story 5.2 part A: an edited artifact answers with its new version
+
+    @Test
+    void anArtifactEditedToVersionTwoAndIndexedIsReadAndCitedAsVersionTwoUnderCampanha() throws Exception {
+        Gm gm = signUp();
+        endIngestion();
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        UUID first = indexed(gm);
+        Map<String, Object> edit = new LinkedHashMap<>();
+        edit.put("version", 1);
+        edit.put("recordType", "item");
+        edit.put("name", "Espada Rubra de Kael");
+        edit.put("fields", List.of(Map.of("name", "Dano", "value", "2d6 fogo")));
+        edit.put("content", "Reforjada no vulcão.");
+        JsonNode edited = ok(send("PATCH", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael, gm.session(),
+                edit));
+        assertThat(edited.path("version").asInt()).isEqualTo(2);
+        UUID second = indexed(gm);
+        assertThat(second).isNotEqualTo(first);
+        endIngestion();
+
+        Answer answer = asked(gm, "O que faz a Espada Rubra de Kael?");
+
+        // The campaign tier lists the artifact, and its read is version 2's: its name, fields and content, not 1's.
+        assertThat(strings(answer.claim().path("input").path("tiers").get(0).path("sources"))).contains(kael);
+        JsonNode record = ok(readRecords(answer, List.of(kael))).path("records").get(0);
+        assertThat(record.path("id").asString()).isEqualTo(kael);
+        assertThat(record.path("tier").asString()).isEqualTo("campaign");
+        assertThat(record.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+        assertThat(record.path("fields")).extracting(field -> field.path("name").asString() + "="
+                + field.path("value").asString()).containsExactly("Dano=2d6 fogo", "content=Reforjada no vulcão.");
+        assertThat(record.toString()).doesNotContain("1d8 cortante").doesNotContain("Forjada nas montanhas");
+
+        events(answer, List.of(delta("Causa 2d6 de fogo."), recordCitation(kael, 5)));
+        done(answer);
+
+        // Cited by value as version 2, under "Campanha".
+        JsonNode references = references(gm, answer);
+        assertThat(references).hasSize(1);
+        JsonNode reference = references.get(0);
+        assertThat(reference.path("kind").asString()).isEqualTo("artifact");
+        assertThat(reference.path("artifactId").asString()).isEqualTo(kael);
+        assertThat(reference.path("artifactVersion").asInt()).isEqualTo(2);
+        assertThat(reference.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+        assertThat(reference.path("tier").asString()).isEqualTo("campaign");
+        TurnReferenceRow row = turnReferences.anyOfTurn(answer.turnId()).getFirst();
+        assertThat(row.artifact()).isTrue();
+        assertThat(row.record().artifactVersion()).isEqualTo(2);
+        // The cited version opens as the reference names it.
+        JsonNode cited = ok(get("/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael + "/versions/2",
+                gm.session()));
+        assertThat(cited.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+    }
+
+    // --- Story 5.2 part B: a deleted artifact
+
+    @Test
+    void anArtifactDeletedWhileAnAnswerRunsIsLeftOutOfItsReadAndCitationsAndTheAnswerCompletes() throws Exception {
+        Gm gm = signUp();
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        String own = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Lembrete", "fields", List.of()));
+        endIngestion();
+        Answer answer = asked(gm, "O que faz a Espada de Kael?");
+        assertThat(strings(answer.claim().path("input").path("tiers").get(0).path("sources"))).contains(kael, own);
+
+        HttpResponse<String> deleted = send("DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael,
+                gm.session(), null);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+
+        // Matrix row "Mid-answer": its read leaves the deleted artifact out instead of refusing, before and after the
+        // pass, and its citation is dropped.
+        JsonNode read = ok(readRecords(answer, List.of(kael, own)));
+        assertThat(read.path("records")).extracting(record -> record.path("id").asString()).containsExactly(own);
+        deletion.sweep();
+        assertThat(ok(readRecords(answer, List.of(kael))).path("records")).isEmpty();
+        events(answer, List.of(delta("Nada sobre ela."), recordCitation(kael, 0), recordCitation(own, 1)));
+        done(answer);
+        assertThat(references(gm, answer)).extracting(reference -> reference.path("artifactId").asString())
+                .containsExactly(own);
+        assertThat(jobs.rows.get(answer.jobId()).state()).isEqualTo("done");
+        // The next question has no such source.
+        Answer next = asked(gm, "E agora?");
+        assertThat(next.claim().path("input").toString()).doesNotContain(kael).contains(own);
+    }
+
+    @Test
+    void aStoredReferenceToADeletedArtifactReadsRemovedOnceItIsDeleting() throws Exception {
+        Gm gm = signUp();
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        String own = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Lembrete", "fields", List.of()));
+        endIngestion();
+        Answer answer = asked(gm, "O que faz a Espada de Kael?");
+        events(answer, List.of(delta("Causa 1d8 cortante."), recordCitation(kael, 5), recordCitation(own, 6)));
+        done(answer);
+        assertThat(references(gm, answer)).extracting(reference -> reference.path("removed").asBoolean())
+                .containsExactly(false, false);
+        List<TurnReferenceRow> stored = turnReferences.anyOfTurn(answer.turnId());
+
+        HttpResponse<String> deleted = send("DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael,
+                gm.session(), null);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+
+        // Matrix row "Cited": the reopened conversation shows it removed, with its name and fields as stored.
+        JsonNode references = references(gm, answer);
+        assertThat(references.get(0).path("artifactId").asString()).isEqualTo(kael);
+        assertThat(references.get(0).path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(references.get(0).path("removed").asBoolean()).isTrue();
+        assertThat(references.get(1).path("artifactId").asString()).isEqualTo(own);
+        assertThat(references.get(1).path("removed").asBoolean()).isFalse();
+        deletion.sweep();
+        assertThat(references(gm, answer).get(0).path("removed").asBoolean()).isTrue();
+        assertThat(references(gm, answer).get(1).path("removed").asBoolean()).isFalse();
+        // Worked out when read: nothing is stored.
+        assertThat(turnReferences.anyOfTurn(answer.turnId())).isEqualTo(stored);
+    }
+
+    /**
+     * The owner's one open {@code index.artifact} job, offered if it waits, claimed and done under recipe "2", as the
+     * worker would; its id.
+     */
+    private UUID indexed(Gm gm) throws Exception {
+        List<UUID> open = jobs.rows.values().stream().filter(row -> row.ownerId().equals(gm.id())
+                && row.kind().equals("index.artifact") && OPEN.contains(row.state())).map(row -> row.id()).toList();
+        assertThat(open).as("the open index.artifact jobs of %s", gm.id()).hasSize(1);
+        UUID jobId = open.getFirst();
+        jobs.rows.computeIfPresent(jobId, (id, row) -> row.state().equals("waiting") ? row.offered(row.updatedAt())
+                : row);
+        report(jobId, claim(jobId), "{\"indexRecipe\":\"2\"}");
+        assertThat(jobs.rows.get(jobId).state()).isEqualTo("done");
+        return jobId;
     }
 
     /** A new artifact of the campaign, written through the public API; its id. */

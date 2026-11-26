@@ -28,7 +28,8 @@ import org.springframework.stereotype.Repository;
  *
  * <p>Story 5.1: an artifact is a row of {@code record} with a campaign and no version (V43). Every query of an extracted
  * record names a version or ({@link #EXTRACTED}) requires one, so none answers an artifact, even by its id; the artifact
- * queries name the campaign.
+ * queries name the campaign. From Story 5.2 part B every artifact query leaves out a deleting artifact (its
+ * {@code deleted_at} set by the GM's delete), except the two {@code ALL} reaches a deletion's removal reads.
  */
 @Repository
 class JpaRecordStore implements RecordStore {
@@ -63,27 +64,37 @@ class JpaRecordStore implements RecordStore {
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
             + LIVE + " group by r.recordType order by r.recordType";
 
-    private static final String ARTIFACT = "select r from Record r where r.campaignId = :campaign and r.id = :id";
+    private static final String ARTIFACT = "select r from Record r where r.campaignId = :campaign and r.id = :id"
+            + LIVE;
     /** A campaign's artifacts, newest first: one text per filter (Sonar S2077 wants no text assembled at run time). */
-    private static final String ARTIFACTS = "select r from Record r where r.campaignId = :campaign order by r.id desc";
+    private static final String ARTIFACTS = "select r from Record r where r.campaignId = :campaign" + LIVE
+            + " order by r.id desc";
     private static final String ARTIFACTS_OF_TYPE = "select r from Record r where r.campaignId = :campaign"
-            + " and r.recordType = :type order by r.id desc";
+            + " and r.recordType = :type" + LIVE + " order by r.id desc";
     private static final String ARTIFACTS_BEFORE = "select r from Record r where r.campaignId = :campaign"
-            + " and r.id < :before order by r.id desc";
+            + " and r.id < :before" + LIVE + " order by r.id desc";
     private static final String ARTIFACTS_OF_TYPE_BEFORE = "select r from Record r where r.campaignId = :campaign"
-            + " and r.recordType = :type and r.id < :before order by r.id desc";
-    private static final String ARTIFACT_COUNT = "select count(r) from Record r where r.campaignId = :campaign";
+            + " and r.recordType = :type and r.id < :before" + LIVE + " order by r.id desc";
+    private static final String ARTIFACT_COUNT = "select count(r) from Record r where r.campaignId = :campaign" + LIVE;
     private static final String ARTIFACT_COUNT_OF_TYPE = "select count(r) from Record r where r.campaignId = :campaign"
-            + " and r.recordType = :type";
-    private static final String ARTIFACTS_IN = "select count(r) from Record r where r.campaignId in :campaigns";
+            + " and r.recordType = :type" + LIVE;
+    private static final String ARTIFACTS_IN = "select count(r) from Record r where r.campaignId in :campaigns" + LIVE;
     private static final String ARTIFACTS_OF_TYPE_IN = "select count(r) from Record r where r.campaignId in :campaigns"
-            + " and r.recordType = :type";
+            + " and r.recordType = :type" + LIVE;
     private static final String ARTIFACT_TYPES = "select r.recordType, count(r) from Record r"
-            + " where r.campaignId = :campaign group by r.recordType order by r.recordType";
+            + " where r.campaignId = :campaign" + LIVE + " group by r.recordType order by r.recordType";
+    /** Story 5.2 part B: the ids of the campaigns' artifacts, deleting ones too (a deletion's removal reads these). */
     private static final String ARTIFACT_IDS = "select r.id from Record r where r.campaignId in :campaigns"
             + " order by r.id";
+    private static final String LIVE_ARTIFACT_IDS = "select r.id from Record r where r.campaignId in :campaigns"
+            + LIVE + " order by r.id";
     private static final String ARTIFACTS_FOUND = "select r from Record r where r.id in :ids"
             + " and r.campaignId is not null order by r.id";
+    private static final String LIVE_ARTIFACTS_FOUND = "select r from Record r where r.id in :ids"
+            + " and r.campaignId is not null" + LIVE + " order by r.id";
+    /** One live artifact by id, of any campaign (Story 5.2: its retype locks it, and from part B its delete). */
+    private static final String ARTIFACT_BY_ID = "select r from Record r where r.id = :id and r.campaignId is not null"
+            + LIVE;
     private static final String ARTIFACTS_BY_IDS = "select r from Record r where r.id in :ids"
             + " and r.campaignId is not null";
 
@@ -331,11 +342,48 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public List<ArtifactRow> findArtifacts(Collection<UUID> ids) {
+    public Optional<ArtifactRow> retypeArtifact(UUID id, String type) {
+        Optional<RecordEntity> found = lockedArtifact(id);
+        found.ifPresent(entity -> {
+            entity.retype(type);
+            flushChecked();
+        });
+        return found.map(RecordEntity::artifact);
+    }
+
+    @Override
+    public boolean markArtifactDeleting(UUID id, Instant at) {
+        Optional<RecordEntity> found = lockedArtifact(id);
+        found.ifPresent(entity -> {
+            entity.markDeleting(at);
+            flushChecked();
+        });
+        return found.isPresent();
+    }
+
+    /**
+     * The live artifact, locked for writing until the transaction ends (Story 5.2), read again under the lock as
+     * {@link #locked} does; empty for a deleting one (Story 5.2 part B).
+     */
+    private Optional<RecordEntity> lockedArtifact(UUID id) {
+        try {
+            EntityManager em = em();
+            Optional<RecordEntity> found = em.createQuery(ARTIFACT_BY_ID, RecordEntity.class).setParameter("id", id)
+                    .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst();
+            found.ifPresent(entity -> em.refresh(entity, LockModeType.PESSIMISTIC_WRITE));
+            return found.filter(entity -> !entity.deleted());
+        } catch (RuntimeException refused) {
+            throw JpaKnowledgeStore.conflictOf(refused).orElseThrow(() -> refused);
+        }
+    }
+
+    @Override
+    public List<ArtifactRow> findArtifacts(Collection<UUID> ids, Reach reach) {
         if (ids.isEmpty()) {
             return List.of();
         }
-        return em().createQuery(ARTIFACTS_FOUND, RecordEntity.class).setParameter("ids", List.copyOf(ids))
+        String query = reach == Reach.ALL ? ARTIFACTS_FOUND : LIVE_ARTIFACTS_FOUND;
+        return em().createQuery(query, RecordEntity.class).setParameter("ids", List.copyOf(ids))
                 .getResultList().stream().map(RecordEntity::artifact).toList();
     }
 
@@ -393,11 +441,12 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds) {
+    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds, Reach reach) {
         if (campaignIds.isEmpty()) {
             return List.of();
         }
-        return em().createQuery(ARTIFACT_IDS, UUID.class).setParameter("campaigns", campaignIds).getResultList();
+        String query = reach == Reach.ALL ? ARTIFACT_IDS : LIVE_ARTIFACT_IDS;
+        return em().createQuery(query, UUID.class).setParameter("campaigns", campaignIds).getResultList();
     }
 
     @Override

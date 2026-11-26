@@ -21,17 +21,22 @@ import java.util.UUID;
  * <p>Story 5.1: an artifact is a row of {@code record} too (V43), with a campaign instead of a version. No read above
  * ever answers one, not even by its id: each goes through a version, or leaves out a row without one. Only the
  * artifact reads and writes below ({@link #insertArtifact} to {@link #deleteArtifacts}) touch artifact rows, always
- * within campaigns of the owner. They read no {@code deleted_at}: no artifact is ever a tombstone in Story 5.1 (a
- * campaign's deletion removes its artifacts' rows). Story 5.2's delete of an artifact must add that filter to every
- * artifact read.
+ * within campaigns of the owner.
+ *
+ * <p>Story 5.2 part B: the GM's delete of an artifact sets its {@code deleted_at} ({@link #markArtifactDeleting}) until
+ * its deletion's pass removes the row: the artifact is deleting. Every artifact read leaves a deleting one out, except
+ * {@link #findArtifacts} and {@link #artifactIdsOf} with {@link Reach#ALL}, which a deletion's own removal reads.
  */
 public interface RecordStore {
 
-    /** Which records {@link #findAll} answers (Story 4.5 part B). */
+    /**
+     * Which records {@link #findAll} answers (Story 4.5 part B), and (Story 5.2 part B) which artifacts
+     * {@link #findArtifacts} and {@link #artifactIdsOf} answer.
+     */
     enum Reach {
-        /** Live records only: never one the GM deleted. */
+        /** Live records only: never one the GM deleted (an artifact: never a deleting one). */
         LIVE,
-        /** Every record, deleted or not. */
+        /** Every record, deleted or not (every artifact, deleting or not). */
         ALL
     }
 
@@ -151,10 +156,26 @@ public interface RecordStore {
     Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id);
 
     /**
-     * The current owner's artifacts with these ids, of any campaign, by id (Story 5.1 part B: an artifact's index jobs
-     * check its campaign); an extracted record's id, an unknown one or another owner's is left out.
+     * Gives the current owner's artifact {@code id} the type key {@code type} (Story 5.2: an edit or a restore, whose
+     * newest version has that type), with its row locked for the caller's transaction, which must exist; answers the row
+     * as changed, or empty for an extracted record's id, an unknown one, another owner's or (Story 5.2 part B) a
+     * deleting one. Never a correction.
      */
-    List<ArtifactRow> findArtifacts(Collection<UUID> ids);
+    Optional<ArtifactRow> retypeArtifact(UUID id, String type);
+
+    /**
+     * Marks the current owner's live artifact {@code id} deleting at {@code at} (Story 5.2 part B, the GM's delete),
+     * with its row locked for the caller's transaction, which must exist, as {@link #retypeArtifact} locks it; answers
+     * whether it was marked now: false for a deleting one, an extracted record's id, an unknown one or another owner's.
+     */
+    boolean markArtifactDeleting(UUID id, Instant at);
+
+    /**
+     * The current owner's artifacts with these ids, of any campaign, by id (Story 5.1 part B: an artifact's index jobs
+     * check its campaign), deleting ones too only with {@link Reach#ALL} (Story 5.2 part B); an extracted record's id,
+     * an unknown one or another owner's is left out.
+     */
+    List<ArtifactRow> findArtifacts(Collection<UUID> ids, Reach reach);
 
     /**
      * The current owner's artifacts of the campaign {@code campaignId} (Story 5.1), newest first (by id, a UUIDv7):
@@ -178,8 +199,11 @@ public interface RecordStore {
     /** How many artifacts of each type key the current owner's campaign has (Story 5.1); a type with none is left out. */
     Map<String, Long> artifactTypes(UUID campaignId);
 
-    /** The ids of every artifact of the current owner's campaigns with these ids (Story 5.1, their deletion). */
-    List<UUID> artifactIdsOf(Collection<UUID> campaignIds);
+    /**
+     * The ids of every artifact of the current owner's campaigns with these ids (Story 5.1, their deletion; from Story
+     * 5.1 part B the campaign tier too), by id, deleting ones too only with {@link Reach#ALL} (Story 5.2 part B).
+     */
+    List<UUID> artifactIdsOf(Collection<UUID> campaignIds, Reach reach);
 
     /**
      * Deletes the current owner's artifact identities with these ids (Story 5.1, a campaign's deletion, once their

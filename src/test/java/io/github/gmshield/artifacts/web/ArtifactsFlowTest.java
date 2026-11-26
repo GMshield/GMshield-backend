@@ -10,6 +10,7 @@ import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -67,6 +68,20 @@ import tools.jackson.databind.json.JsonMapper;
  * is accepted (an archived campaign takes artifacts too) and cannot be deleted while an artifact uses it, a malformed
  * body or query is {@code request.invalid} without a field, both deletion dialogs count the artifacts that go, and a
  * campaign's deletion takes its artifacts. The cross-owner rows are also in {@code CrossOwnerAuditFlowTest}.
+ *
+ * <p>Story 5.2 part A, every row of its matrix: an edit stores version 2 and keeps version 1 (a refused one stores
+ * nothing); three versions list newest first a page at a time; a restore copies an earlier version's type, name, fields
+ * and content as the newest, and a stale one is refused; a cited version opens as it was (an unknown number is not
+ * found); a stale edit from a second tab is {@code request.stale_version} and saves once resent on the newest version;
+ * another owner's and another campaign's artifact or version are not found for each new route. Besides the matrix: a
+ * restore of a version whose type the system no longer has names the record type, and a malformed edit, restore or
+ * versions query is {@code request.invalid}. The index order is {@code ArtifactIndexingTest}'s.
+ *
+ * <p>Story 5.2 part B: a delete is 202 (no body, {@code no-store}) and the artifact leaves every read, list and count
+ * at once, then its pass removes its identity, versions and index rows; a second delete or a read of it is not found;
+ * another owner's or another campaign's artifact is not found to a delete and nothing changes; a deleting artifact
+ * leaves both deletion dialogs' counts and the type-in-use guard, and a campaign's deletion still removes it. The claim
+ * wait and the removal job are {@code ArtifactIndexingTest}'s, the answers {@code RecordsFlowTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -122,6 +137,8 @@ class ArtifactsFlowTest {
     private InMemoryKnowledgeStore knowledge;
     @Autowired
     private InMemoryArtifactVersionStore versions;
+    @Autowired
+    private InMemoryArtifactIndexStore index;
     @Autowired
     private InMemoryLibraryStore library;
     @Autowired
@@ -457,7 +474,433 @@ class ArtifactsFlowTest {
         assertThat(versions.rows).doesNotContainKey(going + "/1").containsKey(staying + "/1");
     }
 
+    // --- edit and versions (Story 5.2)
+
+    @Test
+    void anEditStoresVersionTwoKeepsVersionOneAndARefusedEditStoresNothing() throws Exception {
+        Gm gm = signUp();
+        approvedIn(gm, gm.system(), "weapon");
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+
+        HttpResponse<String> edited = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, "{\"version\":1,"
+                + "\"recordType\":\"weapon\",\"name\":\" Espada de Kael, a Rubra \",\"fields\":[{\"name\":\"Dano\","
+                + "\"value\":\"2d6 fogo\"}],\"content\":\"Reforjada no vulcão.\"}");
+
+        // Matrix row "Edit": version 2, with the new type, name, field and content.
+        assertThat(edited.statusCode()).as(edited.body()).isEqualTo(200);
+        assertThat(edited.headers().firstValue("Cache-Control")).hasValue("no-store");
+        JsonNode body = json(edited);
+        assertThat(body.path("id").asString()).isEqualTo(id);
+        assertThat(body.path("version").asInt()).isEqualTo(2);
+        assertThat(body.path("currentVersion").asInt()).isEqualTo(2);
+        assertThat(body.path("recordType").asString()).isEqualTo("weapon");
+        assertThat(body.path("name").asString()).isEqualTo("Espada de Kael, a Rubra");
+        assertThat(body.path("fields").toString()).isEqualTo("[{\"name\":\"Dano\",\"value\":\"2d6 fogo\"}]");
+        assertThat(body.path("content").asString()).isEqualTo("Reforjada no vulcão.");
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + id))).isEqualTo(body);
+        // The identity mirrors the newest version's type, so the list and its chips read it.
+        assertThat(records.artifacts.get(UUID.fromString(id)).type()).isEqualTo("weapon");
+        JsonNode listed = json(get(gm, artifacts(gm.campaign())));
+        assertThat(listed.path("items").get(0).path("recordType").asString()).isEqualTo("weapon");
+        assertThat(listed.path("items").get(0).path("version").asInt()).isEqualTo(2);
+        assertThat(listed.path("types").toString()).isEqualTo("[{\"key\":\"weapon\",\"count\":1}]");
+        // Version 1 is kept as it was, encrypted, with its own type.
+        ArtifactVersionRow first = versions.rows.get(id + "/1");
+        assertThat(first.recordType()).isEqualTo("item");
+        ArtifactVersionRow second = versions.rows.get(id + "/2");
+        assertThat(second.recordType()).isEqualTo("weapon");
+        assertThat(new String(second.name(), StandardCharsets.ISO_8859_1)).doesNotContain("Rubra");
+        assertThat(new String(second.content(), StandardCharsets.ISO_8859_1)).doesNotContain("vulcão");
+        JsonNode kept = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/1"));
+        assertThat(kept.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(kept.path("recordType").asString()).isEqualTo("item");
+
+        // Bad input: 400 on that field, nothing stored.
+        for (String bad : List.of("{\"version\":2,\"recordType\":\"item\",\"name\":\"  \",\"fields\":[]}",
+                "{\"version\":2,\"recordType\":\"nope\",\"name\":\"Espada\",\"fields\":[]}",
+                "{\"version\":2,\"recordType\":\"item\",\"name\":\"Espada\",\"fields\":[{\"name\":\"Dano\","
+                        + "\"value\":\" \"}]}",
+                "{\"version\":2,\"recordType\":\"item\",\"name\":\"Espada\",\"fields\":[],\"content\":\""
+                        + "a".repeat(20_001) + "\"}")) {
+            HttpResponse<String> refused = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, bad);
+            assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+            assertThat(json(refused).path("params").has("field")).isTrue();
+        }
+        assertThat(versionsOf(id)).isEqualTo(2);
+        assertThat(records.artifacts.get(UUID.fromString(id)).type()).isEqualTo("weapon");
+    }
+
+    @Test
+    void anEditThatChangesNothingAnswersTheNewestVersionAndStoresNoVersionAndNoIndexJob() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        JsonNode before = json(get(gm, artifacts(gm.campaign()) + "/" + id));
+        String same = "{\"version\":1,\"recordType\":\"item\",\"name\":\"Espada de Kael \",\"fields\":["
+                + "{\"name\":\" Dano\",\"value\":\"1d8 cortante\"},{\"name\":\"Peso\",\"value\":\"1,5 kg \"}],"
+                + "\"content\":\" Forjada nas montanhas do norte.\\nBrilha perto de orcs. \"}";
+
+        HttpResponse<String> unchanged = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same);
+
+        // The same type, name, fields and content after trimming: version 1 as it is, nothing stored, no new job.
+        assertThat(unchanged.statusCode()).as(unchanged.body()).isEqualTo(200);
+        assertThat(json(unchanged)).isEqualTo(before);
+        assertThat(versionsOf(id)).isEqualTo(1);
+        assertThat(index.rows.values()).filteredOn(row -> row.recordId().toString().equals(id)).hasSize(1);
+        // A stale version is still refused, and a real change still stores version 2.
+        assertThat(send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same.replace("\"version\":1",
+                "\"version\":2")).statusCode()).isEqualTo(409);
+        assertThat(send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, same.replace("Kael ", "Kael, a Rubra"))
+                .statusCode()).isEqualTo(200);
+        assertThat(versionsOf(id)).isEqualTo(2);
+        assertThat(index.rows.values()).filteredOn(row -> row.recordId().toString().equals(id)).hasSize(2);
+    }
+
+    @Test
+    void threeVersionsListNewestFirstAPageAtATimeWithTheirTotal() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "item", "Espada");
+        edit(gm, id, 1, "note", "Espada lembrada");
+        edit(gm, id, 2, "item", "Espada de Kael");
+
+        JsonNode all = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions"));
+
+        // Matrix row "Versions": number, type, name and time, newest first.
+        assertThat(all.path("total").asLong()).isEqualTo(3);
+        assertThat(all.has("nextCursor")).isFalse();
+        assertThat(numbers(all)).containsExactly(3, 2, 1);
+        JsonNode newest = all.path("items").get(0);
+        assertThat(fieldNames(newest)).containsExactly("number", "recordType", "name", "createdAt");
+        assertThat(newest.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(all.path("items").get(1).path("recordType").asString()).isEqualTo("note");
+        assertThat(all.path("items").get(2).path("name").asString()).isEqualTo("Espada");
+        // The current one is the artifact's currentVersion.
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + id)).path("currentVersion").asInt()).isEqualTo(3);
+
+        JsonNode page = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions?limit=2"));
+        assertThat(numbers(page)).containsExactly(3, 2);
+        assertThat(page.path("nextCursor").asInt()).isEqualTo(2);
+        JsonNode rest = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions?limit=2&cursor=2"));
+        assertThat(numbers(rest)).containsExactly(1);
+        assertThat(rest.has("nextCursor")).isFalse();
+        JsonNode numbered = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions?limit=2&offset=2"));
+        assertThat(numbers(numbered)).containsExactly(1);
+        assertThat(numbered.path("total").asLong()).isEqualTo(3);
+    }
+
+    @Test
+    void aRestoreCopiesAnEarlierVersionAsTheNewestAndAStaleOneIsRefused() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        edit(gm, id, 1, "note", "Espada lembrada");
+        edit(gm, id, 2, "character_sheet", "Kael");
+
+        // Stale: the GM saw version 2.
+        HttpResponse<String> stale = send(gm, "POST", artifacts(gm.campaign()) + "/" + id + "/versions/1/restore",
+                "{\"version\":2}");
+        assertThat(stale.statusCode()).as(stale.body()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        assertThat(versionsOf(id)).isEqualTo(3);
+
+        HttpResponse<String> restored = send(gm, "POST", artifacts(gm.campaign()) + "/" + id
+                + "/versions/1/restore", "{\"version\":3}");
+
+        // Matrix row "Restore": version 4 holds version 1's type, name, fields and content; 1 to 3 are kept.
+        assertThat(restored.statusCode()).as(restored.body()).isEqualTo(200);
+        JsonNode body = json(restored);
+        assertThat(body.path("version").asInt()).isEqualTo(4);
+        assertThat(body.path("currentVersion").asInt()).isEqualTo(4);
+        assertThat(body.path("recordType").asString()).isEqualTo("item");
+        assertThat(body.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(body.path("fields").toString())
+                .isEqualTo("[{\"name\":\"Dano\",\"value\":\"1d8 cortante\"},{\"name\":\"Peso\",\"value\":\"1,5 kg\"}]");
+        assertThat(body.path("content").asString()).startsWith("Forjada nas montanhas do norte.");
+        assertThat(versionsOf(id)).isEqualTo(4);
+        assertThat(records.artifacts.get(UUID.fromString(id)).type()).isEqualTo("item");
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/3")).path("name").asString())
+                .isEqualTo("Kael");
+        assertThat(numbers(json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions"))))
+                .containsExactly(4, 3, 2, 1);
+        // An unknown number is not found.
+        assertNotFound(send(gm, "POST", artifacts(gm.campaign()) + "/" + id + "/versions/9/restore",
+                "{\"version\":4}"));
+        assertThat(versionsOf(id)).isEqualTo(4);
+    }
+
+    @Test
+    void aRestoreOfAVersionWhoseTypeTheSystemNoLongerHasNamesTheRecordType() throws Exception {
+        Gm gm = signUp();
+        UUID type = approvedTypeId(gm, gm.system(), "arma_magica");
+        String id = create(gm, gm.campaign(), "arma_magica", "Arco élfico");
+        edit(gm, id, 1, "item", "Arco élfico");
+        // No artifact has the type any more, so it can be deleted.
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + type, null).statusCode()).isEqualTo(204);
+
+        HttpResponse<String> refused = send(gm, "POST", artifacts(gm.campaign()) + "/" + id
+                + "/versions/1/restore", "{\"version\":2}");
+
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
+        assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        assertThat(json(refused).path("params").path("field").asString()).isEqualTo("recordType");
+        assertThat(versionsOf(id)).isEqualTo(2);
+        // Version 1 still opens with the type it had.
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/1")).path("recordType").asString())
+                .isEqualTo("arma_magica");
+    }
+
+    @Test
+    void aCitedVersionOpensAsItWasAndAnUnknownNumberIsNotFound() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        edit(gm, id, 1, "note", "Espada lembrada");
+
+        HttpResponse<String> cited = get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/1");
+
+        // Matrix row "Cited version": version 1's content, with the newest number beside it.
+        assertThat(cited.statusCode()).as(cited.body()).isEqualTo(200);
+        assertThat(cited.headers().firstValue("Cache-Control")).hasValue("no-store");
+        JsonNode body = json(cited);
+        assertThat(body.path("version").asInt()).isEqualTo(1);
+        assertThat(body.path("currentVersion").asInt()).isEqualTo(2);
+        assertThat(body.path("recordType").asString()).isEqualTo("item");
+        assertThat(body.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(body.path("content").asString()).startsWith("Forjada");
+        JsonNode newest = json(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/2"));
+        assertThat(newest).isEqualTo(json(get(gm, artifacts(gm.campaign()) + "/" + id)));
+        for (String number : List.of("9", "0", "01", "x", "-1", "1234567890")) {
+            assertNotFound(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions/" + number));
+        }
+    }
+
+    @Test
+    void aStaleEditFromASecondTabIsAConflictAndSavesOnceResentOnTheNewestVersion() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "item", "Espada");
+        edit(gm, id, 1, "item", "Espada de Kael");
+        // Tabs A and B are both on version 2; A saves first.
+        edit(gm, id, 2, "item", "Espada da aba A");
+
+        String tabB = "{\"version\":2,\"recordType\":\"note\",\"name\":\"Espada da aba B\",\"fields\":[]}";
+        HttpResponse<String> refused = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, tabB);
+
+        // Matrix row "Stale edit": B gets 409 and nothing is stored.
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
+        assertThat(json(refused).path("code").asString()).isEqualTo("request.stale_version");
+        assertThat(refused.body()).doesNotContain("aba");
+        assertThat(versionsOf(id)).isEqualTo(3);
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + id)).path("name").asString())
+                .isEqualTo("Espada da aba A");
+
+        // "Manter a minha como nova versão": the same draft on the newest version.
+        HttpResponse<String> kept = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id,
+                tabB.replace("\"version\":2", "\"version\":3"));
+        assertThat(kept.statusCode()).as(kept.body()).isEqualTo(200);
+        assertThat(json(kept).path("version").asInt()).isEqualTo(4);
+        assertThat(json(kept).path("name").asString()).isEqualTo("Espada da aba B");
+        assertThat(json(kept).path("recordType").asString()).isEqualTo("note");
+        // A version ahead of the newest is stale too.
+        assertThat(send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, tabB.replace("\"version\":2",
+                "\"version\":9")).statusCode()).isEqualTo(409);
+    }
+
+    @Test
+    void aMalformedEditRestoreOrVersionsQueryIsInvalid() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "item", "Espada");
+        String artifact = artifacts(gm.campaign()) + "/" + id;
+
+        for (String body : List.of("{\"recordType\":\"item\",\"name\":\"Espada\",\"fields\":[]}",
+                "{\"version\":0,\"recordType\":\"item\",\"name\":\"Espada\",\"fields\":[]}",
+                "{\"version\":1,\"name\":\"Espada\",\"fields\":[]}", "{\"version\":1,\"recordType\":\"item\","
+                        + "\"fields\":[]}", "{\"version\":1,\"recordType\":\"item\",\"name\":\"Espada\"}", "[]", "{")) {
+            HttpResponse<String> refused = send(gm, "PATCH", artifact, body);
+            assertThat(refused.statusCode()).as(body + " " + refused.body()).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("request.invalid");
+        }
+        for (String body : List.of("{}", "{\"version\":0}", "{\"version\":\"x\"}", "[]")) {
+            HttpResponse<String> refused = send(gm, "POST", artifact + "/versions/1/restore", body);
+            assertThat(refused.statusCode()).as(body + " " + refused.body()).isEqualTo(400);
+        }
+        for (String query : List.of("limit=0", "limit=51", "offset=-1", "cursor=0", "cursor=x", "cursor=2&offset=1")) {
+            HttpResponse<String> refused = get(gm, artifact + "/versions?" + query);
+            assertThat(refused.statusCode()).as(query).isEqualTo(400);
+        }
+        assertThat(versionsOf(id)).isEqualTo(1);
+    }
+
+    @Test
+    void anotherOwnersOrAnotherCampaignsArtifactOrVersionIsNotFoundOnEveryNewRoute() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = create(a, a.campaign(), "item", "Espada de Kael");
+        UUID other = UUID.fromString(json(send(a, "POST", "/api/v1/campaigns", "{\"name\":\"Outra mesa\","
+                + "\"systemId\":\"" + a.system() + "\"}")).path("id").asString());
+        String edit = "{\"version\":1,\"recordType\":\"note\",\"name\":\"Tomado\",\"fields\":[]}";
+
+        // Matrix row "Other owner or campaign": B edits, lists, reads or restores A's artifact or version.
+        for (String path : List.of(artifacts(a.campaign()) + "/" + theirs, artifacts(b.campaign()) + "/" + theirs)) {
+            assertNotFound(send(b, "PATCH", path, edit));
+            assertNotFound(get(b, path + "/versions"));
+            assertNotFound(get(b, path + "/versions/1"));
+            assertNotFound(send(b, "POST", path + "/versions/1/restore", "{\"version\":1}"));
+        }
+        // A's own artifact under A's other campaign.
+        String underOther = artifacts(other) + "/" + theirs;
+        assertNotFound(send(a, "PATCH", underOther, edit));
+        assertNotFound(get(a, underOther + "/versions"));
+        assertNotFound(get(a, underOther + "/versions/1"));
+        assertNotFound(send(a, "POST", underOther + "/versions/1/restore", "{\"version\":1}"));
+        assertThat(versionsOf(theirs)).isEqualTo(1);
+        assertThat(json(get(a, artifacts(a.campaign()) + "/" + theirs)).path("name").asString())
+                .isEqualTo("Espada de Kael");
+    }
+
+    // --- delete (Story 5.2 part B)
+
+    @Test
+    void aDeletedArtifactIsGoneFromEveryReadAtOnceAndItsRowsGoWithThePass() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        edit(gm, id, 1, "item", "Espada de Kael II");
+        edit(gm, id, 2, "item", "Espada de Kael III");
+        String kept = create(gm, gm.campaign(), "character_sheet", "Kael");
+        String path = artifacts(gm.campaign()) + "/" + id;
+
+        HttpResponse<String> deleted = send(gm, "DELETE", path, null);
+
+        // Matrix row "Delete": 202, no body, no-store.
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(deleted.body()).isEmpty();
+        assertThat(deleted.headers().firstValue("Cache-Control")).hasValue("no-store");
+        // Before its pass: in no read, list or count.
+        assertNotFound(get(gm, path));
+        assertNotFound(get(gm, path + "/versions"));
+        assertNotFound(get(gm, path + "/versions/1"));
+        assertNotFound(send(gm, "PATCH", path, "{\"version\":3,\"recordType\":\"note\",\"name\":\"X\",\"fields\":[]}"));
+        assertNotFound(send(gm, "POST", path + "/versions/1/restore", "{\"version\":3}"));
+        JsonNode listed = json(get(gm, artifacts(gm.campaign())));
+        assertThat(ids(listed)).containsExactly(kept);
+        assertThat(listed.path("total").asLong()).isEqualTo(1);
+        assertThat(listed.path("types").toString()).doesNotContain("\"item\"");
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "?recordType=item")).path("total").asLong()).isZero();
+        assertThat(versionsOf(id)).isEqualTo(3);
+
+        deletion.sweep();
+
+        // Once the pass ran: no identity, no version, no index row; one removal job (ArtifactIndexingTest).
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id)).containsKey(UUID.fromString(kept));
+        assertThat(versionsOf(id)).isZero();
+        assertThat(index.rows.values()).noneMatch(row -> row.recordId().toString().equals(id));
+        assertThat(index.removalRows.values()).anyMatch(row -> row.artifactId().toString().equals(id));
+        assertNotFound(get(gm, path));
+        assertThat(get(gm, artifacts(gm.campaign()) + "/" + kept).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void aSecondDeleteOrOpeningADeletedArtifactIsNotFoundAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String path = artifacts(gm.campaign()) + "/" + id;
+        assertThat(send(gm, "DELETE", path, null).statusCode()).isEqualTo(202);
+
+        // Matrix row "Already deleted": a second tab deletes it again, or opens it, before and after the pass.
+        assertNotFound(send(gm, "DELETE", path, null));
+        assertNotFound(get(gm, path));
+        deletion.sweep();
+        assertNotFound(send(gm, "DELETE", path, null));
+        assertNotFound(get(gm, path));
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
+    }
+
+    @Test
+    void anotherOwnersOrAnotherCampaignsArtifactIsNotFoundToADeleteAndNothingChanges() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = create(a, a.campaign(), "item", "Espada de Kael");
+        UUID other = UUID.fromString(json(send(a, "POST", "/api/v1/campaigns", "{\"name\":\"Outra mesa\","
+                + "\"systemId\":\"" + a.system() + "\"}")).path("id").asString());
+
+        // Matrix row "Other owner or campaign".
+        assertNotFound(send(b, "DELETE", artifacts(a.campaign()) + "/" + theirs, null));
+        assertNotFound(send(b, "DELETE", artifacts(b.campaign()) + "/" + theirs, null));
+        assertNotFound(send(a, "DELETE", artifacts(other) + "/" + theirs, null));
+        assertNotFound(send(a, "DELETE", artifacts(a.campaign()) + "/" + UUID.randomUUID(), null));
+        assertNotFound(send(a, "DELETE", artifacts(a.campaign()) + "/nope", null));
+        assertNotFound(send(a, "DELETE", "/api/v1/campaigns/nope/artifacts/" + theirs, null));
+        deletion.sweep();
+
+        assertThat(records.deletingArtifacts).doesNotContain(UUID.fromString(theirs));
+        assertThat(records.artifacts).containsKey(UUID.fromString(theirs));
+        assertThat(get(a, artifacts(a.campaign()) + "/" + theirs).statusCode()).isEqualTo(200);
+        assertThat(versionsOf(theirs)).isEqualTo(1);
+    }
+
+    @Test
+    void aDeletingArtifactLeavesTheDialogCountsAndTheTypeGuardAndACampaignsDeletionStillRemovesIt()
+            throws Exception {
+        Gm gm = signUp();
+        UUID used = approvedTypeId(gm, gm.system(), "arma_magica");
+        UUID other = UUID.fromString(json(send(gm, "POST", "/api/v1/campaigns", "{\"name\":\"Outra mesa\","
+                + "\"systemId\":\"" + gm.system() + "\"}")).path("id").asString());
+        String deleting = create(gm, other, "arma_magica", "Arco élfico");
+        String staying = create(gm, other, "note", "Lembrete");
+        assertThat(json(get(gm, "/api/v1/campaigns/" + other + "/deletion")).path("artifacts").asLong()).isEqualTo(2);
+
+        assertThat(send(gm, "DELETE", artifacts(other) + "/" + deleting, null).statusCode()).isEqualTo(202);
+
+        // Before its pass: the dialogs count the live artifact only, and its type is no longer in use.
+        assertThat(json(get(gm, "/api/v1/campaigns/" + other + "/deletion")).path("artifacts").asLong()).isEqualTo(1);
+        assertThat(json(get(gm, "/api/v1/systems/" + gm.system() + "/deletion")).path("artifacts").asLong())
+                .isEqualTo(1);
+        // A campaign's deletion committed before the artifact's pass still takes the deleting artifact.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + other, null).statusCode()).isEqualTo(202);
+        deletion.sweep();
+        deletion.sweep();
+
+        assertThat(records.artifacts).doesNotContainKeys(UUID.fromString(deleting), UUID.fromString(staying));
+        assertThat(versionsOf(deleting)).isZero();
+        assertThat(library.campaigns).doesNotContainKey(other);
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(204);
+    }
+
+    @Test
+    void theTypeOfADeletingArtifactIsNotInUse() throws Exception {
+        Gm gm = signUp();
+        UUID used = approvedTypeId(gm, gm.system(), "arma_magica");
+        String id = create(gm, gm.campaign(), "arma_magica", "Arco élfico");
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(409);
+
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + id, null).statusCode()).isEqualTo(202);
+
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(204);
+        deletion.sweep();
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
+    }
+
     // --- helpers
+
+    private void edit(Gm gm, String id, int version, String type, String name) throws Exception {
+        HttpResponse<String> edited = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, "{\"version\":" + version
+                + ",\"recordType\":\"" + type + "\",\"name\":\"" + name + "\",\"fields\":[]}");
+        assertThat(edited.statusCode()).as(edited.body()).isEqualTo(200);
+        assertThat(json(edited).path("version").asInt()).isEqualTo(version + 1);
+    }
+
+    private long versionsOf(String id) {
+        return versions.rows.values().stream().filter(row -> row.recordId().toString().equals(id)).count();
+    }
+
+    private static List<Integer> numbers(JsonNode page) {
+        List<Integer> numbers = new ArrayList<>();
+        page.path("items").forEach(item -> numbers.add(item.path("number").asInt()));
+        return numbers;
+    }
+
+    private static List<String> fieldNames(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.propertyNames().forEach(names::add);
+        return names;
+    }
 
     private void assertInvalid(Gm gm, String body, String field, Integer min, Integer max, Integer index)
             throws Exception {

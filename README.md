@@ -1639,7 +1639,7 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - **Deletion.** A campaign's or a system's deletion removes its artifacts, versions first
     (`artifacts.service.ArtifactsDeletion`, a `SystemDeletionHandler` of part `artifacts`). Both dialogs count them:
     `SystemDeletion` (`GET /api/v1/systems/{id}/deletion`) and `CampaignDeletion` (`GET /api/v1/campaigns/{id}/deletion`)
-    gain `artifacts` (additive, contract 1.42.0). The GM cannot delete an artifact yet (Story 5.2).
+    gain `artifacts` (additive, contract 1.42.0). From Story 5.2 part B the GM deletes an artifact (below).
   - **Type in use.** `Ontology.delete` also refuses `ontology.record_type_in_use` (409) for an approved type that an
     artifact of the system's campaigns has (`RecordStore.artifactsOfTypeIn`).
   - **V43.** `record.version_id`, `ordinal`, `first_page`, `name` and `fields` become nullable; `record.campaign_id`
@@ -1712,6 +1712,78 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.index_retry_swept`, `artifacts.index_retry_sweep_failed`, `artifacts.index_retry_owner_failed`,
     `artifacts.deletion_prepared`, and `artifacts` on `scope.resolved` and `scope.question_input`. Deploy order: worker (it runs the two new kinds), then backend, then
     frontend (minimum public contract 1.43.0). An older frontend skips an artifact's reference.
+
+- **Edit an artifact and keep its versions (`artifacts`, `knowledge`, Story 5.2 part A, public contract 1.44.0,
+  internal contract unchanged, migration V45).** The GM edits an artifact in place, every earlier version is kept, and
+  an earlier version can be restored as the newest; nothing is deleted.
+  - **Routes.** `PATCH /api/v1/campaigns/{campaignId}/artifacts/{artifactId}` (`updateArtifact`, body `{version,
+    recordType, name, fields, content?}`) and `POST …/artifacts/{artifactId}/versions/{number}/restore`
+    (`restoreArtifactVersion`, body `{version}`) each answer 200 with the new version as an `Artifact`; `GET
+    …/artifacts/{artifactId}/versions` (`listArtifactVersions`, `?cursor&offset&limit`) answers `{items, nextCursor,
+    total}`, newest first, each item `{number, recordType, name, createdAt}` (the cursor is the last number shown); `GET
+    …/artifacts/{artifactId}/versions/{number}` (`getArtifactVersion`) answers that version as an `Artifact`, as a
+    reference that cited it opens it. `Artifact` gains `currentVersion`, the newest number (equal to `version` unless an
+    earlier version is read). All `no-store`. The four routes join the cross-owner audit.
+  - **Checks.** An edit keeps create's limits and type check (`ArtifactRecords.checked`/`checkedType`): `request.invalid`
+    (400) naming the field, and nothing is stored. A restore of a version whose record type the system no longer has is
+    `request.invalid` with `params.field` `recordType`. `version` names the newest version the GM saw: any other number,
+    or a number another write took first (the key on record and number, the store's `VersionTaken`), is
+    `request.stale_version` (409). An edit that changes nothing (the same type, name, fields and content as the newest
+    version it names) answers that version and stores no version and no index job. Another owner's or another
+    campaign's artifact, and a version number the artifact does not have (or a malformed one), are
+    `request.not_found` (404).
+  - **Write.** In one transaction the edit or restore locks the artifact's unended index jobs, then its newest version
+    (the order a job's completion takes them), reads the newest number again, inserts the next version (its own record
+    type, name, fields and content, encrypted as version 1's), gives the identity the new type
+    (`ArtifactRecords.retype`, `RecordStore.retypeArtifact`, the row locked; never the extracted records' correction) and
+    creates the new version's `index.artifact` job. `record.type` therefore always mirrors the newest version, and every
+    reader (the artifacts tab, "Personagens", scope, the type-in-use guard) keeps reading it.
+  - **Index order.** `ArtifactIndexing.start` cancels the unended jobs of the artifact's older versions before it
+    creates the new one, since the worker keeps one point per artifact; `retryFailed` retries only a row of the newest
+    version, and `reconcile` already reads only the newest.
+  - **V45.** `record_version.record_type`, filled from each version's record, then NOT NULL, with V40's key check.
+    Rolling back past V45 is safe once the NOT NULL is dropped (`alter table record_version alter column record_type
+    drop not null;`), since the previous release inserts versions without it; the migration's comment gives the
+    statements that fill those rows before this release is deployed again.
+  - Log lines (ids and counts only): `artifacts.updated`, `artifacts.restored`, `artifacts.versions_listed`,
+    `artifacts.index_superseded`, and `version` on `artifacts.read`. Deploy order: backend, then frontend (minimum
+    public contract 1.44.0); the previous frontend keeps working, since the change is additive.
+
+- **Delete an artifact (`artifacts`, `knowledge`, `library`, `scope`, `conversations`, Story 5.2 part B, public contract
+  1.45.0, internal contract unchanged, migration V46, AD-22).** The GM deletes an artifact with every version; it is
+  the recorded, resumable deletion of `SystemDeletion`, of the new kind `artifact`.
+  - **Route.** `DELETE /api/v1/campaigns/{campaignId}/artifacts/{artifactId}` (`deleteArtifact`) answers 202 with no
+    body, `no-store`. Another owner's or another campaign's artifact, an unknown or malformed id and an artifact already
+    being deleted are `request.not_found` (404). The route joins the cross-owner audit.
+  - **The GM's transaction** (`Artifacts.delete`) finds the live artifact, locks its unended index jobs, then its newest
+    version (the order an edit takes), marks its `record` row deleting (`record.deleted_at`,
+    `ArtifactRecords.markDeleting`, `RecordStore.markArtifactDeleting`, the row locked) and records the deletion
+    (`SystemDeletion.deleteArtifact`, `Going.ofArtifact`), whose `ArtifactsDeletion` prepare cancels those jobs and
+    answers their latest claim lapse. The one-shot pass is scheduled once that transaction commits.
+  - **Hidden at once.** Every artifact read leaves a deleting artifact out: its page, a version, the versions list, an
+    edit and a restore (404), the list and its type counts ("Personagens" included), the campaign tier of a question's
+    scope, the index backfill and retries, the type-in-use guard and the counts of the campaign and system deletion
+    dialogs.
+    Only `ArtifactRecords.allOf`/`allIdsOf` (`RecordStore.Reach.ALL`) read it, for a deletion's removal, so a campaign's
+    or a system's deletion still removes a deleting artifact.
+  - **The pass** waits for any live claim of a cancelled job, then, in one transaction, creates one
+    `index.artifact_removal` job and deletes the artifact's `artifact_index` rows, its versions and its row. A restart
+    before the pass leaves the record to the sweep.
+  - **Answers.** An answer running when the artifact is deleted leaves it out of its records read and its citations
+    instead of failing (`Scopes.recordContents`/`citedRecords`; each job call resolves the turn's scope again, and
+    `CampaignArtifacts.deleted` names a deleted artifact's id from its recorded deletion). The internal records read
+    (`readJobRecords`) then answers 200 with fewer records than asked instead of 403; its description says so, and the
+    worker fails that attempt for a retry, whose scope no longer holds the artifact (internal contract version
+    unchanged, `openapi/internal.json` regenerated). A stored artifact reference is `removed`
+    when its artifact is deleting or gone, worked out when it is read (`Scopes.removedArtifacts`, through the
+    `CampaignArtifacts.live` port); nothing is stored. A material's deletion touches no artifact row, version or
+    reference.
+  - **V46.** `deletion_kind_check` allows `artifact`. Before rolling back past V46, let every pending artifact deletion
+    finish (the migration's comment gives the checks and the statement that restores the previous check).
+  - Log lines (ids and counts only): `artifacts.delete`, `library.artifact_deleting`, `library.artifact_deleted`, and
+    `artifactId` on `artifacts.deletion_prepared` and `artifacts.deletion_removed`. Deploy order: backend, then
+    frontend (minimum public contract 1.45.0); the previous frontend keeps working, since the change is additive (its
+    link to a deleted artifact opens "not found").
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

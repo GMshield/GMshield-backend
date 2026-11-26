@@ -69,7 +69,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * owner's, or one already gone is nothing to do. Neither counts anything here: the dialog's counts are
  * {@link MaterialDeletions#count}.
  *
- * <p>Story 3.10 part B: a conversation's deletion ({@code Going.ofConversation}) takes nothing here.
+ * <p>Story 3.10 part B: a conversation's deletion ({@code Going.ofConversation}) takes nothing here, nor (Story 5.2
+ * part B) an artifact's ({@code Going.ofArtifact}): no artifact row, version or reference is a material's.
  */
 @Service
 class SystemMaterialsDeletion implements SystemDeletionHandler {
@@ -128,7 +129,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public Optional<Instant> prepare(Going going) {
-        if (going.ofOneConversation()) {
+        if (going.ofOneConversation() || going.ofOneArtifact()) {
             return Optional.empty();
         }
         Instant now = now();
@@ -163,7 +164,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.ofOneConversation()) {
+        if (going.ofOneConversation() || going.ofOneArtifact()) {
             return;
         }
         if (going.versionId() != null) {

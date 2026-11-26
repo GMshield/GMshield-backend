@@ -73,7 +73,11 @@ import tools.jackson.databind.json.JsonMapper;
  * (the content as a last field), and a completion stores the recipe it reports (a bad one is refused); the backfill
  * gives each artifact not indexed under a stated recipe one job, and none while a job is unended; a failed job is
  * retried with a new one; a campaign's deletion cancels its artifacts' index jobs, removes their rows and creates one
- * {@code index.artifact_removal} job per artifact, by owner and source.
+ * {@code index.artifact_removal} job per artifact, by owner and source. Story 5.2 part A: an edit or a restore commits
+ * the new version's job and cancels the older versions' unended jobs, so only the newest is indexed, and the retry
+ * sweep never retries an older version's failed row. Story 5.2 part B: an artifact's own deletion cancels its index
+ * jobs, waits for a claimed one's claim to lapse, then removes its index rows, versions and identity and creates one
+ * {@code index.artifact_removal} job; neither the backfill nor a retry gives a deleting artifact a job.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -203,6 +207,100 @@ class ArtifactIndexingTest {
         assertThat(jobs.rows.values()).filteredOn(one -> !jobsBefore.contains(one.id()))
                 .noneMatch(one -> one.ownerId().equals(gm.id()));
         assertThat(rowsOf(id)).hasSize(1);
+    }
+
+    // --- a new version (Story 5.2)
+
+    @Test
+    void aNewVersionCommitsItsJobAndCancelsTheOlderVersionsUnendedJobs() throws Exception {
+        Gm gm = signUp();
+        UUID id = created(gm, gm.campaign(), KAEL);
+        UUID first = onlyRow(id).jobId();
+
+        edited(gm, id, 1, "Espada de Kael, a Rubra");
+
+        // Matrix row "Edit": the job of version 2 commits with it; version 1's unended job is cancelled.
+        assertThat(jobs.rows.get(first).state()).isEqualTo("cancelled");
+        ArtifactIndexRow second = rowOf(id, 2);
+        assertThat(OPEN).contains(jobs.rows.get(second.jobId()).state());
+        assertThat(jobs.rows.get(second.jobId()).kind()).isEqualTo("index.artifact");
+
+        // Matrix row "Index order": version 2's job is claimed (unended) when version 3 is saved.
+        offer(second.jobId());
+        JsonNode claim = claim(second.jobId());
+        HttpResponse<String> restored = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + id
+                + "/versions/1/restore", "{\"version\":2}");
+        assertThat(restored.statusCode()).as(restored.body()).isEqualTo(200);
+        assertThat(jobs.rows.get(second.jobId()).state()).isEqualTo("cancelled");
+        ArtifactIndexRow third = rowOf(id, 3);
+        assertThat(OPEN).contains(jobs.rows.get(third.jobId()).state());
+        // Version 2's worker can no longer report: only version 3 is indexed.
+        HttpResponse<String> late = outcome(second.jobId(), claim, "{\"outcome\":\"done\","
+                + "\"result\":{\"indexRecipe\":\"2\"}}");
+        assertThat(late.statusCode()).isNotEqualTo(204);
+        assertThat(rowOf(id, 2).recipe()).isNull();
+        offer(third.jobId());
+        JsonNode thirdClaim = claim(third.jobId());
+        JsonNode line = JSON.readTree(input(third.jobId(), thirdClaim, "records").body().strip());
+        assertThat(line.path("type").asString()).isEqualTo("item");
+        assertThat(line.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(outcome(third.jobId(), thirdClaim, "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\"}}")
+                .statusCode()).isEqualTo(204);
+        assertThat(rowOf(id, 3).recipe()).isEqualTo("2");
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("artifacts.index_superseded"));
+        for (ILoggingEvent event : logged.list) {
+            String text = event.getFormattedMessage() + " " + event.getKeyValuePairs();
+            assertThat(text).doesNotContain("Kael").doesNotContain("Rubra").doesNotContain("Forjada");
+        }
+    }
+
+    @Test
+    void aNewRecipeIndexesOnlyTheNewestVersionAgainAndLeavesTheOlderVersionsRowAndJobAlone() throws Exception {
+        Gm gm = signUp();
+        UUID id = created(gm, gm.campaign(), KAEL);
+        UUID first = onlyRow(id).jobId();
+        offer(first);
+        JsonNode firstClaim = claim(first);
+        assertThat(outcome(first, firstClaim, "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\"}}")
+                .statusCode()).isEqualTo(204);
+        edited(gm, id, 1, "Espada de Kael, a Rubra");
+        UUID second = rowOf(id, 2).jobId();
+        offer(second);
+        JsonNode secondClaim = claim(second);
+        assertThat(outcome(second, secondClaim, "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\"}}")
+                .statusCode()).isEqualTo(204);
+
+        // Under "2" nothing is stale; under "3" only version 2 gets a new job.
+        reconcile.reconcile("2");
+        assertThat(rowOf(id, 2).jobId()).isEqualTo(second);
+        reconcile.reconcile("3");
+
+        ArtifactIndexRow again = rowOf(id, 2);
+        assertThat(again.jobId()).isNotEqualTo(second);
+        assertThat(again.recipe()).isNull();
+        assertThat(OPEN).contains(jobs.rows.get(again.jobId()).state());
+        ArtifactIndexRow kept = rowOf(id, 1);
+        assertThat(kept.jobId()).isEqualTo(first);
+        assertThat(kept.recipe()).isEqualTo("2");
+        assertThat(jobs.rows.get(first).state()).isEqualTo("done");
+    }
+
+    @Test
+    void aFailedRowOfAnOlderVersionIsNotRetried() throws Exception {
+        Gm gm = signUp();
+        UUID id = created(gm, gm.campaign(), KAEL);
+        UUID first = onlyRow(id).jobId();
+        failed(first);
+
+        edited(gm, id, 1, "Espada de Kael, a Rubra");
+        retry.sweep();
+
+        // Matrix row "Index order": the failed version 1 row stays as it was; version 2 has its own job.
+        ArtifactIndexRow kept = rowOf(id, 1);
+        assertThat(kept.jobId()).isEqualTo(first);
+        assertThat(kept.retries()).isZero();
+        assertThat(jobs.rows.get(first).state()).isEqualTo("failed");
+        assertThat(OPEN).contains(jobs.rows.get(rowOf(id, 2).jobId()).state());
     }
 
     // --- index
@@ -476,6 +574,90 @@ class ArtifactIndexingTest {
         assertThat(outcome(removal.jobId(), claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
     }
 
+    // --- an artifact's own deletion (Story 5.2 part B)
+
+    @Test
+    void anArtifactsDeletionWaitsForItsClaimedIndexJobThenRemovesItsRowsWithOneRemovalJob() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID staying = created(gm, gm.campaign(), "{\"recordType\":\"note\",\"name\":\"Lembrete\",\"fields\":[]}");
+        edited(gm, going, 1, "Espada de Kael II");
+        UUID job = rowOf(going, 2).jobId();
+        offer(job);
+        claim(job);
+        Instant lapses = jobs.rows.get(job).claimLapsesAt();
+        assertThat(lapses).isAfter(clock.instant());
+
+        HttpResponse<String> deleted = send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going,
+                null);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(jobs.rows.get(job).state()).isEqualTo("cancelled");
+        deletion.sweep();
+
+        // Matrix row "Claimed index job": the worker may still write its point until its claim lapses.
+        assertThat(rowsOf(going)).hasSize(2);
+        assertThat(versions.rows).containsKeys(going + "/1", going + "/2");
+        assertThat(records.artifacts).containsKey(going);
+        assertThat(index.removalRows.values()).noneMatch(row -> row.artifactId().equals(going));
+
+        clock.set(lapses.plus(Duration.ofSeconds(1)));
+        deletion.sweep();
+        deletion.sweep();
+
+        assertThat(rowsOf(going)).isEmpty();
+        assertThat(versions.rows).doesNotContainKeys(going + "/1", going + "/2").containsKey(staying + "/1");
+        assertThat(records.artifacts).doesNotContainKey(going).containsKey(staying);
+        assertThat(records.deletingArtifacts).doesNotContain(going);
+        assertThat(rowsOf(staying)).hasSize(1);
+        // One removal of its points, by owner and source, whatever the passes.
+        ArtifactIndexRemovalRow removal = removalOf(going);
+        assertThat(removal.ownerId()).isEqualTo(gm.id());
+        assertThat(jobs.rows.get(removal.jobId()).kind()).isEqualTo("index.artifact_removal");
+        assertThat(OPEN).contains(jobs.rows.get(removal.jobId()).state());
+        assertThat(index.removalRows.values()).noneMatch(row -> row.artifactId().equals(staying));
+    }
+
+    @Test
+    void anArtifactsDeletionCancelsItsUnclaimedJobAndRemovesItAtTheFirstPass() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID job = onlyRow(going).jobId();
+
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going, null)
+                .statusCode()).isEqualTo(202);
+        assertThat(jobs.rows.get(job).state()).isEqualTo("cancelled");
+        // The backend restarted before its pass: the sweep finishes the deletion.
+        deletion.sweep();
+
+        assertThat(rowsOf(going)).isEmpty();
+        assertThat(versions.rows).doesNotContainKey(going + "/1");
+        assertThat(records.artifacts).doesNotContainKey(going);
+        assertThat(removalOf(going).ownerId()).isEqualTo(gm.id());
+    }
+
+    @Test
+    void neitherTheBackfillNorARetryGivesAJobToADeletingArtifact() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID job = onlyRow(going).jobId();
+        failed(job);
+        UUID never = created(gm, gm.campaign(), "{\"recordType\":\"note\",\"name\":\"Nunca\",\"fields\":[]}");
+        index.rows.remove(onlyRow(never).jobId());
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going, null)
+                .statusCode()).isEqualTo(202);
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + never, null)
+                .statusCode()).isEqualTo(202);
+        Set<UUID> before = Set.copyOf(jobs.rows.keySet());
+
+        reconcile.reconcile("guard-" + UUID.randomUUID().toString().substring(0, 8));
+        retry.sweep();
+
+        assertThat(onlyRow(going).jobId()).isEqualTo(job);
+        assertThat(rowsOf(never)).isEmpty();
+        assertThat(jobs.rows.values()).filteredOn(one -> !before.contains(one.id()))
+                .noneMatch(one -> one.ownerId().equals(gm.id()) && one.kind().equals("index.artifact"));
+    }
+
     // --- helpers
 
     /** A second campaign of the GM's system; its id. */
@@ -507,6 +689,20 @@ class ArtifactIndexingTest {
         HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns/" + campaign + "/artifacts", body);
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
         return UUID.fromString(json(created).path("id").asString());
+    }
+
+    /** The GM's edit of the artifact from version {@code version}, as an item with no field, under a new name. */
+    private void edited(Gm gm, UUID id, int version, String name) throws Exception {
+        HttpResponse<String> edited = send(gm, "PATCH", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + id,
+                "{\"version\":" + version + ",\"recordType\":\"item\",\"name\":\"" + name + "\",\"fields\":[]}");
+        assertThat(edited.statusCode()).as(edited.body()).isEqualTo(200);
+    }
+
+    /** The one index row of the artifact's version {@code number}. */
+    private ArtifactIndexRow rowOf(UUID artifact, int number) {
+        List<ArtifactIndexRow> rows = rowsOf(artifact).stream().filter(row -> row.number() == number).toList();
+        assertThat(rows).as("the index rows of %s version %s", artifact, number).hasSize(1);
+        return rows.getFirst();
     }
 
     private List<ArtifactIndexRow> rowsOf(UUID artifact) {

@@ -16,8 +16,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * The scope's part of a deletion (Story 3.5, AD-22), as the owner of the work: when a system or a campaign goes, the
  * stored settings and material switches of the campaigns going; when a material goes, its switch rows in every
- * campaign. A version's removal, or (Story 3.10 part B) a conversation's deletion, takes nothing here. It counts
- * nothing and cancels nothing (no job is the scope's), and its removal, in one transaction, is safe to repeat.
+ * campaign. A version's removal, (Story 3.10 part B) a conversation's deletion or (Story 5.2 part B) an artifact's
+ * takes nothing here. It counts nothing and cancels nothing (no job is the scope's), and its removal, in one
+ * transaction, is safe to repeat.
  */
 @Service
 class ScopeDeletion implements SystemDeletionHandler {
@@ -52,7 +53,7 @@ class ScopeDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.versionId() != null || going.ofOneConversation()) {
+        if (going.versionId() != null || going.ofOneConversation() || going.ofOneArtifact()) {
             return;
         }
         new TransactionTemplate(transactions.getObject()).executeWithoutResult(status -> {

@@ -12,7 +12,8 @@ import java.util.UUID;
  * reference also carries {@link Cited} (null on a passage's): the record's id, core type key, name and fields as they
  * were when the answer was written; its place is the record's first page and its passages the record's passages there.
  * From Story 5.1 part B a cited artifact's reference carries {@link Cited} with the artifact's version
- * ({@link #ARTIFACT}): it has no material, section path, page (0) or passage, and it is never removed until Story 5.2.
+ * ({@link #ARTIFACT}): it has no material, section path, page (0) or passage. From Story 5.2 part B it is removed once
+ * its artifact is deleting or gone, worked out when it is read.
  * {@code toString} names the number and the page only.
  */
 public record TurnReference(int number, String materialName, List<String> sectionPath, int page,

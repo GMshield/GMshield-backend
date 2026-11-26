@@ -123,6 +123,9 @@ class CrossOwnerAuditFlowTest {
     /** A new artifact (Story 5.1): valid, so only the campaign's owner decides the answer. */
     private static final String NEW_ARTIFACT = "{\"recordType\":\"item\",\"name\":\"Tomado\","
             + "\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}],\"content\":\"Tomado\"}";
+    /** An artifact's edit (Story 5.2): valid, on the version the world holds, so only the owner decides the answer. */
+    private static final String ARTIFACT_EDIT = "{\"version\":{artifactVersion},\"recordType\":\"item\","
+            + "\"name\":\"Tomado\",\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}],\"content\":\"Tomado\"}";
     /** A record's correction (Story 4.5): valid, so only the record's owner and scope decide the answer. */
     private static final String RECORD_CORRECTION = "{\"version\":{recordVersion},\"name\":\"Tomado\","
             + "\"recordType\":\"spell\",\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}]}";
@@ -247,6 +250,19 @@ class CrossOwnerAuditFlowTest {
             route("GET", "/api/v1/campaigns/{campaignId}/artifacts", "campaignId", "campaign"),
             route("POST", "/api/v1/campaigns/{campaignId}/artifacts", "campaignId", "campaign").json(NEW_ARTIFACT),
             route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
+                    "artifactId", "artifact").own("campaignId"),
+            // an artifact's edit, its versions, one version and a restore (Story 5.2)
+            route("PATCH", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
+                    "artifactId", "artifact").json(ARTIFACT_EDIT).own("campaignId"),
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/versions", "campaignId", "campaign",
+                    "artifactId", "artifact").own("campaignId"),
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/versions/{number}", "campaignId",
+                    "campaign", "artifactId", "artifact", "number", "1").own("campaignId"),
+            route("POST", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/versions/{number}/restore",
+                    "campaignId", "campaign", "artifactId", "artifact", "number", "1")
+                    .json("{\"version\":{artifactVersion}}").own("campaignId"),
+            // an artifact's deletion (Story 5.2 part B)
+            route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
                     "artifactId", "artifact").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
@@ -735,6 +751,8 @@ class CrossOwnerAuditFlowTest {
                         + "\"value\":\"16\"}],\"content\":\"Guerreiro do norte.\"}");
         assertThat(artifact.statusCode()).as(artifact.body()).isEqualTo(201);
         items.put("artifact", json(artifact).path("id").asString());
+        // Story 5.2: its newest version, which an edit and a restore name.
+        items.put("artifactVersion", Integer.toString(json(artifact).path("version").asInt()));
         // Story 5.1 part B: its index job, claimed and done as the worker would, so the ingestion lane is free again;
         // its input is the artifact's one records line, read under that claim only.
         UUID indexJob = stores.jobs(List.of(gm.id())).stream().filter(job -> job.ownerId().equals(gm.id())
