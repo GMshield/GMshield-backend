@@ -189,29 +189,34 @@ class LibraryController {
             @Schema(description = TOTAL, format = "int64", example = "4") long total) {
     }
 
-    @Schema(name = "SystemDeletion", requiredProperties = {"campaigns", "conversations", "materials"})
+    @Schema(name = "SystemDeletion", requiredProperties = {"campaigns", "conversations", "materials", "artifacts"})
     record SystemDeletionView(
             @Schema(description = "How many campaigns of the system go with it", format = "int64", minimum = "0",
                     example = "2") long campaigns,
             @Schema(description = "How many conversations of those campaigns go with it", format = "int64",
                     minimum = "0", example = "3") long conversations,
             @Schema(description = "How many materials go with it: those of its campaigns, and those attached to it and"
-                    + " to no other system", format = "int64", minimum = "0", example = "1") long materials) {
+                    + " to no other system", format = "int64", minimum = "0", example = "1") long materials,
+            @Schema(description = "How many artifacts of those campaigns go with it (contract 1.42.0)", format = "int64",
+                    minimum = "0", example = "4") long artifacts) {
 
         static SystemDeletionView of(SystemDeletion.Counts counts) {
-            return new SystemDeletionView(counts.campaigns(), counts.conversations(), counts.materials());
+            return new SystemDeletionView(counts.campaigns(), counts.conversations(), counts.materials(),
+                    counts.artifacts());
         }
     }
 
-    @Schema(name = "CampaignDeletion", requiredProperties = {"conversations", "materials"})
+    @Schema(name = "CampaignDeletion", requiredProperties = {"conversations", "materials", "artifacts"})
     record CampaignDeletionView(
             @Schema(description = "How many conversations of the campaign go with it", format = "int64", minimum = "0",
                     example = "1") long conversations,
             @Schema(description = "How many materials attached to the campaign go with it (those with a version that"
-                    + " is not discarded)", format = "int64", minimum = "0", example = "2") long materials) {
+                    + " is not discarded)", format = "int64", minimum = "0", example = "2") long materials,
+            @Schema(description = "How many artifacts of the campaign go with it (contract 1.42.0)", format = "int64",
+                    minimum = "0", example = "3") long artifacts) {
 
         static CampaignDeletionView of(SystemDeletion.CampaignCounts counts) {
-            return new CampaignDeletionView(counts.conversations(), counts.materials());
+            return new CampaignDeletionView(counts.conversations(), counts.materials(), counts.artifacts());
         }
     }
 

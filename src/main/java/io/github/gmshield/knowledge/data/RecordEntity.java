@@ -18,6 +18,12 @@ import org.hibernate.annotations.TenantId;
  * is Hibernate's: each correction raises it, and an update of a row whose version moved meanwhile fails. From Story
  * 4.5 part B (V42) the GM's delete marks it ({@code deleted_at}) and the removal of its point marks it again
  * ({@code point_removed_at}); neither ever goes back to null.
+ *
+ * <p>Story 5.1 (V43): an artifact is a row of this table too, the identity and type key of a record the GM wrote in a
+ * campaign ({@code campaign_id}). It has no version, ordinal, first page, name or fields (its content is in the
+ * {@code artifacts} module's {@code record_version}), so those are boxed and null for it, and exactly one of the version
+ * and the campaign is set. Every read of an extracted record leaves an artifact out (it filters through a version), and
+ * an artifact is read only by the artifact reads, which name its campaign.
  */
 @Entity(name = "Record")
 @Table(name = "record")
@@ -31,27 +37,32 @@ class RecordEntity {
     @Column(name = "owner_id", nullable = false, updatable = false)
     private UUID ownerId;
 
-    @Column(name = "version_id", nullable = false, updatable = false)
+    /** The material version of an extracted record; null for an artifact (Story 5.1). */
+    @Column(name = "version_id", updatable = false)
     private UUID versionId;
 
-    @Column(name = "ordinal", nullable = false, updatable = false)
-    private int ordinal;
+    /** The campaign of an artifact (Story 5.1, V43); null for an extracted record. */
+    @Column(name = "campaign_id", updatable = false)
+    private UUID campaignId;
 
-    @Column(name = "first_page", nullable = false, updatable = false)
-    private int firstPage;
+    @Column(name = "ordinal", updatable = false)
+    private Integer ordinal;
+
+    @Column(name = "first_page", updatable = false)
+    private Integer firstPage;
 
     /** The type's key: a JPQL path names it {@code recordType}, never the keyword {@code type}. */
     @Column(name = "type", nullable = false)
     private String recordType;
 
-    @Column(name = "name", nullable = false)
+    @Column(name = "name")
     private byte[] name;
 
     /** The name's keyed fingerprint (V37); null for a record stored before it and never corrected. */
     @Column(name = "name_fingerprint")
     private byte[] nameFingerprint;
 
-    @Column(name = "fields", nullable = false)
+    @Column(name = "fields")
     private byte[] fields;
 
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -97,6 +108,15 @@ class RecordEntity {
         this.extractedNameFingerprint = row.extractedNameFingerprint();
         this.deletedAt = row.deletedAt();
         this.pointRemovedAt = row.pointRemovedAt();
+    }
+
+    /** An artifact's identity row (Story 5.1): its campaign and type key, with no version, place, name or fields. */
+    RecordEntity(ArtifactRow row) {
+        this.id = row.id();
+        this.ownerId = row.ownerId();
+        this.campaignId = row.campaignId();
+        this.recordType = row.type();
+        this.createdAt = row.createdAt();
     }
 
     UUID id() {
@@ -156,7 +176,19 @@ class RecordEntity {
         this.correctedAt = correction.correctedAt();
     }
 
+    /** The row of an artifact (Story 5.1); only an artifact read calls it, and only on a row with a campaign. */
+    ArtifactRow artifact() {
+        if (campaignId == null) {
+            throw new IllegalStateException("knowledge.not_an_artifact");
+        }
+        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt);
+    }
+
+    /** The row of an extracted record; only a read that filters through a version calls it. */
     RecordRow row(List<UUID> passageIds) {
+        if (versionId == null || ordinal == null || firstPage == null) {
+            throw new IllegalStateException("knowledge.not_an_extracted_record");
+        }
         return new RecordRow(id, ownerId, versionId, ordinal, firstPage, recordType, name, nameFingerprint, fields,
                 passageIds, createdAt, rowVersion, correctedAt, extractedType, extractedNameFingerprint, deletedAt,
                 pointRemovedAt);

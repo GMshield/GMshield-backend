@@ -17,6 +17,13 @@ import java.util.UUID;
  * <p>Story 4.5 part B: a record the GM deleted stays as a tombstone ({@link RecordRow#deleted}). Every read below
  * leaves it out unless it says otherwise: {@link #findAll} by its {@link Reach}, {@link #tombstones}, and the deletes
  * of a version's rows, which take tombstones too.
+ *
+ * <p>Story 5.1: an artifact is a row of {@code record} too (V43), with a campaign instead of a version. No read above
+ * ever answers one, not even by its id: each goes through a version, or leaves out a row without one. Only the
+ * artifact reads and writes below ({@link #insertArtifact} to {@link #deleteArtifacts}) touch artifact rows, always
+ * within campaigns of the owner. They read no {@code deleted_at}: no artifact is ever a tombstone in Story 5.1 (a
+ * campaign's deletion removes its artifacts' rows). Story 5.2's delete of an artifact must add that filter to every
+ * artifact read.
  */
 public interface RecordStore {
 
@@ -136,4 +143,41 @@ public interface RecordStore {
      * as it is. Answers how many were marked.
      */
     int pointsRemoved(Collection<UUID> ids, Instant at);
+
+    /** Stores the current owner's new artifact identity (Story 5.1), in the caller's transaction. */
+    void insertArtifact(ArtifactRow row);
+
+    /** The current owner's artifact {@code id} of the campaign {@code campaignId}; empty for any other id (Story 5.1). */
+    Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id);
+
+    /**
+     * The current owner's artifacts of the campaign {@code campaignId} (Story 5.1), newest first (by id, a UUIDv7):
+     * only those of the type key {@code type} when it is not null, only those older than {@code before} when it is not
+     * null, the first {@code offset} skipped, at most {@code limit}.
+     */
+    List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit);
+
+    /** How many artifacts the current owner's campaign has (Story 5.1), of the type key {@code type} when not null. */
+    long artifactCount(UUID campaignId, String type);
+
+    /** How many artifacts the current owner's campaigns with these ids hold (Story 5.1, their deletion's dialogs). */
+    long artifactsIn(Collection<UUID> campaignIds);
+
+    /**
+     * How many artifacts of the type key {@code type} the current owner's campaigns with these ids hold (Story 5.1: an
+     * approved type that an artifact uses is in use).
+     */
+    long artifactsOfTypeIn(Collection<UUID> campaignIds, String type);
+
+    /** How many artifacts of each type key the current owner's campaign has (Story 5.1); a type with none is left out. */
+    Map<String, Long> artifactTypes(UUID campaignId);
+
+    /** The ids of every artifact of the current owner's campaigns with these ids (Story 5.1, their deletion). */
+    List<UUID> artifactIdsOf(Collection<UUID> campaignIds);
+
+    /**
+     * Deletes the current owner's artifact identities with these ids (Story 5.1, a campaign's deletion, once their
+     * versions are gone); answers how many went. An extracted record's id is never deleted here.
+     */
+    int deleteArtifacts(Collection<UUID> ids);
 }

@@ -3,6 +3,7 @@ package io.github.gmshield.knowledge.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.TypedQuery;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -24,11 +25,17 @@ import org.springframework.stereotype.Repository;
  * every read leaves a deleted record (a tombstone) out, as {@link RecordStore} says, and a delete locks the row and marks
  * it through its entity. The entity manager is looked up on first use, so the unit tests, which start without a
  * database, can still create the application.
+ *
+ * <p>Story 5.1: an artifact is a row of {@code record} with a campaign and no version (V43). Every query of an extracted
+ * record names a version or ({@link #EXTRACTED}) requires one, so none answers an artifact, even by its id; the artifact
+ * queries name the campaign.
  */
 @Repository
 class JpaRecordStore implements RecordStore {
 
     private static final String LIVE = " and r.deletedAt is null";
+    /** Story 5.1: an extracted record has a version; an artifact (a campaign's record) has none and is left out. */
+    private static final String EXTRACTED = " and r.versionId is not null";
     private static final String OF_VERSION = "select r from Record r where r.versionId = :version" + LIVE
             + " order by r.firstPage, r.ordinal, r.id";
     private static final String ALL_OF_VERSION = "select r from Record r where r.versionId = :version";
@@ -38,14 +45,14 @@ class JpaRecordStore implements RecordStore {
             + " and r.firstPage between :first and :last";
     private static final String LINKS = "select l from RecordPassage l where l.recordId in :records"
             + " order by l.recordId, l.passageId";
-    private static final String BY_ID = "select r from Record r where r.id = :id";
+    private static final String BY_ID = "select r from Record r where r.id = :id" + EXTRACTED;
     private static final String LIVE_BY_ID = BY_ID + LIVE;
-    private static final String VERSION_OF = "select r.versionId from Record r where r.id = :id" + LIVE;
+    private static final String VERSION_OF = "select r.versionId from Record r where r.id = :id" + EXTRACTED + LIVE;
     private static final String OF_TYPE = "select r from Record r where r.versionId in :versions"
             + " and r.recordType = :type" + LIVE;
     private static final String LINKS_OF = "select l.passageId from RecordPassage l where l.recordId = :record"
             + " order by l.passageId";
-    private static final String BY_IDS = "select r from Record r where r.id in :ids";
+    private static final String BY_IDS = "select r from Record r where r.id in :ids" + EXTRACTED;
     private static final String DELETED_BY_IDS = BY_IDS + " and r.deletedAt is not null and r.pointRemovedAt is null";
     private static final String NAMED = "select r from Record r where r.versionId in :versions"
             + " and r.nameFingerprint = :fingerprint" + LIVE + " order by r.id";
@@ -55,6 +62,28 @@ class JpaRecordStore implements RecordStore {
     static final int FINGERPRINTS_PER_QUERY = 500;
     private static final String COUNTS = "select r.recordType, count(r) from Record r where r.versionId in :versions"
             + LIVE + " group by r.recordType order by r.recordType";
+
+    private static final String ARTIFACT = "select r from Record r where r.campaignId = :campaign and r.id = :id";
+    /** A campaign's artifacts, newest first: one text per filter (Sonar S2077 wants no text assembled at run time). */
+    private static final String ARTIFACTS = "select r from Record r where r.campaignId = :campaign order by r.id desc";
+    private static final String ARTIFACTS_OF_TYPE = "select r from Record r where r.campaignId = :campaign"
+            + " and r.recordType = :type order by r.id desc";
+    private static final String ARTIFACTS_BEFORE = "select r from Record r where r.campaignId = :campaign"
+            + " and r.id < :before order by r.id desc";
+    private static final String ARTIFACTS_OF_TYPE_BEFORE = "select r from Record r where r.campaignId = :campaign"
+            + " and r.recordType = :type and r.id < :before order by r.id desc";
+    private static final String ARTIFACT_COUNT = "select count(r) from Record r where r.campaignId = :campaign";
+    private static final String ARTIFACT_COUNT_OF_TYPE = "select count(r) from Record r where r.campaignId = :campaign"
+            + " and r.recordType = :type";
+    private static final String ARTIFACTS_IN = "select count(r) from Record r where r.campaignId in :campaigns";
+    private static final String ARTIFACTS_OF_TYPE_IN = "select count(r) from Record r where r.campaignId in :campaigns"
+            + " and r.recordType = :type";
+    private static final String ARTIFACT_TYPES = "select r.recordType, count(r) from Record r"
+            + " where r.campaignId = :campaign group by r.recordType order by r.recordType";
+    private static final String ARTIFACT_IDS = "select r.id from Record r where r.campaignId in :campaigns"
+            + " order by r.id";
+    private static final String ARTIFACTS_BY_IDS = "select r from Record r where r.id in :ids"
+            + " and r.campaignId is not null";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -284,6 +313,93 @@ class JpaRecordStore implements RecordStore {
         }
         return em().createQuery(LINKS, RecordPassageEntity.class)
                 .setParameter("records", records.stream().map(RecordEntity::id).toList()).getResultList();
+    }
+
+    @Override
+    public void insertArtifact(ArtifactRow row) {
+        EntityManager em = em();
+        em.persist(new RecordEntity(row));
+        flushChecked();
+    }
+
+    @Override
+    public Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id) {
+        return em().createQuery(ARTIFACT, RecordEntity.class).setParameter("campaign", campaignId)
+                .setParameter("id", id).getResultList().stream().findFirst().map(RecordEntity::artifact);
+    }
+
+    @Override
+    public List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit) {
+        String query;
+        if (type == null) {
+            query = before == null ? ARTIFACTS : ARTIFACTS_BEFORE;
+        } else {
+            query = before == null ? ARTIFACTS_OF_TYPE : ARTIFACTS_OF_TYPE_BEFORE;
+        }
+        TypedQuery<RecordEntity> read = em().createQuery(query, RecordEntity.class).setParameter("campaign", campaignId);
+        if (type != null) {
+            read.setParameter("type", type);
+        }
+        if (before != null) {
+            read.setParameter("before", before);
+        }
+        return read.setFirstResult(offset).setMaxResults(limit).getResultList().stream().map(RecordEntity::artifact)
+                .toList();
+    }
+
+    @Override
+    public long artifactCount(UUID campaignId, String type) {
+        if (type == null) {
+            return em().createQuery(ARTIFACT_COUNT, Long.class).setParameter("campaign", campaignId).getSingleResult();
+        }
+        return em().createQuery(ARTIFACT_COUNT_OF_TYPE, Long.class).setParameter("campaign", campaignId)
+                .setParameter("type", type).getSingleResult();
+    }
+
+    @Override
+    public long artifactsIn(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery(ARTIFACTS_IN, Long.class).setParameter("campaigns", campaignIds).getSingleResult();
+    }
+
+    @Override
+    public long artifactsOfTypeIn(Collection<UUID> campaignIds, String type) {
+        if (campaignIds.isEmpty()) {
+            return 0;
+        }
+        return em().createQuery(ARTIFACTS_OF_TYPE_IN, Long.class).setParameter("campaigns", campaignIds)
+                .setParameter("type", type).getSingleResult();
+    }
+
+    @Override
+    public Map<String, Long> artifactTypes(UUID campaignId) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        em().createQuery(ARTIFACT_TYPES, Object[].class).setParameter("campaign", campaignId).getResultList()
+                .forEach(row -> counts.put((String) row[0], (Long) row[1]));
+        return counts;
+    }
+
+    @Override
+    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(ARTIFACT_IDS, UUID.class).setParameter("campaigns", campaignIds).getResultList();
+    }
+
+    @Override
+    public int deleteArtifacts(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return 0;
+        }
+        EntityManager em = em();
+        List<RecordEntity> found = em.createQuery(ARTIFACTS_BY_IDS, RecordEntity.class).setParameter("ids", ids)
+                .getResultList();
+        found.forEach(em::remove);
+        em.flush();
+        return found.size();
     }
 
     /** The shared, transaction-bound entity manager: each transaction (or each call outside one) has its own session. */

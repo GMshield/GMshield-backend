@@ -3,6 +3,7 @@ package io.github.gmshield.materials.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
+import io.github.gmshield.artifacts.service.Artifacts;
 import io.github.gmshield.conversations.service.Conversations;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
@@ -70,6 +71,8 @@ class SystemDeletionIntegrationTest {
     private List<SystemDeletionHandler> handlers;
     @Autowired
     private Conversations conversations;
+    @Autowired
+    private Artifacts artifacts;
     @Autowired
     private MaterialStore store;
     @Autowired
@@ -321,6 +324,35 @@ class SystemDeletionIntegrationTest {
         assertThat(files.fileExists(b.id(), lateUpload)).isFalse();
         assertThat(jdbc.sql("select done_at from deletion where id = ?").param(deletionId).query().singleRow()
                 .get("done_at")).isNotNull();
+    }
+
+    /**
+     * Story 5.1: a system's deletion counts the artifacts of its campaigns and takes them, their versions first, before
+     * the campaigns' and the system's rows: the pass ends, and no record or record version of theirs is left.
+     */
+    @Test
+    void aSystemDeletionTakesTheArtifactsOfItsCampaignsOnPostgres() throws Exception {
+        Owner a = owner();
+        UUID system = as(a.id(), () -> library.createSystem(new Library.SystemFields("Ordem Paranormal", null, null)))
+                .id();
+        UUID campaign = campaign(a.id(), system, "Mesa de sábado");
+        UUID artifact = as(a.id(), () -> artifacts.create(campaign, new Artifacts.Written("character_sheet", "Kael",
+                List.of(new Artifacts.Field("Força", "16")), "Guerreiro do norte."))).orElseThrow().id();
+        UUID kept = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("note", "Lembrete",
+                List.of(), null))).orElseThrow().id();
+        assertThat(as(a.id(), () -> deletion.preview(system)).orElseThrow().artifacts()).isOne();
+
+        assertThat(as(a.id(), () -> deletion.delete(system))).isTrue();
+        UUID deletionId = jdbc.sql("select id from deletion where target_id = ?").param(system).query(UUID.class)
+                .single();
+        assertThat(deletion.run(a.id(), deletionId)).isTrue();
+
+        assertThat(count("system", "id = ?", system)).isZero();
+        assertThat(count("campaign", "id = ?", campaign)).isZero();
+        assertThat(count("record", "id = ? or campaign_id = ?", artifact, campaign)).isZero();
+        assertThat(count("record_version", "record_id = ?", artifact)).isZero();
+        assertThat(count("record", "id = ?", kept)).isOne();
+        assertThat(count("record_version", "record_id = ?", kept)).isOne();
     }
 
     // --- helpers

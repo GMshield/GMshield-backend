@@ -18,7 +18,9 @@
  * {@code term_alias}) it keeps the record types and terms a records step proposes, per system, through the port
  * {@code materials.service.OntologyProposals} that {@code service.Proposals} implements, and the GM's decisions on them
  * ({@code service.Proposals}, {@code service.Terms}); an origin names its material through
- * {@code materials.service.MaterialNames}.
+ * {@code materials.service.MaterialNames}. From Story 5.1 an artifact (a record the GM wrote in a campaign) is a row of
+ * {@code record} too, with its campaign instead of a version: {@code service.ArtifactRecords} owns that identity and
+ * type for the {@code artifacts} module, which owns the content; no read of a system's records reaches it.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service",
