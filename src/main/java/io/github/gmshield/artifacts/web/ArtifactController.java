@@ -9,6 +9,7 @@ import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.util.List;
 import java.util.Optional;
@@ -18,6 +19,7 @@ import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -40,6 +42,10 @@ import org.springframework.web.bind.annotation.RestController;
  * version and name the newest version the GM saw; a stale one is {@code request.stale_version} (409). The versions list
  * newest first, and one version opens by its number (a reference that cited it). A version number that is malformed or
  * that the artifact does not have is {@code request.not_found} too.
+ *
+ * <p>Story 5.2 part B (contract 1.45.0): a {@code DELETE} starts the artifact's recorded deletion (202, no body,
+ * {@code no-store}). From then on it is not found on every route; a deleting artifact is {@code request.not_found} to
+ * a second delete too.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -486,6 +492,31 @@ class ArtifactController {
         Artifacts.Artifact created = artifacts.restore(campaign, artifact, restored, seen)
                 .orElseThrow(ArtifactController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(created));
+    }
+
+    @DeleteMapping(path = ARTIFACT)
+    @Operation(operationId = "deleteArtifact", summary = "Deletes one of the account's campaigns' artifacts with every"
+            + " version (contract 1.45.0; 202, no body): from now on it is not found on every route (its page, its"
+            + " versions, an edit or a restore), gone from the campaign's list and type counts and from the campaign"
+            + " tier of every question, and an answer still being written leaves it out; its versions, index rows and"
+            + " index points are removed in the background. A reference an answer stored to it reads as a removed"
+            + " source. Nothing of its campaign, of its system's materials or of other artifacts changes. Cannot be"
+            + " undone." + NOT_FOUND + " request.not_found (404) too for an artifact already being deleted;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion is recorded"))
+    ResponseEntity<Void> deleteArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (!artifacts.delete(campaign, artifact)) {
+            throw notFound();
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */

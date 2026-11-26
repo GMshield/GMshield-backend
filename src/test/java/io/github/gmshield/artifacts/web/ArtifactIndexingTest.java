@@ -75,7 +75,9 @@ import tools.jackson.databind.json.JsonMapper;
  * retried with a new one; a campaign's deletion cancels its artifacts' index jobs, removes their rows and creates one
  * {@code index.artifact_removal} job per artifact, by owner and source. Story 5.2 part A: an edit or a restore commits
  * the new version's job and cancels the older versions' unended jobs, so only the newest is indexed, and the retry
- * sweep never retries an older version's failed row.
+ * sweep never retries an older version's failed row. Story 5.2 part B: an artifact's own deletion cancels its index
+ * jobs, waits for a claimed one's claim to lapse, then removes its index rows, versions and identity and creates one
+ * {@code index.artifact_removal} job; neither the backfill nor a retry gives a deleting artifact a job.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -570,6 +572,90 @@ class ArtifactIndexingTest {
         assertThat(claim.path("input").path("source").asString()).isEqualTo(going.toString());
         assertThat(claim.path("input").path("owner").asString()).isEqualTo(gm.id().toString());
         assertThat(outcome(removal.jobId(), claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+    }
+
+    // --- an artifact's own deletion (Story 5.2 part B)
+
+    @Test
+    void anArtifactsDeletionWaitsForItsClaimedIndexJobThenRemovesItsRowsWithOneRemovalJob() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID staying = created(gm, gm.campaign(), "{\"recordType\":\"note\",\"name\":\"Lembrete\",\"fields\":[]}");
+        edited(gm, going, 1, "Espada de Kael II");
+        UUID job = rowOf(going, 2).jobId();
+        offer(job);
+        claim(job);
+        Instant lapses = jobs.rows.get(job).claimLapsesAt();
+        assertThat(lapses).isAfter(clock.instant());
+
+        HttpResponse<String> deleted = send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going,
+                null);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(jobs.rows.get(job).state()).isEqualTo("cancelled");
+        deletion.sweep();
+
+        // Matrix row "Claimed index job": the worker may still write its point until its claim lapses.
+        assertThat(rowsOf(going)).hasSize(2);
+        assertThat(versions.rows).containsKeys(going + "/1", going + "/2");
+        assertThat(records.artifacts).containsKey(going);
+        assertThat(index.removalRows.values()).noneMatch(row -> row.artifactId().equals(going));
+
+        clock.set(lapses.plus(Duration.ofSeconds(1)));
+        deletion.sweep();
+        deletion.sweep();
+
+        assertThat(rowsOf(going)).isEmpty();
+        assertThat(versions.rows).doesNotContainKeys(going + "/1", going + "/2").containsKey(staying + "/1");
+        assertThat(records.artifacts).doesNotContainKey(going).containsKey(staying);
+        assertThat(records.deletingArtifacts).doesNotContain(going);
+        assertThat(rowsOf(staying)).hasSize(1);
+        // One removal of its points, by owner and source, whatever the passes.
+        ArtifactIndexRemovalRow removal = removalOf(going);
+        assertThat(removal.ownerId()).isEqualTo(gm.id());
+        assertThat(jobs.rows.get(removal.jobId()).kind()).isEqualTo("index.artifact_removal");
+        assertThat(OPEN).contains(jobs.rows.get(removal.jobId()).state());
+        assertThat(index.removalRows.values()).noneMatch(row -> row.artifactId().equals(staying));
+    }
+
+    @Test
+    void anArtifactsDeletionCancelsItsUnclaimedJobAndRemovesItAtTheFirstPass() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID job = onlyRow(going).jobId();
+
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going, null)
+                .statusCode()).isEqualTo(202);
+        assertThat(jobs.rows.get(job).state()).isEqualTo("cancelled");
+        // The backend restarted before its pass: the sweep finishes the deletion.
+        deletion.sweep();
+
+        assertThat(rowsOf(going)).isEmpty();
+        assertThat(versions.rows).doesNotContainKey(going + "/1");
+        assertThat(records.artifacts).doesNotContainKey(going);
+        assertThat(removalOf(going).ownerId()).isEqualTo(gm.id());
+    }
+
+    @Test
+    void neitherTheBackfillNorARetryGivesAJobToADeletingArtifact() throws Exception {
+        Gm gm = signUp();
+        UUID going = created(gm, gm.campaign(), KAEL);
+        UUID job = onlyRow(going).jobId();
+        failed(job);
+        UUID never = created(gm, gm.campaign(), "{\"recordType\":\"note\",\"name\":\"Nunca\",\"fields\":[]}");
+        index.rows.remove(onlyRow(never).jobId());
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + going, null)
+                .statusCode()).isEqualTo(202);
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + never, null)
+                .statusCode()).isEqualTo(202);
+        Set<UUID> before = Set.copyOf(jobs.rows.keySet());
+
+        reconcile.reconcile("guard-" + UUID.randomUUID().toString().substring(0, 8));
+        retry.sweep();
+
+        assertThat(onlyRow(going).jobId()).isEqualTo(job);
+        assertThat(rowsOf(never)).isEmpty();
+        assertThat(jobs.rows.values()).filteredOn(one -> !before.contains(one.id()))
+                .noneMatch(one -> one.ownerId().equals(gm.id()) && one.kind().equals("index.artifact"));
     }
 
     // --- helpers

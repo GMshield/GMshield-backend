@@ -76,6 +76,12 @@ import tools.jackson.databind.json.JsonMapper;
  * another owner's and another campaign's artifact or version are not found for each new route. Besides the matrix: a
  * restore of a version whose type the system no longer has names the record type, and a malformed edit, restore or
  * versions query is {@code request.invalid}. The index order is {@code ArtifactIndexingTest}'s.
+ *
+ * <p>Story 5.2 part B: a delete is 202 (no body, {@code no-store}) and the artifact leaves every read, list and count
+ * at once, then its pass removes its identity, versions and index rows; a second delete or a read of it is not found;
+ * another owner's or another campaign's artifact is not found to a delete and nothing changes; a deleting artifact
+ * leaves both deletion dialogs' counts and the type-in-use guard, and a campaign's deletion still removes it. The claim
+ * wait and the removal job are {@code ArtifactIndexingTest}'s, the answers {@code RecordsFlowTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -747,6 +753,128 @@ class ArtifactsFlowTest {
         assertThat(versionsOf(theirs)).isEqualTo(1);
         assertThat(json(get(a, artifacts(a.campaign()) + "/" + theirs)).path("name").asString())
                 .isEqualTo("Espada de Kael");
+    }
+
+    // --- delete (Story 5.2 part B)
+
+    @Test
+    void aDeletedArtifactIsGoneFromEveryReadAtOnceAndItsRowsGoWithThePass() throws Exception {
+        Gm gm = signUp();
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        edit(gm, id, 1, "item", "Espada de Kael II");
+        edit(gm, id, 2, "item", "Espada de Kael III");
+        String kept = create(gm, gm.campaign(), "character_sheet", "Kael");
+        String path = artifacts(gm.campaign()) + "/" + id;
+
+        HttpResponse<String> deleted = send(gm, "DELETE", path, null);
+
+        // Matrix row "Delete": 202, no body, no-store.
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(deleted.body()).isEmpty();
+        assertThat(deleted.headers().firstValue("Cache-Control")).hasValue("no-store");
+        // Before its pass: in no read, list or count.
+        assertNotFound(get(gm, path));
+        assertNotFound(get(gm, path + "/versions"));
+        assertNotFound(get(gm, path + "/versions/1"));
+        assertNotFound(send(gm, "PATCH", path, "{\"version\":3,\"recordType\":\"note\",\"name\":\"X\",\"fields\":[]}"));
+        assertNotFound(send(gm, "POST", path + "/versions/1/restore", "{\"version\":3}"));
+        JsonNode listed = json(get(gm, artifacts(gm.campaign())));
+        assertThat(ids(listed)).containsExactly(kept);
+        assertThat(listed.path("total").asLong()).isEqualTo(1);
+        assertThat(listed.path("types").toString()).doesNotContain("\"item\"");
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "?recordType=item")).path("total").asLong()).isZero();
+        assertThat(versionsOf(id)).isEqualTo(3);
+
+        deletion.sweep();
+
+        // Once the pass ran: no identity, no version, no index row; one removal job (ArtifactIndexingTest).
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id)).containsKey(UUID.fromString(kept));
+        assertThat(versionsOf(id)).isZero();
+        assertThat(index.rows.values()).noneMatch(row -> row.recordId().toString().equals(id));
+        assertThat(index.removalRows.values()).anyMatch(row -> row.artifactId().toString().equals(id));
+        assertNotFound(get(gm, path));
+        assertThat(get(gm, artifacts(gm.campaign()) + "/" + kept).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void aSecondDeleteOrOpeningADeletedArtifactIsNotFoundAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String path = artifacts(gm.campaign()) + "/" + id;
+        assertThat(send(gm, "DELETE", path, null).statusCode()).isEqualTo(202);
+
+        // Matrix row "Already deleted": a second tab deletes it again, or opens it, before and after the pass.
+        assertNotFound(send(gm, "DELETE", path, null));
+        assertNotFound(get(gm, path));
+        deletion.sweep();
+        assertNotFound(send(gm, "DELETE", path, null));
+        assertNotFound(get(gm, path));
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
+    }
+
+    @Test
+    void anotherOwnersOrAnotherCampaignsArtifactIsNotFoundToADeleteAndNothingChanges() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = create(a, a.campaign(), "item", "Espada de Kael");
+        UUID other = UUID.fromString(json(send(a, "POST", "/api/v1/campaigns", "{\"name\":\"Outra mesa\","
+                + "\"systemId\":\"" + a.system() + "\"}")).path("id").asString());
+
+        // Matrix row "Other owner or campaign".
+        assertNotFound(send(b, "DELETE", artifacts(a.campaign()) + "/" + theirs, null));
+        assertNotFound(send(b, "DELETE", artifacts(b.campaign()) + "/" + theirs, null));
+        assertNotFound(send(a, "DELETE", artifacts(other) + "/" + theirs, null));
+        assertNotFound(send(a, "DELETE", artifacts(a.campaign()) + "/" + UUID.randomUUID(), null));
+        assertNotFound(send(a, "DELETE", artifacts(a.campaign()) + "/nope", null));
+        assertNotFound(send(a, "DELETE", "/api/v1/campaigns/nope/artifacts/" + theirs, null));
+        deletion.sweep();
+
+        assertThat(records.deletingArtifacts).doesNotContain(UUID.fromString(theirs));
+        assertThat(records.artifacts).containsKey(UUID.fromString(theirs));
+        assertThat(get(a, artifacts(a.campaign()) + "/" + theirs).statusCode()).isEqualTo(200);
+        assertThat(versionsOf(theirs)).isEqualTo(1);
+    }
+
+    @Test
+    void aDeletingArtifactLeavesTheDialogCountsAndTheTypeGuardAndACampaignsDeletionStillRemovesIt()
+            throws Exception {
+        Gm gm = signUp();
+        UUID used = approvedTypeId(gm, gm.system(), "arma_magica");
+        UUID other = UUID.fromString(json(send(gm, "POST", "/api/v1/campaigns", "{\"name\":\"Outra mesa\","
+                + "\"systemId\":\"" + gm.system() + "\"}")).path("id").asString());
+        String deleting = create(gm, other, "arma_magica", "Arco élfico");
+        String staying = create(gm, other, "note", "Lembrete");
+        assertThat(json(get(gm, "/api/v1/campaigns/" + other + "/deletion")).path("artifacts").asLong()).isEqualTo(2);
+
+        assertThat(send(gm, "DELETE", artifacts(other) + "/" + deleting, null).statusCode()).isEqualTo(202);
+
+        // Before its pass: the dialogs count the live artifact only, and its type is no longer in use.
+        assertThat(json(get(gm, "/api/v1/campaigns/" + other + "/deletion")).path("artifacts").asLong()).isEqualTo(1);
+        assertThat(json(get(gm, "/api/v1/systems/" + gm.system() + "/deletion")).path("artifacts").asLong())
+                .isEqualTo(1);
+        // A campaign's deletion committed before the artifact's pass still takes the deleting artifact.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + other, null).statusCode()).isEqualTo(202);
+        deletion.sweep();
+        deletion.sweep();
+
+        assertThat(records.artifacts).doesNotContainKeys(UUID.fromString(deleting), UUID.fromString(staying));
+        assertThat(versionsOf(deleting)).isZero();
+        assertThat(library.campaigns).doesNotContainKey(other);
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(204);
+    }
+
+    @Test
+    void theTypeOfADeletingArtifactIsNotInUse() throws Exception {
+        Gm gm = signUp();
+        UUID used = approvedTypeId(gm, gm.system(), "arma_magica");
+        String id = create(gm, gm.campaign(), "arma_magica", "Arco élfico");
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(409);
+
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + id, null).statusCode()).isEqualTo(202);
+
+        assertThat(send(gm, "DELETE", "/api/v1/record-types/" + used, null).statusCode()).isEqualTo(204);
+        deletion.sweep();
+        assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
     }
 
     // --- helpers

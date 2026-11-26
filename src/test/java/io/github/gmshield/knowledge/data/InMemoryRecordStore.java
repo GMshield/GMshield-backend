@@ -25,7 +25,9 @@ import java.util.regex.Pattern;
  *
  * <p>Story 5.1: an artifact's identity is a row of the same table on PostgreSQL; here it is kept apart, in
  * {@link #artifacts}, so no read of an extracted record can see one, as no JPA read does (the integration tests check
- * that against the table). The campaign key is PostgreSQL's alone.
+ * that against the table). The campaign key is PostgreSQL's alone. From Story 5.2 part B an artifact the GM deleted is
+ * kept in {@link #deletingArtifacts} until its row goes, and every artifact read leaves it out unless its
+ * {@link Reach} is {@link Reach#ALL}, as the JPA store does.
  */
 public class InMemoryRecordStore implements RecordStore {
 
@@ -35,6 +37,8 @@ public class InMemoryRecordStore implements RecordStore {
     public final Map<UUID, RecordRow> records = new ConcurrentHashMap<>();
     /** The artifacts' identity rows (Story 5.1), by id. */
     public final Map<UUID, ArtifactRow> artifacts = new ConcurrentHashMap<>();
+    /** The ids of the artifacts the GM deleted whose rows are still here (Story 5.2 part B). */
+    public final Set<UUID> deletingArtifacts = ConcurrentHashMap.newKeySet();
 
     @Override
     public synchronized void insert(List<RecordRow> rows) {
@@ -255,14 +259,14 @@ public class InMemoryRecordStore implements RecordStore {
     public Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id) {
         UUID owner = OwnerContext.require();
         return Optional.ofNullable(artifacts.get(id))
-                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId));
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId) && live(row));
     }
 
     @Override
     public synchronized Optional<ArtifactRow> retypeArtifact(UUID id, String type) {
         UUID owner = OwnerContext.require();
         ArtifactRow row = artifacts.get(id);
-        if (row == null || !row.ownerId().equals(owner)) {
+        if (row == null || !row.ownerId().equals(owner) || !live(row)) {
             return Optional.empty();
         }
         if (!TYPE.matcher(type).matches()) {
@@ -275,11 +279,23 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public List<ArtifactRow> findArtifacts(Collection<UUID> ids) {
+    public synchronized boolean markArtifactDeleting(UUID id, Instant at) {
+        UUID owner = OwnerContext.require();
+        ArtifactRow row = artifacts.get(id);
+        if (row == null || !row.ownerId().equals(owner) || !live(row)) {
+            return false;
+        }
+        deletingArtifacts.add(id);
+        RollbackUndo.onRollback(() -> deletingArtifacts.remove(id));
+        return true;
+    }
+
+    @Override
+    public List<ArtifactRow> findArtifacts(Collection<UUID> ids, Reach reach) {
         UUID owner = OwnerContext.require();
         return ids.stream().distinct().map(artifacts::get)
-                .filter(row -> row != null && row.ownerId().equals(owner)).sorted(Comparator.comparing(ArtifactRow::id))
-                .toList();
+                .filter(row -> row != null && row.ownerId().equals(owner) && (reach == Reach.ALL || live(row)))
+                .sorted(Comparator.comparing(ArtifactRow::id)).toList();
     }
 
     @Override
@@ -298,14 +314,14 @@ public class InMemoryRecordStore implements RecordStore {
     public long artifactsIn(Collection<UUID> campaignIds) {
         UUID owner = OwnerContext.require();
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
-                && campaignIds.contains(row.campaignId())).count();
+                && campaignIds.contains(row.campaignId()) && live(row)).count();
     }
 
     @Override
     public long artifactsOfTypeIn(Collection<UUID> campaignIds, String type) {
         UUID owner = OwnerContext.require();
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
-                && campaignIds.contains(row.campaignId()) && row.type().equals(type)).count();
+                && campaignIds.contains(row.campaignId()) && row.type().equals(type) && live(row)).count();
     }
 
     @Override
@@ -316,10 +332,11 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds) {
+    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds, Reach reach) {
         UUID owner = OwnerContext.require();
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
-                && campaignIds.contains(row.campaignId())).map(ArtifactRow::id).sorted().toList();
+                && campaignIds.contains(row.campaignId()) && (reach == Reach.ALL || live(row))).map(ArtifactRow::id)
+                .sorted().toList();
     }
 
     @Override
@@ -330,7 +347,13 @@ public class InMemoryRecordStore implements RecordStore {
             ArtifactRow row = artifacts.get(id);
             if (row != null && row.ownerId().equals(owner)) {
                 artifacts.remove(id);
-                RollbackUndo.onRollback(() -> artifacts.put(row.id(), row));
+                boolean deleting = deletingArtifacts.remove(id);
+                RollbackUndo.onRollback(() -> {
+                    artifacts.put(row.id(), row);
+                    if (deleting) {
+                        deletingArtifacts.add(row.id());
+                    }
+                });
                 deleted++;
             }
         }
@@ -340,7 +363,12 @@ public class InMemoryRecordStore implements RecordStore {
     private java.util.stream.Stream<ArtifactRow> ofCampaign(UUID campaignId, String type) {
         UUID owner = OwnerContext.require();
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
-                && row.campaignId().equals(campaignId) && (type == null || row.type().equals(type)));
+                && row.campaignId().equals(campaignId) && (type == null || row.type().equals(type)) && live(row));
+    }
+
+    /** Whether the artifact is not deleting (Story 5.2 part B). */
+    private boolean live(ArtifactRow row) {
+        return !deletingArtifacts.contains(row.id());
     }
 
     /** UUIDs in PostgreSQL's order: their bytes as unsigned numbers, so a UUIDv7's time orders it. */

@@ -25,6 +25,21 @@ final class StubCampaignArtifacts implements CampaignArtifacts {
         held.put(artifact.id(), new Held(owner, campaignId, artifact));
     }
 
+    /** Story 5.2 part B: no artifact is deleted in the scope's unit tests. */
+    @Override
+    public Set<UUID> deleted(Collection<UUID> ids) {
+        OwnerContext.require();
+        return Set.of();
+    }
+
+    @Override
+    public Set<UUID> live(UUID campaignId, Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        return ids.stream().distinct().map(held::get)
+                .filter(one -> one != null && one.owner().equals(owner) && one.campaignId().equals(campaignId))
+                .map(one -> one.artifact().id()).collect(Collectors.toUnmodifiableSet());
+    }
+
     @Override
     public Set<UUID> ids(UUID campaignId) {
         UUID owner = OwnerContext.require();

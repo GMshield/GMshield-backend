@@ -261,6 +261,9 @@ class CrossOwnerAuditFlowTest {
             route("POST", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/versions/{number}/restore",
                     "campaignId", "campaign", "artifactId", "artifact", "number", "1")
                     .json("{\"version\":{artifactVersion}}").own("campaignId"),
+            // an artifact's deletion (Story 5.2 part B)
+            route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
+                    "artifactId", "artifact").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

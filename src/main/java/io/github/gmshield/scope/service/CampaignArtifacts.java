@@ -10,12 +10,25 @@ import java.util.UUID;
  * What the scope reads of a campaign's artifacts (Story 5.1 part B): a port the {@code artifacts} module implements, so
  * {@code scope} depends on no module that holds artifacts. Everything runs as the owner of the work, in the caller's
  * transaction (or a read of its own), and within one campaign of the owner: another campaign's artifact, another owner's
- * or an unknown id is never answered.
+ * or an unknown id is never answered. From Story 5.2 part B a deleting artifact (the GM deleted it, and its rows are
+ * still being removed) is never answered either, as one that is gone.
  */
 public interface CampaignArtifacts {
 
     /** The ids of the owner's campaign's artifacts; none for an unknown campaign or another owner's. */
     Set<UUID> ids(UUID campaignId);
+
+    /**
+     * Which of these ids are the owner's campaign's live artifacts (Story 5.2 part B): one that is deleting or gone,
+     * another campaign's, another owner's or unknown is left out.
+     */
+    Set<UUID> live(UUID campaignId, Collection<UUID> ids);
+
+    /**
+     * Which of these ids name an artifact of the owner that the GM deleted (Story 5.2 part B), whether it is still
+     * deleting or already gone, of whichever campaign; any other id is left out.
+     */
+    Set<UUID> deleted(Collection<UUID> ids);
 
     /**
      * The owner's campaign's artifacts with these ids, each with its newest version, decrypted, in no set order; an id

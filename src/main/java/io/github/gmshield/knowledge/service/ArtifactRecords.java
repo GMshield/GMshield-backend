@@ -34,6 +34,11 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * A value outside its limits is {@code request.invalid} (400) naming its field in {@code params.field}
  * ({@value #NAME}, {@value #RECORD_TYPE}, {@value #FIELDS}, {@value #FIELD_NAME} or {@value #FIELD_VALUE}, the last two
  * with the field's {@code index} from 0), with its limits; no param carries what was written.
+ *
+ * <p>Story 5.2 part B: the GM's delete marks the row deleting ({@link #markDeleting}) until the artifact's deletion
+ * removes it. Every read here leaves a deleting artifact out (its page, an edit, the lists and counts, the campaign
+ * tier, the backfill and retries, the type-in-use guard), except {@link #allIdsOf} and {@link #allOf}, which a
+ * deletion's own removal reads.
  */
 @Service
 public class ArtifactRecords {
@@ -160,19 +165,44 @@ public class ArtifactRecords {
         return store.retypeArtifact(id, recordType).map(ArtifactRecords::identity);
     }
 
-    /** The owner's artifact {@code id} of the campaign {@code campaignId}; empty for any other id. */
+    /**
+     * Marks the owner's live artifact {@code id} deleting at {@code at} (Story 5.2 part B), with its row locked, in the
+     * caller's transaction, which must exist: from the commit every read here but {@link #allIdsOf} and {@link #allOf}
+     * leaves it out. Answers whether it was marked now: false for a deleting one or any id that is not one of the
+     * owner's artifacts.
+     */
+    public boolean markDeleting(UUID id, Instant at) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("knowledge.transaction_required");
+        }
+        OwnerContext.require();
+        return store.markArtifactDeleting(id, at);
+    }
+
+    /** The owner's live artifact {@code id} of the campaign {@code campaignId}; empty for any other id. */
     public Optional<Identity> find(UUID campaignId, UUID id) {
         OwnerContext.require();
         return store.findArtifact(campaignId, id).map(ArtifactRecords::identity);
     }
 
     /**
-     * The owner's artifacts with these ids, of whichever campaign, by id (Story 5.1 part B); an extracted record's id,
-     * an unknown one or another owner's is left out.
+     * The owner's live artifacts with these ids, of whichever campaign, by id (Story 5.1 part B); an extracted record's
+     * id, an unknown one, another owner's or (Story 5.2 part B) a deleting one is left out.
      */
     public List<Identity> findAll(Collection<UUID> ids) {
         OwnerContext.require();
-        return ids.isEmpty() ? List.of() : store.findArtifacts(ids).stream().map(ArtifactRecords::identity).toList();
+        return ids.isEmpty() ? List.of() : store.findArtifacts(ids, RecordStore.Reach.LIVE).stream()
+                .map(ArtifactRecords::identity).toList();
+    }
+
+    /**
+     * {@link #findAll}, deleting artifacts included (Story 5.2 part B): what an artifact's deletion still has to
+     * remove.
+     */
+    public List<Identity> allOf(Collection<UUID> ids) {
+        OwnerContext.require();
+        return ids.isEmpty() ? List.of() : store.findArtifacts(ids, RecordStore.Reach.ALL).stream()
+                .map(ArtifactRecords::identity).toList();
     }
 
     /**
@@ -199,16 +229,28 @@ public class ArtifactRecords {
                 .map(entry -> new TypeCount(entry.getKey(), entry.getValue())).toList();
     }
 
-    /** How many artifacts the owner's campaigns with these ids hold (Story 5.1: the deletion dialogs name them). */
+    /**
+     * How many live artifacts the owner's campaigns with these ids hold (Story 5.1: the deletion dialogs name them;
+     * from Story 5.2 part B a deleting one is not counted).
+     */
     public long count(Collection<UUID> campaignIds) {
         OwnerContext.require();
         return store.artifactsIn(campaignIds);
     }
 
-    /** The ids of every artifact of the owner's campaigns with these ids (their deletion). */
+    /**
+     * The ids of every live artifact of the owner's campaigns with these ids (the campaign tier of a question's scope);
+     * a deleting one (Story 5.2 part B) is left out.
+     */
     public List<UUID> idsOf(Collection<UUID> campaignIds) {
         OwnerContext.require();
-        return store.artifactIdsOf(campaignIds);
+        return store.artifactIdsOf(campaignIds, RecordStore.Reach.LIVE);
+    }
+
+    /** {@link #idsOf}, deleting artifacts included (Story 5.2 part B): what a campaign's deletion removes. */
+    public List<UUID> allIdsOf(Collection<UUID> campaignIds) {
+        OwnerContext.require();
+        return store.artifactIdsOf(campaignIds, RecordStore.Reach.ALL);
     }
 
     /**

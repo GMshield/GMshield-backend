@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -142,6 +143,13 @@ import tools.jackson.databind.node.ObjectNode;
  *       last field by the job), when its type key is one of the campaign's system's; any other id as before. An artifact
  *       is found by a question only once its index job has ended, since the worker finds it through the index.
  *       {@link #status} counts the campaign's artifacts as a source when the campaign tier is on.</li>
+ *   <li>Story 5.2 part B (a deleted artifact): the port never answers an artifact the GM deleted (deleting, its rows
+ *       still being removed, or gone), so it leaves the campaign tier of every scope resolved from the delete's commit.
+ *       An answer's later calls resolve its scope again, without it: {@link #recordContents} leaves out an id the port
+ *       names deleted ({@link CampaignArtifacts#deleted}, deleting or gone) instead of refusing, and {@link
+ *       #citedRecords} drops it as any id out of the scope, so that answer completes without it. {@link
+ *       #removedArtifacts} names the artifacts among some ids that are deleting or gone, so a stored reference to one
+ *       reads as removed.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -636,20 +644,22 @@ public class Scopes {
         List<UUID> extracted = wanted.stream().filter(id -> !ofCampaign.contains(id)).toList();
         ExtractedRecords.Reach reach = refuse ? ExtractedRecords.Reach.ALL : ExtractedRecords.Reach.LIVE;
         List<Placed> placed = extracted.isEmpty() ? List.of() : located(scope, records.located(extracted, reach));
-        if (refuse && placed.size() != extracted.size()) {
+        if (refuse && placed.size() != extracted.size() && !deletedArtifacts(extracted, placed)) {
             return Optional.empty();
         }
         Map<UUID, ScopedRecordContent> found = new HashMap<>();
         if (!artifactIds.isEmpty()) {
             Set<String> keys = scope.recordTypes();
-            artifacts.read(scope.campaignId(), artifactIds).stream()
-                    .filter(artifact -> keys.contains(artifact.recordType()))
+            // Story 5.2 part B: the port leaves out an artifact deleted since the scope was resolved (deleting or
+            // gone); it is left out of the answer, never refused. One it answers of a type the system lost is refused.
+            List<CampaignArtifacts.Artifact> live = artifacts.read(scope.campaignId(), artifactIds);
+            if (refuse && live.stream().anyMatch(artifact -> !keys.contains(artifact.recordType()))) {
+                return Optional.empty();
+            }
+            live.stream().filter(artifact -> keys.contains(artifact.recordType()))
                     .forEach(artifact -> found.put(artifact.id(), new ScopedRecordContent(ScopedRecord.artifact(
                             artifact.id(), artifact.recordType(), artifact.name(), artifact.version()),
                             artifact.fields(), artifact.content())));
-            if (refuse && found.size() != artifactIds.size()) {
-                return Optional.empty();
-            }
         }
         Map<UUID, ExtractedRecords.Content> contents = new HashMap<>();
         if (!placed.isEmpty()) {
@@ -667,6 +677,17 @@ public class Scopes {
             }
         }
         return Optional.of(wanted.stream().map(found::get).filter(Objects::nonNull).toList());
+    }
+
+    /**
+     * Whether every id of {@code extracted} that is not {@code placed} names an artifact the GM deleted (Story 5.2 part
+     * B: the scope of an answer's later call no longer lists it), deleting or gone: it is then left out, never refused.
+     * Asked only when some id was not placed, so a read of records alone asks nothing more.
+     */
+    private boolean deletedArtifacts(List<UUID> extracted, List<Placed> placed) {
+        Set<UUID> found = placed.stream().map(one -> one.record().id()).collect(Collectors.toSet());
+        List<UUID> missing = extracted.stream().filter(id -> !found.contains(id)).toList();
+        return artifacts.deleted(missing).containsAll(missing);
     }
 
     /**
@@ -720,6 +741,21 @@ public class Scopes {
                     .map(ScopeReads.Place::passageId).toList(), tier.get()));
         }
         return List.copyOf(found);
+    }
+
+    /**
+     * Which of these artifact ids are removed for the owner (Story 5.2 part B): every one that is not a live artifact
+     * of the owner's campaign {@code campaignId} (deleting, gone, or never one of its artifacts), so a stored reference
+     * to it reads as removed. Nothing is decrypted.
+     */
+    public Set<UUID> removedArtifacts(UUID campaignId, Set<UUID> artifactIds) {
+        Objects.requireNonNull(artifactIds, "artifactIds");
+        OwnerContext.require();
+        if (artifactIds.isEmpty()) {
+            return Set.of();
+        }
+        Set<UUID> live = campaignId == null ? Set.of() : reading(() -> artifacts.live(campaignId, artifactIds));
+        return artifactIds.stream().filter(id -> !live.contains(id)).collect(Collectors.toUnmodifiableSet());
     }
 
     /** Which of these versions are removed for the owner, as the class says. */

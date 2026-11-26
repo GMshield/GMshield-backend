@@ -427,7 +427,8 @@ class ConversationController {
                     schema = @Schema(implementation = ReferenceField.class)) List<ReferenceField> fields,
             @Schema(description = "Whether its source has been removed since (its version gone, discarded or pending"
                     + " removal, or its material gone), as of when the event is sent. A version superseded by a newer"
-                    + " accepted one is not removed. An artifact's is false") boolean removed,
+                    + " accepted one is not removed. From contract 1.45.0 an artifact's is true once the artifact is"
+                    + " deleted (being deleted or gone)") boolean removed,
             @Schema(description = "The tier its source had in the turn's scope when the answer was written (Story"
                     + " 3.7), kept when the source leaves the scope; absent for a reference stored before then",
                     allowableValues = {"campaign", "system", "other"}) String tier) {

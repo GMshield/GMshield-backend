@@ -70,7 +70,9 @@ import tools.jackson.databind.node.ObjectNode;
  *       in order.</li>
  *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
  *       {@code removed} as of now when its source is removed ({@link Scopes#removedVersions}); from Story 4.3 part C
- *       a record's reference with the record's name and fields as stored, never read from the record again.</li>
+ *       a record's reference with the record's name and fields as stored, never read from the record again; from
+ *       Story 5.2 part B an artifact's reference is {@code removed} when its artifact is deleting or gone
+ *       ({@link Scopes#removedArtifacts}).</li>
  *   <li>{@link #stop} (Story 2.6): the GM's stop of a turn of the owner (else {@code request.not_found}), in one
  *       transaction that first locks the turn's job row, the lock its batches and its outcome take: a {@code waiting}
  *       or {@code offered} job is cancelled, a {@code running} one keeps its claim (so the worker can still post usage
@@ -775,9 +777,12 @@ public class Conversations {
             }
             Set<UUID> removed = scopes.removedVersions(rows.stream().map(TurnReferenceRow::versionId)
                     .filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet()));
+            Set<UUID> removedArtifacts = removedArtifacts(turnId, rows);
             return rows.stream().map(row -> row.artifact()
-                    // Story 5.1 part B: an artifact's reference has no place, and is never removed until Story 5.2.
-                    ? new TurnReference(row.number(), null, List.of(), 0, List.of(), false, row.tier(), cited(row))
+                    // Story 5.1 part B: an artifact's reference has no place; from Story 5.2 part B it is removed once
+                    // its artifact is deleting or gone.
+                    ? new TurnReference(row.number(), null, List.of(), 0, List.of(),
+                    removedArtifacts.contains(row.record().recordId()), row.tier(), cited(row))
                     : new TurnReference(row.number(),
                     vault.decryptText(TurnReferences.materialName(row.id(), row.ownerId()), row.materialName()),
                     TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
@@ -785,6 +790,22 @@ public class Conversations {
                     row.page(), row.passageIds(), removed.contains(row.versionId()), row.tier(), cited(row)))
                     .toList();
         });
+    }
+
+    /**
+     * Which artifacts the turn's artifact references name are removed (Story 5.2 part B): deleting or gone, worked out
+     * now through the scope; none when no reference names an artifact. Runs in the caller's read transaction.
+     */
+    private Set<UUID> removedArtifacts(UUID turnId, List<TurnReferenceRow> rows) {
+        Set<UUID> ids = rows.stream().filter(TurnReferenceRow::artifact).map(row -> row.record().recordId())
+                .collect(Collectors.toUnmodifiableSet());
+        if (ids.isEmpty()) {
+            return Set.of();
+        }
+        UUID campaignId = store.findTurn(turnId)
+                .flatMap(turn -> store.findConversationAnyState(turn.conversationId()))
+                .map(ConversationRow::campaignId).orElse(null);
+        return scopes.removedArtifacts(campaignId, ids);
     }
 
     /** The record a stored reference names (Story 4.3 part C), decrypted; null for a passage place's reference. */

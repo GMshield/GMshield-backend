@@ -29,6 +29,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * one transaction, creates one {@code index.artifact_removal} job per artifact ({@link ArtifactIndexRemovals#start},
  * by owner and source), then deletes the artifacts' {@code artifact_index} rows, their versions and their identities.
  * It is safe to repeat: a repeated pass finds no artifact left, and creates no job.
+ *
+ * <p>Story 5.2 part B: an artifact's own deletion ({@link Going#ofOneArtifact}) is the same for that one artifact: its
+ * prepare cancels its unended index jobs and answers their latest claim lapse, and its removal takes its rows and
+ * creates its removal job, the same way; it counts nothing. Both read the artifact whether deleting or not
+ * ({@link ArtifactRecords#allOf}, {@link ArtifactRecords#allIdsOf}), so a campaign's or a system's deletion still takes
+ * a deleting artifact; the dialogs count live artifacts only.
  */
 @Service
 class ArtifactsDeletion implements SystemDeletionHandler {
@@ -62,7 +68,9 @@ class ArtifactsDeletion implements SystemDeletionHandler {
         return PART;
     }
 
-    /** How many artifacts the campaigns going hold (none for a material, a version or a conversation). */
+    /**
+     * How many live artifacts the campaigns going hold (none for a material, a version, a conversation or an artifact).
+     */
     @Override
     public long count(Going going) {
         OwnerContext.require();
@@ -75,10 +83,10 @@ class ArtifactsDeletion implements SystemDeletionHandler {
     @Override
     public Optional<Instant> prepare(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.ofOneItem() || going.campaignIds().isEmpty()) {
+        if (!going.ofOneArtifact() && (going.ofOneItem() || going.campaignIds().isEmpty())) {
             return Optional.empty();
         }
-        List<UUID> ids = records.idsOf(going.campaignIds());
+        List<UUID> ids = going(going);
         Optional<Instant> lapse = jobs.claimLapse(indexing.jobsOf(ids));
         int cancelled = indexing.cancel(ids);
         going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("artifacts", ids.size())
@@ -89,11 +97,11 @@ class ArtifactsDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.ofOneItem() || going.campaignIds().isEmpty()) {
+        if (!going.ofOneArtifact() && (going.ofOneItem() || going.campaignIds().isEmpty())) {
             return;
         }
         Integer removed = new TransactionTemplate(transactions.getObject()).execute(status -> {
-            List<UUID> ids = records.idsOf(going.campaignIds());
+            List<UUID> ids = going(going);
             // Story 5.1 part B: one removal of each artifact's points, then its index rows before its versions.
             ids.forEach(removals::start);
             index.deleteOf(ids);
@@ -102,5 +110,16 @@ class ArtifactsDeletion implements SystemDeletionHandler {
         });
         going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("artifacts", removed)
                 .log("artifacts.deletion_removed");
+    }
+
+    /**
+     * The ids of the artifacts that go, deleting ones included: that one artifact while it is left (Story 5.2 part B),
+     * or every artifact of the campaigns going.
+     */
+    private List<UUID> going(Going going) {
+        if (going.ofOneArtifact()) {
+            return records.allOf(List.of(going.artifactId())).stream().map(ArtifactRecords.Identity::id).toList();
+        }
+        return records.allIdsOf(going.campaignIds());
     }
 }

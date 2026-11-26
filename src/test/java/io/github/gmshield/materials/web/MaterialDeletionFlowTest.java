@@ -9,6 +9,10 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.ArtifactIndexRow;
+import io.github.gmshield.artifacts.data.ArtifactVersionRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
@@ -20,6 +24,8 @@ import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.jobs.service.JobRef;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.jobs.service.Lane;
+import io.github.gmshield.knowledge.data.ArtifactRow;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.DeletionRow;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.LibraryTestStores;
@@ -78,7 +84,8 @@ import tools.jackson.databind.json.JsonMapper;
  * an earlier reference reads removed and its page is not found), a version in another state (409), a version of another
  * material and another owner's material (404), a version that left {@code discarded} during the wait (the pass fails,
  * the next prepares again), a running claim the removal waits for, and a failed {@code index.removal} started again by
- * the sweep. The same rows against PostgreSQL are in {@code MaterialDeletionIntegrationTest}.
+ * the sweep. The same rows against PostgreSQL are in {@code MaterialDeletionIntegrationTest}. Story 5.2 part B: a
+ * material's deletion touches no artifact identity, version or index row.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -138,6 +145,12 @@ class MaterialDeletionFlowTest {
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryIndexStore index;
+    @Autowired
+    private InMemoryRecordStore records;
+    @Autowired
+    private InMemoryArtifactVersionStore artifactVersions;
+    @Autowired
+    private InMemoryArtifactIndexStore artifactIndex;
     @Autowired
     private InMemoryJobStorage jobs;
     @Autowired
@@ -270,6 +283,38 @@ class MaterialDeletionFlowTest {
         int removals = index.removals.size();
         assertThat(deletion.sweep()).isZero();
         assertThat(index.removals).hasSize(removals);
+    }
+
+    @Test
+    void aMaterialsDeletionLeavesEveryArtifactWithAllItsVersions() throws Exception {
+        Gm gm = signUp();
+        Made book = material(gm, null, "ready", 2, START.minusSeconds(60));
+        String artifacts = "/api/v1/campaigns/" + gm.campaign() + "/artifacts";
+        HttpResponse<String> created = sendJson(gm, "POST", artifacts, "{\"recordType\":\"item\","
+                + "\"name\":\"Espada de Kael\",\"fields\":[]}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID artifact = UUID.fromString(json(created).path("id").asString());
+        HttpResponse<String> edited = sendJson(gm, "PATCH", artifacts + "/" + artifact, "{\"version\":1,"
+                + "\"recordType\":\"item\",\"name\":\"Espada de Kael II\",\"fields\":[]}");
+        assertThat(edited.statusCode()).as(edited.body()).isEqualTo(200);
+        Map<String, ArtifactVersionRow> versionsBefore = Map.copyOf(artifactVersions.rows);
+        ArtifactRow identity = records.artifacts.get(artifact);
+        Map<UUID, ArtifactIndexRow> indexBefore = Map.copyOf(artifactIndex.rows);
+
+        // Matrix row "Material deleted".
+        assertThat(send(gm, "DELETE", "/api/v1/materials/" + book.materialId()).statusCode()).isEqualTo(202);
+        assertThat(deletion.sweep()).isEqualTo(1);
+
+        assertThat(materials.materials).doesNotContainKey(book.materialId());
+        assertThat(records.artifacts.get(artifact)).isEqualTo(identity);
+        assertThat(records.deletingArtifacts).doesNotContain(artifact);
+        assertThat(artifactVersions.rows).isEqualTo(versionsBefore).containsKeys(artifact + "/1", artifact + "/2");
+        assertThat(artifactIndex.rows).isEqualTo(indexBefore);
+        assertThat(artifactIndex.removalRows.values()).noneMatch(row -> row.artifactId().equals(artifact));
+        assertThat(deletions.rows.values()).noneMatch(row -> row.kind().equals(DeletionRow.ARTIFACT));
+        JsonNode read = json(get(gm, artifacts + "/" + artifact));
+        assertThat(read.path("version").asInt()).isEqualTo(2);
+        assertThat(json(get(gm, artifacts + "/" + artifact + "/versions")).path("total").asLong()).isEqualTo(2);
     }
 
     @Test
@@ -622,6 +667,13 @@ class MaterialDeletionFlowTest {
     private HttpResponse<String> get(Gm gm, String path) throws Exception {
         return client.send(HttpRequest.newBuilder(uri(path)).header("Authorization", "Bearer " + CREDENTIAL)
                 .header("X-Session-Token", gm.session()).GET().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> sendJson(Gm gm, String method, String path, String body) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri(path)).header("Authorization", "Bearer " + CREDENTIAL)
+                .header("X-Session-Token", gm.session()).header("Content-Type", "application/json")
+                .method(method, HttpRequest.BodyPublishers.ofString(body)).build(),
+                HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> send(Gm gm, String method, String path) throws Exception {

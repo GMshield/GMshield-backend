@@ -5,6 +5,7 @@ import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.artifacts.data.VersionTaken;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -59,6 +60,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *   <li>{@link #restore} (Story 5.2): the same write, with the type, name, fields and content of an earlier version; a
  *       version whose type the system no longer has is {@code request.invalid} naming the record type.</li>
  *   <li>{@link #versions} (Story 5.2): the artifact's versions newest first, a page at a time, with the total.</li>
+ *   <li>{@link #delete} (Story 5.2 part B): in one transaction, the artifact's unended index jobs are locked (as an
+ *       edit takes them), then its newest version, then its identity is marked deleting
+ *       ({@link ArtifactRecords#markDeleting}) and its deletion recorded ({@link SystemDeletion#deleteArtifact}, whose
+ *       handler cancels those jobs). From the commit every call here answers it as not found; the recorded, resumable
+ *       deletion then removes its versions, index rows and identity, and its points through one removal job.</li>
  * </ul>
  *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
@@ -90,17 +96,19 @@ public class Artifacts {
     private final Library library;
     private final Vault vault;
     private final ArtifactIndexing indexing;
+    private final ObjectProvider<SystemDeletion> deletions;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
     Artifacts(ArtifactRecords records, ArtifactVersionStore versions, Library library, Vault vault,
-              ArtifactIndexing indexing, ObjectProvider<PlatformTransactionManager> transactions,
-              ObjectProvider<Clock> clock) {
+              ArtifactIndexing indexing, ObjectProvider<SystemDeletion> deletions,
+              ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.records = records;
         this.versions = versions;
         this.library = library;
         this.vault = vault;
         this.indexing = indexing;
+        this.deletions = deletions;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -298,7 +306,7 @@ public class Artifacts {
     public Optional<Artifact> update(UUID campaignId, UUID artifactId, int version, Written written) {
         UUID owner = OwnerContext.require();
         Optional<Artifact> updated = writing(() -> library.campaign(campaignId).flatMap(campaign ->
-                records.find(campaign.id(), artifactId).map(identity -> {
+                records.find(campaign.id(), artifactId).flatMap(identity -> {
                     String recordType = records.checkedType(campaign.system().id(), written.recordType());
                     ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields()
                             .stream().map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
@@ -312,7 +320,7 @@ public class Artifacts {
                         Artifact current = open(vault, identity, newest, owner);
                         if (current.recordType().equals(recordType) && current.name().equals(checked.name())
                                 && current.fields().equals(fields) && Objects.equals(current.content(), content)) {
-                            return current;
+                            return Optional.of(current);
                         }
                     }
                     return next(identity, owner, version, recordType, checked.name(), fields, content);
@@ -336,7 +344,7 @@ public class Artifacts {
         UUID owner = OwnerContext.require();
         Optional<Artifact> restored = writing(() -> library.campaign(campaignId).flatMap(campaign ->
                 records.find(campaign.id(), artifactId).flatMap(identity -> versions.find(identity.id(), number)
-                        .map(earlier -> {
+                        .flatMap(earlier -> {
                             Artifact copied = open(vault, identity, earlier, earlier.number(), owner);
                             String recordType = records.checkedType(campaign.system().id(), earlier.recordType());
                             return next(identity, owner, version, recordType, copied.name(), copied.fields(),
@@ -385,19 +393,61 @@ public class Artifacts {
     }
 
     /**
+     * Starts the deletion of the owner's artifact {@code artifactId} of the campaign {@code campaignId} (Story 5.2 part
+     * B), as the class says; true when it was recorded now. False (nothing changes) when the campaign is not the
+     * owner's or not readable, or the artifact is not the campaign's, a deleting one included.
+     */
+    public boolean delete(UUID campaignId, UUID artifactId) {
+        UUID owner = OwnerContext.require();
+        boolean recorded = Boolean.TRUE.equals(writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .map(identity -> {
+                    UUID id = identity.id();
+                    // The order an edit takes: its unended index jobs, then its newest version, then its identity.
+                    indexing.lockUnended(id);
+                    Optional<ArtifactVersionRow> newest = versions.latest(id);
+                    // A second delete that waited on the first's locks may find its versions gone: not found.
+                    if (newest.isEmpty()) {
+                        return false;
+                    }
+                    versions.lock(id, newest.get().number());
+                    Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+                    // A second delete that waited on those locks finds it deleting: nothing changes.
+                    if (!records.markDeleting(id, now)) {
+                        return false;
+                    }
+                    if (!deletions.getObject().deleteArtifact(id)) {
+                        // Marked but not recorded, no pass would ever remove it: the mark rolls back.
+                        throw new IllegalStateException("artifacts.deletion_not_recorded");
+                    }
+                    return true;
+                }).orElse(false)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("recorded", recorded).log("artifacts.delete");
+        return recorded;
+    }
+
+    /**
      * The next version of the artifact {@code identity} (Story 5.2), in the caller's transaction: {@code seen} must be
      * its newest number, read again once that version is locked (behind its unended index jobs' locks, as
      * {@link ArtifactIndexing#lockUnended} says); a number taken first by another write is stale too. Then the version,
-     * the identity's type and the version's index job.
+     * the identity's type and the version's index job. Empty (Story 5.2 part B) when the artifact turned deleting while
+     * the write waited on those locks: nothing is stored then.
      */
-    private Artifact next(ArtifactRecords.Identity identity, UUID owner, int seen, String recordType, String name,
-                          List<Field> fields, String content) {
+    private Optional<Artifact> next(ArtifactRecords.Identity identity, UUID owner, int seen, String recordType,
+                                    String name, List<Field> fields, String content) {
         UUID id = identity.id();
         if (newestNumber(id) != seen) {
             throw new ApiException(STALE_VERSION);
         }
         indexing.lockUnended(id);
-        if (versions.lock(id, seen).isEmpty() || newestNumber(id) != seen) {
+        Optional<ArtifactVersionRow> locked = versions.lock(id, seen);
+        // Story 5.2 part B: a delete that committed while this write waited (its pass may have removed the versions
+        // too) makes the artifact not found, never stale.
+        if (records.find(identity.campaignId(), id).isEmpty()) {
+            return Optional.empty();
+        }
+        if (locked.isEmpty() || newestNumber(id) != seen) {
             throw new ApiException(STALE_VERSION);
         }
         int number = seen + 1;
@@ -409,8 +459,8 @@ public class Artifacts {
         }
         records.retype(id, recordType).orElseThrow(() -> new IllegalStateException("artifacts.identity_missing"));
         indexing.start(id, number, now);
-        return new Artifact(id, identity.campaignId(), recordType, name, fields, content, number, number,
-                identity.createdAt());
+        return Optional.of(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number, number,
+                identity.createdAt()));
     }
 
     private int newestNumber(UUID id) {

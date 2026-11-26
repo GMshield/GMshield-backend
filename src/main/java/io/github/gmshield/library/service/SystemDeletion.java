@@ -8,7 +8,9 @@ import io.github.gmshield.shared.service.OwnerContext;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -21,6 +23,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -68,6 +72,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  * conversation {@code deleting} and cancels its answer jobs in the GM's transaction, then removes its rows; every other
  * handler ignores it. A campaign's or a system's deletion meanwhile takes the conversation too: its own deletion then
  * finds nothing left and is marked done.
+ *
+ * <p>Story 5.2 part B: deleting one of the owner's artifacts ({@link #deleteArtifact}) is the same process again, of
+ * kind {@code artifact}, recorded as a conversation's is. {@code library} keeps the id opaque: the {@code artifacts}
+ * module finds the artifact, locks it and marks it deleting in the GM's transaction, then records the deletion in that
+ * same transaction; its handler, given {@code Going.ofArtifact}, cancels the artifact's index jobs and waits for their
+ * claims, then removes its rows. Every other handler ignores it. A campaign's or a system's deletion meanwhile takes
+ * the artifact too: its own deletion then finds nothing left and is marked done.
  */
 @Service
 public class SystemDeletion {
@@ -228,12 +239,37 @@ public class SystemDeletion {
     }
 
     /**
+     * Records the deletion of the owner's artifact {@code artifactId} (Story 5.2 part B), as the class says, in the
+     * caller's transaction when there is one: the {@code artifacts} module has found it the owner's and live, and
+     * marked it deleting. Answers whether it was recorded now: false when its deletion was recorded already (nothing
+     * changes then).
+     */
+    public boolean deleteArtifact(UUID artifactId) {
+        return recordDeletion(DeletionRow.ARTIFACT, artifactId, SystemDeletionHandler.Going.ofArtifact(artifactId));
+    }
+
+    /**
      * Whether the deletion of the owner's material {@code materialId} is recorded, pending or done (Story 3.4 part B:
      * from then on its count and its versions are not found).
      */
     public boolean materialDeletionRecorded(UUID materialId) {
         UUID owner = OwnerContext.require();
         return deletions.findTarget(owner, DeletionRow.MATERIAL, materialId).isPresent();
+    }
+
+    /**
+     * Which of these ids name an artifact of the owner whose deletion is recorded, pending or done (Story 5.2 part B:
+     * an answer still running leaves such an artifact out instead of failing, also once its rows are gone).
+     */
+    public Set<UUID> artifactDeletionsRecorded(Collection<UUID> artifactIds) {
+        UUID owner = OwnerContext.require();
+        Set<UUID> recorded = new HashSet<>();
+        for (UUID id : Set.copyOf(artifactIds)) {
+            if (deletions.findTarget(owner, DeletionRow.ARTIFACT, id).isPresent()) {
+                recorded.add(id);
+            }
+        }
+        return Set.copyOf(recorded);
     }
 
     /**
@@ -342,8 +378,8 @@ public class SystemDeletion {
             handler.remove(prepared.going());
         }
         if (prepared.going().ofOneItem()) {
-            // A material, a version or a conversation: nothing of library's own goes; the handlers' removal ended, so
-            // the record does.
+            // A material, a version, a conversation or an artifact: nothing of library's own goes; the handlers'
+            // removal ended, so the record does.
             writing(() -> deletions.done(owner, row.id(), now()));
             prepared.going().about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("deletionId", row.id())
                     .log("library." + row.kind() + "_deleted");
@@ -368,20 +404,20 @@ public class SystemDeletion {
 
     /**
      * Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. A
-     * material or a version (Story 3.4 part B), or a conversation (Story 3.10 part B), is not library's to find: the
-     * handlers find what is left of it, and nothing when it is gone.
+     * material or a version (Story 3.4 part B), a conversation (Story 3.10 part B) or an artifact (Story 5.2 part B) is
+     * not library's to find: the handlers find what is left of it, and nothing when it is gone.
      */
     private boolean targetDeleting(DeletionRow row) {
         return switch (row.kind()) {
             case DeletionRow.CAMPAIGN -> store.campaignDeleting(row.targetId());
-            case DeletionRow.MATERIAL, DeletionRow.VERSION, DeletionRow.CONVERSATION -> true;
+            case DeletionRow.MATERIAL, DeletionRow.VERSION, DeletionRow.CONVERSATION, DeletionRow.ARTIFACT -> true;
             default -> store.deleting(row.targetId());
         };
     }
 
     /**
      * What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone, or
-     * (kinds {@code material}, {@code version} and {@code conversation}) that one id.
+     * (kinds {@code material}, {@code version}, {@code conversation} and {@code artifact}) that one id.
      */
     private SystemDeletionHandler.Going goingOf(DeletionRow row) {
         return switch (row.kind()) {
@@ -389,6 +425,7 @@ public class SystemDeletion {
             case DeletionRow.MATERIAL -> SystemDeletionHandler.Going.ofMaterial(row.targetId());
             case DeletionRow.VERSION -> SystemDeletionHandler.Going.ofVersion(row.targetId());
             case DeletionRow.CONVERSATION -> SystemDeletionHandler.Going.ofConversation(row.targetId());
+            case DeletionRow.ARTIFACT -> SystemDeletionHandler.Going.ofArtifact(row.targetId());
             default -> new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
         };
     }
@@ -425,8 +462,25 @@ public class SystemDeletion {
         return notBefore;
     }
 
-    /** The one-shot pass at {@code at}, when a scheduler runs here; otherwise the sweep finds it. */
+    /**
+     * The one-shot pass at {@code at}, when a scheduler runs here; otherwise the sweep finds it. Inside a caller's
+     * transaction (Story 5.2 part B: an artifact's deletion is recorded in the GM's), it is scheduled once that
+     * transaction commits, so the pass finds the record; never after a rollback.
+     */
     private void later(UUID ownerId, UUID deletionId, Instant at) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    schedule(ownerId, deletionId, at);
+                }
+            });
+            return;
+        }
+        schedule(ownerId, deletionId, at);
+    }
+
+    private void schedule(UUID ownerId, UUID deletionId, Instant at) {
         try {
             SystemDeletionSweepSchedule later = schedule.getIfAvailable();
             if (later != null) {

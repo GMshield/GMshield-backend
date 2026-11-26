@@ -3,7 +3,9 @@ package io.github.gmshield.library.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import io.github.gmshield.library.data.CampaignRow;
@@ -30,7 +32,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Story 3.4 part B: a material's deletion and a version's removal are recorded once, prepared in the same transaction
  * (waiting for the latest claim lapse), and done once the handlers' removal ends, with nothing of library's touched.
  * Story 3.10 part B: a conversation's deletion is the same, its id kept opaque, waiting for the claims its prepare
- * answers; a second delete records nothing.
+ * answers; a second delete records nothing. Story 5.2 part B: an artifact's deletion, recorded inside the caller's
+ * transaction, schedules its one-shot pass only once that transaction commits, and never when it rolls back.
  */
 class SystemDeletionTest {
 
@@ -285,5 +288,33 @@ class SystemDeletionTest {
         assertThat(store.campaigns).containsKey(campaign);
         assertThat(store.systems).containsKey(system);
         assertThat(deletion.run(owner, row.id())).isFalse();
+    }
+
+    @Test
+    void anArtifactsDeletionRecordedInACallersTransactionSchedulesItsPassOnlyAfterTheCommit() {
+        SystemDeletion deletion = deletion();
+        UUID owner = Ids.newId();
+        UUID artifact = Ids.newId();
+
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(deletion.deleteArtifact(artifact)).isTrue();
+            // Not before the commit: the pass would not find the record yet.
+            verify(schedule, never()).once(any(), any());
+            return null;
+        }));
+        verify(schedule).once(any(), eq(NOW));
+        assertThat(deletions.rows.values()).anyMatch(row -> row.targetId().equals(artifact)
+                && row.kind().equals(DeletionRow.ARTIFACT));
+
+        // Rolled back: no pass is ever scheduled. (Whether the record rolls back with it is PostgreSQL's: this test's
+        // transaction manager starts the deletion's own transaction apart instead of joining the caller's.)
+        clearInvocations(schedule);
+        UUID other = Ids.newId();
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(deletion.deleteArtifact(other)).isTrue();
+            status.setRollbackOnly();
+            return null;
+        }));
+        verify(schedule, never()).once(any(), any());
     }
 }
