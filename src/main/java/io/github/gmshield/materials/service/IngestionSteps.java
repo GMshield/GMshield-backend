@@ -154,10 +154,6 @@ public class IngestionSteps implements JobHandler, IngestionStart {
     static final int MAX_RECORDS = 1_000;
     /** The core types a records step extracts (Story 4.2), as the records line counts them by name. */
     static final List<String> EXTRACTED_CORE = List.of("rule", "spell", "item");
-    static final int MAX_RECORD_NAME = 200;
-    static final int MAX_FIELDS = 64;
-    static final int MAX_FIELD_NAME = 200;
-    static final int MAX_FIELD_VALUE = 8_000;
     static final int MAX_RECORD_PASSAGES = 100;
     static final String RECORD_INVALID = "ingestion.record_invalid";
     /**
@@ -780,7 +776,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * version's format, size and page total, whose first step reads a copy of the accepted version's cleaned original
      * as a restart does ({@link #START_STAGES}: the clean stage reads a stored original again). The copy has a file id
      * of its own, since a file id belongs to one version file of its owner, and goes after the transaction when it does
-     * not commit (a failed copy throws, so the transaction rolls back and its pieces go then). The accepted version, its files, passages and points are not touched: it keeps serving until the new
+     * not commit (a failed copy throws, so the transaction rolls back and its pieces go then). From Story 4.5 the new
+     * version names the accepted one ({@code reprocessed_from}). The accepted version, its files, passages and points are not touched: it keeps serving until the new
      * version is accepted. Refused with {@code material.action_unavailable} when the accepted version has no original
      * or its format has no chain. Answers the new version.
      */
@@ -796,7 +793,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
         UUID fileId = Ids.newId();
         VersionRow version = new VersionRow(versionId, owner, accepted.materialId(), Uploads.WAITING, accepted.format(),
                 accepted.sizeBytes(), now, now, accepted.pageTotal(), null, null);
-        materials.insertVersion(version);
+        // Story 4.5: the new version names the accepted one, whose corrections its acceptance carries over.
+        materials.insertVersion(version, accepted.id());
         VersionFileRow source = original.get();
         copyFile(owner, source, fileId);
         materials.insertVersionFile(new VersionFileRow(Ids.newId(), owner, versionId, fileId, VersionFileRow.ORIGINAL,
@@ -1344,8 +1342,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
      * (and that input belongs to no other stage), and {@code records} (null when absent): at most
      * {@value #MAX_RECORDS}, each a {@code type} that is a record type key ({@link RecordTypeKeys#KEY}; whether the
      * material may extract it is checked when the report is recorded), a non-blank {@code name} of at most
-     * {@value #MAX_RECORD_NAME} code points, {@code fields} (at most {@value #MAX_FIELDS}, each a non-blank
-     * {@code name} and {@code value}) and 1 to {@value #MAX_RECORD_PASSAGES} distinct {@code passageIds}.
+     * {@value ExtractedRecords#MAX_NAME} code points, {@code fields} (at most {@value ExtractedRecords#MAX_FIELDS},
+     * each a non-blank {@code name} and {@code value}) and 1 to {@value #MAX_RECORD_PASSAGES} distinct {@code passageIds}.
      */
     record Report(String pipelineVersion, Integer pageTotal, UUID original, List<Batch> batches, List<Batch> texts,
                   List<Range> layers, List<Range> pages, List<Next> next, List<Passage> passages,
@@ -1513,14 +1511,14 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 if (!item.isObject() || !type.isString() || !RecordTypeKeys.valid(type.asString())) {
                     throw new JobResultInvalid(RECORD_INVALID);
                 }
-                found.add(new ReportedRecord(type.asString(), text(item.path("name"), MAX_RECORD_NAME),
+                found.add(new ReportedRecord(type.asString(), text(item.path("name"), ExtractedRecords.MAX_NAME),
                         recordFields(item.path("fields")), recordPassages(item.path("passageIds"))));
             }
             return List.copyOf(found);
         }
 
         private static List<ExtractedRecords.Field> recordFields(JsonNode node) {
-            if (!node.isArray() || node.size() > MAX_FIELDS) {
+            if (!node.isArray() || node.size() > ExtractedRecords.MAX_FIELDS) {
                 throw new JobResultInvalid(RECORD_INVALID);
             }
             List<ExtractedRecords.Field> found = new ArrayList<>(node.size());
@@ -1528,8 +1526,8 @@ public class IngestionSteps implements JobHandler, IngestionStart {
                 if (!field.isObject()) {
                     throw new JobResultInvalid(RECORD_INVALID);
                 }
-                found.add(new ExtractedRecords.Field(text(field.path("name"), MAX_FIELD_NAME),
-                        text(field.path("value"), MAX_FIELD_VALUE)));
+                found.add(new ExtractedRecords.Field(text(field.path("name"), ExtractedRecords.MAX_FIELD_NAME),
+                        text(field.path("value"), ExtractedRecords.MAX_FIELD_VALUE)));
             }
             return List.copyOf(found);
         }

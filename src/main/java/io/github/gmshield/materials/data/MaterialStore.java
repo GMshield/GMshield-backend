@@ -17,6 +17,19 @@ public interface MaterialStore {
 
     void insertVersion(VersionRow row);
 
+    /**
+     * Inserts a version that reprocessing made from the accepted version {@code reprocessedFrom} (Story 4.5: its
+     * acceptance carries that version's corrections over). The link is set once, here, and never changed.
+     */
+    void insertVersion(VersionRow row, UUID reprocessedFrom);
+
+    /**
+     * The accepted version that reprocessing read again to make the current owner's version {@code id} (Story 4.5);
+     * empty for a version made otherwise (an upload, a replacement), an unknown id, another owner's, or once that
+     * version was deleted.
+     */
+    Optional<UUID> reprocessedFrom(UUID id);
+
     /** Says that a material belongs to a game system (Story 1.14). */
     void insertMaterialSystem(MaterialSystemRow row);
 

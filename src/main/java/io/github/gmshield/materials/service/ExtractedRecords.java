@@ -3,7 +3,9 @@ package io.github.gmshield.materials.service;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 import org.springframework.modulith.NamedInterface;
 
 /**
@@ -19,9 +21,23 @@ import org.springframework.modulith.NamedInterface;
  * for the {@code scope} module, which checks them against the campaign's scope. Whether a version is {@code ready} and
  * allowed is the caller's check, never this port's. Story 4.3 part C: an answer reads the name and fields of the
  * records it was handed or cited through {@link #read}, once the {@code scope} module has checked their ids.
+ *
+ * <p>Story 4.5: a record's limits ({@link #MAX_NAME}, {@link #MAX_FIELDS}, {@link #MAX_FIELD_NAME} and
+ * {@link #MAX_FIELD_VALUE}, in code points) hold for an extraction's report and for the GM's correction alike; and a
+ * version that reprocessing created takes over, at its acceptance, the corrections of the version it replaces
+ * ({@link #carryCorrections}).
  */
 @NamedInterface("service")
 public interface ExtractedRecords {
+
+    /** A record's name: non-blank, at most this many code points. */
+    int MAX_NAME = 200;
+    /** A record's fields: at most this many. */
+    int MAX_FIELDS = 64;
+    /** A field's name: non-blank, at most this many code points. */
+    int MAX_FIELD_NAME = 200;
+    /** A field's value: non-blank, at most this many code points. */
+    int MAX_FIELD_VALUE = 8_000;
 
     /** A record's field: a name and a value, both non-blank. {@code toString} names neither. */
     @NamedInterface("service")
@@ -139,4 +155,41 @@ public interface ExtractedRecords {
      * records is left out. The caller checks the ids against what it may read before it calls this.
      */
     List<Content> read(Collection<UUID> ids);
+
+    /**
+     * Where a corrected record's passages land in a new version (Story 4.5): the new version's passages that stand where
+     * the record's did, in order, and the lowest page among them. {@code toString} names numbers only.
+     */
+    @NamedInterface("service")
+    record Remapped(List<UUID> passageIds, int firstPage) {
+        public Remapped {
+            passageIds = List.copyOf(passageIds);
+        }
+
+        @Override
+        public String toString() {
+            return "Remapped[passages=" + passageIds.size() + ", firstPage=" + firstPage + "]";
+        }
+    }
+
+    /**
+     * What a carry-over did (Story 4.5): the corrections that matched a new record, those copied into the new version,
+     * and those dropped because none of their pages has a passage in it.
+     */
+    @NamedInterface("service")
+    record Carried(int matched, int copied, int dropped) {
+    }
+
+    /**
+     * Carries every correction of the version {@code fromVersionId} over to the version {@code toVersionId}, which
+     * reprocessing made from it and which is being accepted (Story 4.5), in the caller's transaction. A record of the new
+     * version matches a correction when its (type key, name fingerprint) equals the correction's extracted key, or, when
+     * none does, its corrected key; of several, the one whose first page is nearest the correction's wins, then the
+     * lowest ordinal, and a record takes at most one correction. A matched record takes the corrected type, name and fields (and the
+     * correction's time and extracted key) and keeps its own references. A correction that matches none is copied into
+     * the new version as a new record with its corrected values, its passages those {@code remap} finds for its old
+     * passages (empty: the correction is dropped and counted). Answers the counts.
+     */
+    Carried carryCorrections(UUID fromVersionId, UUID toVersionId,
+                             Function<List<UUID>, Optional<Remapped>> remap);
 }

@@ -2,6 +2,7 @@ package io.github.gmshield.knowledge.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.LockModeType;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -16,7 +17,8 @@ import org.springframework.stereotype.Repository;
 /**
  * {@code record} and {@code record_passage} through JPA (Story 4.2), as the library's stores: every read is JPQL, which
  * Hibernate filters by the owner of the work ({@code @TenantId}), and nothing is written by a bulk statement (a delete
- * loads the rows and removes them, links first). The entity manager is looked up on first use, so the unit tests, which
+ * loads the rows and removes them, links first). From Story 4.5 a correction locks its row and writes it through its
+ * entity; a row whose version moved is a {@link KnowledgeConflict}, never the database's message. The entity manager is looked up on first use, so the unit tests, which
  * start without a database, can still create the application.
  */
 @Repository
@@ -127,6 +129,55 @@ class JpaRecordStore implements RecordStore {
         }
         return withLinks(em().createQuery(NAMED, RecordEntity.class).setParameter("versions", versionIds)
                 .setParameter("fingerprint", nameFingerprint).getResultList());
+    }
+
+    @Override
+    public Optional<RecordRow> correct(UUID id, long version, RecordCorrection correction) {
+        Optional<RecordEntity> found = locked(id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        RecordEntity entity = found.get();
+        if (entity.rowVersion() != version) {
+            throw new KnowledgeConflict(KnowledgeConflict.Reason.STALE_VERSION);
+        }
+        entity.correct(correction);
+        flushChecked();
+        return Optional.of(entity.row(passagesOf(id)));
+    }
+
+    @Override
+    public boolean carry(UUID id, RecordCorrection correction, String extractedType, byte[] extractedNameFingerprint) {
+        Optional<RecordEntity> found = locked(id);
+        found.ifPresent(entity -> {
+            entity.carry(correction, extractedType, extractedNameFingerprint);
+            flushChecked();
+        });
+        return found.isPresent();
+    }
+
+    /**
+     * The record, locked for writing until the transaction ends. An entity the session already holds (read before the
+     * lock) is read again under the lock, so its version is the locked row's; a version that moved is stale.
+     */
+    private Optional<RecordEntity> locked(UUID id) {
+        try {
+            EntityManager em = em();
+            Optional<RecordEntity> found = em.createQuery(BY_ID, RecordEntity.class).setParameter("id", id)
+                    .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst();
+            found.ifPresent(entity -> em.refresh(entity, LockModeType.PESSIMISTIC_WRITE));
+            return found;
+        } catch (RuntimeException refused) {
+            throw JpaKnowledgeStore.conflictOf(refused).orElseThrow(() -> refused);
+        }
+    }
+
+    private void flushChecked() {
+        try {
+            em().flush();
+        } catch (RuntimeException refused) {
+            throw JpaKnowledgeStore.conflictOf(refused).orElseThrow(() -> refused);
+        }
     }
 
     private List<RecordRow> withLinks(List<RecordEntity> found) {

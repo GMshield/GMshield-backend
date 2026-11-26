@@ -1493,6 +1493,46 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     public contract stays 1.38.0), then backend. This is an exception to the usual backend-first order (part A was
     backend → worker → frontend): only the backend writes the new keys, so the apps that read them go first. The worker's and the frontend's minimum contracts stay where they are.
 
+- **Correct a record (`knowledge`, `materials`, Story 4.5 part A, public contract 1.40.0, internal contract unchanged,
+  migration V41).** The GM corrects a misread record's name, type and fields; the record keeps its id and its source
+  references.
+  - **Routes.** `PATCH /api/v1/systems/{systemId}/records/{recordId}` (`correctRecord`) and `PATCH
+    /api/v1/campaigns/{campaignId}/records/{recordId}` (`correctCampaignRecord`) take `{version, name, recordType,
+    fields: [{name, value}]}` and answer the record as `getRecord` does, its `version` raised by one. `Record` gains
+    `version` (additive). Each route has the visibility of its read (a record of a ready version of the system, or of
+    the campaign's current scope): anything else is 404 `request.not_found`. A stale version is 409
+    `request.stale_version`; a blank or too long name is 400 `record.name_invalid` (`min`, `max`), more than 64 fields
+    `record.fields_invalid` (`max`), a field's name or value outside its limits `record.field_name_invalid` or
+    `record.field_value_invalid` (`min`, `max`, `index`), and a key that is not one of the page's system's record types
+    (core or approved; the campaign's system on the campaign route) `record.type_invalid`. Values are trimmed. The
+    limits are the extraction's, now shared in `materials.service.ExtractedRecords` (`MAX_NAME` 200, `MAX_FIELDS` 64,
+    `MAX_FIELD_NAME` 200, `MAX_FIELD_VALUE` 8,000 code points). Both routes join the cross-owner audit.
+  - **Storage.** A correction rewrites the record in place (`RecordStore.correct`, the row locked and its Hibernate
+    `@Version` checked): its type key, name and fields (vault ciphertexts bound to the row), its name fingerprint
+    worked out again, and `corrected_at`. The first correction keeps the type key and fingerprint the model produced as
+    the extracted match key (`extracted_type`, `extracted_name_fingerprint`). No history of a record's corrections is
+    kept; answers already stored keep the record by value.
+  - **Reindex.** The port `materials.service.RecordIndexing` locks the record's version first (a correction never
+    crosses the acceptance of a version that replaces it), requires `ready`, and adds an `index.change` records run of
+    the record's first page (`[page, page]`) to the version's set, in the correction's transaction: the point keeps
+    the record's id and gets the new text and `record_type`. The worker does not change; the version's recipe stays.
+  - **Carry-over.** A version made by reprocessing an accepted one names it (`material_version.reprocessed_from`, set
+    by `IngestionSteps.reprocessAccepted`). Its acceptance carries every correction of that version over
+    (`ExtractedRecords.carryCorrections`, in the accept transaction, before `IndexChanges.start`): a new record whose
+    (type key, name fingerprint) equals a correction's extracted or corrected key takes the corrected type, name and
+    fields and keeps its own references (the nearest first page wins, then the lowest ordinal; a record takes one
+    correction). A correction that matches none is copied in as a new record, its passages remapped by
+    `materials.service.PassageRemap` to the new version's passages on its old pages (same page and section path first,
+    otherwise every passage on the page; its first page is their lowest); one whose pages have no passage there is
+    dropped and counted. A replacement upload names no version and carries nothing over.
+  - **V41.** `record.version`, `corrected_at`, `extracted_type`, `extracted_name_fingerprint`;
+    `material_version.reprocessed_from` (its version's deletion clears it). A rollback past V41 is safe: the previous
+    release neither reads nor writes these columns, and reads a corrected record as its own.
+  - Log lines (ids and counts only): `knowledge.record_corrected`, `knowledge.campaign_record_corrected`,
+    `index.records_page_started`, `material.corrections_carried` (`matched`, `copied`, `dropped`). Deploy order:
+    backend, then frontend (minimum public contract 1.40.0); the old frontend keeps reading records, since `version` is
+    additive.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

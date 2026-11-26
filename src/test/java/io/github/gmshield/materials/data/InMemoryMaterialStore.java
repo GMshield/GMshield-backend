@@ -24,6 +24,8 @@ public class InMemoryMaterialStore implements MaterialStore {
 
     public final Map<UUID, MaterialRow> materials = new ConcurrentHashMap<>();
     public final Map<UUID, VersionRow> versions = new ConcurrentHashMap<>();
+    /** {@code material_version.reprocessed_from} (Story 4.5), by version. */
+    public final Map<UUID, UUID> reprocessedLinks = new ConcurrentHashMap<>();
     public final Map<UUID, MaterialSystemRow> systems = new ConcurrentHashMap<>();
     /** {@code ingestion_step} (Story 1.15). */
     public final Map<UUID, StepRow> steps = new ConcurrentHashMap<>();
@@ -58,6 +60,21 @@ public class InMemoryMaterialStore implements MaterialStore {
         }
         versions.put(row.id(), row);
         RollbackUndo.onRollback(() -> versions.remove(row.id()));
+    }
+
+    @Override
+    public synchronized void insertVersion(VersionRow row, UUID reprocessedFrom) {
+        insertVersion(row);
+        if (reprocessedFrom != null) {
+            reprocessedLinks.put(row.id(), reprocessedFrom);
+            RollbackUndo.onRollback(() -> reprocessedLinks.remove(row.id()));
+        }
+    }
+
+    @Override
+    public Optional<UUID> reprocessedFrom(UUID id) {
+        // As the table's key clears it: a link to a version deleted since reads as none.
+        return findVersion(id).map(row -> reprocessedLinks.get(row.id())).filter(versions::containsKey);
     }
 
     @Override

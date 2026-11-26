@@ -7,6 +7,7 @@ import io.github.gmshield.materials.data.PageRangeRow;
 import io.github.gmshield.materials.data.UploadStorage;
 import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.OwnerContext;
+import io.github.gmshield.vault.service.Vault;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -29,7 +30,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <ul>
  *   <li>{@value Materials#ACCEPT}: {@code needs_review} becomes {@code ready}, and a {@code ready} version of the same
  *       material before it becomes {@code superseded} (it keeps its points); from Story 2.1 the version's passages get
- *       their index changes ({@link IndexChanges#start}) in the same transaction;</li>
+ *       their index changes ({@link IndexChanges#start}) in the same transaction; from Story 4.5, before those start,
+ *       a version that reprocessing made from an accepted one takes over that version's corrections
+ *       ({@link ExtractedRecords#carryCorrections});</li>
  *   <li>{@value Materials#REPROCESS}: the unreadable pages of a {@code needs_review} version are read again
  *       ({@link IngestionSteps#reprocess}); from Story 3.4, a {@code ready} version is read again as a new version of
  *       its material, from a copy of its cleaned original ({@link IngestionSteps#reprocessAccepted}), after the check
@@ -58,14 +61,18 @@ public class MaterialActions {
     private final Materials reads;
     private final IngestionSettings settings;
     private final Library library;
+    private final ExtractedRecords records;
+    private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<Clock> clock;
 
     MaterialActions(MaterialStore materials, UploadStorage uploads, IngestionSteps ingestion, VersionRemoval removal,
                     IndexChanges indexChanges, IndexRemovals indexRemovals, Materials reads, IngestionSettings settings,
-                    Library library, ObjectProvider<PlatformTransactionManager> transactions,
-                    ObjectProvider<Clock> clock) {
+                    Library library, ExtractedRecords records, Vault vault,
+                    ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.library = library;
+        this.records = records;
+        this.vault = vault;
         this.indexChanges = indexChanges;
         this.indexRemovals = indexRemovals;
         this.settings = settings;
@@ -135,7 +142,24 @@ public class MaterialActions {
             }
         }
         materials.changeVersionState(version.id(), Materials.READY, now);
+        // Story 4.5: before its index changes start, so the records they index are the corrected ones.
+        materials.reprocessedFrom(version.id()).ifPresent(from -> carryCorrections(from, version));
         indexChanges.start(version);
+    }
+
+    /**
+     * The corrections of the version {@code from} carried over to {@code version}, which reprocessing made from it
+     * (Story 4.5; never for a replacement upload, which names no version). Logs the counts only.
+     */
+    private void carryCorrections(UUID from, VersionRow version) {
+        // A correction locks its version first (RecordIndexing): with this lock, none of the replaced version's runs
+        // meanwhile, and one that waited finds the version superseded once this commits.
+        materials.lockVersion(from);
+        ExtractedRecords.Carried carried = records.carryCorrections(from, version.id(),
+                new PassageRemap(materials, vault, OwnerContext.require(), version.id()));
+        log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("fromVersionId", from)
+                .addKeyValue("matched", carried.matched()).addKeyValue("copied", carried.copied())
+                .addKeyValue("dropped", carried.dropped()).log("material.corrections_carried");
     }
 
     /** In place while the version needs review; as a new version while it is ready (Story 3.4). */
