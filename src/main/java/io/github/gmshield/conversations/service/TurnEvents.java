@@ -79,7 +79,10 @@ final class TurnEvents {
      * {@code {stopped, silent, modelKnowledge, references: [{number, kind, materialName, sectionPath, page, passageIds,
      * removed, tier?}]}}, {@code tier} (Story 3.7) only on a reference stored with one. {@code kind} (Story 4.3 part C)
      * is {@code passage} or {@code record}; a record's reference adds {@code recordId}, {@code recordType},
-     * {@code name} and {@code fields: [{name, value}]}. {@code stopped} (Story 2.6) is whether the GM stopped the
+     * {@code name} and {@code fields: [{name, value}]}. From Story 5.1 part B {@code kind} may be {@code artifact}: a
+     * cited artifact's reference carries {@code artifactId}, {@code artifactVersion}, {@code recordType}, {@code name},
+     * {@code fields}, {@code removed} and {@code tier}, and none of {@code materialName}, {@code sectionPath},
+     * {@code page} and {@code passageIds}. {@code stopped} (Story 2.6) is whether the GM stopped the
      * answer; {@code silent} is true exactly when it was not stopped, there is no reference and (Story 3.8) no
      * {@code model} tier event was stored: a stopped answer is never the silent one. {@code modelKnowledge} is the
      * turn's frozen switch.
@@ -96,6 +99,20 @@ final class TurnEvents {
             entry.put("number", reference.number());
             entry.put("kind", reference.kind());
             TurnReference.Cited record = reference.record();
+            if (TurnReference.ARTIFACT.equals(reference.kind())) {
+                entry.put("artifactId", record.id().toString());
+                entry.put("artifactVersion", record.artifactVersion());
+                entry.put("recordType", record.type());
+                entry.put("name", record.name());
+                ArrayNode fields = entry.putArray("fields");
+                record.fields().forEach(field -> fields.addObject().put("name", field.name())
+                        .put("value", field.value()));
+                entry.put("removed", reference.removed());
+                if (reference.tier() != null) {
+                    entry.put("tier", reference.tier());
+                }
+                continue;
+            }
             if (record != null) {
                 entry.put("recordId", record.id().toString());
                 entry.put("recordType", record.type());

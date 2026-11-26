@@ -380,40 +380,54 @@ class ConversationController {
                     format = "int32", minimum = "0") int offset) {
     }
 
-    @Schema(name = "TurnSourceReference", requiredProperties = {"number", "kind", "materialName", "sectionPath",
-        "page", "passageIds", "removed"}, description = "A source reference of a completed answer, stored by value with"
-            + " the turn: one distinct place (material version, section path, page) the answer cited, or (contract"
-            + " 1.37.0) one record the answer cited, with its name, type and fields as they were when the answer was"
-            + " written, placed at its first page")
+    @Schema(name = "TurnSourceReference", requiredProperties = {"number", "kind", "removed"},
+            description = "A source reference of a completed answer, stored by value with the turn: one distinct place"
+            + " (material version, section path, page) the answer cited, or (contract 1.37.0) one record the answer"
+            + " cited, with its name, type and fields as they were when the answer was written, placed at its first"
+            + " page, or (contract 1.43.0) one of the campaign's artifacts the answer cited, with its id, the version"
+            + " cited, its type, name and fields as they were then. A passage's and a record's reference always carry"
+            + " materialName, sectionPath, page and passageIds; an artifact's carries none of them (it opens the"
+            + " artifact's page, never a source view)")
     record SourceReference(
             @Schema(description = "Its number, 1..n by first citation: unique within the turn and contiguous from 1",
                     format = "int32", minimum = "1") int number,
-            @Schema(description = "passage for a cited place, record for a cited record (contract 1.37.0)",
-                    allowableValues = {"passage", "record"}) String kind,
-            @Schema(description = "The material's name") String materialName,
+            @Schema(description = "passage for a cited place, record for a cited record (contract 1.37.0), artifact for"
+                    + " a cited artifact (contract 1.43.0)", allowableValues = {"passage", "record", "artifact"})
+            String kind,
+            @Schema(description = "The material's name; absent for an artifact") String materialName,
             @ArraySchema(arraySchema = @Schema(description = "The section path, outermost first; may be empty. For a"
-                    + " record, its first passage's on its first page"), schema = @Schema(type = "string"))
+                    + " record, its first passage's on its first page; absent for an artifact"),
+                    schema = @Schema(type = "string"))
             List<String> sectionPath,
-            @Schema(description = "The page; for a record, its first page", format = "int32", minimum = "1") int page,
+            @Schema(description = "The page; for a record, its first page; absent for an artifact", format = "int32",
+                    minimum = "1") Integer page,
             @ArraySchema(arraySchema = @Schema(description = "The cited passages at this place, in the order first"
                     + " cited; a passage id appears in at most one passage reference of the turn. For a record, its"
-                    + " passages on its first page, so the source view marks them: record references may share them"),
+                    + " passages on its first page, so the source view marks them: record references may share them."
+                    + " Absent for an artifact"),
                     minItems = 1, schema = @Schema(type = "string", format = "uuid"))
             List<UUID> passageIds,
             @Schema(description = "The cited record's id; only for a record (contract 1.37.0)", format = "uuid")
             UUID recordId,
-            @Schema(description = "The record's type key; only for a record (contract 1.37.0). A client shows its own"
-                    + " translation of a core key, and from contract 1.39.0 the name of the campaign system's record"
-                    + " type with that key (the key itself when none matches)", pattern = "^[a-z][a-z0-9_]{0,31}$")
+            @Schema(description = "The cited artifact's id; only for an artifact (contract 1.43.0). Its page is"
+                    + " /campaigns/{campaignId}/artifacts/{artifactId} of the conversation's campaign", format = "uuid")
+            UUID artifactId,
+            @Schema(description = "The number of the artifact's version the answer cited; only for an artifact"
+                    + " (contract 1.43.0)", format = "int32", minimum = "1") Integer artifactVersion,
+            @Schema(description = "The record's type key; only for a record (contract 1.37.0) or an artifact (contract"
+                    + " 1.43.0). A client shows its own translation of a core key, and from contract 1.39.0 the name of"
+                    + " the campaign system's record type with that key (the key itself when none matches)",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$")
             String recordType,
-            @Schema(description = "The record's name, as it was when the answer was written; only for a record"
-                    + " (contract 1.37.0)") String name,
-            @ArraySchema(arraySchema = @Schema(description = "The record's fields in order, as they were when the"
-                    + " answer was written; may be empty; only for a record (contract 1.37.0)"),
+            @Schema(description = "The record's or the artifact's name, as it was when the answer was written; only for"
+                    + " a record (contract 1.37.0) or an artifact (contract 1.43.0)") String name,
+            @ArraySchema(arraySchema = @Schema(description = "The record's or the artifact's fields in order, as they"
+                    + " were when the answer was written; may be empty; only for a record (contract 1.37.0) or an"
+                    + " artifact (contract 1.43.0), whose content is never among them"),
                     schema = @Schema(implementation = ReferenceField.class)) List<ReferenceField> fields,
             @Schema(description = "Whether its source has been removed since (its version gone, discarded or pending"
                     + " removal, or its material gone), as of when the event is sent. A version superseded by a newer"
-                    + " accepted one is not removed") boolean removed,
+                    + " accepted one is not removed. An artifact's is false") boolean removed,
             @Schema(description = "The tier its source had in the turn's scope when the answer was written (Story"
                     + " 3.7), kept when the source leaves the scope; absent for a reference stored before then",
                     allowableValues = {"campaign", "system", "other"}) String tier) {

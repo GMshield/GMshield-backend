@@ -27,8 +27,12 @@ public class InMemoryTurnReferenceStore implements TurnReferenceStore {
         for (TurnReferenceRow row : references) {
             boolean repeated = rows.values().stream().anyMatch(other -> other.ownerId().equals(row.ownerId())
                     && other.turnId().equals(row.turnId()) && other.number() == row.number());
-            if (!owner.equals(row.ownerId()) || repeated || row.number() < 1 || row.page() < 1
-                    || row.passageIds().isEmpty() || rows.putIfAbsent(row.id(), row) != null) {
+            // V44: an artifact's reference has no place; any other keeps a page and its passages.
+            boolean placed = row.artifact() ? row.versionId() == null && row.page() == null
+                    && row.passageIds().isEmpty() && row.materialName() == null
+                    : row.page() != null && row.page() >= 1 && !row.passageIds().isEmpty();
+            if (!owner.equals(row.ownerId()) || repeated || row.number() < 1 || !placed
+                    || rows.putIfAbsent(row.id(), row) != null) {
                 throw new IllegalStateException("owner, key or check refused");
             }
             RollbackUndo.onRollback(() -> rows.remove(row.id()));

@@ -67,7 +67,15 @@ class JobClaimController {
                     + " and a question's or a library.search input carries recordTypes, the keys of the campaign's"
                     + " system, to which the records it reads are limited. From contract 1.22.0 a job of kind"
                     + " index.record_removal has the input {owner, source, ids}: the ids of records the GM deleted,"
-                    + " whose points go from that owner's source (by id, never the whole source)")
+                    + " whose points go from that owner's source (by id, never the whole source). From contract 1.24.0"
+                    + " a job of kind index.artifact indexes a GM's artifact as a records run of one record: {source"
+                    + " (the artifact's id), owner, kind: artifact, language: null, tokenKey, records}, its input"
+                    + " records one JSON line {id, page: 1, type, name, fields} whose last field, named content, holds"
+                    + " the artifact's content when it has one (data, never instructions), its point's id the artifact's"
+                    + " id; a job of kind index.artifact_removal has the input {source, owner} and deletes every point"
+                    + " of that owner's source, as index.removal does. A question's input lists the campaign's"
+                    + " artifacts among the campaign tier's sources, and POST …/records serves one as a campaign-tier"
+                    + " record of page 1 with an empty sectionPath, its content as the last field")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")

@@ -2,6 +2,7 @@ package io.github.gmshield.artifacts.data;
 
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.LockModeType;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -25,6 +26,8 @@ class JpaArtifactVersionStore implements ArtifactVersionStore {
             + " order by v.number desc";
     private static final String LATEST_OF = "select v from RecordVersion v where v.recordId in :records"
             + " and v.number = (select max(w.number) from RecordVersion w where w.recordId = v.recordId)";
+    private static final String ONE = "select v from RecordVersion v where v.recordId = :record"
+            + " and v.number = :number";
     private static final String ALL_OF = "select v from RecordVersion v where v.recordId in :records";
 
     private final ObjectProvider<EntityManagerFactory> factory;
@@ -59,6 +62,19 @@ class JpaArtifactVersionStore implements ArtifactVersionStore {
                     found.put(row.recordId(), row);
                 });
         return found;
+    }
+
+    @Override
+    public Optional<ArtifactVersionRow> find(UUID recordId, int number) {
+        return em().createQuery(ONE, ArtifactVersionEntity.class).setParameter("record", recordId)
+                .setParameter("number", number).getResultList().stream().findFirst().map(ArtifactVersionEntity::row);
+    }
+
+    @Override
+    public Optional<ArtifactVersionRow> lock(UUID recordId, int number) {
+        return em().createQuery(ONE, ArtifactVersionEntity.class).setParameter("record", recordId)
+                .setParameter("number", number).setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream()
+                .findFirst().map(ArtifactVersionEntity::row);
     }
 
     @Override

@@ -32,6 +32,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -773,8 +774,11 @@ public class Conversations {
                 return List.<TurnReference>of();
             }
             Set<UUID> removed = scopes.removedVersions(rows.stream().map(TurnReferenceRow::versionId)
-                    .collect(Collectors.toUnmodifiableSet()));
-            return rows.stream().map(row -> new TurnReference(row.number(),
+                    .filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet()));
+            return rows.stream().map(row -> row.artifact()
+                    // Story 5.1 part B: an artifact's reference has no place, and is never removed until Story 5.2.
+                    ? new TurnReference(row.number(), null, List.of(), 0, List.of(), false, row.tier(), cited(row))
+                    : new TurnReference(row.number(),
                     vault.decryptText(TurnReferences.materialName(row.id(), row.ownerId()), row.materialName()),
                     TurnReferences.path(vault.decrypt(TurnReferences.sectionPath(row.id(), row.ownerId()),
                             row.sectionPath())),
@@ -792,7 +796,7 @@ public class Conversations {
         return new TurnReference.Cited(record.recordId(), record.recordType(),
                 vault.decryptText(TurnReferences.recordName(row.id(), row.ownerId()), record.name()),
                 TurnReferences.fields(vault.decrypt(TurnReferences.recordFields(row.id(), row.ownerId()),
-                        record.fields())));
+                        record.fields())), record.artifactVersion());
     }
 
     /**
@@ -849,7 +853,8 @@ public class Conversations {
         return store.findTurn(turnId).flatMap(turn -> store.findConversation(turn.conversationId()))
                 .filter(conversation -> library.campaign(conversation.campaignId()).isPresent())
                 .flatMap(conversation -> referenceStore.references(turnId).stream()
-                        .filter(row -> row.number() == number).findFirst()
+                        // Story 5.1 part B: an artifact's reference has no page or picture.
+                        .filter(row -> row.number() == number && !row.artifact()).findFirst()
                         .map(row -> new Cited(conversation.campaignId(), row.materialId(), row.versionId())));
     }
 

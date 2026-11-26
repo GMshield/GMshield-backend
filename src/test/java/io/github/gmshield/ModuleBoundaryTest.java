@@ -184,7 +184,9 @@ class ModuleBoundaryTest {
      * Story 3.5: {@code scope} has one too, for the settings of the campaigns and the switches of the materials going.
      * Story 4.1: {@code knowledge} has one too, for a system's record types, and {@code library} does not depend on it
      * (it seeds the core types by listening to {@code SystemCreated}). Story 5.1: {@code artifacts} has one too, for the
-     * artifacts of the campaigns going.
+     * artifacts of the campaigns going; from part B it also cancels their index jobs and removes their points, through
+     * {@code jobs}, and {@code scope} reads the campaign's artifacts through its own port, which {@code artifacts}
+     * implements, so {@code scope} still depends on no module that holds them.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
@@ -197,6 +199,9 @@ class ModuleBoundaryTest {
                         base + ".scope..", base + ".accounts..", base + ".audit..", base + ".limits..",
                         base + ".knowledge..", base + ".artifacts..")
                 .because("library depends on shared and vault only").check(application);
+        noClasses().that().resideInAPackage(base + ".scope..").should().dependOnClassesThat()
+                .resideInAnyPackage(base + ".artifacts..")
+                .because("scope reads artifacts through its CampaignArtifacts port only").check(application);
         List<String> handlers = application.get(io.github.gmshield.library.service.SystemDeletionHandler.class)
                 .getAllSubclasses().stream().map(JavaClass::getPackageName).sorted().toList();
         assertThat(handlers).containsExactly(base + ".artifacts.service", base + ".conversations.service",

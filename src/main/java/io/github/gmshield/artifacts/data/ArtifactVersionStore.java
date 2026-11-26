@@ -21,6 +21,15 @@ public interface ArtifactVersionStore {
     /** The newest version of each of the current owner's artifacts with these ids, by record id; one with none is left out. */
     Map<UUID, ArtifactVersionRow> latest(Collection<UUID> recordIds);
 
+    /** The current owner's version {@code number} of the artifact {@code recordId}; empty for none (Story 5.1 part B). */
+    Optional<ArtifactVersionRow> find(UUID recordId, int number);
+
+    /**
+     * {@link #find}, with the row locked for the caller's transaction (Story 5.1 part B): an artifact's index jobs are
+     * created, retried and completed under this lock, so one version never gets two sets at once.
+     */
+    Optional<ArtifactVersionRow> lock(UUID recordId, int number);
+
     /** Deletes every version of the current owner's artifacts with these ids; answers how many went. */
     int deleteOf(Collection<UUID> recordIds);
 }

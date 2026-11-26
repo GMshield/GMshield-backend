@@ -82,6 +82,8 @@ class JpaRecordStore implements RecordStore {
             + " where r.campaignId = :campaign group by r.recordType order by r.recordType";
     private static final String ARTIFACT_IDS = "select r.id from Record r where r.campaignId in :campaigns"
             + " order by r.id";
+    private static final String ARTIFACTS_FOUND = "select r from Record r where r.id in :ids"
+            + " and r.campaignId is not null order by r.id";
     private static final String ARTIFACTS_BY_IDS = "select r from Record r where r.id in :ids"
             + " and r.campaignId is not null";
 
@@ -326,6 +328,15 @@ class JpaRecordStore implements RecordStore {
     public Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id) {
         return em().createQuery(ARTIFACT, RecordEntity.class).setParameter("campaign", campaignId)
                 .setParameter("id", id).getResultList().stream().findFirst().map(RecordEntity::artifact);
+    }
+
+    @Override
+    public List<ArtifactRow> findArtifacts(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(ARTIFACTS_FOUND, RecordEntity.class).setParameter("ids", List.copyOf(ids))
+                .getResultList().stream().map(RecordEntity::artifact).toList();
     }
 
     @Override

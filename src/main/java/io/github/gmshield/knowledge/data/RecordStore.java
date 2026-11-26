@@ -151,6 +151,12 @@ public interface RecordStore {
     Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id);
 
     /**
+     * The current owner's artifacts with these ids, of any campaign, by id (Story 5.1 part B: an artifact's index jobs
+     * check its campaign); an extracted record's id, an unknown one or another owner's is left out.
+     */
+    List<ArtifactRow> findArtifacts(Collection<UUID> ids);
+
+    /**
      * The current owner's artifacts of the campaign {@code campaignId} (Story 5.1), newest first (by id, a UUIDv7):
      * only those of the type key {@code type} when it is not null, only those older than {@code before} when it is not
      * null, the first {@code offset} skipped, at most {@code limit}.

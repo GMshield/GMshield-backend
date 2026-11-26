@@ -4,7 +4,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.GmshieldApplication;
+import io.github.gmshield.artifacts.data.ArtifactIndexStore;
+import io.github.gmshield.artifacts.data.ArtifactVersionStore;
+import io.github.gmshield.artifacts.data.StaleArtifacts;
+import io.github.gmshield.artifacts.service.ArtifactIndexReconcile;
+import io.github.gmshield.artifacts.service.ArtifactIndexRetrySweep;
 import io.github.gmshield.artifacts.service.Artifacts;
+import io.github.gmshield.jobs.service.JobClaims;
+import io.github.gmshield.jobs.service.JobFiles;
+import io.github.gmshield.jobs.service.JobRecord;
+import io.github.gmshield.jobs.service.JobRecordReads;
+import io.github.gmshield.conversations.data.TurnReferenceRow;
+import io.github.gmshield.conversations.data.TurnReferenceStore;
+import io.github.gmshield.conversations.service.Conversations;
+import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.knowledge.data.KnowledgeStore;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
@@ -19,6 +32,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -38,6 +52,8 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Story 5.1 part A against a real PostgreSQL and Redis (test mode): V43 and an artifact written by hand. The artifact
@@ -50,6 +66,13 @@ import org.springframework.transaction.support.TransactionTemplate;
  * artifact in the table, no read of a system's records answers it (every {@link RecordStore} read by id, the record
  * type's list and count, both record pages and the port the answers and searches read through), an approved type
  * that an artifact uses cannot be deleted, and a campaign's deletion removes it, its versions first.
+ *
+ * <p>Story 5.1 part B (V44): a save commits its {@code index.artifact} job and {@code artifact_index} row with it, and a
+ * rollback leaves neither; the row's keys hold its record and version within the owner; the backfill's reads (the owners
+ * across the table, the owner's newest versions not indexed under a recipe) and the version's lock work on PostgreSQL;
+ * an artifact's {@code turn_reference} round-trips by value (no material column, its version kept) and the table's check
+ * refuses a row of both kinds; a campaign's deletion cancels the artifacts' index jobs, removes their rows before the
+ * versions and records one {@code index.artifact_removal} per artifact.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
@@ -89,6 +112,26 @@ class ArtifactsIntegrationTest {
     private PlatformTransactionManager transactions;
     @Autowired
     private ConfigurableApplicationContext context;
+    @Autowired
+    private ArtifactIndexStore index;
+    @Autowired
+    private ArtifactVersionStore versions;
+    @Autowired
+    private StaleArtifacts stale;
+    @Autowired
+    private Conversations conversations;
+    @Autowired
+    private TurnReferenceStore turnReferences;
+    @Autowired
+    private JobClaims claims;
+    @Autowired
+    private JobFiles jobFiles;
+    @Autowired
+    private JobRecordReads recordReads;
+    @Autowired
+    private ArtifactIndexRetrySweep retrySweep;
+    @Autowired
+    private ArtifactIndexReconcile reconcile;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID system, UUID campaign) {
@@ -290,6 +333,117 @@ class ArtifactsIntegrationTest {
         assertThat(count("record_version", "record_id = ?", going)).isZero();
         assertThat(count("record", "id = ?", staying)).isOne();
         assertThat(count("record_version", "record_id = ?", staying)).isOne();
+        // Story 5.1 part B: its index job cancelled, its row gone before the versions, one removal by owner and source.
+        assertThat(count("artifact_index", "record_id = ?", going)).isZero();
+        assertThat(count("artifact_index", "record_id = ?", staying)).isOne();
+        assertThat(jdbc.sql("select j.state from job j join artifact_index i on i.job_id = j.id where i.record_id = ?")
+                .param(staying).query(String.class).single()).isIn("waiting", "offered");
+        Map<String, Object> removal = jdbc.sql("select r.owner_id, j.kind from artifact_index_removal r join job j"
+                + " on j.id = r.job_id where r.artifact_id = ?").param(going).query().singleRow();
+        assertThat(removal).containsEntry("owner_id", a.id()).containsEntry("kind", "index.artifact_removal");
+        assertThat(jdbc.sql("select count(*) from job where owner_id = ? and kind = 'index.artifact' and state ="
+                + " 'cancelled'").param(a.id()).query(Long.class).single()).isOne();
+    }
+
+    // --- Story 5.1 part B
+
+    @Test
+    void aSaveCommitsItsIndexJobWithItARollbackLeavesNeitherAndTheBackfillReadsWork() throws Exception {
+        Owner a = owner();
+        UUID created = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+
+        Map<String, Object> row = jdbc.sql("select job_id, owner_id, number, recipe, retries from artifact_index"
+                + " where record_id = ?").param(created).query().singleRow();
+        assertThat(row).containsEntry("owner_id", a.id()).containsEntry("number", 1);
+        assertThat(row.get("recipe")).isNull();
+        assertThat(((Number) row.get("retries")).intValue()).isZero();
+        UUID job = (UUID) row.get("job_id");
+        assertThat(jdbc.sql("select kind, lane from job where id = ?").param(job).query().singleRow())
+                .containsEntry("kind", "index.artifact").containsEntry("lane", "ingestion");
+
+        // A rollback of the save's transaction leaves no artifact, no version, no index row and no job.
+        long jobs = count("job", "owner_id = ?", a.id());
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(artifacts.create(a.campaign(), new Artifacts.Written("note", "Rascunho", List.of(), null)))
+                    .isPresent();
+            status.setRollbackOnly();
+            return null;
+        }));
+        assertThat(count("record", "campaign_id = ?", a.campaign())).isOne();
+        assertThat(count("record_version", "owner_id = ?", a.id())).isOne();
+        assertThat(count("artifact_index", "owner_id = ?", a.id())).isOne();
+        assertThat(count("job", "owner_id = ?", a.id())).isEqualTo(jobs);
+
+        // The backfill's reads: the owner is stale under a recipe no row reports, and its version is listed.
+        assertThat(stale.owners("2")).contains(a.id());
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(versions.lock(created, 1)).isPresent();
+            assertThat(index.notIndexedUnder("2")).contains(new ArtifactIndexStore.VersionKey(created, 1));
+            assertThat(index.recordRecipe(job, "2")).isTrue();
+            assertThat(index.notIndexedUnder("2")).doesNotContain(new ArtifactIndexStore.VersionKey(created, 1));
+            assertThat(index.notIndexedUnder("3")).contains(new ArtifactIndexStore.VersionKey(created, 1));
+            return null;
+        }));
+        assertThat(stale.owners("2")).doesNotContain(a.id());
+        assertThat(stale.owners("3")).contains(a.id());
+
+        // The row's keys: its record and version, within the owner.
+        Owner b = owner();
+        assertThatThrownBy(() -> jdbc.sql("insert into artifact_index (job_id, owner_id, record_id, number,"
+                + " created_at) values (?, ?, ?, 2, now())").params(Ids.newId(), a.id(), created).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into artifact_index (job_id, owner_id, record_id, number,"
+                + " created_at) values (?, ?, ?, 1, now())").params(Ids.newId(), b.id(), created).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void anArtifactsReferenceRoundTripsByValueAndTheCheckRefusesAReferenceOfBothKinds() throws Exception {
+        Owner a = owner();
+        UUID artifact = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        UUID turn = as(a.id(), () -> conversations.ask(a.campaign(), "Quanto dano?")).turnId();
+        UUID rowId = Ids.newId();
+
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            turnReferences.insertReferences(List.of(TurnReferenceRow.artifact(rowId, a.id(), turn, 1,
+                    Instant.now().truncatedTo(ChronoUnit.MICROS), "campaign", new TurnReferenceRow.Recorded(artifact,
+                            "item", vault.encryptText(new Binding("turn_reference", "record_name", rowId, a.id()), KAEL),
+                            vault.encrypt(new Binding("turn_reference", "record_fields", rowId, a.id()),
+                                    "[{\"name\":\"Dano\",\"value\":\"1d8\"}]".getBytes(StandardCharsets.UTF_8)), 1))));
+            return null;
+        }));
+
+        Map<String, Object> stored = jdbc.sql("select version_id, material_id, page, passage_ids, material_name,"
+                + " section_path, record_id, artifact_id, artifact_version, record_type from turn_reference where id = ?")
+                .param(rowId).query().singleRow();
+        assertThat(stored).containsEntry("artifact_id", artifact).containsEntry("artifact_version", 1)
+                .containsEntry("record_type", "item");
+        for (String column : List.of("version_id", "material_id", "page", "passage_ids", "material_name",
+                "section_path", "record_id")) {
+            assertThat(stored.get(column)).as(column).isNull();
+        }
+        List<TurnReference> read = as(a.id(), () -> conversations.references(turn));
+        assertThat(read).singleElement().satisfies(reference -> {
+            assertThat(reference.kind()).isEqualTo(TurnReference.ARTIFACT);
+            assertThat(reference.record().id()).isEqualTo(artifact);
+            assertThat(reference.record().artifactVersion()).isEqualTo(1);
+            assertThat(reference.record().name()).isEqualTo(KAEL);
+            assertThat(reference.record().fields()).extracting(TurnReference.Field::name).containsExactly("Dano");
+            assertThat(reference.removed()).isFalse();
+            assertThat(reference.tier()).isEqualTo("campaign");
+        });
+        // A row that is an artifact's and names a material version too is refused.
+        assertThatThrownBy(() -> jdbc.sql("insert into turn_reference (id, owner_id, turn_id, number, version_id,"
+                + " material_id, page, passage_ids, material_name, section_path, created_at, artifact_id,"
+                + " artifact_version, record_type, record_name, record_fields) values (?, ?, ?, 2, ?, ?, 1,"
+                + " array[?]::uuid[], ?, ?, now(), ?, 1, 'item', ?, ?)").params(Ids.newId(), a.id(), turn, Ids.newId(),
+                Ids.newId(), Ids.newId(), new byte[] {1}, new byte[] {1}, artifact, new byte[] {1}, new byte[] {1})
+                .update()).isInstanceOf(DataIntegrityViolationException.class);
+        // And an artifact's without its version.
+        assertThatThrownBy(() -> jdbc.sql("insert into turn_reference (id, owner_id, turn_id, number, created_at,"
+                + " artifact_id, record_type, record_name, record_fields) values (?, ?, ?, 3, now(), ?, 'item', ?, ?)")
+                .params(Ids.newId(), a.id(), turn, artifact, new byte[] {1}, new byte[] {1}).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
     }
 
     @Test
@@ -306,6 +460,115 @@ class ArtifactsIntegrationTest {
         assertThat(count("record_type", "id = ?", used)).isOne();
         assertThat(as(a.id(), () -> ontology.delete(unused))).isTrue();
         assertThat(count("record_type", "id = ?", unused)).isZero();
+    }
+
+    @Test
+    void anArtifactsIndexJobReadsItsLineOnPostgresAndAnAnswerReadsTheArtifactAsACampaignRecord() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        UUID created = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        UUID job = jdbc.sql("select job_id from artifact_index where record_id = ?").param(created).query(UUID.class)
+                .single();
+
+        // The worker's claim: a records run's input, and its one line read from PostgreSQL, the content last.
+        JobClaims.Claim claim = claims.claim(job);
+        assertThat(claim.input().path("source").asString()).isEqualTo(created.toString());
+        assertThat(claim.input().path("kind").asString()).isEqualTo("artifact");
+        assertThat(claim.input().path("language").isNull()).isTrue();
+        assertThat(claim.input().path("records").asString()).isEqualTo("records");
+        ByteArrayOutputStream read = new ByteArrayOutputStream();
+        jobFiles.open(job, claim.claimId(), claim.grant(), "records").input().writeTo(read);
+        JsonNode line = JsonMapper.builder().build().readTree(read.toString(StandardCharsets.UTF_8).strip());
+        assertThat(line.path("id").asString()).isEqualTo(created.toString());
+        assertThat(line.path("page").asInt()).isEqualTo(1);
+        assertThat(line.path("type").asString()).isEqualTo("item");
+        assertThat(line.path("name").asString()).isEqualTo(KAEL);
+        assertThat(line.path("fields").toString()).isEqualTo("[{\"name\":\"Dano\",\"value\":\"1d8 cortante\"},"
+                + "{\"name\":\"Peso\",\"value\":\"1,5 kg\"},{\"name\":\"content\",\"value\":"
+                + "\"Forjada nas montanhas do norte.\"}]");
+        claims.report(job, claim.claimId(), claim.grant(), "done", null,
+                JsonMapper.builder().build().readTree("{\"indexRecipe\":\"it-a1\",\"points\":1}"));
+        assertThat(jdbc.sql("select recipe from artifact_index where job_id = ?").param(job).query(String.class)
+                .single()).isEqualTo("it-a1");
+
+        // An answer of the campaign lists it among the campaign tier's sources and reads it as a campaign record.
+        UUID turn = as(a.id(), () -> conversations.ask(a.campaign(), "O que faz a Espada de Kael?")).turnId();
+        UUID answerJob = jdbc.sql("select job_id from turn where id = ?").param(turn).query(UUID.class).single();
+        JobClaims.Claim answer = claims.claim(answerJob, null, List.of("azure-openai"));
+        assertThat(answer.input().path("tiers").get(0).path("sources").toString()).contains(created.toString());
+        List<JobRecord> records = recordReads.read(answerJob, answer.claimId(), answer.grant(), List.of(created));
+        assertThat(records).singleElement().satisfies(record -> {
+            assertThat(record.tier()).isEqualTo("campaign");
+            assertThat(record.type()).isEqualTo("item");
+            assertThat(record.name()).isEqualTo(KAEL);
+            assertThat(record.page()).isEqualTo(1);
+            assertThat(record.sectionPath()).isEmpty();
+            assertThat(record.fields()).extracting(JobRecord.Field::name).containsExactly("Dano", "Peso", "content");
+        });
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void failedIndexAndRemovalJobsMoveToNewJobsAndANewRecipeIndexesAgainOnPostgres() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        UUID other = as(a.id(), () -> library.createCampaign(a.system(), "Outra mesa")).orElseThrow().id();
+        UUID going = as(a.id(), () -> artifacts.create(other, kael())).orElseThrow().id();
+        UUID staying = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        assertThat(as(a.id(), () -> deletion.deleteCampaign(other))).isTrue();
+        deletion.sweep();
+        UUID failedIndex = jdbc.sql("select job_id from artifact_index where record_id = ?").param(staying)
+                .query(UUID.class).single();
+        UUID failedRemoval = jdbc.sql("select job_id from artifact_index_removal where artifact_id = ?").param(going)
+                .query(UUID.class).single();
+        jdbc.sql("update job set state = 'failed', outcome_code = 'index.store_unavailable' where id in (?, ?)")
+                .params(failedIndex, failedRemoval).update();
+        // Other tests' failed artifact jobs are left out, so the sweep's count is this owner's alone.
+        jdbc.sql("update job set state = 'cancelled' where kind in ('index.artifact', 'index.artifact_removal')"
+                + " and state = 'failed' and owner_id <> ?").param(a.id()).update();
+
+        assertThat(retrySweep.sweep()).isEqualTo(2);
+
+        Map<String, Object> index = jdbc.sql("select i.job_id, i.recipe, i.retries, j.kind from artifact_index i join"
+                + " job j on j.id = i.job_id where i.record_id = ?").param(staying).query().singleRow();
+        assertThat(index.get("job_id")).isNotEqualTo(failedIndex);
+        assertThat(index).containsEntry("kind", "index.artifact").containsEntry("recipe", null);
+        assertThat(((Number) index.get("retries")).intValue()).isOne();
+        Map<String, Object> removal = jdbc.sql("select r.job_id, r.owner_id, j.kind from artifact_index_removal r join"
+                + " job j on j.id = r.job_id where r.artifact_id = ?").param(going).query().singleRow();
+        assertThat(removal.get("job_id")).isNotEqualTo(failedRemoval);
+        assertThat(removal).containsEntry("owner_id", a.id()).containsEntry("kind", "index.artifact_removal");
+        assertThat(jdbc.sql("select state from job where id = ?").param(failedRemoval).query(String.class).single())
+                .isEqualTo("failed");
+        // A row at 3 retries whose job failed is not retried again.
+        UUID retried = (UUID) index.get("job_id");
+        jdbc.sql("update artifact_index set retries = 3 where job_id = ?").param(retried).update();
+        jdbc.sql("update job set state = 'failed' where id = ?").param(retried).update();
+        jdbc.sql("update job set state = 'cancelled' where kind = 'index.artifact_removal' and state in ('waiting',"
+                + " 'offered', 'failed')").update();
+        assertThat(retrySweep.sweep()).isZero();
+
+        // Indexed under one recipe, the version is indexed again under a new one: its row replaced by a new job's.
+        jdbc.sql("update artifact_index set recipe = 'it-r1' where job_id = ?").param(retried).update();
+        jdbc.sql("update job set state = 'done' where id = ?").param(retried).update();
+        assertThat(reconcile.reconcile("it-r1")).isGreaterThanOrEqualTo(0);
+        assertThat(jdbc.sql("select job_id from artifact_index where record_id = ?").param(staying).query(UUID.class)
+                .single()).isEqualTo(retried);
+        assertThat(reconcile.reconcile("it-r2")).isGreaterThanOrEqualTo(1);
+        Map<String, Object> again = jdbc.sql("select i.job_id, i.recipe, i.retries, j.kind, j.state from artifact_index i"
+                + " join job j on j.id = i.job_id where i.record_id = ?").param(staying).query().singleRow();
+        assertThat(again.get("job_id")).isNotEqualTo(retried);
+        assertThat(again).containsEntry("kind", "index.artifact").containsEntry("recipe", null);
+        assertThat(((Number) again.get("retries")).intValue()).isZero();
+        assertThat((String) again.get("state")).isIn("waiting", "offered");
+        // The reconcile visited every owner: the jobs it gave other tests' artifacts are ended here.
+        freeTheIngestionLane();
+    }
+
+    /** One ingestion job at a time: whatever another test left open would hold this test's jobs back. */
+    private void freeTheIngestionLane() {
+        jdbc.sql("update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null"
+                + " where lane = 'ingestion' and state in ('waiting', 'offered', 'running')").update();
     }
 
     /** A record type the GM approved in the owner's system with this key (Story 4.4), stored directly: its id. */

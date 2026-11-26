@@ -43,7 +43,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       fields keep a record's limits ({@link ArtifactRecords#checked}); the content is optional, at most
  *       {@value #MAX_CONTENT} code points after trimming, and a blank one is none. A value outside its limits is
  *       {@code request.invalid} (400) naming its field, and nothing is stored. A character sheet stores what was
- *       written: nothing is calculated.</li>
+ *       written: nothing is calculated. From Story 5.1 part B the same transaction creates the version's index job
+ *       ({@link ArtifactIndexing#start}): a rollback leaves neither.</li>
  *   <li>{@link #list}: the campaign's artifacts newest first (by id, a UUIDv7), of one type key or all, a page at a time
  *       (after a cursor, or at an offset), with the total and the type keys in use with their counts.</li>
  *   <li>{@link #get}: one artifact with its newest version.</li>
@@ -74,15 +75,18 @@ public class Artifacts {
     private final ArtifactVersionStore versions;
     private final Library library;
     private final Vault vault;
+    private final ArtifactIndexing indexing;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
     Artifacts(ArtifactRecords records, ArtifactVersionStore versions, Library library, Vault vault,
-              ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+              ArtifactIndexing indexing, ObjectProvider<PlatformTransactionManager> transactions,
+              ObjectProvider<Clock> clock) {
         this.records = records;
         this.versions = versions;
         this.library = library;
         this.vault = vault;
+        this.indexing = indexing;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -170,6 +174,8 @@ public class Artifacts {
                     vault.encryptText(binding(FIELD_NAME, id, owner), checked.name()),
                     vault.encrypt(binding(FIELD_FIELDS, id, owner), fieldsJson(fields)),
                     content == null ? null : vault.encryptText(binding(FIELD_CONTENT, id, owner), content), now));
+            // Story 5.1 part B: its index job, in the same transaction.
+            indexing.start(id, FIRST_VERSION, now);
             return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION, now);
         }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
@@ -234,7 +240,7 @@ public class Artifacts {
                 .map(identity -> {
                     ArtifactVersionRow version = versions.latest(identity.id())
                             .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
-                    return open(identity, version, owner);
+                    return open(vault, identity, version, owner);
                 }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("artifactId", artifactId).addKeyValue("found", found.isPresent())
@@ -242,7 +248,8 @@ public class Artifacts {
         return found;
     }
 
-    private Artifact open(ArtifactRecords.Identity identity, ArtifactVersionRow version, UUID owner) {
+    /** An artifact's identity and one of its versions, decrypted (Story 5.1 part B: its index input and its sources). */
+    static Artifact open(Vault vault, ArtifactRecords.Identity identity, ArtifactVersionRow version, UUID owner) {
         UUID id = identity.id();
         byte[] stored = version.content();
         return new Artifact(id, identity.campaignId(), identity.recordType(),

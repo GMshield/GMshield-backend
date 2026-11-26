@@ -1654,6 +1654,65 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.deletion_removed`. Deploy order: backend, then frontend (minimum public contract 1.42.0); the previous
     frontend keeps working, since the change is additive.
 
+- **Artifacts answer questions (`artifacts`, `scope`, `conversations`, `knowledge`, Story 5.1 part B, public contract
+  1.43.0, internal contract 1.24.0, migration V44).** A saved artifact is indexed, joins the campaign tier of its
+  campaign's questions, and an answer that uses one cites it by value under "Campanha".
+  - **Module.** `artifacts` may now use `jobs :: service` and `scope :: service` too.
+  - **Index job.** `Artifacts.create` creates, in the save's transaction, one `index.artifact` job on the ingestion lane
+    (`artifacts.service.ArtifactIndexing`, modelled on `IndexChanges`): an `artifact_index` row keyed by the job names
+    the version (record and number) and records the recipe its result reports. Its claim input is a records run's,
+    `{source: artifactId, owner, kind: "artifact", language: null, tokenKey, records}`, and its input `records` one JSON
+    line `{id, page: 1, type, name, fields}`, the content (when there is one) as a last field named `content`. A bad
+    recipe is `index.recipe_invalid` (`job.result_invalid`). A failed job is retried with a new one, the row moved to it,
+    at most 3 times (`ArtifactIndexRetrySweep`, on the materials' index retry schedule and switch). A failed
+    `index.artifact_removal` job is retried the same way with no cap, as the materials' removals are: its row moves to
+    the new job, the same artifact and owner.
+  - **Backfill.** On `IndexRecipeStated`, `ArtifactIndexReconcile` (beside `IndexReconcile`, which is untouched) visits
+    each owner with a newest artifact version that no row reports under that recipe (`StaleArtifacts`, owners only, one
+    JDBC statement) as that owner, and gives each such version of a readable campaign with no unended job a new job,
+    with the version locked. The artifacts saved under part A are indexed the first time the worker states its recipe.
+  - **Scope.** `scope.service.CampaignArtifacts` is a port that `artifacts` implements (`ArtifactSources`): a campaign's
+    artifact ids, and artifacts by id with their newest version. `ResolvedScope.artifacts()` holds the campaign's
+    artifact ids when the campaign tier is on, never among `allowedSources()`. `Scopes.questionInput` lists them after
+    the campaign tier's sources; `searchInput` never does (a search places every hit as a material's), nor does any
+    list, name or term read. `recordContents` (`POST …/records`) and `citedRecords` read an id of that set through the
+    port as a campaign-tier record (page 1, `sectionPath []`; the job adds its content as the last field, named
+    `content`), when its type is a key of the campaign's system; any other id is refused or dropped as before. A
+    campaign whose only campaign-tier sources are artifacts keeps its `campaign` tier event (`ResolvedScope.hasSources`)
+    and has sources for the GM's notice. An artifact is found by a question only once its index job has ended.
+  - **Citation.** A cited artifact is a reference of its own, numbered with the others, stored by value in
+    `turn_reference` with `artifact_id` and `artifact_version`, its type, name and fields (encrypted as a record's),
+    never its content, and the tier `campaign`; no material column. The `done` event's reference has
+    `kind: "artifact"`, `artifactId`, `artifactVersion`, `recordType`, `name`, `fields`, `removed` (false until Story
+    5.2) and `tier`, and none of `materialName`, `sectionPath`, `page` and `passageIds` (now optional in
+    `TurnSourceReference`). Its page and picture routes answer `request.not_found`.
+  - **Deletion.** A campaign's or a system's deletion first locks and cancels its artifacts' unended index jobs and
+    waits for their claims (`ArtifactsDeletion.prepare`), then, in one transaction, creates one `index.artifact_removal`
+    job per artifact (`ArtifactIndexRemovals`, input `{source: artifactId, owner}`, the worker's `index.removal` logic;
+    its `artifact_index_removal` row has no reference to the artifact) and removes the `artifact_index` rows, the
+    versions and the identities.
+  - **V44.** The tables `artifact_index` (job key, owner, record and number, recipe, retries, references on (owner,
+    record) and (record, number)) and `artifact_index_removal`; `turn_reference`'s material columns become nullable,
+    `artifact_id` and `artifact_version` are added, and `turn_reference_record_check` now holds a passage's, a record's
+    and an artifact's row. Rolling back past V44 is safe until an artifact is cited: then delete those references first
+    (`delete from turn_reference where artifact_id is not null`). In any case end the jobs of the two new kinds, whose
+    handlers the previous release does not have, as `Jobs.cancel` ends a job, with the backend stopped, as
+    `gmshield_backend`:
+
+    ```sql
+    update job set state = 'cancelled', grant_hash = null, claim_renew_at = null, claim_lapses_at = null,
+                   outcome_code = null, updated_at = now()
+     where kind in ('index.artifact', 'index.artifact_removal') and state in ('waiting', 'offered', 'running');
+    ```
+
+  - Log lines (ids and counts only): `artifacts.index_created`, `artifacts.index_opened`, `artifacts.index_done`,
+    `artifacts.index_failed`, `artifacts.index_retried`, `artifacts.index_reconciled`, `artifacts.reconciled`,
+    `artifacts.reconcile_failed`, `artifacts.reconcile_owner_failed`, `artifacts.index_removal_created`,
+    `artifacts.index_removal_done`, `artifacts.index_removal_failed`, `artifacts.index_removal_retried`,
+    `artifacts.index_retry_swept`, `artifacts.index_retry_sweep_failed`, `artifacts.index_retry_owner_failed`,
+    `artifacts.deletion_prepared`, and `artifacts` on `scope.resolved` and `scope.question_input`. Deploy order: worker (it runs the two new kinds), then backend, then
+    frontend (minimum public contract 1.43.0). An older frontend skips an artifact's reference.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

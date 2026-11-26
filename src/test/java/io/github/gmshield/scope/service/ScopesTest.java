@@ -58,6 +58,8 @@ class ScopesTest {
     private final Set<UUID> failed = ConcurrentHashMap.newKeySet();
     /** How many times the jobs module was asked which index changes are unended or failed. */
     private final AtomicInteger jobsAsked = new AtomicInteger();
+    /** The campaigns' artifacts, as the artifacts module would answer (Story 5.1 part B). */
+    private final StubCampaignArtifacts artifacts = new StubCampaignArtifacts();
     private ScopeFixture fixture;
     private Scopes scopes;
 
@@ -78,7 +80,8 @@ class ScopesTest {
                     return ids.stream().filter(failed::contains).collect(Collectors.toSet());
                 },
                 beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS,
-                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, vault, beans.getBeanProvider(PlatformTransactionManager.class));
+                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, artifacts, vault,
+                beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
     }
 
@@ -1038,6 +1041,107 @@ class ScopesTest {
         assertThat(as(lib.gm().owner(), () -> scopes.results(systemOnly, List.of(a0)))).isEmpty();
         assertThatThrownBy(() -> as(them.owner(), () -> scopes.results(scope, List.of(a0))))
                 .isInstanceOf(IllegalStateException.class);
+    }
+
+    // --- Story 5.1 part B: the campaign's artifacts
+
+    private CampaignArtifacts.Artifact kael(UUID id, String recordType) {
+        return new CampaignArtifacts.Artifact(id, recordType, "Espada de Kael",
+                List.of(new ScopedRecordContent.Field("Dano", "1d8 cortante")), "Forjada nas montanhas do norte.", 1);
+    }
+
+    @Test
+    void theCampaignsArtifactsJoinOnlyTheQuestionInputsCampaignTierAndOnlyWithThatTierOn() {
+        Library2 lib = twoTiers();
+        UUID artifact = Ids.newId();
+        artifacts.put(lib.gm().owner(), lib.gm().campaign(), kael(artifact, "item"));
+        UUID sibling = Ids.newId();
+        artifacts.put(lib.gm().owner(), fixture.otherCampaign(lib.gm()), kael(sibling, "item"));
+
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(), ScopeSettings.STARTING));
+
+        // Matrix row "Answer": the artifact is a campaign-tier source of a question, after the materials' sources.
+        assertThat(scope.artifacts()).containsExactly(artifact);
+        assertThat(scope.allowedSources()).doesNotContain(artifact);
+        assertThat(scope.hasSources(Tier.CAMPAIGN)).isTrue();
+        JsonNode question = as(lib.gm().owner(), () -> scopes.questionInput(scope, "Espada de Kael?"));
+        assertThat(strings(question.path("tiers").get(0).path("sources")))
+                .containsExactly(lib.a().toString(), artifact.toString());
+        assertThat(strings(question.path("tiers").get(1).path("sources"))).containsExactly(lib.b().toString());
+        // Matrix row "Library search": never in a search's input.
+        JsonNode search = as(lib.gm().owner(), () -> scopes.searchInput(scope, "Kael"));
+        assertThat(strings(search.path("tiers").get(0).path("sources"))).containsExactly(lib.a().toString());
+        // Matrix row "Other campaign": another campaign's artifact is no source.
+        assertThat(question.toString()).doesNotContain(sibling.toString());
+        // Matrix row "Campaign tier off": no artifact is a source.
+        ResolvedScope off = as(lib.gm().owner(), () -> scopes.resolve(lib.gm().campaign(),
+                new ScopeSettings(false, true, false, false)));
+        assertThat(off.artifacts()).isEmpty();
+        assertThat(as(lib.gm().owner(), () -> scopes.questionInput(off, "Kael?")).toString())
+                .doesNotContain(artifact.toString());
+    }
+
+    @Test
+    void aCampaignWhoseOnlySourcesAreArtifactsHasSourcesAndItsCampaignTier() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID artifact = Ids.newId();
+        artifacts.put(gm.owner(), gm.campaign(), kael(artifact, "item"));
+
+        ResolvedScope scope = as(gm.owner(), () -> scopes.resolveSources(gm.campaign(), ScopeSettings.STARTING));
+
+        assertThat(scope.sources(Tier.CAMPAIGN)).isEmpty();
+        assertThat(scope.hasSources(Tier.CAMPAIGN)).isTrue();
+        assertThat(scope.hasSources(Tier.SYSTEM)).isFalse();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)).hasSources()).isTrue();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), new ScopeSettings(false, true, false, false)))
+                .hasSources()).isFalse();
+    }
+
+    @Test
+    void anArtifactIsReadAndCitedAsACampaignTierRecordOfPageOneAndAnyOtherIdIsRefusedOrDropped() {
+        Library2 lib = twoTiers();
+        UUID artifact = Ids.newId();
+        artifacts.put(lib.gm().owner(), lib.gm().campaign(), kael(artifact, "item"));
+        UUID sibling = Ids.newId();
+        artifacts.put(lib.gm().owner(), fixture.otherCampaign(lib.gm()), kael(sibling, "item"));
+        UUID unknownType = Ids.newId();
+        artifacts.put(lib.gm().owner(), lib.gm().campaign(), kael(unknownType, "talento"));
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+
+        List<ScopedRecordContent> read = as(lib.gm().owner(), () -> scopes.recordContents(scope, List.of(artifact)));
+
+        assertThat(read).singleElement().satisfies(content -> {
+            assertThat(content.record().recordId()).isEqualTo(artifact);
+            assertThat(content.record().artifact()).isTrue();
+            assertThat(content.record().artifactVersion()).isEqualTo(1);
+            assertThat(content.record().tier()).isEqualTo(Tier.CAMPAIGN);
+            assertThat(content.record().page()).isEqualTo(1);
+            assertThat(content.record().sectionPath()).isEmpty();
+            assertThat(content.record().passageIds()).isEmpty();
+            assertThat(content.record().versionId()).isNull();
+            assertThat(content.record().recordType()).isEqualTo("item");
+            assertThat(content.record().name()).isEqualTo("Espada de Kael");
+            assertThat(content.fields()).extracting(ScopedRecordContent.Field::name).containsExactly("Dano");
+            assertThat(content.content()).isEqualTo("Forjada nas montanhas do norte.");
+        });
+        // Matrix row "Other campaign": a records read of its id is refused, as is a type the system lacks.
+        for (List<UUID> refused : List.of(List.of(sibling), List.of(artifact, sibling), List.of(unknownType))) {
+            assertThatThrownBy(() -> as(lib.gm().owner(), () -> scopes.recordContents(scope, refused)))
+                    .as("%s", refused).isInstanceOfSatisfying(ApiException.class,
+                            e -> assertThat(e.problem().status()).isEqualTo(403));
+        }
+        // A citation drops what is not one, never refuses.
+        assertThat(as(lib.gm().owner(), () -> scopes.citedRecords(scope, List.of(sibling, artifact, unknownType))))
+                .extracting(content -> content.record().recordId()).containsExactly(artifact);
+        // The campaign tier off: the artifact is no record of the scope.
+        ResolvedScope off = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                new ScopeSettings(false, true, false, false)));
+        assertThat(as(lib.gm().owner(), () -> scopes.citedRecords(off, List.of(artifact)))).isEmpty();
+        // Matrix row "Other owner": another owner's scope never reads it.
+        ScopeFixture.Starter them = fixture.starter();
+        assertThatThrownBy(() -> as(them.owner(), () -> scopes.recordContents(scope, List.of(artifact))))
+                .isInstanceOf(ApiException.class);
     }
 
     private static List<String> fieldNames(JsonNode node) {
