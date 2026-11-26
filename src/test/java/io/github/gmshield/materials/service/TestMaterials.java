@@ -107,6 +107,20 @@ public final class TestMaterials {
         }
     };
 
+    /** Term matches with no ontology and no record (Story 4.6): nothing matches. */
+    public static final TermMatches NO_TERMS = new TermMatches() {
+        @Override
+        public Ontological ontology(UUID systemId, Collection<String> names) {
+            return Ontological.NONE;
+        }
+
+        @Override
+        public List<ExtractedRecords.Located> records(Collection<UUID> versionIds, Set<String> recordTypes,
+                                                      Collection<String> names, int limit) {
+            return List.of();
+        }
+    };
+
     /**
      * Record type keys for the tests that build the services by hand (Story 4.4 part B): every system has the core keys
      * only, and a records step extracts rule, spell and item.

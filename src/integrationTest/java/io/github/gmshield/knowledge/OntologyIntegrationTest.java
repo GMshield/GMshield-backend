@@ -28,6 +28,7 @@ import io.github.gmshield.materials.service.MaterialActions;
 import io.github.gmshield.materials.service.RecordIndexing;
 import io.github.gmshield.materials.service.RecordRemovals;
 import io.github.gmshield.materials.service.RecordTypeKeys;
+import io.github.gmshield.materials.service.TermMatches;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -701,6 +702,59 @@ class OntologyIntegrationTest {
                 .map(row -> (UUID) row.get("id")).findFirst().orElseThrow();
     }
 
+    // --- Story 4.6: the fingerprint-IN lookups of term resolution
+
+    @Autowired
+    private TermMatches termMatches;
+
+    @Test
+    void aQuestionsNamesMatchTypesTermsAliasesAndRecordsByFingerprintWithinTheirOwnerOnPostgres() throws Exception {
+        Owner a = owner();
+        Owner b = owner();
+        RecordTypeRow talent = row(a.id(), a.system(), null, "Talento");
+        write(a.id(), () -> store.insertRecordTypes(List.of(talent)));
+        term(a.id(), a.system(), "Pontos de Vida", "PV", "Vida");
+        term(b.id(), b.system(), "Bola de Fogo", "Fireball");
+        UUID light = spellRecord(a.id(), a.system());
+        UUID version = jdbc.sql("select version_id from record where id = ?").param(light).query(UUID.class).single();
+        UUID theirs = spellRecord(b.id(), b.system());
+        UUID theirVersion = jdbc.sql("select version_id from record where id = ?").param(theirs).query(UUID.class)
+                .single();
+
+        TermMatches.Ontological found = as(a.id(), () -> transactional(() -> termMatches.ontology(a.system(),
+                List.of("talento", "magias", "pv", "fireball", "bola de fogo", "nada"))));
+        // A core name in pt-BR (plural), the approved type's stored name, and the term by its alias: its name and every
+        // alias. Another owner's term matches nothing.
+        assertThat(found.recordTypes()).containsExactly("spell", talent.key());
+        assertThat(found.names()).containsExactly("Pontos de Vida", "PV", "Vida");
+        assertThat(as(b.id(), () -> transactional(() -> termMatches.ontology(a.system(), List.of("pv")))).names())
+                .isEmpty();
+
+        // Past one query's worth of names: the term and the type after 1,200 others still come back.
+        List<String> many = new java.util.ArrayList<>();
+        for (int i = 0; i < 1_200; i++) {
+            many.add("nome " + i);
+        }
+        List<String> fillerThenTerms = new java.util.ArrayList<>(many);
+        fillerThenTerms.addAll(List.of("pv", "talento"));
+        TermMatches.Ontological past = as(a.id(), () -> transactional(() -> termMatches.ontology(a.system(),
+                fillerThenTerms)));
+        assertThat(past.recordTypes()).containsExactly(talent.key());
+        assertThat(past.names()).containsExactly("Pontos de Vida", "PV", "Vida");
+
+        // Records: by name within the given versions and type keys; past one query's worth of names too.
+        many.add("LUZ ");
+        assertThat(as(a.id(), () -> transactional(() -> termMatches.records(List.of(version), java.util.Set.of("spell"),
+                many, 100)))).extracting(ExtractedRecords.Located::id).containsExactly(light);
+        assertThat(as(a.id(), () -> transactional(() -> termMatches.records(List.of(version), java.util.Set.of("item"),
+                List.of("luz"), 100)))).isEmpty();
+        assertThat(as(a.id(), () -> transactional(() -> termMatches.records(List.of(version, theirVersion),
+                java.util.Set.of("spell"), List.of("luz"), 100)))).extracting(ExtractedRecords.Located::id)
+                .containsExactly(light);
+        assertThat(as(a.id(), () -> transactional(() -> termMatches.records(List.of(version),
+                java.util.Set.of("spell"), List.of("luz"), 0)))).isEmpty();
+    }
+
     // --- deletion
 
     @Test
@@ -799,6 +853,37 @@ class OntologyIntegrationTest {
                     List.of(passage), 1)));
         });
         return jdbc.sql("select id from record where version_id = ?").param(version).query(UUID.class).single();
+    }
+
+    /** A term approved in the system with these aliases, stored with SQL as an approval and merges leave it. */
+    private void term(UUID owner, UUID system, String name, String... aliases) {
+        UUID proposal = approvedProposal(owner, system, name);
+        UUID term = Ids.newId();
+        jdbc.sql("insert into term (id, owner_id, system_id, name, name_fingerprint, definition, proposal_id,"
+                + " created_at) values (?, ?, ?, ?, ?, ?, ?, now())").params(term, owner, system,
+                vault.encryptText(new Binding("term", "name", term, owner), name),
+                vault.fingerprint("record_type", "name", Library.uniqueForm(name)),
+                vault.encryptText(new Binding("term", "definition", term, owner), "Definição"), proposal).update();
+        for (String alias : aliases) {
+            UUID id = Ids.newId();
+            jdbc.sql("insert into term_alias (id, owner_id, system_id, term_id, name, name_fingerprint, proposal_id,"
+                    + " created_at) values (?, ?, ?, ?, ?, ?, ?, now())").params(id, owner, system, term,
+                    vault.encryptText(new Binding("term_alias", "name", id, owner), alias),
+                    vault.fingerprint("record_type", "name", Library.uniqueForm(alias)), proposal).update();
+        }
+    }
+
+    /** {@code work} in a read transaction of its own. */
+    private <T> T transactional(Callable<T> work) {
+        TransactionTemplate template = new TransactionTemplate(transactions);
+        template.setReadOnly(true);
+        return template.execute(status -> {
+            try {
+                return work.call();
+            } catch (Exception failed) {
+                throw new IllegalStateException(failed);
+            }
+        });
     }
 
     /** A raw insert, past the application, to prove what the table itself refuses. */

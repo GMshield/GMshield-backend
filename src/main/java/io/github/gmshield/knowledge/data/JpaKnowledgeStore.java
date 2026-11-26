@@ -4,10 +4,13 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.OptimisticLockException;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.hibernate.StaleStateException;
 import org.hibernate.exception.ConstraintViolationException;
@@ -50,6 +53,8 @@ class JpaKnowledgeStore implements KnowledgeStore {
             + " and (r.typeKey = :key or (r.typeKey is null and r.core = :key))";
     private static final String APPROVED_OF_SYSTEM = "select r from RecordType r where r.systemId = :system"
             + " and r.core is null order by r.id";
+    private static final String NAMED_ANY = "select r from RecordType r where r.systemId = :system"
+            + " and r.nameFingerprint in :fingerprints order by r.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -168,6 +173,20 @@ class JpaKnowledgeStore implements KnowledgeStore {
     public List<RecordTypeRow> approvedRecordTypes(UUID systemId) {
         return em().createQuery(APPROVED_OF_SYSTEM, RecordTypeEntity.class).setParameter("system", systemId)
                 .getResultList().stream().map(RecordTypeEntity::row).toList();
+    }
+
+    @Override
+    public List<RecordTypeRow> recordTypesNamed(UUID systemId, Collection<byte[]> nameFingerprints) {
+        List<byte[]> fingerprints = List.copyOf(nameFingerprints);
+        Map<UUID, RecordTypeRow> found = new TreeMap<>();
+        for (int from = 0; from < fingerprints.size(); from += JpaRecordStore.FINGERPRINTS_PER_QUERY) {
+            List<byte[]> chunk = fingerprints.subList(from, Math.min(fingerprints.size(),
+                    from + JpaRecordStore.FINGERPRINTS_PER_QUERY));
+            em().createQuery(NAMED_ANY, RecordTypeEntity.class).setParameter("system", systemId)
+                    .setParameter("fingerprints", chunk).getResultList().stream().map(RecordTypeEntity::row)
+                    .forEach(row -> found.putIfAbsent(row.id(), row));
+        }
+        return List.copyOf(found.values());
     }
 
     private Optional<RecordTypeEntity> entity(UUID id, LockModeType lock) {

@@ -1,5 +1,6 @@
 package io.github.gmshield.knowledge.data;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -76,4 +77,10 @@ public interface KnowledgeStore {
 
     /** The current owner's record types of the system {@code systemId} that are not core, oldest first (Story 4.4). */
     List<RecordTypeRow> approvedRecordTypes(UUID systemId);
+
+    /**
+     * The current owner's record types of the system {@code systemId} whose name fingerprint is one of
+     * {@code nameFingerprints} (Story 4.6: a fingerprint-IN equality, never a text search), oldest first.
+     */
+    List<RecordTypeRow> recordTypesNamed(UUID systemId, Collection<byte[]> nameFingerprints);
 }

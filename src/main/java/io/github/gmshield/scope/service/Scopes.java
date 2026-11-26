@@ -4,6 +4,7 @@ import io.github.gmshield.library.service.Library;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.materials.service.RecordTypeKeys;
 import io.github.gmshield.materials.service.ScopeReads;
+import io.github.gmshield.materials.service.TermMatches;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -19,6 +20,7 @@ import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -127,6 +129,10 @@ import tools.jackson.databind.node.ObjectNode;
  *       whatever its index point ({@link ExtractedRecords.Reach#ALL}), so an answer whose search found the point (just
  *       before its removal, or a point written back later) does not fail; a cited one is dropped. {@link #deletedRecords} names the owner's deleted records among
  *       some ids, so a library search that finds one drops it instead of failing.</li>
+ *   <li>Story 4.6 (term resolution): {@link #resolveTerms} matches a question's spans of 1 to 6 words against the
+ *       campaign's system's ontology and the scope's record names ({@link TermMatches}), each an equality on a keyed
+ *       fingerprint, and answers the record type keys, names and in-scope record ids it found ({@link ResolvedTerms}).
+ *       No model, no text search, no definition.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -147,21 +153,30 @@ public class Scopes {
      * page at a time within its time budget.
      */
     public static final int MAX_PENDING = 5_000;
+    /** The most records a question's term resolution names (Story 4.6). */
+    public static final int MAX_TERM_RECORDS = 100;
+    /**
+     * The most records a term resolution's records query reads before the scope leaves out those it cannot place and
+     * the first {@value #MAX_TERM_RECORDS} are kept, campaign tier first.
+     */
+    static final int TERM_RECORDS_READ = 1_000;
     private static final Logger log = LoggerFactory.getLogger(Scopes.class);
 
     private final Library library;
     private final ScopeReads reads;
     private final ExtractedRecords records;
     private final RecordTypeKeys recordTypeKeys;
+    private final TermMatches termMatches;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    Scopes(Library library, ScopeReads reads, ExtractedRecords records, RecordTypeKeys recordTypeKeys, Vault vault,
-           ObjectProvider<PlatformTransactionManager> transactions) {
+    Scopes(Library library, ScopeReads reads, ExtractedRecords records, RecordTypeKeys recordTypeKeys,
+           TermMatches termMatches, Vault vault, ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
         this.reads = reads;
         this.records = records;
         this.recordTypeKeys = recordTypeKeys;
+        this.termMatches = termMatches;
         this.vault = vault;
         this.transactions = transactions;
     }
@@ -537,6 +552,57 @@ public class Scopes {
                 .addKeyValue("kept", found.size()).addKeyValue("dropped", wanted.size() - found.size())
                 .log("scope.cited_records_read");
         return found;
+    }
+
+    /**
+     * A question's terms resolved within {@code scope} (Story 4.6, internal contract 1.23.0): the question's spans
+     * ({@link TermSpans}: 1 to {@value TermSpans#MAX_WORDS} contiguous words in their unique form) matched against what
+     * the campaign's system's ontology holds ({@link TermMatches#ontology}: the core types' names in pt-BR and en, the
+     * approved types' names, the terms' names and aliases) and against the names of the scope's records
+     * ({@link TermMatches#records}), each an equality on a keyed fingerprint. The record type keys are those of the
+     * campaign's system ({@link ResolvedScope#recordTypes}); the records are those of an allowed source still
+     * {@code ready}, of one of those keys, placed as {@link #records} places them, campaign tier first, then system, then
+     * other, each by id, at most {@value #MAX_TERM_RECORDS}; the names are the matched terms' names and aliases, then the
+     * records' names, each once. A record the GM deleted is never named. Its line {@code scope.terms_resolved} carries
+     * counts only.
+     */
+    public ResolvedTerms resolveTerms(ResolvedScope scope, String question) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(question, "question");
+        requireOwner(scope);
+        List<String> spans = TermSpans.of(question);
+        ResolvedTerms resolved = spans.isEmpty() ? ResolvedTerms.NONE : reading(() -> {
+            Library.Campaign campaign = campaignOf(scope.campaignId());
+            TermMatches.Ontological ontology = termMatches.ontology(campaign.system().id(), spans);
+            Set<String> keys = scope.recordTypes();
+            List<String> types = ontology.recordTypes().stream().filter(keys::contains).sorted().toList();
+            List<ScopedRecord> named = scope.allowedSources().isEmpty() || keys.isEmpty() ? List.of()
+                    : termRecords(scope, termMatches.records(scope.allowedSources(), keys, spans, TERM_RECORDS_READ));
+            Set<String> names = new LinkedHashSet<>(ontology.names());
+            named.forEach(record -> names.add(record.name()));
+            return new ResolvedTerms(types, List.copyOf(names), named.stream().map(ScopedRecord::recordId).toList());
+        });
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("spans", spans.size())
+                .addKeyValue("recordTypes", resolved.recordTypes().size())
+                .addKeyValue("names", resolved.names().size()).addKeyValue("records", resolved.records().size())
+                .log("scope.terms_resolved");
+        return resolved;
+    }
+
+    /**
+     * The first {@value #MAX_TERM_RECORDS} of these records placed within {@code scope} ({@link #located}), campaign tier
+     * first, then by id, with their names. Runs in the caller's read transaction.
+     */
+    private List<ScopedRecord> termRecords(ResolvedScope scope, List<ExtractedRecords.Located> named) {
+        List<Placed> kept = located(scope, named).stream()
+                .sorted(Comparator.comparing(Placed::tier).thenComparing(one -> one.record().id()))
+                .limit(MAX_TERM_RECORDS).toList();
+        if (kept.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, String> names = records.names(kept.stream().map(one -> one.record().id()).toList());
+        return kept.stream().filter(one -> names.containsKey(one.record().id()))
+                .map(one -> one.scoped(names.get(one.record().id()))).toList();
     }
 
     /**

@@ -8,8 +8,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import org.hibernate.StaleStateException;
 import org.hibernate.exception.ConstraintViolationException;
@@ -54,6 +56,11 @@ class JpaOntologyStore implements OntologyStore {
             + " and a.nameFingerprint = :fingerprint";
     private static final String ALIASES_OF_TERMS = "select a from TermAlias a where a.termId in :terms order by a.id";
     private static final String ALIASES_OF_SYSTEM = "select a from TermAlias a where a.systemId = :system";
+    private static final String TERMS_BY_IDS = "select t from Term t where t.id in :ids order by t.id";
+    private static final String TERMS_NAMED_ANY = "select t from Term t where t.systemId = :system"
+            + " and t.nameFingerprint in :fingerprints order by t.id";
+    private static final String ALIASES_NAMED_ANY = "select a from TermAlias a where a.systemId = :system"
+            + " and a.nameFingerprint in :fingerprints order by a.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -244,6 +251,47 @@ class JpaOntologyStore implements OntologyStore {
         }
         return em().createQuery(ALIASES_OF_TERMS, TermAliasEntity.class).setParameter("terms", Set.copyOf(termIds))
                 .getResultList().stream().map(TermAliasEntity::row).toList();
+    }
+
+    @Override
+    public List<TermRow> findTerms(Collection<UUID> ids) {
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(TERMS_BY_IDS, TermEntity.class).setParameter("ids", Set.copyOf(ids)).getResultList()
+                .stream().map(TermEntity::row).toList();
+    }
+
+    @Override
+    public List<TermRow> termsNamed(UUID systemId, Collection<byte[]> nameFingerprints) {
+        Map<UUID, TermRow> found = new TreeMap<>();
+        for (List<byte[]> chunk : chunks(nameFingerprints)) {
+            em().createQuery(TERMS_NAMED_ANY, TermEntity.class).setParameter("system", systemId)
+                    .setParameter("fingerprints", chunk).getResultList().stream().map(TermEntity::row)
+                    .forEach(row -> found.putIfAbsent(row.id(), row));
+        }
+        return List.copyOf(found.values());
+    }
+
+    @Override
+    public List<TermAliasRow> aliasesNamed(UUID systemId, Collection<byte[]> nameFingerprints) {
+        Map<UUID, TermAliasRow> found = new TreeMap<>();
+        for (List<byte[]> chunk : chunks(nameFingerprints)) {
+            em().createQuery(ALIASES_NAMED_ANY, TermAliasEntity.class).setParameter("system", systemId)
+                    .setParameter("fingerprints", chunk).getResultList().stream().map(TermAliasEntity::row)
+                    .forEach(row -> found.putIfAbsent(row.id(), row));
+        }
+        return List.copyOf(found.values());
+    }
+
+    /** The fingerprints in lists of at most {@link JpaRecordStore#FINGERPRINTS_PER_QUERY}, one query each. */
+    private static List<List<byte[]>> chunks(Collection<byte[]> nameFingerprints) {
+        List<byte[]> all = List.copyOf(nameFingerprints);
+        List<List<byte[]>> chunks = new ArrayList<>();
+        for (int from = 0; from < all.size(); from += JpaRecordStore.FINGERPRINTS_PER_QUERY) {
+            chunks.add(all.subList(from, Math.min(all.size(), from + JpaRecordStore.FINGERPRINTS_PER_QUERY)));
+        }
+        return chunks;
     }
 
     @Override
