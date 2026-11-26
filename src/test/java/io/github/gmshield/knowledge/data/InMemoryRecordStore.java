@@ -259,6 +259,14 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
+    public List<ArtifactRow> findArtifacts(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        return ids.stream().distinct().map(artifacts::get)
+                .filter(row -> row != null && row.ownerId().equals(owner)).sorted(Comparator.comparing(ArtifactRow::id))
+                .toList();
+    }
+
+    @Override
     public List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit) {
         return ofCampaign(campaignId, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
                 .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())

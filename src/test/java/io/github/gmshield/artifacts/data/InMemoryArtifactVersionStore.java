@@ -49,6 +49,17 @@ public class InMemoryArtifactVersionStore implements ArtifactVersionStore {
     }
 
     @Override
+    public Optional<ArtifactVersionRow> find(UUID recordId, int number) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(rows.get(key(recordId, number))).filter(row -> row.ownerId().equals(owner));
+    }
+
+    @Override
+    public Optional<ArtifactVersionRow> lock(UUID recordId, int number) {
+        return find(recordId, number);
+    }
+
+    @Override
     public synchronized int deleteOf(Collection<UUID> recordIds) {
         UUID owner = OwnerContext.require();
         List<Map.Entry<String, ArtifactVersionRow>> found = rows.entrySet().stream()

@@ -16,7 +16,11 @@ import java.util.UUID;
  * in-scope passages not indexed (their index change has not ended, or its job failed), kept by tier (Story 2.3: the
  * question input groups them so); empty, not computed, in a scope from {@link Scopes#resolveSources}. From Story 3.5
  * there are three tiers (campaign, system, other), and each allowed source knows its material. Only {@link Scopes}
- * makes one, so a scope cannot be forged by another module. {@code toString} names ids and counts only.
+ * makes one, so a scope cannot be forged by another module. From Story 5.1 part B it also holds the ids of the
+ * campaign's artifacts when its campaign tier is on ({@link #artifacts}): they are no source of {@link #sources} or
+ * {@link #allowedSources}, so no read of a material's passages or records ever reaches one, and only a question's input
+ * lists them, among the campaign tier's sources ({@link Scopes#questionInput}). {@code toString} names ids and counts
+ * only.
  */
 public final class ResolvedScope {
 
@@ -27,13 +31,16 @@ public final class ResolvedScope {
     private final Map<Tier, List<UUID>> pending = new EnumMap<>(Tier.class);
     private final Map<UUID, UUID> materialOf;
     private final Set<String> recordTypes;
+    private final Set<UUID> artifacts;
 
     /**
      * {@code sources} and {@code pending} by tier (a missing tier has none); {@code materialOf} the material of each
-     * allowed source; {@code recordTypes} the record type keys of the campaign's system (Story 4.4 part B).
+     * allowed source; {@code recordTypes} the record type keys of the campaign's system (Story 4.4 part B);
+     * {@code artifacts} the ids of the campaign's artifacts, none when its campaign tier is off (Story 5.1 part B).
      */
     ResolvedScope(UUID ownerId, UUID campaignId, ScopeSettings settings, Map<Tier, List<UUID>> sources,
-                  Map<Tier, List<UUID>> pending, Map<UUID, UUID> materialOf, Set<String> recordTypes) {
+                  Map<Tier, List<UUID>> pending, Map<UUID, UUID> materialOf, Set<String> recordTypes,
+                  Set<UUID> artifacts) {
         this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
         this.campaignId = Objects.requireNonNull(campaignId, "campaignId");
         this.settings = Objects.requireNonNull(settings, "settings");
@@ -43,6 +50,23 @@ public final class ResolvedScope {
         }
         this.materialOf = Map.copyOf(materialOf);
         this.recordTypes = Set.copyOf(recordTypes);
+        this.artifacts = Set.copyOf(artifacts);
+    }
+
+    /**
+     * The ids of the campaign's artifacts (Story 5.1 part B), campaign-tier sources of a question only; none when the
+     * campaign tier is off.
+     */
+    public Set<UUID> artifacts() {
+        return artifacts;
+    }
+
+    /**
+     * Whether a tier has a source a question may use (Story 5.1 part B): an allowed source, or for the campaign tier one
+     * of the campaign's artifacts too.
+     */
+    public boolean hasSources(Tier tier) {
+        return !sources.get(tier).isEmpty() || tier == Tier.CAMPAIGN && !artifacts.isEmpty();
     }
 
     /**
@@ -119,6 +143,6 @@ public final class ResolvedScope {
         return "ResolvedScope[ownerId=" + ownerId + ", campaignId=" + campaignId + ", campaignSources="
                 + sources.get(Tier.CAMPAIGN).size() + ", systemSources=" + sources.get(Tier.SYSTEM).size()
                 + ", otherSources=" + sources.get(Tier.OTHER).size() + ", pending=" + pending().size()
-                + ", recordTypes=" + recordTypes.size() + "]";
+                + ", recordTypes=" + recordTypes.size() + ", artifacts=" + artifacts.size() + "]";
     }
 }

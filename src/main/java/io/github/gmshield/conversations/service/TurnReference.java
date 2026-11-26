@@ -11,6 +11,8 @@ import java.util.UUID;
  * answer was written ({@code null} for a reference stored before then). From Story 4.3 part C a cited record's
  * reference also carries {@link Cited} (null on a passage's): the record's id, core type key, name and fields as they
  * were when the answer was written; its place is the record's first page and its passages the record's passages there.
+ * From Story 5.1 part B a cited artifact's reference carries {@link Cited} with the artifact's version
+ * ({@link #ARTIFACT}): it has no material, section path, page (0) or passage, and it is never removed until Story 5.2.
  * {@code toString} names the number and the page only.
  */
 public record TurnReference(int number, String materialName, List<String> sectionPath, int page,
@@ -19,6 +21,8 @@ public record TurnReference(int number, String materialName, List<String> sectio
     /** A reference's kind: a passage place's, or a record's. */
     public static final String PASSAGE = "passage";
     public static final String RECORD = "record";
+    /** Story 5.1 part B: a cited artifact's reference. */
+    public static final String ARTIFACT = "artifact";
 
     /** One field of a cited record: a name and a value. {@code toString} names neither. */
     public record Field(String name, String value) {
@@ -33,8 +37,12 @@ public record TurnReference(int number, String materialName, List<String> sectio
         }
     }
 
-    /** The record a reference names, as stored with it. {@code toString} names the id and the type only. */
-    public record Cited(UUID id, String type, String name, List<Field> fields) {
+    /**
+     * The record a reference names, as stored with it; for an artifact (Story 5.1 part B) its id and the number of the
+     * version cited ({@code artifactVersion}, null for an extracted record). {@code toString} names the id, the type and
+     * the version only.
+     */
+    public record Cited(UUID id, String type, String name, List<Field> fields, Integer artifactVersion) {
         public Cited {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(type, "type");
@@ -42,9 +50,15 @@ public record TurnReference(int number, String materialName, List<String> sectio
             fields = List.copyOf(fields);
         }
 
+        /** An extracted record, as stored with its reference. */
+        public Cited(UUID id, String type, String name, List<Field> fields) {
+            this(id, type, name, fields, null);
+        }
+
         @Override
         public String toString() {
-            return "Cited[id=" + id + ", type=" + type + ", fields=" + fields.size() + "]";
+            return "Cited[id=" + id + ", type=" + type + ", fields=" + fields.size() + ", artifactVersion="
+                    + artifactVersion + "]";
         }
     }
 
@@ -59,9 +73,12 @@ public record TurnReference(int number, String materialName, List<String> sectio
         this(number, materialName, sectionPath, page, passageIds, removed, tier, null);
     }
 
-    /** {@value #RECORD} for a record's reference, else {@value #PASSAGE}. */
+    /** {@value #ARTIFACT} for an artifact's reference, {@value #RECORD} for a record's, else {@value #PASSAGE}. */
     public String kind() {
-        return record == null ? PASSAGE : RECORD;
+        if (record == null) {
+            return PASSAGE;
+        }
+        return record.artifactVersion() == null ? RECORD : ARTIFACT;
     }
 
     @Override

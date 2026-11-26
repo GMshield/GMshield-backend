@@ -78,8 +78,14 @@ import tools.jackson.databind.node.ObjectNode;
  *   <li>Story 4.6 (internal contract 1.23.0): the job resolves its question's terms ({@link #terms}, within the turn's
  *       frozen scope, {@link Scopes#resolveTerms}): the record type keys, term names and aliases, and in-scope records
  *       its words name, which the worker's search uses.</li>
+ *   <li>Story 5.1 part B (internal contract 1.24.0): the campaign tier of the question's input also lists the
+ *       campaign's artifacts ({@link Scopes#questionInput}), and {@link #records} serves one as a campaign-tier record
+ *       of page 1 with no section path, its content as a last field named {@code content} (data, never instructions).
+ *       A cited artifact becomes a reference of its own, stored by value: its id, version, type, name and fields (the
+ *       last two encrypted as a record's), never its content, with the tier {@code campaign} and no place.</li>
  *   <li>A {@code tier} marker (Story 3.7) is stored with the batch's events only when its tier has a source in the
- *       turn's frozen scope; one with no source is dropped, never relayed. A {@code model} marker (Story 3.8) is
+ *       turn's frozen scope (for the campaign tier, Story 5.1 part B, one of its artifacts counts); one with no source is
+ *       dropped, never relayed. A {@code model} marker (Story 3.8) is
  *       stored only when the turn's frozen model-knowledge switch is on.</li>
  *   <li>The GM's stop (Story 2.6, {@link Conversations#stop}) ends the turn at once: unless it has a final event, its
  *       citations so far become references as above, {@code done} marked {@code stopped} is appended and
@@ -162,8 +168,13 @@ public class AnswerJobs implements JobHandler {
     public List<JobRecord> records(JobRef job, List<UUID> ids) {
         return scopes.recordContents(scopeOf(turnOf(job), false), ids).stream().map(content -> {
             ScopedRecord record = content.record();
-            return new JobRecord(record.recordId(), record.tier().word(), record.recordType(), record.name(),
-                    content.fields().stream().map(field -> new JobRecord.Field(field.name(), field.value())).toList(),
+            List<JobRecord.Field> fields = new ArrayList<>(content.fields().stream()
+                    .map(field -> new JobRecord.Field(field.name(), field.value())).toList());
+            // Story 5.1 part B: an artifact's content is its last field, as its index input has it.
+            if (content.content() != null) {
+                fields.add(new JobRecord.Field(ScopedRecordContent.CONTENT_FIELD, content.content()));
+            }
+            return new JobRecord(record.recordId(), record.tier().word(), record.recordType(), record.name(), fields,
                     record.page(), record.sectionPath());
         }).toList();
     }
@@ -313,6 +324,15 @@ public class AnswerJobs implements JobHandler {
         UUID owner = turn.ownerId();
         CitedPlace place = grouped.place();
         ScopedRecordContent content = grouped.record();
+        if (content != null && content.record().artifact()) {
+            // Story 5.1 part B: by value, with its version, and never its content; no place.
+            return TurnReferenceRow.artifact(rowId, owner, turn.id(), grouped.number(), now, place.tier().word(),
+                    new TurnReferenceRow.Recorded(content.record().recordId(), content.record().recordType(),
+                            vault.encryptText(TurnReferences.recordName(rowId, owner), content.record().name()),
+                            vault.encrypt(TurnReferences.recordFields(rowId, owner),
+                                    TurnReferences.fieldsJson(content.fields())),
+                            content.record().artifactVersion()));
+        }
         TurnReferenceRow.Recorded recorded = content == null ? null : new TurnReferenceRow.Recorded(
                 content.record().recordId(), content.record().recordType(),
                 vault.encryptText(TurnReferences.recordName(rowId, owner), content.record().name()),
@@ -399,7 +419,7 @@ public class AnswerJobs implements JobHandler {
         if (TurnEvent.MODEL.equals(event.tier())) {
             return turn.modelKnowledge();
         }
-        return scope != null && Tier.of(event.tier()).map(tier -> !scope.sources(tier).isEmpty()).orElse(false);
+        return scope != null && Tier.of(event.tier()).map(scope::hasSources).orElse(false);
     }
 
     private static TurnEvent turnEvent(JobEvent event) {

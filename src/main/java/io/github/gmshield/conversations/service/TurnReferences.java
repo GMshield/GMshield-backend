@@ -21,7 +21,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * of the reference row. From Story 4.3 part C a cited record is a reference of its own, whatever place it shares with
  * other citations: its key includes the record's id, its place is its first passage's on its first page and its
  * passages are its passages there; its name and fields (a JSON array of {@code {name, value}}) are encrypted under
- * bindings of the reference row too.
+ * bindings of the reference row too. From Story 5.1 part B a cited artifact is a reference of its own as well: it has no
+ * place (no version, section path or passage, page 1 to group by), and its name and fields are stored as a record's.
  */
 final class TurnReferences {
 
@@ -44,9 +45,16 @@ final class TurnReferences {
             return new Cited(place, null);
         }
 
-        /** A cited record: its place is its first passage's on its first page. */
+        /**
+         * A cited record: its place is its first passage's on its first page. A cited artifact (Story 5.1 part B) has no
+         * passage and no place but its tier.
+         */
         static Cited record(ScopedRecordContent content) {
             ScopedRecord record = content.record();
+            if (record.artifact()) {
+                return new Cited(new CitedPlace(null, null, null, null, List.of(), record.page(), record.tier()),
+                        content);
+            }
             return new Cited(new CitedPlace(record.passageIds().getFirst(), record.versionId(), record.materialId(),
                     record.materialName(), record.sectionPath(), record.page(), record.tier()), content);
         }

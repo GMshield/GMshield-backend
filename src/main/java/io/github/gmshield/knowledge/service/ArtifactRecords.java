@@ -152,6 +152,15 @@ public class ArtifactRecords {
     }
 
     /**
+     * The owner's artifacts with these ids, of whichever campaign, by id (Story 5.1 part B); an extracted record's id,
+     * an unknown one or another owner's is left out.
+     */
+    public List<Identity> findAll(Collection<UUID> ids) {
+        OwnerContext.require();
+        return ids.isEmpty() ? List.of() : store.findArtifacts(ids).stream().map(ArtifactRecords::identity).toList();
+    }
+
+    /**
      * The owner's artifacts of the campaign {@code campaignId}, newest first: of the type key {@code recordType} only
      * when it is not null, only those older than {@code before} when it is not null, the first {@code offset} skipped,
      * at most {@code limit}.

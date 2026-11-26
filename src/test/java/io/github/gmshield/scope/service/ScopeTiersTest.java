@@ -53,6 +53,7 @@ class ScopeTiersTest {
     /** The jobs that have not ended, as the jobs module would answer. */
     private final Set<UUID> unended = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final StaticListableBeanFactory beans = new StaticListableBeanFactory();
+    private final StubCampaignArtifacts artifacts = new StubCampaignArtifacts();
 
     @BeforeEach
     void wire() {
@@ -63,7 +64,8 @@ class ScopeTiersTest {
         scopes = new Scopes(library, TestMaterials.scopeReads(materials, index, vault,
                 ids -> ids.stream().filter(unended::contains).collect(java.util.stream.Collectors.toSet()),
                 ids -> Set.of(), beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS,
-                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, vault, beans.getBeanProvider(PlatformTransactionManager.class));
+                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, artifacts, vault,
+                beans.getBeanProvider(PlatformTransactionManager.class));
         campaignScopes = new CampaignScopes(store, scopes, library,
                 beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);

@@ -9,6 +9,7 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -83,7 +84,8 @@ import tools.jackson.databind.node.ObjectNode;
  * is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
  * open uploads; a conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it
  * also cites the record, which becomes a reference of its own), a done, dismissed turn, a
- * search, and a turn still waiting in a second conversation; from Story 5.1 an artifact of the campaign. Account B then walks {@link #ROUTES}, every public route
+ * search, and a turn still waiting in a second conversation; from Story 5.1 an artifact of the campaign (from part B
+ * indexed, and cited by the bookmarked turn too). Account B then walks {@link #ROUTES}, every public route
  * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
  * a random id on that route (the trace id aside), and a route with a container and an item ({@code own}) answers the
  * same with B's own container. B's body and header fields that name an item ({@link #probes}) answer exactly what a
@@ -359,6 +361,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryArtifactVersionStore artifactVersions;
     @Autowired
+    private InMemoryArtifactIndexStore artifactIndex;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -428,8 +432,8 @@ class CrossOwnerAuditFlowTest {
     void start() {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
-                    library, deletions, scopes, knowledge, records, ontology, artifactVersions, materials, uploads, index,
-                    conversations, references, searches, clock, vault), START);
+                    library, deletions, scopes, knowledge, records, ontology, artifactVersions, artifactIndex, materials,
+                    uploads, index, conversations, references, searches, clock, vault), START);
         }
         stores.start();
     }
@@ -623,6 +627,65 @@ class CrossOwnerAuditFlowTest {
         assertNoneOfTheirs(b, a);
     }
 
+    /**
+     * Story 5.1 part B: another account's artifact is never a source of B's answer. B's answer job reads A's artifact id
+     * exactly as it reads a random id (refused, naming nothing) while it reads B's own, B's question input lists only
+     * B's own artifact, and A's index job's input is read under A's claim only: B's claim gets what a random job gets.
+     */
+    @Test
+    void anotherAccountsArtifactIsReadByNoAnswerAndItsIndexInputOnlyUnderItsOwnClaim() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = artifact(a, "Espada de Kael");
+        String own = artifact(b, "Arco de Lia");
+        UUID theirJob = stores.jobs(List.of(a.id())).stream().filter(job -> job.ownerId().equals(a.id())
+                && job.kind().equals("index.artifact")).map(CrossOwnerAuditStores.Job::id).findFirst().orElseThrow();
+        stores.endIngestion();
+
+        HttpResponse<String> asked = ask(b, "{\"question\":\"Espada de Kael?\"}");
+        UUID jobId = stores.turnJob(UUID.fromString(json(asked).path("id").asString()));
+        HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + jobId + "/claims",
+                "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
+                "application/json");
+        assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        JsonNode claim = json(claimed);
+        assertThat(claim.path("input").path("tiers").get(0).path("sources").toString()).contains(own)
+                .doesNotContain(theirs);
+
+        String random = UUID.randomUUID().toString();
+        HttpResponse<String> read = claimed(jobId, claim, "records", "{\"ids\":[\"" + theirs + "\"]}");
+        HttpResponse<String> unknown = claimed(jobId, claim, "records", "{\"ids\":[\"" + random + "\"]}");
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(unknown.statusCode()).isEqualTo(403);
+        assertThat(code(answerOf(read))).isEqualTo("scope.passage_refused");
+        assertThat(normal(answerOf(read), Set.of(theirs))).isEqualTo(normal(answerOf(unknown), Set.of(random)));
+        assertThat(read.body()).doesNotContain("Kael");
+        HttpResponse<String> mineRead = claimed(jobId, claim, "records", "{\"ids\":[\"" + own + "\"]}");
+        assertThat(mineRead.statusCode()).as(mineRead.body()).isEqualTo(200);
+        assertThat(json(mineRead).path("records").get(0).path("tier").asString()).isEqualTo("campaign");
+
+        String path = "/claims/" + claim.path("claimId").asString() + "/inputs/records";
+        HttpResponse<String> input = worker("GET", "/internal/v1/jobs/" + theirJob + path, null, "X-Job-Grant",
+                claim.path("grant").asString());
+        HttpResponse<String> randomInput = worker("GET", "/internal/v1/jobs/" + UUID.randomUUID() + path, null,
+                "X-Job-Grant", claim.path("grant").asString());
+        assertThat(input.statusCode()).as(input.body()).isEqualTo(randomInput.statusCode()).isIn(403, 404);
+        assertThat(input.body()).doesNotContain("Kael");
+    }
+
+    /** A worker call's response as the audit compares answers. */
+    private static Answer answerOf(HttpResponse<String> response) {
+        return new Answer(response.statusCode(), response.headers().firstValue("Content-Type").orElse(""),
+                response.body(), null);
+    }
+
+    /** A new artifact of the account's campaign, as its id. */
+    private String artifact(Gm gm, String name) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/artifacts",
+                "{\"recordType\":\"item\",\"name\":\"" + name + "\",\"fields\":[],\"content\":\"Forjada.\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return json(created).path("id").asString();
+    }
+
     // --- what A owns and what B owns
 
     /**
@@ -672,6 +735,20 @@ class CrossOwnerAuditFlowTest {
                         + "\"value\":\"16\"}],\"content\":\"Guerreiro do norte.\"}");
         assertThat(artifact.statusCode()).as(artifact.body()).isEqualTo(201);
         items.put("artifact", json(artifact).path("id").asString());
+        // Story 5.1 part B: its index job, claimed and done as the worker would, so the ingestion lane is free again;
+        // its input is the artifact's one records line, read under that claim only.
+        UUID indexJob = stores.jobs(List.of(gm.id())).stream().filter(job -> job.ownerId().equals(gm.id())
+                && job.kind().equals("index.artifact")).map(CrossOwnerAuditStores.Job::id).findFirst().orElseThrow();
+        JsonNode indexClaim = claim(indexJob);
+        assertThat(indexClaim.path("input").path("source").asString()).isEqualTo(items.get("artifact"));
+        HttpResponse<String> line = worker("GET", "/internal/v1/jobs/" + indexJob + "/claims/"
+                + indexClaim.path("claimId").asString() + "/inputs/records", null, "X-Job-Grant",
+                indexClaim.path("grant").asString());
+        assertThat(line.statusCode()).as(line.body()).isEqualTo(200);
+        assertThat(line.body()).contains(items.get("artifact"));
+        HttpResponse<String> indexed = claimed(indexJob, indexClaim, "outcome",
+                "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\",\"points\":1}}");
+        assertThat(indexed.statusCode()).as(indexed.body()).isEqualTo(204);
 
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
@@ -688,7 +765,7 @@ class CrossOwnerAuditFlowTest {
 
         HttpResponse<String> asked = ask(gm, "{\"question\":\"" + QUESTION + "\"}");
         // Story 4.3 part C: the turn also cites the spell record, so it has a record reference too.
-        UUID turn = answered(asked, passage, items.get("record"));
+        UUID turn = answered(asked, passage, items.get("record"), items.get("artifact"));
         items.put("conversation", json(asked).path("conversationId").asString());
         items.put("turn", turn.toString());
         assertThat(send(gm, "PUT", "/api/v1/turns/" + turn + "/bookmark", "").statusCode()).isEqualTo(204);
@@ -1023,6 +1100,11 @@ class CrossOwnerAuditFlowTest {
      * {@code record} when given, done.
      */
     private UUID answered(HttpResponse<String> asked, UUID passage, String record) throws Exception {
+        return answered(asked, passage, record, null);
+    }
+
+    /** {@link #answered(HttpResponse, UUID, String)}, citing the campaign's {@code artifact} too when given (Story 5.1). */
+    private UUID answered(HttpResponse<String> asked, UUID passage, String record, String artifact) throws Exception {
         UUID turnId = UUID.fromString(json(asked).path("id").asString());
         UUID jobId = stores.turnJob(turnId);
         HttpResponse<String> claimed = worker("POST", "/internal/v1/jobs/" + jobId + "/claims",
@@ -1033,7 +1115,8 @@ class CrossOwnerAuditFlowTest {
         HttpResponse<String> events = claimed(jobId, claim, "events", "{\"batch\":1,\"events\":[{\"type\":\"delta\","
                 + "\"text\":\"Fire Bolt causa 1d10 de dano de fogo.\"},{\"type\":\"citation\",\"passageId\":\""
                 + passage + "\",\"offset\":0}" + (record == null ? "" : ",{\"type\":\"citation\",\"recordId\":\""
-                + record + "\",\"offset\":0}") + "],\"usage\":[]}");
+                + record + "\",\"offset\":0}") + (artifact == null ? "" : ",{\"type\":\"citation\",\"recordId\":\""
+                + artifact + "\",\"offset\":0}") + "],\"usage\":[]}");
         assertThat(events.statusCode()).as(events.body()).isEqualTo(200);
         HttpResponse<String> done = claimed(jobId, claim, "outcome", "{\"outcome\":\"done\"}");
         assertThat(done.statusCode()).as(done.body()).isEqualTo(204);

@@ -133,6 +133,15 @@ import tools.jackson.databind.node.ObjectNode;
  *       campaign's system's ontology and the scope's record names ({@link TermMatches}), each an equality on a keyed
  *       fingerprint, and answers the record type keys, names and in-scope record ids it found ({@link ResolvedTerms}).
  *       No model, no text search, no definition.</li>
+ *   <li>Story 5.1 part B (artifacts): when the campaign tier is on, {@link #resolve} also reads the ids of the
+ *       campaign's artifacts ({@link CampaignArtifacts}, a port the {@code artifacts} module implements) into
+ *       {@link ResolvedScope#artifacts}, never among its allowed sources. {@link #questionInput} alone lists them, after
+ *       the campaign tier's sources; {@link #searchInput} never does, nor does any read of passages, of search results,
+ *       of a records list, of names or of terms. {@link #recordContents} and {@link #citedRecords} read an id of that
+ *       set through the port, as a campaign-tier record of the scope (page 1, no section path, its content handed as its
+ *       last field by the job), when its type key is one of the campaign's system's; any other id as before. An artifact
+ *       is found by a question only once its index job has ended, since the worker finds it through the index.
+ *       {@link #status} counts the campaign's artifacts as a source when the campaign tier is on.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -167,16 +176,19 @@ public class Scopes {
     private final ExtractedRecords records;
     private final RecordTypeKeys recordTypeKeys;
     private final TermMatches termMatches;
+    private final CampaignArtifacts artifacts;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
     Scopes(Library library, ScopeReads reads, ExtractedRecords records, RecordTypeKeys recordTypeKeys,
-           TermMatches termMatches, Vault vault, ObjectProvider<PlatformTransactionManager> transactions) {
+           TermMatches termMatches, CampaignArtifacts artifacts, Vault vault,
+           ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
         this.reads = reads;
         this.records = records;
         this.recordTypeKeys = recordTypeKeys;
         this.termMatches = termMatches;
+        this.artifacts = artifacts;
         this.vault = vault;
         this.transactions = transactions;
     }
@@ -229,10 +241,13 @@ public class Scopes {
                 sources.put(tier, ids);
                 pending.put(tier, withPending ? pendingOf(ids) : List.of());
             }
+            // Story 5.1 part B: the campaign's artifacts, with the campaign tier only; never an allowed source.
+            Set<UUID> ofCampaign = settings.on(Tier.CAMPAIGN) ? artifacts.ids(campaign.id()) : Set.of();
             ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, sources, pending, materialOf,
-                    recordTypeKeys.keysOf(campaign.system().id()));
+                    recordTypeKeys.keysOf(campaign.system().id()), ofCampaign);
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("campaignSources", sources.get(Tier.CAMPAIGN).size())
+                    .addKeyValue("artifacts", ofCampaign.size())
                     .addKeyValue("systemSources", sources.get(Tier.SYSTEM).size())
                     .addKeyValue("otherSources", sources.get(Tier.OTHER).size())
                     .addKeyValue("materialsOff", settings.materialsOff().size())
@@ -265,12 +280,15 @@ public class Scopes {
                     .map(count -> new Indexing(count.remaining())).orElse(null);
             IndexingFailure failed = sources.isEmpty() ? null : reads.failed(sources)
                     .map(count -> new IndexingFailure(count.passages(), count.retrying())).orElse(null);
+            // Story 5.1 part B: a campaign whose only sources are its artifacts has sources too.
+            boolean hasSources = !sources.isEmpty()
+                    || settings.on(Tier.CAMPAIGN) && !artifacts.ids(campaign.id()).isEmpty();
             log.atDebug().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
-                    .addKeyValue("sources", sources.size())
+                    .addKeyValue("sources", sources.size()).addKeyValue("hasSources", hasSources)
                     .addKeyValue("remaining", indexing == null ? 0 : indexing.remaining())
                     .addKeyValue("failed", failed == null ? 0 : failed.passages())
                     .addKeyValue("retrying", failed != null && failed.retrying()).log("scope.indexing");
-            return new ScopeStatus(!sources.isEmpty(), indexing, failed);
+            return new ScopeStatus(hasSources, indexing, failed);
         });
     }
 
@@ -546,7 +564,8 @@ public class Scopes {
         Objects.requireNonNull(ids, "ids");
         requireOwner(scope);
         List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
-        List<ScopedRecordContent> found = wanted.isEmpty() || scope.allowedSources().isEmpty() ? List.of()
+        List<ScopedRecordContent> found = wanted.isEmpty()
+                || scope.allowedSources().isEmpty() && scope.artifacts().isEmpty() ? List.of()
                 : reading(() -> contents(scope, wanted, false)).orElseThrow();
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", wanted.size())
                 .addKeyValue("kept", found.size()).addKeyValue("dropped", wanted.size() - found.size())
@@ -611,26 +630,43 @@ public class Scopes {
      * Runs in the caller's read transaction.
      */
     private Optional<List<ScopedRecordContent>> contents(ResolvedScope scope, List<UUID> wanted, boolean refuse) {
+        // Story 5.1 part B: an id of the campaign's artifacts is read through the port, never placed as a record.
+        Set<UUID> ofCampaign = scope.artifacts();
+        List<UUID> artifactIds = wanted.stream().filter(ofCampaign::contains).toList();
+        List<UUID> extracted = wanted.stream().filter(id -> !ofCampaign.contains(id)).toList();
         ExtractedRecords.Reach reach = refuse ? ExtractedRecords.Reach.ALL : ExtractedRecords.Reach.LIVE;
-        List<Placed> placed = located(scope, records.located(wanted, reach));
-        if (refuse && placed.size() != wanted.size()) {
+        List<Placed> placed = extracted.isEmpty() ? List.of() : located(scope, records.located(extracted, reach));
+        if (refuse && placed.size() != extracted.size()) {
             return Optional.empty();
         }
+        Map<UUID, ScopedRecordContent> found = new HashMap<>();
+        if (!artifactIds.isEmpty()) {
+            Set<String> keys = scope.recordTypes();
+            artifacts.read(scope.campaignId(), artifactIds).stream()
+                    .filter(artifact -> keys.contains(artifact.recordType()))
+                    .forEach(artifact -> found.put(artifact.id(), new ScopedRecordContent(ScopedRecord.artifact(
+                            artifact.id(), artifact.recordType(), artifact.name(), artifact.version()),
+                            artifact.fields(), artifact.content())));
+            if (refuse && found.size() != artifactIds.size()) {
+                return Optional.empty();
+            }
+        }
         Map<UUID, ExtractedRecords.Content> contents = new HashMap<>();
-        records.read(placed.stream().map(one -> one.record().id()).toList(), reach)
-                .forEach(content -> contents.put(content.id(), content));
-        List<ScopedRecordContent> found = new ArrayList<>();
+        if (!placed.isEmpty()) {
+            records.read(placed.stream().map(one -> one.record().id()).toList(), reach)
+                    .forEach(content -> contents.put(content.id(), content));
+        }
         for (Placed one : placed) {
             ExtractedRecords.Content content = contents.get(one.record().id());
             if (content == null && refuse) {
                 return Optional.empty();
             }
             if (content != null) {
-                found.add(new ScopedRecordContent(one.scoped(content.name()), content.fields().stream()
-                        .map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList()));
+                found.put(one.record().id(), new ScopedRecordContent(one.scoped(content.name()), content.fields()
+                        .stream().map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList()));
             }
         }
-        return Optional.of(List.copyOf(found));
+        return Optional.of(wanted.stream().map(found::get).filter(Objects::nonNull).toList());
     }
 
     /**
@@ -751,7 +787,7 @@ public class Scopes {
         if (question == null || question.isEmpty() || question.codePointCount(0, question.length()) > MAX_QUESTION) {
             throw new IllegalArgumentException("scope.question_invalid");
         }
-        return withRecordTypes(textInput(scope, "question", question, "scope.question_input"), scope);
+        return withRecordTypes(textInput(scope, "question", question, "scope.question_input", true), scope);
     }
 
     /**
@@ -796,7 +832,8 @@ public class Scopes {
         if (query == null || query.isEmpty() || query.codePointCount(0, query.length()) > MAX_QUERY) {
             throw new IllegalArgumentException("scope.query_invalid");
         }
-        ObjectNode input = withRecordTypes(textInput(scope, "query", query, "scope.search_input"), scope);
+        // Story 5.1 part B: never the campaign's artifacts (a search places every result as a material's).
+        ObjectNode input = withRecordTypes(textInput(scope, "query", query, "scope.search_input", false), scope);
         if (recordType != null) {
             input.put("recordType", recordType);
         }
@@ -805,9 +842,11 @@ public class Scopes {
 
     /**
      * {@code {<field>: text, owner, modelKnowledge, tiers: [{tier, sources, pending}], tokenKey}} within {@code scope},
-     * as {@link #questionInput} says; {@code line} names the log line, which carries counts only.
+     * as {@link #questionInput} says; {@code line} names the log line, which carries counts only. With
+     * {@code withArtifacts} (a question's input only, Story 5.1 part B), the campaign tier's sources end with the ids of
+     * the campaign's artifacts.
      */
-    private ObjectNode textInput(ResolvedScope scope, String field, String text, String line) {
+    private ObjectNode textInput(ResolvedScope scope, String field, String text, String line, boolean withArtifacts) {
         Objects.requireNonNull(scope, "scope");
         if (!OwnerContext.require().equals(scope.ownerId())) {
             throw new IllegalStateException("scope.owner_mismatch");
@@ -822,6 +861,9 @@ public class Scopes {
             entry.put("tier", tier.word());
             ArrayNode sources = entry.putArray("sources");
             scope.sources(tier).forEach(source -> sources.add(source.toString()));
+            if (withArtifacts && tier == Tier.CAMPAIGN) {
+                scope.artifacts().stream().sorted().forEach(artifact -> sources.add(artifact.toString()));
+            }
             ArrayNode pending = entry.putArray("pending");
             scope.pending(tier).stream().limit(MAX_PENDING).forEach(id -> pending.add(id.toString()));
         }
@@ -839,6 +881,7 @@ public class Scopes {
                 .addKeyValue("campaignSources", scope.sources(Tier.CAMPAIGN).size())
                 .addKeyValue("systemSources", scope.sources(Tier.SYSTEM).size())
                 .addKeyValue("otherSources", scope.sources(Tier.OTHER).size())
+                .addKeyValue("artifacts", withArtifacts ? scope.artifacts().size() : 0)
                 .addKeyValue("pending", scope.pending().size())
                 .addKeyValue("pendingListed", listed)
                 .addKeyValue("pendingLeftOut", scope.pending().size() - listed)
