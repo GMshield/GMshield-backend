@@ -2,6 +2,7 @@ package io.github.gmshield.knowledge.service;
 
 import io.github.gmshield.knowledge.data.KnowledgeConflict;
 import io.github.gmshield.knowledge.data.KnowledgeStore;
+import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemCreated;
@@ -45,7 +46,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * on the version it was read at ({@code request.stale_version}, 409, when it moved) to a name no other type of the
  * system has ({@code ontology.record_type_name_taken}, 409; {@code ontology.record_type_name_invalid}, 400, outside 1
  * to {@value #NAME_MAX} code points after trimming), and removed while it has no records
- * ({@code ontology.record_type_in_use}, 409). From Story 4.2 a record type's record count is the number of records of
+ * ({@code ontology.record_type_in_use}, 409; from Story 5.1 also while an artifact of the system's campaigns has its
+ * key). From Story 4.2 a record type's record count is the number of records of
  * its core type in the system's {@code ready} versions ({@link ReadyVersions#ofSystem}: the materials attached to the
  * system and those of its campaigns), so a version that needs review counts nowhere; a type that is not core has none
  * until Story 4.4 part B, which counts the records of its key. Logs carry ids, counts and versions only.
@@ -76,14 +78,15 @@ public class Ontology {
     private final Library library;
     private final ReadyVersions ready;
     private final ExtractedRecords records;
+    private final RecordStore artifacts;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final NameSpace names;
     private final Origins origins;
     private final Clock clock;
 
     Ontology(KnowledgeStore store, Vault vault, Library library, ReadyVersions ready, ExtractedRecords records,
-             ObjectProvider<PlatformTransactionManager> transactions, NameSpace names, Origins origins,
-             ObjectProvider<Clock> clock) {
+             RecordStore artifacts, ObjectProvider<PlatformTransactionManager> transactions, NameSpace names,
+             Origins origins, ObjectProvider<Clock> clock) {
         this.store = store;
         this.names = names;
         this.origins = origins;
@@ -91,6 +94,7 @@ public class Ontology {
         this.library = library;
         this.ready = ready;
         this.records = records;
+        this.artifacts = artifacts;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -230,7 +234,7 @@ public class Ontology {
             if (row.core() != null) {
                 throw new ApiException(KnowledgeProblems.CORE_RECORD_TYPE);
             }
-            if (records(row, counts(row.systemId())) > 0) {
+            if (records(row, counts(row.systemId())) > 0 || artifactsOf(row) > 0) {
                 throw new ApiException(KnowledgeProblems.RECORD_TYPE_IN_USE);
             }
             return conflicts(() -> store.delete(id));
@@ -240,6 +244,15 @@ public class Ontology {
                     .log("knowledge.record_type_deleted");
         }
         return deleted;
+    }
+
+    /**
+     * How many artifacts of the system's campaigns have the type's key (Story 5.1): an artifact uses its type as a
+     * record does, so a type that one uses is in use.
+     */
+    private long artifactsOf(RecordTypeRow row) {
+        return library.campaignIdsOf(row.systemId())
+                .map(campaigns -> artifacts.artifactsOfTypeIn(campaigns, row.key())).orElse(0L);
     }
 
     /** Inserts the core types of {@code systemId} whose key is not in {@code present}; how many it inserted. */

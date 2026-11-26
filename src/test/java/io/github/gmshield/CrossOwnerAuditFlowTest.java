@@ -9,6 +9,7 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
@@ -82,7 +83,7 @@ import tools.jackson.databind.node.ObjectNode;
  * is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
  * open uploads; a conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it
  * also cites the record, which becomes a reference of its own), a done, dismissed turn, a
- * search, and a turn still waiting in a second conversation. Account B then walks {@link #ROUTES}, every public route
+ * search, and a turn still waiting in a second conversation; from Story 5.1 an artifact of the campaign. Account B then walks {@link #ROUTES}, every public route
  * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
  * a random id on that route (the trace id aside), and a route with a container and an item ({@code own}) answers the
  * same with B's own container. B's body and header fields that name an item ({@link #probes}) answer exactly what a
@@ -117,6 +118,9 @@ class CrossOwnerAuditFlowTest {
     private static final String QUESTION = "Quanto dano causa Fire Bolt?";
     private static final String SCOPE_CHANGE = "{\"version\":{scopeVersion},\"campaignTier\":false,\"systemTier\":false,"
             + "\"otherTier\":true,\"modelKnowledge\":true,\"materialsOff\":[]}";
+    /** A new artifact (Story 5.1): valid, so only the campaign's owner decides the answer. */
+    private static final String NEW_ARTIFACT = "{\"recordType\":\"item\",\"name\":\"Tomado\","
+            + "\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}],\"content\":\"Tomado\"}";
     /** A record's correction (Story 4.5): valid, so only the record's owner and scope decide the answer. */
     private static final String RECORD_CORRECTION = "{\"version\":{recordVersion},\"name\":\"Tomado\","
             + "\"recordType\":\"spell\",\"fields\":[{\"name\":\"Nota\",\"value\":\"Tomado\"}]}";
@@ -237,6 +241,11 @@ class CrossOwnerAuditFlowTest {
             // a record deleted as a campaign shows it (Story 4.5 part B)
             route("DELETE", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign",
                     "recordId", "record").own("campaignId"),
+            // a campaign's artifacts and one of them (Story 5.1)
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts", "campaignId", "campaign"),
+            route("POST", "/api/v1/campaigns/{campaignId}/artifacts", "campaignId", "campaign").json(NEW_ARTIFACT),
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
+                    "artifactId", "artifact").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -348,6 +357,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryOntologyStore ontology;
     @Autowired
+    private InMemoryArtifactVersionStore artifactVersions;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -417,9 +428,8 @@ class CrossOwnerAuditFlowTest {
     void start() {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
-                    library, deletions, scopes, knowledge, records, ontology, materials, uploads, index, conversations,
-                    references,
-                    searches, clock, vault), START);
+                    library, deletions, scopes, knowledge, records, ontology, artifactVersions, materials, uploads, index,
+                    conversations, references, searches, clock, vault), START);
         }
         stores.start();
     }
@@ -656,6 +666,13 @@ class CrossOwnerAuditFlowTest {
         assertThat(approved.statusCode()).as(approved.body()).isEqualTo(200);
         items.put("term", json(approved).path("resultId").asString());
 
+        // Story 5.1: an artifact of the campaign, written by hand.
+        HttpResponse<String> artifact = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/artifacts",
+                "{\"recordType\":\"character_sheet\",\"name\":\"Kael\",\"fields\":[{\"name\":\"Força\","
+                        + "\"value\":\"16\"}],\"content\":\"Guerreiro do norte.\"}");
+        assertThat(artifact.statusCode()).as(artifact.body()).isEqualTo(201);
+        items.put("artifact", json(artifact).path("id").asString());
+
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
                 + "\"materialsOff\":[]}");
@@ -802,6 +819,7 @@ class CrossOwnerAuditFlowTest {
                 "/api/v1/conversations/current", "/api/v1/campaigns/" + b.gm().campaign() + "/scope",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=questions",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=rules",
+                "/api/v1/campaigns/" + b.gm().campaign() + "/artifacts",
                 "/api/v1/systems/" + b.get("system") + "/record-types",
                 "/api/v1/systems/" + b.get("system") + "/proposals", "/api/v1/systems/" + b.get("system") + "/terms",
                 "/api/v1/materials/" + b.get("material") + "/proposals")) {

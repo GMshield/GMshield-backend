@@ -75,6 +75,8 @@ public class SystemDeletion {
     /** The parts a handler counts ({@link SystemDeletionHandler#part}). */
     public static final String CONVERSATIONS = "conversations";
     public static final String MATERIALS = "materials";
+    /** Story 5.1: the artifacts of the campaigns going ({@code artifacts.service.ArtifactsDeletion}). */
+    public static final String ARTIFACTS = "artifacts";
     static final int BATCH = 50;
     private static final Logger log = LoggerFactory.getLogger(SystemDeletion.class);
 
@@ -97,12 +99,25 @@ public class SystemDeletion {
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
-    /** What goes with a system, as the confirmation dialog names it. */
-    public record Counts(long campaigns, long conversations, long materials) {
+    /** What goes with a system, as the confirmation dialog names it; from Story 5.1 its campaigns' artifacts too. */
+    public record Counts(long campaigns, long conversations, long materials, long artifacts) {
+
+        /** What goes with a system that holds no artifact. */
+        public Counts(long campaigns, long conversations, long materials) {
+            this(campaigns, conversations, materials, 0);
+        }
     }
 
-    /** What goes with a campaign, as the confirmation dialog names it (Story 3.2 part B). */
-    public record CampaignCounts(long conversations, long materials) {
+    /**
+     * What goes with a campaign, as the confirmation dialog names it (Story 3.2 part B); from Story 5.1 its artifacts
+     * too.
+     */
+    public record CampaignCounts(long conversations, long materials, long artifacts) {
+
+        /** What goes with a campaign that holds no artifact. */
+        public CampaignCounts(long conversations, long materials) {
+            this(conversations, materials, 0);
+        }
     }
 
     /** What goes with the owner's system {@code systemId}; empty for an unknown system, another owner's or a deleting one. */
@@ -115,7 +130,7 @@ public class SystemDeletion {
                 parts.merge(handler.part(), handler.count(going), Long::sum);
             }
             return new Counts(going.campaignIds().size(), parts.getOrDefault(CONVERSATIONS, 0L),
-                    parts.getOrDefault(MATERIALS, 0L));
+                    parts.getOrDefault(MATERIALS, 0L), parts.getOrDefault(ARTIFACTS, 0L));
         }));
     }
 
@@ -130,7 +145,8 @@ public class SystemDeletion {
             for (SystemDeletionHandler handler : handlers()) {
                 parts.merge(handler.part(), handler.count(going), Long::sum);
             }
-            return new CampaignCounts(parts.getOrDefault(CONVERSATIONS, 0L), parts.getOrDefault(MATERIALS, 0L));
+            return new CampaignCounts(parts.getOrDefault(CONVERSATIONS, 0L), parts.getOrDefault(MATERIALS, 0L),
+                    parts.getOrDefault(ARTIFACTS, 0L));
         }));
     }
 

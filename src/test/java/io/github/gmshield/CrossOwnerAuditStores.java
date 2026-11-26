@@ -59,11 +59,15 @@ interface CrossOwnerAuditStores {
      * A copy of the stores' rows, by table and key, for {@link CrossOwnerAuditFlowTest#differences}: the rows of
      * {@code owners} at least. The job table is named {@code job} and the search table {@code search}, each keyed by
      * its id. In memory the tables are a hand-kept list; on PostgreSQL they are every table with an {@code owner_id}
-     * column.
+     * column. Story 5.1: an artifact is a row of {@code record} on PostgreSQL, kept apart in memory as {@code artifact};
+     * its versions are {@code record_version} ({@code record version} in memory).
      */
     Map<String, Map<Object, Object>> tables(Collection<UUID> owners);
 
-    /** Which tables of {@link #tables} hold which of A's items, by the audit's names for them. */
+    /**
+     * Which tables of {@link #tables} hold which of A's items, by the audit's names for them (from Story 5.1 the
+     * artifact too).
+     */
     Map<String, List<String>> held();
 
     /** The job ids offered on each work stream. */

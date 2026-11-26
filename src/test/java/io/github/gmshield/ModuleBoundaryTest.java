@@ -183,7 +183,8 @@ class ModuleBoundaryTest {
      * module, and both handlers are there. Story 3.2 part B: a campaign's deletion goes through the same handlers.
      * Story 3.5: {@code scope} has one too, for the settings of the campaigns and the switches of the materials going.
      * Story 4.1: {@code knowledge} has one too, for a system's record types, and {@code library} does not depend on it
-     * (it seeds the core types by listening to {@code SystemCreated}).
+     * (it seeds the core types by listening to {@code SystemCreated}). Story 5.1: {@code artifacts} has one too, for the
+     * artifacts of the campaigns going.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
@@ -194,11 +195,12 @@ class ModuleBoundaryTest {
         noClasses().that().resideInAPackage(base + ".library..").should().dependOnClassesThat()
                 .resideInAnyPackage(base + ".materials..", base + ".conversations..", base + ".jobs..",
                         base + ".scope..", base + ".accounts..", base + ".audit..", base + ".limits..",
-                        base + ".knowledge..")
+                        base + ".knowledge..", base + ".artifacts..")
                 .because("library depends on shared and vault only").check(application);
         List<String> handlers = application.get(io.github.gmshield.library.service.SystemDeletionHandler.class)
                 .getAllSubclasses().stream().map(JavaClass::getPackageName).sorted().toList();
-        assertThat(handlers).containsExactly(base + ".conversations.service", base + ".knowledge.service",
+        assertThat(handlers).containsExactly(base + ".artifacts.service", base + ".conversations.service",
+                base + ".knowledge.service",
                 base + ".materials.service", base + ".scope.service");
     }
 

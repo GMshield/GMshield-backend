@@ -22,6 +22,10 @@ import java.util.regex.Pattern;
  * has none, Story 4.5 part B), and like the JPA store it leaves deleted records out of every read that does. A write
  * undoes itself when its transaction rolls back. The passage and version keys are PostgreSQL's alone
  * ({@code IngestionIntegrationTest}, {@code MaterialDeletionIntegrationTest}).
+ *
+ * <p>Story 5.1: an artifact's identity is a row of the same table on PostgreSQL; here it is kept apart, in
+ * {@link #artifacts}, so no read of an extracted record can see one, as no JPA read does (the integration tests check
+ * that against the table). The campaign key is PostgreSQL's alone.
  */
 public class InMemoryRecordStore implements RecordStore {
 
@@ -29,12 +33,15 @@ public class InMemoryRecordStore implements RecordStore {
     private static final Pattern TYPE = Pattern.compile("[a-z][a-z0-9_]{0,31}");
 
     public final Map<UUID, RecordRow> records = new ConcurrentHashMap<>();
+    /** The artifacts' identity rows (Story 5.1), by id. */
+    public final Map<UUID, ArtifactRow> artifacts = new ConcurrentHashMap<>();
 
     @Override
     public synchronized void insert(List<RecordRow> rows) {
         UUID owner = OwnerContext.require();
         for (RecordRow row : rows) {
-            if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || !TYPE.matcher(row.type()).matches()
+            if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || artifacts.containsKey(row.id())
+                    || !TYPE.matcher(row.type()).matches()
                     || (row.passageIds().isEmpty() && !row.deleted()) || row.firstPage() < 1 || row.ordinal() < 0
                     || (row.pointRemovedAt() != null && !row.deleted())) {
                 throw new IllegalStateException("key or check refused");
@@ -231,5 +238,90 @@ public class InMemoryRecordStore implements RecordStore {
             RollbackUndo.onRollback(() -> records.put(row.id(), row));
         }
         return found.size();
+    }
+
+    @Override
+    public synchronized void insertArtifact(ArtifactRow row) {
+        UUID owner = OwnerContext.require();
+        if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || artifacts.containsKey(row.id())
+                || !TYPE.matcher(row.type()).matches()) {
+            throw new IllegalStateException("key or check refused");
+        }
+        artifacts.put(row.id(), row);
+        RollbackUndo.onRollback(() -> artifacts.remove(row.id()));
+    }
+
+    @Override
+    public Optional<ArtifactRow> findArtifact(UUID campaignId, UUID id) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(artifacts.get(id))
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId));
+    }
+
+    @Override
+    public List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit) {
+        return ofCampaign(campaignId, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
+                .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())
+                .skip(offset).limit(limit).toList();
+    }
+
+    @Override
+    public long artifactCount(UUID campaignId, String type) {
+        return ofCampaign(campaignId, type).count();
+    }
+
+    @Override
+    public long artifactsIn(Collection<UUID> campaignIds) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && campaignIds.contains(row.campaignId())).count();
+    }
+
+    @Override
+    public long artifactsOfTypeIn(Collection<UUID> campaignIds, String type) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && campaignIds.contains(row.campaignId()) && row.type().equals(type)).count();
+    }
+
+    @Override
+    public Map<String, Long> artifactTypes(UUID campaignId) {
+        Map<String, Long> counts = new TreeMap<>();
+        ofCampaign(campaignId, null).forEach(row -> counts.merge(row.type(), 1L, Long::sum));
+        return counts;
+    }
+
+    @Override
+    public List<UUID> artifactIdsOf(Collection<UUID> campaignIds) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && campaignIds.contains(row.campaignId())).map(ArtifactRow::id).sorted().toList();
+    }
+
+    @Override
+    public synchronized int deleteArtifacts(Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        int deleted = 0;
+        for (UUID id : Set.copyOf(ids)) {
+            ArtifactRow row = artifacts.get(id);
+            if (row != null && row.ownerId().equals(owner)) {
+                artifacts.remove(id);
+                RollbackUndo.onRollback(() -> artifacts.put(row.id(), row));
+                deleted++;
+            }
+        }
+        return deleted;
+    }
+
+    private java.util.stream.Stream<ArtifactRow> ofCampaign(UUID campaignId, String type) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && row.campaignId().equals(campaignId) && (type == null || row.type().equals(type)));
+    }
+
+    /** UUIDs in PostgreSQL's order: their bytes as unsigned numbers, so a UUIDv7's time orders it. */
+    private static int unsigned(UUID left, UUID right) {
+        int high = Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+        return high != 0 ? high : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
     }
 }

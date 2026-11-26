@@ -39,7 +39,7 @@ Base package `io.github.gmshield`. Each direct sub-package is a module, split in
 A module names the modules it may use in its `package-info.java`
 (`@ApplicationModule(allowedDependencies = "shared :: service")`). `ModuleBoundaryTest` fails the
 build when a class uses another module's `web` or `data`, or a module that is not allowed.
-Eleven modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
+Twelve modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
 survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
@@ -48,7 +48,7 @@ files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what
 use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
 `jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
 `scope`, `library` and `vault`), `knowledge` (each system's ontology, Story 4.1, and the extracted records, Story 4.2, below; it may
-use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `library` nor `materials` may use it) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
+use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `library` nor `materials` may use it), `artifacts` (what the GM writes and keeps in a campaign, Story 5.1, below; it may use `shared`, `vault`, `library` and `knowledge`) and `accounts` (sign-in with Google, accounts and sessions, below; it may use `shared`, `vault`, `audit` and
 `library`). `ModuleBoundaryTest` also fails the build when a class outside
 `materials` and `scope` depends on `materials.service.ScopeReads` (AD-9, Story 2.2).
 
@@ -1606,6 +1606,53 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     review, of another owner or of a type the system lacks is never named.
   - Deploy order: the backend, then the worker (an older worker never calls the route; a new worker against an older
     backend gets a 404 and searches as before). The public contract does not change.
+
+- **Write an artifact by hand (`artifacts`, `knowledge`, Story 5.1 part A, public contract 1.42.0, internal contract
+  unchanged, migration V43).** The GM writes and keeps an artifact in a campaign: any core or approved record type of
+  the campaign's system, a name, fields and an optional free text ("Conteúdo").
+  - **Module.** The new module `artifacts` (it may use `shared`, `vault`, `library` and `knowledge :: service`;
+    classes only in `web`, `service` and `data`) owns an artifact's content. `knowledge` owns its identity and type:
+    `knowledge.service.ArtifactRecords` stores, lists, finds and deletes the `record` row of an artifact (its campaign
+    instead of a material version) and checks what the GM wrote against the extraction's limits
+    (`ExtractedRecords.MAX_NAME` and the others) and the type against the system's record types (`findByKey`, core or
+    approved).
+  - **Routes.** `POST /api/v1/campaigns/{campaignId}/artifacts` (`createArtifact`, body `{recordType, name,
+    fields:[{name,value}], content?}`) answers 201 with `Artifact {id, campaignId, recordType, name, fields, content,
+    version, createdAt}` (version 1); `GET` on the same path (`listArtifacts`, `?recordType&cursor&limit&offset`)
+    answers `{items, nextCursor, total, types:[{key,count}]}`, newest first by id (UUIDv7), `types` being the record
+    types in use in the whole campaign whatever the filter, and `offset` and `total` serving the frontend's numbered
+    pages as the other lists do; `GET .../artifacts/{artifactId}` (`getArtifact`) answers one artifact. All `no-store`.
+    A value outside its limits is `request.invalid` (400) with `params.field` (`recordType`, `name` 1 to 200 code
+    points, `fields` at most 64, `fieldName` or `fieldValue` with `index`, 1 to 200 and 1 to 8,000, `content` at most
+    20,000, all after trimming) and its limits; nothing is stored then. Another owner's campaign or artifact, another
+    campaign's artifact, a malformed id and a campaign being deleted are `request.not_found` (404). The three routes
+    join the cross-owner audit. A character sheet stores what was written: nothing is calculated.
+  - **Storage.** One transaction writes the `record` row (`campaign_id`, the type key, no version, ordinal, first page,
+    name or fields) and `record_version` number 1: the name, the fields (a JSON array) and the content (null for
+    none), each encrypted bound to the entity `record_version`, its field, the artifact's id and the owner.
+  - **Records stay extracted.** Every query of `JpaRecordStore` for a system's records goes through a material version
+    (`versionId = :version` or `in :versions`) or, for a read by id (`find`, `findAll`, `versionOf`, the correction's and
+    the delete's lock, `pointsRemoved`), requires one (`versionId is not null`), so an artifact never shows in a record
+    type's list or count, a record page, a correction or delete, a library search, an answer's records or an index
+    input. `ArtifactsIntegrationTest.noReadOfTheSystemsRecordsAnswersAnArtifact` proves it on PostgreSQL (the in-memory
+    store keeps artifacts apart, so the flow test cannot).
+  - **Deletion.** A campaign's or a system's deletion removes its artifacts, versions first
+    (`artifacts.service.ArtifactsDeletion`, a `SystemDeletionHandler` of part `artifacts`). Both dialogs count them:
+    `SystemDeletion` (`GET /api/v1/systems/{id}/deletion`) and `CampaignDeletion` (`GET /api/v1/campaigns/{id}/deletion`)
+    gain `artifacts` (additive, contract 1.42.0). The GM cannot delete an artifact yet (Story 5.2).
+  - **Type in use.** `Ontology.delete` also refuses `ontology.record_type_in_use` (409) for an approved type that an
+    artifact of the system's campaigns has (`RecordStore.artifactsOfTypeIn`).
+  - **V43.** `record.version_id`, `ordinal`, `first_page`, `name` and `fields` become nullable; `record.campaign_id`
+    (key on owner and campaign) with checks that exactly one of version and campaign is set and that an extracted
+    record keeps its values; indexes on (owner, campaign, type) for the type filter and counts and on (owner,
+    campaign, id) for the newest-first list; the table `record_version` (key on record and number, reference on owner
+    and record). Rolling back past V43 is safe (only additions and relaxed NOT NULLs): the previous release never reads
+    an artifact row. But its campaign and system deletions fail on the campaign reference while a campaign going has
+    artifacts, and its `Ontology.delete` would remove an approved type that artifacts use, so delete the artifacts first
+    (`delete from record_version;` then `delete from record where campaign_id is not null;`).
+  - Log lines (ids and counts only): `artifacts.created`, `artifacts.listed`, `artifacts.read`,
+    `artifacts.deletion_removed`. Deploy order: backend, then frontend (minimum public contract 1.42.0); the previous
+    frontend keeps working, since the change is additive.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

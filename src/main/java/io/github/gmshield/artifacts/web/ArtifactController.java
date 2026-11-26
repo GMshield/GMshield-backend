@@ -1,0 +1,318 @@
+package io.github.gmshield.artifacts.web;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import io.github.gmshield.artifacts.service.Artifacts;
+import io.github.gmshield.shared.service.ApiException;
+import io.github.gmshield.shared.service.ApiProblem;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.regex.Pattern;
+import org.springframework.http.CacheControl;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * A campaign's artifacts (Story 5.1 part A, contract 1.42.0): a new artifact written by hand (201), the campaign's
+ * artifacts a page at a time, filtered by record type, and one artifact with its newest version. The owner is the
+ * session's account, set by the request edge ({@code accounts.web}) before any of these runs; nothing here takes an
+ * owner from the request. Another owner's campaign or artifact, an artifact of another campaign, an unknown id, a
+ * malformed id and a campaign being deleted are the same {@code request.not_found} (404). A value outside its limits is
+ * {@code request.invalid} (400) with {@code params.field} naming it; a malformed body, limit, offset, cursor or type is
+ * {@code request.invalid} (400) without one. Every answer is {@code no-store}.
+ */
+@RestController
+@Tag(name = "artifacts")
+class ArtifactController {
+
+    static final String ARTIFACTS = "/api/v1/campaigns/{campaignId}/artifacts";
+    static final String ARTIFACT = "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}";
+    /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
+    private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
+    private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
+    /** A page's position: 0, or up to six digits with no leading zero. */
+    private static final Pattern OFFSET_TEXT = Pattern.compile("0|[1-9][0-9]{0,5}");
+    /** A record type key's text: a lower-case letter, then up to 31 lower-case letters, digits or underscores. */
+    private static final Pattern KEY = Pattern.compile("[a-z][a-z0-9_]{0,31}");
+    private static final String SESSION = "X-Session-Token";
+    private static final String SESSION_SUMMARY = " session.required (401) without a session.";
+    private static final String ID_EXAMPLE = "0190a0b0-0000-7000-8000-000000000030";
+    private static final String LIMITS = " request.invalid (400) with params.field naming the value outside its limits"
+            + " (and its min and max): recordType (not a key of the campaign's system's record types, core or"
+            + " approved), name (1 to 200 code points after trimming), fields (at most 64), fieldName or fieldValue"
+            + " (with index, from 0: a name of 1 to 200, a value of 1 to 8,000, after trimming) or content (at most"
+            + " 20,000 after trimming); request.invalid (400) without a field for a malformed body;";
+
+    private final Artifacts artifacts;
+
+    ArtifactController(Artifacts artifacts) {
+        this.artifacts = artifacts;
+    }
+
+    @Schema(name = "ArtifactField", requiredProperties = {"name", "value"})
+    record FieldView(
+            @Schema(description = "The field's name, as the GM wrote it (trimmed)", example = "Dano") String name,
+            @Schema(description = "The field's value, as the GM wrote it (trimmed): nothing is calculated",
+                    example = "1d8 cortante") String value) {
+
+        @Override
+        public String toString() {
+            return "FieldView";
+        }
+    }
+
+    @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
+        "version", "createdAt"}, description = "An artifact with its newest version (contract 1.42.0)")
+    record ArtifactView(
+            @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
+            @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
+            String campaignId,
+            @Schema(description = "The key of its record type, one of its campaign's system's (core or approved)",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item") String recordType,
+            @Schema(description = "Its name", example = "Espada de Kael") String name,
+            @ArraySchema(arraySchema = @Schema(description = "Its fields, in the order written; empty for none"),
+                    schema = @Schema(implementation = FieldView.class)) List<FieldView> fields,
+            @Schema(description = "Its free text, as written (trimmed); null for none", types = {"string", "null"},
+                    example = "Forjada nas montanhas do norte.") String content,
+            @Schema(description = "The number of the version shown, from 1", format = "int32", minimum = "1",
+                    example = "1") int version,
+            @Schema(description = "When it was written", format = "date-time") String createdAt) {
+
+        static ArtifactView of(Artifacts.Artifact artifact) {
+            return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
+                    artifact.name(), artifact.fields().stream().map(field -> new FieldView(field.name(), field.value()))
+                    .toList(), artifact.content(), artifact.version(), artifact.createdAt().toString());
+        }
+
+        @Override
+        public String toString() {
+            return "ArtifactView[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
+                    + version + "]";
+        }
+    }
+
+    @Schema(name = "ArtifactSummary", requiredProperties = {"id", "recordType", "name", "version", "createdAt"},
+            description = "An artifact in a list (contract 1.42.0)")
+    record SummaryView(
+            @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
+            @Schema(description = "The key of its record type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item")
+            String recordType,
+            @Schema(description = "Its name, in its newest version", example = "Espada de Kael") String name,
+            @Schema(description = "The number of its newest version, from 1", format = "int32", minimum = "1",
+                    example = "1") int version,
+            @Schema(description = "When it was written", format = "date-time") String createdAt) {
+
+        static SummaryView of(Artifacts.Summary summary) {
+            return new SummaryView(summary.id().toString(), summary.recordType(), summary.name(), summary.version(),
+                    summary.createdAt().toString());
+        }
+
+        @Override
+        public String toString() {
+            return "SummaryView[id=" + id + ", recordType=" + recordType + "]";
+        }
+    }
+
+    @Schema(name = "ArtifactTypeCount", requiredProperties = {"key", "count"},
+            description = "A record type in use in a campaign's artifacts")
+    record TypeCountView(
+            @Schema(description = "The record type's key", pattern = "^[a-z][a-z0-9_]{0,31}$",
+                    example = "character_sheet") String key,
+            @Schema(description = "How many of the campaign's artifacts have it", format = "int64", minimum = "1",
+                    example = "2") long count) {
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Schema(name = "ArtifactPage", requiredProperties = {"items", "total", "types"})
+    record PageView(
+            @ArraySchema(schema = @Schema(implementation = SummaryView.class)) List<SummaryView> items,
+            @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
+                    example = ID_EXAMPLE) String nextCursor,
+            @Schema(description = "How many artifacts the list has in all (of its record type when filtered),"
+                    + " whatever the page", format = "int64", minimum = "0", example = "3") long total,
+            @ArraySchema(arraySchema = @Schema(description = "The record types in use in the campaign's artifacts,"
+                    + " whatever the filter, by key, each with its count; empty for a campaign without artifacts"),
+                    schema = @Schema(implementation = TypeCountView.class)) List<TypeCountView> types) {
+    }
+
+    @Schema(name = "NewArtifactField", requiredProperties = {"name", "value"})
+    record FieldBody(
+            @Schema(description = "The field's name: 1 to 200 code points after trimming", minLength = 1,
+                    maxLength = 200, example = "Dano") String name,
+            @Schema(description = "The field's value: 1 to 8,000 code points after trimming", minLength = 1,
+                    maxLength = 8000, example = "1d8 cortante") String value) {
+
+        @Override
+        public String toString() {
+            return "FieldBody";
+        }
+    }
+
+    @Schema(name = "NewArtifact", requiredProperties = {"recordType", "name", "fields"})
+    record NewArtifact(
+            @Schema(description = "The key of one of the campaign's system's record types, core or approved",
+                    pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item") String recordType,
+            @Schema(description = "The artifact's name: 1 to 200 code points after trimming", minLength = 1,
+                    maxLength = 200, example = "Espada de Kael") String name,
+            @ArraySchema(arraySchema = @Schema(description = "The artifact's fields in order, at most 64"),
+                    maxItems = 64, schema = @Schema(implementation = FieldBody.class)) List<FieldBody> fields,
+            @Schema(description = "The artifact's free text: at most 20,000 code points after trimming; absent, null"
+                    + " or blank for none", types = {"string", "null"}, maxLength = 20000,
+                    example = "Forjada nas montanhas do norte.") String content) {
+
+        @Override
+        public String toString() {
+            return "NewArtifact[recordType=" + recordType + ", fields=" + (fields == null ? 0 : fields.size()) + "]";
+        }
+
+        /** What the GM wrote, or {@code request.invalid} for a body without a type, a name or fields. */
+        Artifacts.Written written() {
+            if (recordType == null || name == null || fields == null) {
+                throw invalid();
+            }
+            return new Artifacts.Written(recordType, name, fields.stream()
+                    .map(field -> field == null ? new Artifacts.Field(null, null)
+                            : new Artifacts.Field(field.name(), field.value())).toList(), content);
+        }
+    }
+
+    @PostMapping(path = ARTIFACTS, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseStatus(HttpStatus.CREATED)
+    @Operation(operationId = "createArtifact", summary = "A new artifact of one of the account's campaigns, written by"
+            + " hand (contract 1.42.0; 201): its record type, name, fields and optional content become its version 1,"
+            + " as getArtifact answers it. A character sheet stores what was written: nothing is calculated."
+            + LIMITS + " request.not_found (404) for a campaign that is not the account's (unknown, another account's,"
+            + " malformed or being deleted); nothing is stored then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> createArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @RequestBody NewArtifact body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        Artifacts.Artifact created = artifacts.create(campaign, body.written())
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
+                .body(ArtifactView.of(created));
+    }
+
+    @GetMapping(path = ARTIFACTS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listArtifacts", summary = "One of the account's campaigns' artifacts (contract 1.42.0),"
+            + " newest first, of one record type when recordType is given. A page starts after a cursor or at an"
+            + " offset (a numbered page), and names the total of the list and the record types in use in the whole"
+            + " campaign with their counts. request.not_found (404) for a campaign that is not the account's (unknown,"
+            + " another account's, malformed or being deleted); request.invalid (400) for a recordType that is not a"
+            + " key's text, a limit outside 1 to 50, a malformed cursor, an offset outside 0 to 100000 or a cursor"
+            + " together with an offset above 0;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "recordType", in = ParameterIn.QUERY, description = "Only the artifacts of this"
+                        + " record type key (a key no artifact has lists none)",
+                        schema = @Schema(type = "string", pattern = "^[a-z][a-z0-9_]{0,31}$")),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "cursor", in = ParameterIn.QUERY, description = "The nextCursor of the previous page",
+                        schema = @Schema(type = "string", format = "uuid")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the newest to skip, 0 to"
+                        + " 100000, for a numbered page; not together with cursor",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "0", maximum = "100000",
+                                defaultValue = "0"))})
+    ResponseEntity<PageView> listArtifacts(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(hidden = true) @RequestParam(value = "recordType", required = false) String recordType,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "cursor", required = false) String cursor,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        if (recordType != null && !KEY.matcher(recordType).matches()) {
+            throw invalid();
+        }
+        int size = limit(limit);
+        UUID after = cursor == null ? null : parse(cursor).orElseThrow(ArtifactController::invalid);
+        int from = offset(offset, after);
+        Artifacts.Page page = artifacts.list(campaign, recordType, after, from, size)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new PageView(
+                page.items().stream().map(SummaryView::of).toList(),
+                page.nextCursor() == null ? null : page.nextCursor().toString(), page.total(),
+                page.types().stream().map(type -> new TypeCountView(type.key(), type.count())).toList()));
+    }
+
+    @GetMapping(path = ARTIFACT, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getArtifact", summary = "One artifact of one of the account's campaigns with its newest"
+            + " version (contract 1.42.0). request.not_found (404) for a campaign that is not the account's, and for an"
+            + " artifact that is not this campaign's (unknown, another account's, another campaign's or malformed);"
+            + " none is told apart;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> getArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        return artifacts.get(campaign, artifact).map(found -> ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(ArtifactView.of(found))).orElseThrow(ArtifactController::notFound);
+    }
+
+    /** A malformed id is no different from an unknown one. */
+    private static Optional<UUID> parse(String id) {
+        return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
+    }
+
+    /** A page's size: the default without one, else 1 to 50, or {@code request.invalid}. */
+    private static int limit(String limit) {
+        if (limit == null) {
+            return Artifacts.DEFAULT_LIMIT;
+        }
+        if (!LIMIT.matcher(limit).matches() || Integer.parseInt(limit) > Artifacts.MAX_LIMIT) {
+            throw invalid();
+        }
+        return Integer.parseInt(limit);
+    }
+
+    /**
+     * The position a page starts at: 0 without one, else 0 to {@value Artifacts#MAX_OFFSET}; {@code request.invalid}
+     * for anything else, and for a position above 0 together with a cursor (a page starts at one or the other).
+     */
+    private static int offset(String offset, UUID cursor) {
+        if (offset == null) {
+            return 0;
+        }
+        if (!OFFSET_TEXT.matcher(offset).matches() || Integer.parseInt(offset) > Artifacts.MAX_OFFSET
+                || (cursor != null && Integer.parseInt(offset) > 0)) {
+            throw invalid();
+        }
+        return Integer.parseInt(offset);
+    }
+
+    private static ApiException invalid() {
+        return new ApiException(ApiProblem.forStatus(400));
+    }
+
+    private static ApiException notFound() {
+        return new ApiException(ApiProblem.forStatus(404));
+    }
+}

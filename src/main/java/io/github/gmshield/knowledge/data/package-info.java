@@ -6,6 +6,7 @@
  * the systems from before V34 lists them across owners through {@code JdbcClient} (ids only,
  * {@link io.github.gmshield.knowledge.data.MissingCoreTypes}), then works as each owner. Story 4.2: {@code record} and
  * {@code record_passage} (V35, {@link io.github.gmshield.knowledge.data.RecordStore}), the same way: a record's name
- * and fields are vault ciphertexts, its links name passages of its owner.
+ * and fields are vault ciphertexts, its links name passages of its owner. Story 5.1 (V43): an artifact's identity is a
+ * {@code record} row with a campaign and no version ({@link io.github.gmshield.knowledge.data.ArtifactRow}).
  */
 package io.github.gmshield.knowledge.data;
