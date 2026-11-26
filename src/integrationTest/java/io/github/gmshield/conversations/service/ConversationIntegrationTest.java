@@ -78,6 +78,9 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * Story 4.3 part C (V38): an answer job reads a record with its fields, cites it, and the record becomes a reference of
  * its own in {@code turn_reference}, its name and fields encrypted ({@code record_name}, {@code record_fields}) beside
  * its plain id and type, read back as written after the record is replaced, the four columns set together.
+ * Story 5.3 part A (V47): a draft's turn of kind {@code draft} with its {@code content.draft} job, the default
+ * {@code question} for a row written without the column, the column's check, the kind read back, and a draft outside
+ * the questions area recording nothing.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -851,6 +854,65 @@ class ConversationIntegrationTest {
                 .containsExactly(theirs);
     }
 
+    @Test
+    void aDraftIsATurnOfKindDraftWithAContentDraftJobAndAQuestionDefaultsToQuestionOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        readyVersion(owner, campaign);
+
+        Conversations.Asked question = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        Conversations.Asked draft = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Um encontro para a cripta", question.conversationId(), null, TurnKind.DRAFT));
+
+        // V47: the kind is stored with the turn, and its job is the draft's.
+        Map<String, Object> drafted = jdbc.sql("select t.kind as turn_kind, j.kind as job_kind from turn t"
+                + " join job j on j.id = t.job_id where t.id = :id").param("id", draft.turnId()).query().singleRow();
+        assertThat(drafted).containsEntry("turn_kind", "draft").containsEntry("job_kind", DraftJobs.KIND);
+        assertThat(jdbc.sql("select kind from turn where id = :id").param("id", question.turnId())
+                .query(String.class).single()).isEqualTo("question");
+        // A row written without the column (the previous release's insert) gets the default, read back as a question.
+        UUID oldTurn = Ids.newId();
+        jdbc.sql("insert into turn (id, owner_id, conversation_id, job_id, question, language, campaign_tier,"
+                + " system_tier, other_tier, model_knowledge, created_at) select :id, owner_id, conversation_id, :job,"
+                + " question, language, campaign_tier, system_tier, other_tier, model_knowledge, created_at + interval"
+                + " '1 second' from turn where id = :from").param("id", oldTurn).param("job", Ids.newId())
+                .param("from", question.turnId())
+                .update();
+        assertThat(jdbc.sql("select kind from turn where id = :id").param("id", oldTurn).query(String.class).single())
+                .isEqualTo("question");
+        assertThat(as(owner, () -> store.findTurn(oldTurn)).orElseThrow().kind()).isEqualTo(TurnRow.QUESTION);
+        assertThatThrownBy(() -> jdbc.sql("update turn set kind = 'proposal' where id = :id")
+                .param("id", draft.turnId()).update()).isInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("turn_kind_check");
+        jdbc.sql("delete from turn where id = :id").param("id", oldTurn).update();
+
+        // The draft's claim reads the same input as a question's; it is read back with its kind.
+        answer(draft.turnId(), "## Encontro na cripta");
+        List<Conversations.StoredTurn> turns = as(owner, () -> conversations.turns(question.conversationId()))
+                .orElseThrow();
+        assertThat(turns).extracting(Conversations.StoredTurn::id, Conversations.StoredTurn::kind)
+                .containsExactly(Tuple.tuple(question.turnId(), TurnKind.QUESTION),
+                        Tuple.tuple(draft.turnId(), TurnKind.DRAFT));
+        // A draft outside the questions area records nothing.
+        Conversations.Asked rules = OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Regras?", null,
+                Area.RULES));
+        long before = jdbc.sql("select count(*) from turn where owner_id = :owner").param("owner", owner)
+                .query(Long.class).single();
+        assertThatThrownBy(() -> OwnerContext.callAs(owner, () -> conversations.ask(campaign, "Um item",
+                rules.conversationId(), null, TurnKind.DRAFT))).isInstanceOfSatisfying(ApiException.class, refused -> {
+                    assertThat(refused.problem().code()).isEqualTo("request.invalid");
+                    assertThat(refused.problem().params()).containsEntry("field", "kind");
+                });
+        assertThat(jdbc.sql("select count(*) from turn where owner_id = :owner").param("owner", owner)
+                .query(Long.class).single()).isEqualTo(before);
+        // Leave no job behind.
+        answer(question.turnId(), "Resposta.");
+        answer(rules.turnId(), "Resposta.");
+    }
+
     private static void sleep() {
         try {
             Thread.sleep(2);
@@ -968,7 +1030,7 @@ class ConversationIntegrationTest {
                 UUID turnId = Ids.newId();
                 store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
                         Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
-                        java.util.Set.of(), start.plusSeconds(number), null, null, null));
+                        java.util.Set.of(), start.plusSeconds(number), null, null, null, null));
                 ids.add(turnId);
             }
             return ids;

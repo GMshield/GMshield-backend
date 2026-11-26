@@ -2549,6 +2549,49 @@ class RecordsFlowTest {
         return jobId;
     }
 
+    // --- Story 5.3 part A: a draft reads what an answer reads
+
+    @Test
+    void aDraftsGrantResolvesItsTermsAndReadsTheCampaignArtifactAndTheSystemRecordEachWithItsTier() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("item", "Espada de Kael", 1, List.of(new Field("Dano", "1d6 cortante")))));
+        String system = recordOf(book.versionId(), "Espada de Kael");
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        endIngestion();
+
+        Answer draft = drafted(gm, "Crie uma ficha de item para a Espada de Kael");
+
+        assertThat(jobs.rows.get(draft.jobId()).kind()).isEqualTo("content.draft");
+        assertThat(draft.claim().path("kind").asString()).isEqualTo("content.draft");
+        // The same input as a question's: the campaign tier first, listing the artifact.
+        JsonNode tiers = draft.claim().path("input").path("tiers");
+        assertThat(tiers.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(strings(tiers.get(0).path("sources"))).contains(kael);
+        assertThat(draft.claim().path("input").path("question").asString())
+                .isEqualTo("Crie uma ficha de item para a Espada de Kael");
+        // Its terms name the system's record; its records read serves both, each labelled with its tier.
+        HttpResponse<String> resolved = terms(draft);
+        assertThat(resolved.statusCode()).as(resolved.body()).isEqualTo(200);
+        assertThat(strings(json(resolved).path("records"))).contains(system);
+        assertThat(strings(json(resolved).path("names"))).contains("Espada de Kael");
+        JsonNode read = ok(readRecords(draft, List.of(kael, system)));
+        assertThat(read.path("records")).extracting(record -> record.path("id").asString() + ":"
+                + record.path("tier").asString()).containsExactly(kael + ":campaign", system + ":system");
+        // Its citation of the artifact becomes a reference under the campaign tier, as an answer's does.
+        events(draft, List.of(delta("## Espada de Kael\n\n- Dano: 1d8 cortante"), recordCitation(kael, 20)));
+        done(draft);
+        JsonNode references = references(gm, draft);
+        assertThat(references).hasSize(1);
+        assertThat(references.get(0).path("artifactId").asString()).isEqualTo(kael);
+        assertThat(references.get(0).path("tier").asString()).isEqualTo("campaign");
+        // Another job's grant reads nothing of it.
+        Answer question = asked(gm, "O que faz a Espada de Kael?");
+        assertProblem(worker(draft.path("terms"), null, "X-Job-Grant", question.claim().path("grant").asString()), 403,
+                "job.grant_refused");
+        assertNoLineNames("Espada de Kael", "1d8 cortante", "Crie uma ficha");
+    }
+
     /** A new artifact of the campaign, written through the public API; its id. */
     private String artifact(Gm gm, UUID campaign, Map<String, Object> body) throws Exception {
         HttpResponse<String> created = send("POST", "/api/v1/campaigns/" + campaign + "/artifacts", gm.session(),
@@ -2569,6 +2612,21 @@ class RecordsFlowTest {
     private Answer asked(Gm gm, String question) throws Exception {
         HttpResponse<String> asked = send("POST", "/api/v1/campaigns/" + gm.campaign() + "/turns", gm.session(),
                 Map.of("question", question));
+        assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
+        UUID turnId = UUID.fromString(json(asked).path("id").asString());
+        UUID jobId = conversationStore.turns.get(turnId).jobId();
+        HttpResponse<String> claimed = worker("/internal/v1/jobs/" + jobId + "/claims",
+                "{\"providers\":[\"azure-openai\"]}".getBytes(StandardCharsets.UTF_8), "Content-Type",
+                "application/json");
+        assertThat(claimed.statusCode()).as(claimed.body()).isEqualTo(201);
+        return new Answer(turnId, UUID.fromString(json(asked).path("conversationId").asString()), jobId,
+                json(claimed));
+    }
+
+    /** A draft (Story 5.3 part A) of the GM's current campaign, its job claimed as the worker. */
+    private Answer drafted(Gm gm, String request) throws Exception {
+        HttpResponse<String> asked = send("POST", "/api/v1/campaigns/" + gm.campaign() + "/turns", gm.session(),
+                Map.of("question", request, "kind", "draft"));
         assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
         UUID turnId = UUID.fromString(json(asked).path("id").asString());
         UUID jobId = conversationStore.turns.get(turnId).jobId();

@@ -20,6 +20,8 @@ import org.hibernate.annotations.TenantId;
  *
  * <p>Story 3.12 (V33): {@code bookmarked_at} is mapped the same way: only the store's bulk updates
  * ({@code JpaConversationStore#markBookmarked}, {@code #clearBookmarked}) change it.
+ *
+ * <p>Story 5.3 part A (V47): {@code kind}, written once with the turn ({@code question} or {@code draft}).
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -69,6 +71,9 @@ class TurnEntity {
     @Column(name = "bookmarked_at", updatable = false)
     private Instant bookmarkedAt;
 
+    @Column(name = "kind", nullable = false, updatable = false)
+    private String kind;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -88,6 +93,7 @@ class TurnEntity {
         this.stoppedAt = row.stoppedAt();
         this.dismissedAt = row.dismissedAt();
         this.bookmarkedAt = row.bookmarkedAt();
+        this.kind = row.kind();
     }
 
     void stop(Instant at) {
@@ -97,7 +103,7 @@ class TurnEntity {
     /** The row, with the materials switched off frozen with it (read from {@code turn_material_off}). */
     TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt);
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind);
     }
 
     UUID id() {

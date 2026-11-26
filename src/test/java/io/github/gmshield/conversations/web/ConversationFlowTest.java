@@ -135,6 +135,13 @@ import tools.jackson.databind.json.JsonMapper;
  * refused with {@code conversation.turn_not_done}, another owner's turn on both routes and never in the list, another
  * campaign's answer listed with its name, an archived campaign's and a dismissed answer left out until they come back,
  * the list paged, and no standing as a source (the history and the passage ids handed over are unchanged).
+ *
+ * <p>Story 5.3 part A: every backend row of its I/O matrix: a draft recorded with its {@code content.draft} job, the
+ * question's input, its passages and terms reads, streamed with its tier and references, then done, and read back with
+ * its kind; a draft in a new or the latest questions conversation, a question by default; a draft outside the questions
+ * area (by area or by the conversation's) or an unknown kind refused with the field {@code kind}, nothing recorded; a
+ * stopped draft, a silent one and a failed one; and a finished draft bookmarked, in the next turn's history, never a
+ * source, and dismissed until its undo.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -3186,6 +3193,210 @@ class ConversationFlowTest {
         assertThat(after.input().path("tiers")).isEqualTo(before.input().path("tiers"));
         assertThat(readAfter.statusCode()).as(readAfter.body()).isEqualTo(readBefore.statusCode()).isEqualTo(200);
         assertThat(json(readAfter).path("passages")).hasSize(2).isEqualTo(json(readBefore).path("passages"));
+    }
+
+    // --- Story 5.3 part A: draft content with an agent
+
+    private static final String DRAFT = "Um encontro para a cripta";
+
+    @Test
+    void aDraftIsRecordedWithItsContentDraftJobAndStreamsWithItsReferencesThenDone() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 2);
+        UUID question = answeredIn(gm, null, QUESTION, "Fire Bolt causa 1d10.", passages.getFirst());
+        UUID conversation = conversations.turns.get(question).conversationId();
+
+        HttpResponse<String> asked = askKind(gm, DRAFT, conversation, null, "draft");
+
+        assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
+        UUID turnId = turnId(asked);
+        TurnRow row = conversations.turns.get(turnId);
+        assertThat(row.kind()).isEqualTo(TurnRow.DRAFT);
+        assertThat(row.conversationId()).isEqualTo(conversation);
+        assertThat(conversations.turns.get(question).kind()).isEqualTo(TurnRow.QUESTION);
+        JobRow job = jobs.row(row.jobId());
+        assertThat(job.kind()).isEqualTo("content.draft");
+        assertThat(job.lane()).isEqualTo("interactive");
+        assertThat(stream.offered("gmshield:work:interactive")).contains(job.id());
+
+        Claim claim = claim(job.id());
+        // The same input as a question's: the request, the frozen scope's tiers and the history.
+        assertThat(claim.input().path("question").asString()).isEqualTo(DRAFT);
+        assertThat(claim.input().path("tiers").get(0).path("sources")).hasSize(1);
+        assertThat(claim.input().path("history")).extracting(item -> item.path("question").asString())
+                .containsExactly(QUESTION);
+        HttpResponse<String> read = sendAsWorker("POST", claim.path("passages"), passageIds(passages), claim.grant());
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(json(read).path("passages")).hasSize(2);
+        HttpResponse<String> terms = sendAsWorker("POST", claim.path("terms"), null, claim.grant());
+        assertThat(terms.statusCode()).as(terms.body()).isEqualTo(200);
+
+        assertThat(postEvents(claim, 1, List.of(delta("## Encontro na cripta\n\n"), tier("campaign", 0)),
+                List.of()).statusCode()).isEqualTo(200);
+        assertThat(postEvents(claim, 2, List.of(delta("Três esqueletos guardam a porta."),
+                citation(passages.get(1), 20)), List.of()).statusCode()).isEqualTo(200);
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+
+        List<Event> events = streamAll(gm, turnId, null);
+        assertThat(events).extracting(Event::name).containsExactly("delta", "tier", "delta", "citation", "done");
+        JsonNode done = done(gm, turnId, null);
+        assertThat(done.path("silent").asBoolean()).isFalse();
+        assertThat(done.path("references")).hasSize(1);
+        assertThat(done.path("references").get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(strings(done.path("references").get(0).path("passageIds")))
+                .containsExactly(passages.get(1).toString());
+        // Reopened: each turn says what it is, and the draft keeps its events and references.
+        JsonNode items = json(get(gm, "/api/v1/conversations/" + conversation + "/turns")).path("items");
+        assertThat(items).extracting(item -> item.path("id").asString() + ":" + item.path("kind").asString())
+                .containsExactly(question + ":question", turnId + ":draft");
+        assertThat(items.get(1).path("events")).extracting(event -> event.path("type").asString())
+                .containsExactly("delta", "tier", "delta", "citation", "done");
+        assertThat(items.get(1).path("events").get(4).path("data").path("references")).hasSize(1);
+        // A line carries the kind, never the request or the draft.
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getMessage()).isEqualTo("conversation.turn_recorded");
+            assertThat(event.getKeyValuePairs()).anySatisfy(pair -> {
+                assertThat(pair.key).isEqualTo("kind");
+                assertThat(pair.value).isEqualTo("draft");
+            });
+        });
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("cripta").doesNotContain("esqueletos"));
+    }
+
+    @Test
+    void aDraftInANewOrTheLatestQuestionsConversationIsRecordedAndAQuestionStaysTheDefault() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        // No conversation and no area: the latest questions conversation (made now), as a question would be.
+        UUID first = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        UUID conversation = conversations.turns.get(first).conversationId();
+        assertThat(conversations.conversations.get(conversation).area()).isEqualTo("questions");
+        // A new questions conversation by area.
+        UUID second = turnId(askKind(gm, DRAFT, null, "questions", "draft"));
+        assertThat(conversations.turns.get(second).conversationId()).isNotEqualTo(conversation);
+        // An explicit question, a null kind and no kind are all questions.
+        UUID explicit = turnId(askKind(gm, QUESTION, conversation, null, "question"));
+        UUID absent = turnId(ask(gm, gm.campaign(), QUESTION));
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("question", QUESTION);
+        body.put("kind", null);
+        UUID nulled = turnId(send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/turns",
+                JSON.writeValueAsString(body)));
+        for (UUID turnId : List.of(explicit, absent, nulled)) {
+            assertThat(conversations.turns.get(turnId).kind()).isEqualTo(TurnRow.QUESTION);
+            assertThat(jobs.row(jobOf(turnId)).kind()).isEqualTo("question.answer");
+        }
+        assertThat(jobs.row(jobOf(first)).kind()).isEqualTo("content.draft");
+        assertThat(jobs.row(jobOf(second)).kind()).isEqualTo("content.draft");
+    }
+
+    @Test
+    void aDraftOutsideTheQuestionsAreaOrAnUnknownKindIsInvalidWithTheFieldKindAndRecordsNothing() throws Exception {
+        Gm gm = signUp();
+        accepted(gm, 1);
+        UUID rules = conversationOf(askIn(gm, gm.campaign(), "Que regras existem?", null, "rules"));
+        int turns = conversations.turns.size();
+        int rows = jobs.rows.size();
+        long conversationsBefore = conversations.conversations.size();
+        Instant lastAsked = conversations.conversations.get(rules).lastAskedAt();
+        clock.advance(Duration.ofSeconds(1));
+
+        // By area, by the conversation's area, and a kind that is not one.
+        for (HttpResponse<String> refused : List.of(askKind(gm, DRAFT, null, "rules", "draft"),
+                askKind(gm, DRAFT, rules, null, "draft"), askKind(gm, DRAFT, rules, "rules", "draft"),
+                askKind(gm, DRAFT, null, null, "proposal"), askKind(gm, DRAFT, null, null, "DRAFT"))) {
+            assertProblem(refused, 400, "request.invalid");
+            assertThat(json(refused).path("params").path("field").asString()).as(refused.body()).isEqualTo("kind");
+        }
+        assertThat(conversations.turns).hasSize(turns);
+        assertThat(jobs.rows).hasSize(rows);
+        assertThat(conversations.conversations).hasSize((int) conversationsBefore);
+        assertThat(conversations.conversations.get(rules).lastAskedAt()).isEqualTo(lastAsked);
+        // A question in the rules conversation is still asked.
+        assertThat(askKind(gm, QUESTION, rules, null, "question").statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    void aStoppedDraftEndsStoppedAndADraftWithNothingFoundIsSilentAsAnAnswerIs() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID stopped = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(stopped));
+        assertThat(postEvents(claim, 1, List.of(delta("## Encontro"), citation(passages.getFirst(), 0)), List.of())
+                .statusCode()).isEqualTo(200);
+
+        assertThat(stopTurn(gm, stopped).statusCode()).isEqualTo(204);
+
+        JsonNode done = done(gm, stopped, null);
+        assertThat(done.path("stopped").asBoolean()).isTrue();
+        assertThat(done.path("references")).hasSize(1);
+        HttpResponse<String> after = postEvents(claim, 2, List.of(delta(" mais")), List.of());
+        assertThat(json(after).path("stop").asBoolean()).isTrue();
+        assertThat(report(claim, "{\"outcome\":\"done\"}").statusCode()).isEqualTo(204);
+        assertThat(streamAll(gm, stopped, null)).extracting(Event::name).containsExactly("delta", "citation", "done");
+
+        // Nothing in scope fits: one sentence, no citation, and the turn is silent.
+        UUID nothing = turnId(askKind(gm, "Um dragão de gelo", null, null, "draft"));
+        Claim empty = claim(jobOf(nothing));
+        postEvents(empty, 1, List.of(delta("Nada nas fontes serve para este rascunho.")), List.of());
+        report(empty, "{\"outcome\":\"done\"}");
+        assertThat(done(gm, nothing, null).path("silent").asBoolean()).isTrue();
+        // A failed draft ends with its error, as an answer's does.
+        UUID failed = turnId(askKind(gm, "Uma masmorra", null, null, "draft"));
+        Claim failing = claim(jobOf(failed));
+        postEvents(failing, 1, List.of(delta("## Masmorra")), List.of());
+        report(failing, "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}");
+        assertThat(streamAll(gm, failed, null)).extracting(Event::name).containsExactly("delta", "error");
+    }
+
+    @Test
+    void aFinishedDraftIsBookmarkedDismissedAndInTheHistoryOfLaterTurnsButNeverASource() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID draft = turnId(askKind(gm, DRAFT, null, "questions", "draft"));
+        UUID conversation = conversations.turns.get(draft).conversationId();
+        Claim claim = claim(jobOf(draft));
+        postEvents(claim, 1, List.of(delta("## Encontro na cripta"), citation(passages.getFirst(), 0)), List.of());
+        report(claim, "{\"outcome\":\"done\"}");
+        clock.advance(Duration.ofSeconds(1));
+
+        assertThat(bookmark(gm, "PUT", draft.toString()).statusCode()).isEqualTo(204);
+        assertThat(turnsBookmarked(gm, conversation)).containsExactly(true);
+        assertThat(savedIds(gm, SAVED)).containsExactly(draft.toString());
+
+        // The next turn gets it as history, and its scope and passages are the same as without it.
+        UUID next = turnId(askIn(gm, gm.campaign(), "Quantos esqueletos?", conversation, null));
+        Claim nextClaim = claim(jobOf(next));
+        assertThat(nextClaim.input().path("history")).extracting(item -> item.path("question").asString() + "|"
+                + item.path("answer").asString()).containsExactly(DRAFT + "|## Encontro na cripta");
+        assertThat(handedSources(nextClaim)).containsExactly(handedSources(claim).toArray(UUID[]::new));
+        assertThat(nextClaim.input().toString()).doesNotContain(draft.toString());
+        stopTurn(gm, next);
+
+        // Dismissed: out of the turns and the history until its undo.
+        assertThat(dismissal(gm, "PUT", draft.toString()).statusCode()).isEqualTo(204);
+        assertThat(turnIds(gm, conversation)).containsExactly(next.toString());
+        clock.advance(Duration.ofSeconds(1));
+        UUID later = turnId(askIn(gm, gm.campaign(), "E agora?", conversation, null));
+        assertThat(claim(jobOf(later)).input().path("history")).isEmpty();
+        stopTurn(gm, later);
+        assertThat(dismissal(gm, "DELETE", draft.toString()).statusCode()).isEqualTo(204);
+        assertThat(turnIds(gm, conversation)).startsWith(draft.toString());
+    }
+
+    private HttpResponse<String> askKind(Gm gm, String question, UUID conversation, String area, String kind)
+            throws Exception {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("question", question);
+        if (conversation != null) {
+            body.put("conversationId", conversation.toString());
+        }
+        if (area != null) {
+            body.put("area", area);
+        }
+        body.put("kind", kind);
+        return send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/turns", JSON.writeValueAsString(body));
     }
 
     private static String passageIds(List<UUID> passages) {

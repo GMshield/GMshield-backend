@@ -65,7 +65,8 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@code questions} one; made on its first question), the turn with the question
  *       encrypted, its language ({@link Languages}) and the campaign's stored scope settings frozen on it (Story 3.5,
  *       {@link CampaignScopes#settings}: the switches and the materials off), and its
- *       {@code question.answer} job on the interactive lane.</li>
+ *       {@code question.answer} job, or {@code content.draft} for a draft (Story 5.3 part A), on the interactive
+ *       lane.</li>
  *   <li>{@link #turn} and {@link #eventsAfter}: a turn of the owner, and its stored events after a sequence, decrypted,
  *       in order.</li>
  *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
@@ -127,6 +128,10 @@ import tools.jackson.databind.node.ObjectNode;
  *       (their bookmark is kept, so an undo lists them again), turns of deleting conversations, and campaigns that are
  *       archived or being deleted. A bookmark gives an answer no standing as a source: {@link #history}, the scope
  *       and retrieval never read it. {@link #turns} says whether each turn is saved.</li>
+ *   <li>Story 5.3 part A, drafts. A turn has a {@link TurnKind kind}: a question, or a draft the GM asked for in the
+ *       {@code questions} area ({@link #ask(UUID, String, UUID, Area, TurnKind)}), written by a {@link DraftJobs} job
+ *       from the same sources. A draft is an answer like any other: it is stopped, dismissed, bookmarked, read in
+ *       {@link #turns} (with its kind) and sent in the {@link #history} of later turns, and it is never a source.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -249,10 +254,11 @@ public class Conversations {
 
     /**
      * A stored turn (Story 3.10): its question and language, when it was asked, and its stored events in order, each
-     * with its data as the stream sends it ({@code done}'s built now from its references).
+     * with its data as the stream sends it ({@code done}'s built now from its references); from Story 5.3 part A, its
+     * kind.
      */
     public record StoredTurn(UUID id, String question, String language, Instant createdAt, List<StoredEvent> events,
-                             boolean bookmarked) {
+                             boolean bookmarked, TurnKind kind) {
         public StoredTurn {
             events = List.copyOf(events);
         }
@@ -331,27 +337,41 @@ public class Conversations {
      * has none). The conversation's last question moves to now.
      */
     public Asked ask(UUID campaignId, String question, UUID conversationId, Area area) {
+        return ask(campaignId, question, conversationId, area, TurnKind.QUESTION);
+    }
+
+    /**
+     * Records a turn of {@code kind} on the owner's campaign, as {@link #ask(UUID, String, UUID, Area)} says (Story 5.3
+     * part A): a {@link TurnKind#DRAFT draft} gets a {@value DraftJobs#KIND} job instead of a {@value AnswerJobs#KIND}
+     * one, and only in the {@code questions} area: a draft whose {@code area}, or whose conversation's area, is another
+     * is {@code request.invalid} with the field {@code kind}, and nothing is recorded.
+     */
+    public Asked ask(UUID campaignId, String question, UUID conversationId, Area area, TurnKind kind) {
         if (question == null || question.isBlank()
                 || question.codePointCount(0, question.length()) > Scopes.MAX_QUESTION) {
             throw ConversationProblems.invalid();
         }
+        TurnKind asked = kind == null ? TurnKind.QUESTION : kind;
+        if (asked == TurnKind.DRAFT && area != null && area != Area.QUESTIONS) {
+            throw ConversationProblems.kindInvalid();
+        }
         UUID owner = OwnerContext.require();
         String language = Languages.detect(question);
-        Asked asked = writing(() -> {
+        return writing(() -> {
             if (campaignId == null || library.campaign(campaignId).isEmpty()) {
                 throw ConversationProblems.notFound();
             }
             Instant now = now();
-            ConversationRow conversation = conversationFor(owner, campaignId, conversationId, area, now);
+            ConversationRow conversation = conversationFor(owner, campaignId, conversationId, area, asked, now);
             UUID turnId = Ids.newId();
             ScopeSettings settings = campaignScopes.settings(campaignId);
-            JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
+            JobRef job = jobs.create(asked.jobKind(), Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
-                    settings.modelKnowledge(), settings.materialsOff(), now, null, null, null)));
+                    settings.modelKnowledge(), settings.materialsOff(), now, null, null, null, asked.word())));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
-                    .addKeyValue("turnId", turnId)
+                    .addKeyValue("turnId", turnId).addKeyValue("kind", asked.word())
                     .addKeyValue("jobId", job.id()).addKeyValue("language", language == null ? "unsure" : language)
                     .addKeyValue("otherTier", settings.otherTier())
                     .addKeyValue("materialsOff", settings.materialsOff().size())
@@ -359,16 +379,22 @@ public class Conversations {
                     .log("conversation.turn_recorded");
             return new Asked(turnId, conversation.id(), language);
         });
-        return asked;
     }
 
-    /** The conversation a question goes to, as {@link #ask} says: continued (its last question now) or made now. */
-    private ConversationRow conversationFor(UUID owner, UUID campaignId, UUID conversationId, Area area, Instant now) {
+    /**
+     * The conversation a question goes to, as {@link #ask} says: continued (its last question now) or made now. A
+     * draft continues only a {@code questions} conversation (Story 5.3 part A); this is checked before anything changes.
+     */
+    private ConversationRow conversationFor(UUID owner, UUID campaignId, UUID conversationId, Area area, TurnKind kind,
+                                            Instant now) {
         if (conversationId != null) {
             ConversationRow found = store.findConversation(conversationId)
                     .filter(row -> row.campaignId().equals(campaignId)).orElseThrow(ConversationProblems::notFound);
             if (area != null && !area.word().equals(found.area())) {
                 throw ConversationProblems.invalid();
+            }
+            if (kind == TurnKind.DRAFT && !ConversationRow.QUESTIONS.equals(found.area())) {
+                throw ConversationProblems.kindInvalid();
             }
             store.markAsked(found.id(), now);
             return found;
@@ -549,7 +575,8 @@ public class Conversations {
             stored.add(new StoredEvent(event.sequence(), event.type(), data));
         }
         return new StoredTurn(row.id(), vault.decryptText(question(row.id(), row.ownerId()), row.question()),
-                row.language(), row.createdAt(), stored, row.bookmarkedAt() != null);
+                row.language(), row.createdAt(), stored, row.bookmarkedAt() != null,
+                TurnKind.of(row.kind()).orElse(TurnKind.QUESTION));
     }
 
     private static boolean modelTier(TurnEvent event) {

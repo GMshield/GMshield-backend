@@ -5,6 +5,7 @@ import io.github.gmshield.conversations.service.Area;
 import io.github.gmshield.conversations.service.ConversationProblems;
 import io.github.gmshield.conversations.service.Conversations;
 import io.github.gmshield.conversations.service.Searches;
+import io.github.gmshield.conversations.service.TurnKind;
 import io.github.gmshield.conversations.service.TurnStreams;
 import io.github.gmshield.scope.service.SourcePage;
 import io.github.gmshield.scope.service.SourcePicture;
@@ -62,6 +63,8 @@ import tools.jackson.databind.json.JsonMapper;
  * counts and the history sent with a later question. From Story 3.12, the GM's bookmark of a done turn's answer (PUT)
  * and its removal (DELETE) on {@code /turns/{turnId}/bookmark}, whether each stored turn is saved, and the GM's saved
  * answers across all their campaigns ({@code /saved-answers}, paged by offset, the newest saved first).
+ * From Story 5.3 part A, a turn's kind: a question, or a draft asked in the questions area, recorded with its
+ * {@code content.draft} job and read back with its kind.
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -168,11 +171,17 @@ class ConversationController {
             @Schema(description = "The area of a new conversation (contract 1.29.0); with conversationId it must be"
                     + " that conversation's. Absent or null with no conversationId: the campaign's latest questions"
                     + " conversation is continued (made when it has none)", types = {"string", "null"},
-                    allowableValues = {"questions", "rules"}) String area) {
+                    allowableValues = {"questions", "rules"}) String area,
+            @Schema(description = "What the GM asks for (contract 1.46.0): question (absent or null: a question) is"
+                    + " answered; draft has the agent write the content asked for (an encounter, an item, a creature, a"
+                    + " character sheet...) from the same sources, streamed as an answer is, with nothing written to"
+                    + " the library. A draft is asked only in the questions area: one whose area, or whose"
+                    + " conversation's area, is another is request.invalid with the field kind",
+                    types = {"string", "null"}, allowableValues = {"question", "draft"}) String kind) {
 
         @Override
         public String toString() {
-            return "NewTurn[conversationId=" + conversationId + ", area=" + area + "]";
+            return "NewTurn[conversationId=" + conversationId + ", area=" + area + ", kind=" + kind + "]";
         }
     }
 
@@ -275,7 +284,8 @@ class ConversationController {
     }
 
     @Schema(name = "StoredTurn", requiredProperties = {"id", "question", "language", "createdAt", "events",
-        "bookmarked"}, description = "A turn of a conversation with its stored events (contract 1.29.0). A turn whose"
+        "bookmarked", "kind"},
+            description = "A turn of a conversation with its stored events (contract 1.29.0). A turn whose"
             + " answer is still being written has no done or error event yet: its stream continues after the last"
             + " sequence")
     record StoredTurnView(
@@ -286,12 +296,15 @@ class ConversationController {
             @Schema(format = "date-time") String createdAt,
             @ArraySchema(arraySchema = @Schema(description = "Its stored events, by sequence"),
                     schema = @Schema(implementation = StoredEventView.class)) List<StoredEventView> events,
-            @Schema(description = "Whether the GM saved its answer (contract 1.32.0)") boolean bookmarked) {
+            @Schema(description = "Whether the GM saved its answer (contract 1.32.0)") boolean bookmarked,
+            @Schema(description = "What the GM asked for (contract 1.46.0): a question, or a draft written from the"
+                    + " campaign's sources", allowableValues = {"question", "draft"}) String kind) {
 
         static StoredTurnView of(Conversations.StoredTurn turn) {
             return new StoredTurnView(turn.id(), turn.question(), turn.language(), turn.createdAt().toString(),
                     turn.events().stream().map(event -> new StoredEventView(event.sequence(), event.type(),
-                            JSON.convertValue(event.data(), OBJECT))).toList(), turn.bookmarked());
+                            JSON.convertValue(event.data(), OBJECT))).toList(), turn.bookmarked(),
+                    turn.kind().word());
         }
 
         @Override
@@ -636,7 +649,9 @@ class ConversationController {
             + " question becomes this one. request.invalid (400) for a blank question or one past 4,000 code points, an"
             + " area that is not one, or an area other than the conversation's; request.not_found (404) for a campaign"
             + " that is not the account's or a conversationId that is not one of its conversations; nothing is"
-            + " recorded then",
+            + " recorded then. From contract 1.46.0, kind draft records a draft turn with a content.draft job instead"
+            + " (its events stream as an answer's do); a kind that is not one, or a draft outside the questions area"
+            + " (by area or by the conversation's), is request.invalid (400) with the field kind",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")))
     ResponseEntity<TurnView> ask(
@@ -648,9 +663,11 @@ class ConversationController {
             throw ConversationProblems.invalid();
         }
         Area area = body.area() == null ? null : Area.of(body.area()).orElseThrow(ConversationProblems::invalid);
+        TurnKind kind = body.kind() == null ? TurnKind.QUESTION
+                : TurnKind.of(body.kind()).orElseThrow(ConversationProblems::kindInvalid);
         UUID conversation = body.conversationId() == null ? null
                 : parse(body.conversationId()).orElseThrow(ConversationProblems::notFound);
-        Conversations.Asked asked = conversations.ask(campaign, body.question(), conversation, area);
+        Conversations.Asked asked = conversations.ask(campaign, body.question(), conversation, area, kind);
         return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
                 .body(new TurnView(asked.turnId(), asked.conversationId(), asked.language()));
     }

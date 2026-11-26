@@ -31,6 +31,14 @@ public final class ConversationProblems {
         return new ApiException(ApiProblem.forStatus(400));
     }
 
+    /**
+     * A turn's kind that is not one, or a draft outside the {@code questions} area (Story 5.3 part A): nothing
+     * recorded; the field is {@code kind}.
+     */
+    public static ApiException kindInvalid() {
+        return new ApiException(ApiProblem.forStatus(400).withParams(Map.<String, Object>of("field", "kind")));
+    }
+
     /** A campaign, a turn or a search that is not the owner's, unknown or malformed: the same answer. */
     public static ApiException notFound() {
         return new ApiException(ApiProblem.forStatus(404));

@@ -75,7 +75,11 @@ class JobClaimController {
                     + " id; a job of kind index.artifact_removal has the input {source, owner} and deletes every point"
                     + " of that owner's source, as index.removal does. A question's input lists the campaign's"
                     + " artifacts among the campaign tier's sources, and POST …/records serves one as a campaign-tier"
-                    + " record of page 1 with an empty sectionPath, its content as the last field")
+                    + " record of page 1 with an empty sectionPath, its content as the last field. From contract 1.25.0"
+                    + " a job of kind content.draft (a draft the GM asked for in the questions area) has the same input"
+                    + " as question.answer {question, tiers, recordTypes, history, ...}, reads passages, records and"
+                    + " terms within its turn's scope as question.answer does, posts its draft as answer events and"
+                    + " calls a model; it writes nothing to the library")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")

@@ -1785,6 +1785,29 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     frontend (minimum public contract 1.45.0); the previous frontend keeps working, since the change is additive (its
     link to a deleted artifact opens "not found").
 
+- **Draft content with an agent (`conversations`, Story 5.3 part A, public contract 1.46.0, internal contract 1.25.0,
+  migration V47).** In the questions area the GM asks either a question or a draft (an encounter, an item, a creature,
+  a character sheet...) written from the campaign's own sources. Nothing is written to the library; the proposal and
+  the save confirmation are later parts.
+  - **Route.** `NewTurn.kind` on `POST /api/v1/campaigns/{campaignId}/turns` is `question` (absent or null: the
+    default) or `draft`. A kind that is not one, or a draft outside the questions area (by `area`, or by the
+    conversation's area), is `request.invalid` (400) with the field `kind`, and nothing is recorded.
+    `StoredTurn.kind` says what each stored turn is.
+  - **The turn.** `turn.kind` (V47, `question` or `draft`, default `question`) is written once with the turn. A draft
+    gets a job of kind `content.draft` (`DraftJobs`) on the interactive lane instead of `question.answer`. A draft is
+    a turn, so stop, dismissal, bookmarks, the history sent with later turns, deletion and the cross-owner audit treat
+    it as an answer, and it is never a source.
+  - **The job.** `DraftJobs` is `AnswerJobs` under another kind (it delegates every call): the same input (the question
+    input within the turn's frozen scope, campaign tier first, with the history), the same passages, records and terms
+    reads, the same event batches, tier rules, references, outcome and stop. The worker tells a draft from an answer by
+    the kind alone; `JobClaimController` documents it (`openapi/internal.json` 1.25.0).
+  - **V47.** Additive: the previous release neither reads nor writes `turn.kind`. Before rolling back past V47, cancel
+    every unended `content.draft` job (the previous release has no handler for it); the migration's comment gives the
+    statement that drops the column.
+  - Log lines (ids and counts only): `kind` on `conversation.turn_recorded`. Deploy order: backend, then worker
+    (internal contract 1.25.0), then frontend (minimum public contract 1.46.0); the previous frontend and worker keep
+    working, since questions are unchanged and no draft is asked until the new frontend sends one.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
