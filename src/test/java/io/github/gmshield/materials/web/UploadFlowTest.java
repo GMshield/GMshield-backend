@@ -466,16 +466,27 @@ class UploadFlowTest {
         JsonNode listed = json(get(gm, "/api/v1/materials?state=uploading"));
         assertThat(ofCampaign.statusCode()).isEqualTo(201);
         assertThat(loose.statusCode()).isEqualTo(201);
-        JsonNode looseItem = listed.path("items").get(0);
+        // By name, not by position: the list is newest first by id, and two ids minted in one millisecond sort either way.
+        JsonNode looseItem = itemNamed(listed, "solto.pdf");
         assertThat(looseItem.path("belonging").toString()).isEqualTo("{\"campaign\":null,\"systems\":[]}");
         assertThat(looseItem.has("size")).isFalse();
-        JsonNode campaignItem = listed.path("items").get(1).path("belonging").path("campaign");
+        JsonNode campaignItem = itemNamed(listed, "notas.md").path("belonging").path("campaign");
         assertThat(campaignItem.path("id").asString()).isEqualTo(campaign);
         assertThat(campaignItem.path("name").asString()).isEqualTo(current.path("name").asString());
         assertThat(campaignItem.path("system").path("id").asString()).isEqualTo(first);
         // The single system key still works.
         assertThat(send("POST", "/api/v1/uploads", null, session(gm), "Tus-Resumable", TUS, "Upload-Length", "10",
                 "Upload-Metadata", metadata("a.pdf") + ",system " + b64(first)).statusCode()).isEqualTo(201);
+    }
+
+    /** The item of a material list named {@code name}. */
+    private static JsonNode itemNamed(JsonNode listed, String name) {
+        for (JsonNode item : listed.path("items")) {
+            if (item.path("name").asString().equals(name)) {
+                return item;
+            }
+        }
+        throw new AssertionError("no listed material named " + name);
     }
 
     @Test
