@@ -15,7 +15,9 @@ import org.hibernate.annotations.TenantId;
  * by it. The version is a plain id: the database's key on (owner, version) keeps it within the same owner. A step
  * reported again replaces its records with new rows. From Story 4.5 (V41) a correction rewrites its type, name, name
  * fingerprint and fields in place; its id, version id, ordinal, first page and links never change. Its {@code version}
- * is Hibernate's: each correction raises it, and an update of a row whose version moved meanwhile fails.
+ * is Hibernate's: each correction raises it, and an update of a row whose version moved meanwhile fails. From Story
+ * 4.5 part B (V42) the GM's delete marks it ({@code deleted_at}) and the removal of its point marks it again
+ * ({@code point_removed_at}); neither ever goes back to null.
  */
 @Entity(name = "Record")
 @Table(name = "record")
@@ -68,6 +70,12 @@ class RecordEntity {
     @Column(name = "extracted_name_fingerprint")
     private byte[] extractedNameFingerprint;
 
+    @Column(name = "deleted_at")
+    private Instant deletedAt;
+
+    @Column(name = "point_removed_at")
+    private Instant pointRemovedAt;
+
     protected RecordEntity() {
         // for Hibernate
     }
@@ -87,6 +95,8 @@ class RecordEntity {
         this.correctedAt = row.correctedAt();
         this.extractedType = row.extractedType();
         this.extractedNameFingerprint = row.extractedNameFingerprint();
+        this.deletedAt = row.deletedAt();
+        this.pointRemovedAt = row.pointRemovedAt();
     }
 
     UUID id() {
@@ -95,6 +105,28 @@ class RecordEntity {
 
     long rowVersion() {
         return rowVersion;
+    }
+
+    boolean deleted() {
+        return deletedAt != null;
+    }
+
+    /**
+     * The GM's delete (Story 4.5 part B): the row becomes a tombstone at {@code at}; with {@code pointRemoved} (a record
+     * that was never indexed) its point counts as removed at once. Hibernate raises the version when it writes it.
+     */
+    void delete(Instant at, boolean pointRemoved) {
+        this.deletedAt = at;
+        if (pointRemoved) {
+            this.pointRemovedAt = at;
+        }
+    }
+
+    /** The removal of its point finished at {@code at} (Story 4.5 part B); the first time only. */
+    void pointRemoved(Instant at) {
+        if (pointRemovedAt == null) {
+            this.pointRemovedAt = at;
+        }
     }
 
     /**
@@ -126,6 +158,7 @@ class RecordEntity {
 
     RecordRow row(List<UUID> passageIds) {
         return new RecordRow(id, ownerId, versionId, ordinal, firstPage, recordType, name, nameFingerprint, fields,
-                passageIds, createdAt, rowVersion, correctedAt, extractedType, extractedNameFingerprint);
+                passageIds, createdAt, rowVersion, correctedAt, extractedType, extractedNameFingerprint, deletedAt,
+                pointRemovedAt);
     }
 }

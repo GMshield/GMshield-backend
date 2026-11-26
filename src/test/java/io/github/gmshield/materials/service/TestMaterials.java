@@ -53,8 +53,18 @@ public final class TestMaterials {
         }
 
         @Override
-        public List<Located> located(Collection<UUID> ids) {
+        public List<Located> located(Collection<UUID> ids, Reach reach) {
             return List.of();
+        }
+
+        @Override
+        public Set<UUID> deleted(Collection<UUID> ids) {
+            return Set.of();
+        }
+
+        @Override
+        public int pointsRemoved(Collection<UUID> ids) {
+            return 0;
         }
 
         @Override
@@ -68,14 +78,14 @@ public final class TestMaterials {
         }
 
         @Override
-        public List<Content> read(Collection<UUID> ids) {
+        public List<Content> read(Collection<UUID> ids, Reach reach) {
             return List.of();
         }
 
         @Override
         public Carried carryCorrections(UUID fromVersionId, UUID toVersionId,
                                         java.util.function.Function<List<UUID>, java.util.Optional<Remapped>> remap) {
-            return new Carried(0, 0, 0);
+            return new Carried(0, 0, 0, 0, 0);
         }
     };
 

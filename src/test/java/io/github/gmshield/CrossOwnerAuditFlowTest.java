@@ -194,6 +194,9 @@ class CrossOwnerAuditFlowTest {
             // a record corrected as its system shows it (Story 4.5)
             route("PATCH", "/api/v1/systems/{systemId}/records/{recordId}", "systemId", "system", "recordId", "record")
                     .json(RECORD_CORRECTION).own("systemId"),
+            // a record deleted as its system shows it (Story 4.5 part B)
+            route("DELETE", "/api/v1/systems/{systemId}/records/{recordId}", "systemId", "system", "recordId",
+                    "record").own("systemId"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}", "systemId", "system",
                     "recordId", "record", "page", "1").own("systemId"),
             route("GET", "/api/v1/systems/{systemId}/records/{recordId}/pages/{page}/picture", "systemId", "system",
@@ -231,6 +234,9 @@ class CrossOwnerAuditFlowTest {
             // a record corrected as a campaign shows it (Story 4.5)
             route("PATCH", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign", "recordId",
                     "record").json(RECORD_CORRECTION).own("campaignId"),
+            // a record deleted as a campaign shows it (Story 4.5 part B)
+            route("DELETE", "/api/v1/campaigns/{campaignId}/records/{recordId}", "campaignId", "campaign",
+                    "recordId", "record").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

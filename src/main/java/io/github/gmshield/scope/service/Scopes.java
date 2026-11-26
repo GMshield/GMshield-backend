@@ -122,6 +122,11 @@ import tools.jackson.databind.node.ObjectNode;
  *       passages, so a record id of another key is not a record of the scope ({@link #recordContents} refuses it).
  *       {@link #questionInput} and {@link #searchInput} carry those keys as {@code recordTypes}, and the worker filters
  *       the index's record points to them. A record-type filter may name any key ({@link #recordTypeKey}).</li>
+ *   <li>Story 4.5 part B (a deleted record): no read here answers a record the GM deleted, except
+ *       {@link #recordContents} (an answer's read of the records its search found), which still serves a deleted one
+ *       whatever its index point ({@link ExtractedRecords.Reach#ALL}), so an answer whose search found the point (just
+ *       before its removal, or a point written back later) does not fail; a cited one is dropped. {@link #deletedRecords} names the owner's deleted records among
+ *       some ids, so a library search that finds one drops it instead of failing.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -448,6 +453,20 @@ public class Scopes {
     }
 
     /**
+     * The ids among {@code ids} of the owner's records the GM deleted (Story 4.5 part B), whatever the scope: a library
+     * search drops them from what its worker found. Nothing is decrypted.
+     */
+    public Set<UUID> deletedRecords(ResolvedScope scope, Collection<UUID> ids) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(ids, "ids");
+        requireOwner(scope);
+        Set<UUID> deleted = ids.isEmpty() ? Set.of() : reading(() -> records.deleted(ids));
+        log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("requested", ids.size())
+                .addKeyValue("deleted", deleted.size()).log("scope.deleted_records_read");
+        return deleted;
+    }
+
+    /**
      * The records of {@code scope} whose name equals {@code name}, of the type key {@code recordType} when it is not
      * null, as the class says (Story 4.3 part B); by id. A record among {@code returned} (the ids the worker found) is
      * kept even when its records run is not indexed.
@@ -526,12 +545,13 @@ public class Scopes {
      * Runs in the caller's read transaction.
      */
     private Optional<List<ScopedRecordContent>> contents(ResolvedScope scope, List<UUID> wanted, boolean refuse) {
-        List<Placed> placed = located(scope, records.located(wanted));
+        ExtractedRecords.Reach reach = refuse ? ExtractedRecords.Reach.ALL : ExtractedRecords.Reach.LIVE;
+        List<Placed> placed = located(scope, records.located(wanted, reach));
         if (refuse && placed.size() != wanted.size()) {
             return Optional.empty();
         }
         Map<UUID, ExtractedRecords.Content> contents = new HashMap<>();
-        records.read(placed.stream().map(one -> one.record().id()).toList())
+        records.read(placed.stream().map(one -> one.record().id()).toList(), reach)
                 .forEach(content -> contents.put(content.id(), content));
         List<ScopedRecordContent> found = new ArrayList<>();
         for (Placed one : placed) {

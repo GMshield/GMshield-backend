@@ -143,6 +143,51 @@ class JpaIndexStore implements IndexStore {
         return Optional.of(moved);
     }
 
+    @Override
+    public void insertRecordRemoval(RecordRemovalRow row) {
+        EntityManager em = em();
+        em.persist(new RecordRemovalEntity(row));
+        em.flush();
+    }
+
+    @Override
+    public Optional<RecordRemovalRow> findRecordRemoval(UUID jobId) {
+        return recordRemoval(jobId).map(RecordRemovalEntity::row);
+    }
+
+    @Override
+    public List<RecordRemovalRow> recordRemovals(Collection<UUID> jobIds) {
+        if (jobIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery("select r from RecordRemoval r where r.jobId in :ids order by r.jobId",
+                        RecordRemovalEntity.class)
+                .setParameter("ids", List.copyOf(jobIds)).getResultList().stream().map(RecordRemovalEntity::row)
+                .toList();
+    }
+
+    @Override
+    public Optional<RecordRemovalRow> moveRecordRemoval(UUID jobId, UUID newJobId) {
+        Optional<RecordRemovalEntity> found = recordRemoval(jobId);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        RecordRemovalRow before = found.get().row();
+        RecordRemovalRow moved = new RecordRemovalRow(newJobId, before.ownerId(), before.versionId(),
+                before.recordId());
+        EntityManager em = em();
+        em.remove(found.get());
+        em.flush();
+        em.persist(new RecordRemovalEntity(moved));
+        em.flush();
+        return Optional.of(moved);
+    }
+
+    private Optional<RecordRemovalEntity> recordRemoval(UUID jobId) {
+        return em().createQuery("select r from RecordRemoval r where r.jobId = :job", RecordRemovalEntity.class)
+                .setParameter("job", jobId).getResultList().stream().findFirst();
+    }
+
     private Optional<IndexChangeEntity> change(UUID jobId) {
         return em().createQuery("select c from IndexChange c where c.jobId = :job", IndexChangeEntity.class)
                 .setParameter("job", jobId).getResultList().stream().findFirst();

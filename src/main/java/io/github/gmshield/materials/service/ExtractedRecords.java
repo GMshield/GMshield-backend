@@ -4,6 +4,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import org.springframework.modulith.NamedInterface;
@@ -26,9 +27,24 @@ import org.springframework.modulith.NamedInterface;
  * {@link #MAX_FIELD_VALUE}, in code points) hold for an extraction's report and for the GM's correction alike; and a
  * version that reprocessing created takes over, at its acceptance, the corrections of the version it replaces
  * ({@link #carryCorrections}).
+ *
+ * <p>Story 4.5 part B: a record the GM deleted stays as a tombstone, and no read here answers it, except
+ * {@link #located(Collection, Reach)} and {@link #read(Collection, Reach)} with {@link Reach#ALL} (an answer's read of
+ * the records its search found, whose index may still hold the point) and {@link #deleted}. The index inputs
+ * ({@link #firstPages}, {@link #readRange}) never take one, so its point is never written again;
+ * {@link #pointsRemoved} records that its point is gone; and {@link #carryCorrections} carries tombstones over too.
  */
 @NamedInterface("service")
 public interface ExtractedRecords {
+
+    /** Which records a read by id answers (Story 4.5 part B). */
+    @NamedInterface("service")
+    enum Reach {
+        /** Live records only: never one the GM deleted. */
+        LIVE,
+        /** Every record, deleted ones too, whatever their index point (an answer's read of what its search found). */
+        ALL
+    }
 
     /** A record's name: non-blank, at most this many code points. */
     int MAX_NAME = 200;
@@ -117,10 +133,21 @@ public interface ExtractedRecords {
     }
 
     /**
-     * The records with these ids, in the order given, each once; an id that is not one of the owner's records is left
-     * out. Nothing is decrypted.
+     * The live records with these ids, in the order given, each once; an id that is not one of the owner's live records
+     * is left out. Nothing is decrypted.
      */
-    List<Located> located(Collection<UUID> ids);
+    default List<Located> located(Collection<UUID> ids) {
+        return located(ids, Reach.LIVE);
+    }
+
+    /** As {@link #located(Collection)}, the records {@code reach} takes (Story 4.5 part B). */
+    List<Located> located(Collection<UUID> ids, Reach reach);
+
+    /**
+     * The ids among these of the owner's records the GM deleted (Story 4.5 part B), whatever their point; nothing is
+     * decrypted.
+     */
+    Set<UUID> deleted(Collection<UUID> ids);
 
     /**
      * The records of these versions whose name equals {@code name} once both are in their unique form (trimmed, NFC,
@@ -130,7 +157,10 @@ public interface ExtractedRecords {
      */
     List<Located> named(Collection<UUID> versionIds, String name);
 
-    /** The decrypted names of the owner's records with these ids; an unknown id or another owner's is left out. */
+    /**
+     * The decrypted names of the owner's live records with these ids; an unknown id, another owner's or a deleted one is
+     * left out.
+     */
     Map<UUID, String> names(Collection<UUID> ids);
 
     /**
@@ -151,10 +181,22 @@ public interface ExtractedRecords {
     }
 
     /**
-     * The records with these ids, decrypted, in the order given, each once; an id that is not one of the owner's
-     * records is left out. The caller checks the ids against what it may read before it calls this.
+     * The live records with these ids, decrypted, in the order given, each once; an id that is not one of the owner's
+     * live records is left out. The caller checks the ids against what it may read before it calls this.
      */
-    List<Content> read(Collection<UUID> ids);
+    default List<Content> read(Collection<UUID> ids) {
+        return read(ids, Reach.LIVE);
+    }
+
+    /** As {@link #read(Collection)}, the records {@code reach} takes (Story 4.5 part B). */
+    List<Content> read(Collection<UUID> ids, Reach reach);
+
+    /**
+     * The index points of the owner's deleted records with these ids are removed (Story 4.5 part B, an
+     * {@code index.record_removal} job's completion). A live record, one already
+     * marked or an unknown id is left as it is. Answers how many were marked.
+     */
+    int pointsRemoved(Collection<UUID> ids);
 
     /**
      * Where a corrected record's passages land in a new version (Story 4.5): the new version's passages that stand where
@@ -174,21 +216,28 @@ public interface ExtractedRecords {
 
     /**
      * What a carry-over did (Story 4.5): the corrections that matched a new record, those copied into the new version,
-     * and those dropped because none of their pages has a passage in it.
+     * and those dropped because none of their pages has a passage in it; from part B, the new records deleted because a
+     * deleted record matched them ({@code deleted}), and the deleted records that matched none, copied in as tombstones
+     * ({@code tombstoned}).
      */
     @NamedInterface("service")
-    record Carried(int matched, int copied, int dropped) {
+    record Carried(int matched, int copied, int dropped, int deleted, int tombstoned) {
     }
 
     /**
      * Carries every correction of the version {@code fromVersionId} over to the version {@code toVersionId}, which
-     * reprocessing made from it and which is being accepted (Story 4.5), in the caller's transaction. A record of the new
-     * version matches a correction when its (type key, name fingerprint) equals the correction's extracted key, or, when
-     * none does, its corrected key; of several, the one whose first page is nearest the correction's wins, then the
-     * lowest ordinal, and a record takes at most one correction. A matched record takes the corrected type, name and fields (and the
-     * correction's time and extracted key) and keeps its own references. A correction that matches none is copied into
-     * the new version as a new record with its corrected values, its passages those {@code remap} finds for its old
-     * passages (empty: the correction is dropped and counted). Answers the counts.
+     * reprocessing made from it and which is being accepted (Story 4.5), in the caller's transaction. A record of the
+     * new version matches a correction when its (type key, name fingerprint) equals the correction's extracted key, or,
+     * when none does, its corrected key; of several, the one whose first page is nearest the correction's wins, then
+     * the lowest ordinal, and a record takes at most one correction. A matched record takes the corrected type, name
+     * and fields (and the correction's time and extracted key) and keeps its own references. A correction that matches
+     * none is copied into the new version as a new record with its corrected values, its passages those {@code remap}
+     * finds for its old passages (empty: the correction is dropped and counted). From Story 4.5 part B the version's
+     * deleted records are carried over the same way, after the corrections, among the new records no correction took: a
+     * deleted record matches by its extracted key first (its own key when it was never corrected), then by its own key,
+     * and the matched new record is deleted too, its point counted as removed (it was never indexed); one that matches
+     * none is copied in as a tombstone with its keys and no passage, so a later reprocess still finds it. Answers the
+     * counts.
      */
     Carried carryCorrections(UUID fromVersionId, UUID toVersionId,
                              Function<List<UUID>, Optional<Remapped>> remap);

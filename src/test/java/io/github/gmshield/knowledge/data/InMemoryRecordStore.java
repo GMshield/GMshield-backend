@@ -2,12 +2,14 @@ package io.github.gmshield.knowledge.data;
 
 import io.github.gmshield.shared.data.RollbackUndo;
 import io.github.gmshield.shared.service.OwnerContext;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,9 +18,10 @@ import java.util.regex.Pattern;
 /**
  * {@code record} and {@code record_passage} in memory (Story 4.2), for tests that run without PostgreSQL. Like
  * Hibernate's {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without
- * one; like the table, it keeps the type check and at least one link per record. A write undoes itself when its
- * transaction rolls back. The passage and version keys are PostgreSQL's alone ({@code IngestionIntegrationTest},
- * {@code MaterialDeletionIntegrationTest}).
+ * one; like the table, it keeps the type check and at least one link per live record (a tombstone a carry-over copies
+ * has none, Story 4.5 part B), and like the JPA store it leaves deleted records out of every read that does. A write
+ * undoes itself when its transaction rolls back. The passage and version keys are PostgreSQL's alone
+ * ({@code IngestionIntegrationTest}, {@code MaterialDeletionIntegrationTest}).
  */
 public class InMemoryRecordStore implements RecordStore {
 
@@ -32,7 +35,8 @@ public class InMemoryRecordStore implements RecordStore {
         UUID owner = OwnerContext.require();
         for (RecordRow row : rows) {
             if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || !TYPE.matcher(row.type()).matches()
-                    || row.passageIds().isEmpty() || row.firstPage() < 1 || row.ordinal() < 0) {
+                    || (row.passageIds().isEmpty() && !row.deleted()) || row.firstPage() < 1 || row.ordinal() < 0
+                    || (row.pointRemovedAt() != null && !row.deleted())) {
                 throw new IllegalStateException("key or check refused");
             }
         }
@@ -44,6 +48,16 @@ public class InMemoryRecordStore implements RecordStore {
 
     @Override
     public List<RecordRow> ofVersion(UUID versionId) {
+        return allOfVersion(versionId).stream().filter(row -> !row.deleted()).toList();
+    }
+
+    @Override
+    public List<RecordRow> tombstones(UUID versionId) {
+        return allOfVersion(versionId).stream().filter(RecordRow::deleted)
+                .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
+    }
+
+    private List<RecordRow> allOfVersion(UUID versionId) {
         UUID owner = OwnerContext.require();
         return records.values().stream().filter(row -> row.ownerId().equals(owner) && row.versionId().equals(versionId))
                 .sorted(Comparator.comparingInt(RecordRow::firstPage).thenComparingInt(RecordRow::ordinal)
@@ -52,28 +66,33 @@ public class InMemoryRecordStore implements RecordStore {
 
     @Override
     public synchronized int deleteRange(UUID versionId, int firstPage, int lastPage) {
-        return delete(ofVersion(versionId).stream().filter(row -> row.firstPage() >= firstPage
+        return delete(allOfVersion(versionId).stream().filter(row -> row.firstPage() >= firstPage
                 && row.firstPage() <= lastPage).toList());
     }
 
     @Override
     public synchronized int deleteOfVersion(UUID versionId) {
-        return delete(ofVersion(versionId));
+        return delete(allOfVersion(versionId));
     }
 
     @Override
     public Map<String, Long> countsByType(Collection<UUID> versionIds) {
         UUID owner = OwnerContext.require();
         Map<String, Long> counts = new TreeMap<>();
-        records.values().stream().filter(row -> row.ownerId().equals(owner) && versionIds.contains(row.versionId()))
-                .forEach(row -> counts.merge(row.type(), 1L, Long::sum));
+        records.values().stream().filter(row -> row.ownerId().equals(owner) && versionIds.contains(row.versionId())
+                && !row.deleted()).forEach(row -> counts.merge(row.type(), 1L, Long::sum));
         return counts;
+    }
+
+    @Override
+    public Optional<UUID> versionOf(UUID id) {
+        return find(id).map(RecordRow::versionId);
     }
 
     @Override
     public Optional<RecordRow> find(UUID id) {
         UUID owner = OwnerContext.require();
-        return Optional.ofNullable(records.get(id)).filter(row -> row.ownerId().equals(owner))
+        return Optional.ofNullable(records.get(id)).filter(row -> row.ownerId().equals(owner) && !row.deleted())
                 .map(row -> withLinks(row, row.passageIds().stream().sorted().toList()));
     }
 
@@ -81,7 +100,7 @@ public class InMemoryRecordStore implements RecordStore {
     public List<RecordRow> ofTypeIn(Collection<UUID> versionIds, String type) {
         UUID owner = OwnerContext.require();
         return records.values().stream().filter(row -> row.ownerId().equals(owner)
-                && versionIds.contains(row.versionId()) && row.type().equals(type))
+                && versionIds.contains(row.versionId()) && row.type().equals(type) && !row.deleted())
                 .map(row -> withLinks(row, List.of())).toList();
     }
 
@@ -91,9 +110,13 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public List<RecordRow> findAll(Collection<UUID> ids) {
+    public List<RecordRow> findAll(Collection<UUID> ids, Reach reach) {
         UUID owner = OwnerContext.require();
-        return ids.stream().distinct().map(records::get).filter(row -> row != null && row.ownerId().equals(owner))
+        return ids.stream().distinct().map(records::get).filter(row -> row != null && row.ownerId().equals(owner)
+                        && switch (reach) {
+                            case LIVE -> !row.deleted();
+                            case ALL -> true;
+                        })
                 .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
     }
 
@@ -101,7 +124,7 @@ public class InMemoryRecordStore implements RecordStore {
     public List<RecordRow> named(Collection<UUID> versionIds, byte[] nameFingerprint) {
         UUID owner = OwnerContext.require();
         return records.values().stream().filter(row -> row.ownerId().equals(owner)
-                && versionIds.contains(row.versionId()) && row.nameFingerprint() != null
+                && versionIds.contains(row.versionId()) && !row.deleted() && row.nameFingerprint() != null
                 && Arrays.equals(row.nameFingerprint(), nameFingerprint))
                 .sorted(Comparator.comparing(RecordRow::id))
                 .map(row -> withLinks(row, row.passageIds().stream().sorted().toList())).toList();
@@ -111,7 +134,7 @@ public class InMemoryRecordStore implements RecordStore {
     public synchronized Optional<RecordRow> correct(UUID id, long version, RecordCorrection correction) {
         UUID owner = OwnerContext.require();
         RecordRow before = records.get(id);
-        if (before == null || !before.ownerId().equals(owner)) {
+        if (before == null || !before.ownerId().equals(owner) || before.deleted()) {
             return Optional.empty();
         }
         if (before.version() != version) {
@@ -133,6 +156,42 @@ public class InMemoryRecordStore implements RecordStore {
         }
         written(before, correction, extractedType, extractedNameFingerprint);
         return true;
+    }
+
+    @Override
+    public synchronized boolean delete(UUID id, Instant at, boolean pointRemoved) {
+        UUID owner = OwnerContext.require();
+        RecordRow before = records.get(id);
+        if (before == null || !before.ownerId().equals(owner) || before.deleted()) {
+            return false;
+        }
+        replace(before, at, pointRemoved ? at : null);
+        return true;
+    }
+
+    @Override
+    public synchronized int pointsRemoved(Collection<UUID> ids, Instant at) {
+        UUID owner = OwnerContext.require();
+        int marked = 0;
+        for (UUID id : Set.copyOf(ids)) {
+            RecordRow before = records.get(id);
+            if (before != null && before.ownerId().equals(owner) && before.deleted()
+                    && before.pointRemovedAt() == null) {
+                replace(before, before.deletedAt(), at);
+                marked++;
+            }
+        }
+        return marked;
+    }
+
+    /** The row with these delete times, its version raised by one, as the table's update does. */
+    private void replace(RecordRow before, Instant deletedAt, Instant pointRemovedAt) {
+        RecordRow after = new RecordRow(before.id(), before.ownerId(), before.versionId(), before.ordinal(),
+                before.firstPage(), before.type(), before.name(), before.nameFingerprint(), before.fields(),
+                before.passageIds(), before.createdAt(), before.version() + 1, before.correctedAt(),
+                before.extractedType(), before.extractedNameFingerprint(), deletedAt, pointRemovedAt);
+        records.put(after.id(), after);
+        RollbackUndo.onRollback(() -> records.put(before.id(), before));
     }
 
     /** Writes the correction over the row, its version raised by one, as the table's update does. */

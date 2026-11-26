@@ -22,6 +22,10 @@
  * <p>From Story 3.1 part B, {@code service.SystemMaterialsDeletion} is this module's part of a system's deletion
  * ({@code library.service.SystemDeletionHandler}): it cancels and discards the versions of the materials that go, and
  * later removes them, their rows and files, after one {@code index.removal} per version.
+ *
+ * <p>From Story 4.5 part B, a record the GM deleted loses its index point by a job of kind {@code index.record_removal}
+ * ({@code service.RecordRemovals}, created through {@code service.RecordIndexing}), whose input is a
+ * {@code record_removal} row (V42); the removal retry sweep retries it as it does {@code index.removal}.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Materials",
         allowedDependencies = {"shared :: service", "vault :: service", "jobs :: service", "library :: service"})

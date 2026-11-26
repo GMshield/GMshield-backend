@@ -24,6 +24,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -42,8 +44,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * {@link #named} compares with a search's query; {@link #names} decrypts names for a search's answer only. From Story
  * 4.3 part C {@link #read} decrypts names and fields for an answer (the records handed to the model, and those it
  * cited, stored by value with the turn). From Story 4.5 {@link #carryCorrections} carries a replaced version's
- * corrections over to the version reprocessing made from it, each value encrypted again bound to its new row. Nothing
- * here logs a name or a field.
+ * corrections over to the version reprocessing made from it, each value encrypted again bound to its new row. From Story
+ * 4.5 part B a deleted record (a tombstone) is read only by {@link #located(Collection, Reach)} and
+ * {@link #read(Collection, Reach)} with {@link Reach#ALL}, and by {@link #deleted}; {@link #pointsRemoved}
+ * marks its point gone, and {@link #carryCorrections} carries tombstones over too, never reading their name or fields.
+ * Nothing here logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -116,15 +121,33 @@ public class ExtractedRecordStore implements ExtractedRecords {
     }
 
     @Override
-    public List<Located> located(Collection<UUID> ids) {
+    public List<Located> located(Collection<UUID> ids, Reach reach) {
         OwnerContext.require();
         List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
         if (wanted.isEmpty()) {
             return List.of();
         }
         Map<UUID, RecordRow> found = new HashMap<>();
-        store.findAll(wanted).forEach(row -> found.put(row.id(), row));
+        store.findAll(wanted, reachOf(reach)).forEach(row -> found.put(row.id(), row));
         return wanted.stream().filter(found::containsKey).map(id -> located(found.get(id))).toList();
+    }
+
+    @Override
+    public Set<UUID> deleted(Collection<UUID> ids) {
+        OwnerContext.require();
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        if (wanted.isEmpty()) {
+            return Set.of();
+        }
+        return store.findAll(wanted, RecordStore.Reach.ALL).stream().filter(RecordRow::deleted).map(RecordRow::id)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    @Override
+    public int pointsRemoved(Collection<UUID> ids) {
+        requireTransaction();
+        List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
+        return wanted.isEmpty() ? 0 : store.pointsRemoved(wanted, clock.instant().truncatedTo(ChronoUnit.MICROS));
     }
 
     @Override
@@ -143,21 +166,21 @@ public class ExtractedRecordStore implements ExtractedRecords {
         List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
         Map<UUID, String> found = new HashMap<>();
         if (!wanted.isEmpty()) {
-            store.findAll(wanted).forEach(row -> found.put(row.id(), vault.decryptText(name(row.id(), owner),
-                    row.name())));
+            store.findAll(wanted, RecordStore.Reach.LIVE).forEach(row -> found.put(row.id(),
+                    vault.decryptText(name(row.id(), owner), row.name())));
         }
         return Map.copyOf(found);
     }
 
     @Override
-    public List<Content> read(Collection<UUID> ids) {
+    public List<Content> read(Collection<UUID> ids, Reach reach) {
         UUID owner = OwnerContext.require();
         List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
         if (wanted.isEmpty()) {
             return List.of();
         }
         Map<UUID, RecordRow> found = new HashMap<>();
-        store.findAll(wanted).forEach(row -> found.put(row.id(), row));
+        store.findAll(wanted, reachOf(reach)).forEach(row -> found.put(row.id(), row));
         return wanted.stream().filter(found::containsKey).map(found::get).map(row -> new Content(row.id(),
                 row.versionId(), row.type(), row.firstPage(), vault.decryptText(name(row.id(), owner), row.name()),
                 fieldsOf(vault.decrypt(fields(row.id(), owner), row.fields())))).toList();
@@ -168,12 +191,14 @@ public class ExtractedRecordStore implements ExtractedRecords {
                                     Function<List<UUID>, Optional<Remapped>> remap) {
         UUID owner = requireTransaction();
         List<RecordRow> corrections = store.ofVersion(fromVersionId).stream().filter(RecordRow::corrected).toList();
-        if (corrections.isEmpty()) {
-            return new Carried(0, 0, 0);
+        List<RecordRow> tombstones = store.tombstones(fromVersionId);
+        if (corrections.isEmpty() && tombstones.isEmpty()) {
+            return new Carried(0, 0, 0, 0, 0);
         }
-        List<RecordRow> fresh = new ArrayList<>(store.ofVersion(toVersionId).stream()
-                .filter(row -> !row.corrected()).toList());
-        int nextOrdinal = store.ofVersion(toVersionId).stream().mapToInt(RecordRow::ordinal).max().orElse(-1) + 1;
+        List<RecordRow> newRecords = store.ofVersion(toVersionId);
+        List<RecordRow> fresh = new ArrayList<>(newRecords.stream().filter(row -> !row.corrected()).toList());
+        int nextOrdinal = Stream.concat(newRecords.stream(), store.tombstones(toVersionId).stream())
+                .mapToInt(RecordRow::ordinal).max().orElse(-1) + 1;
         Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
         int matched = 0;
         int dropped = 0;
@@ -195,12 +220,60 @@ public class ExtractedRecordStore implements ExtractedRecords {
             }
             UUID id = Ids.newId();
             RecordCorrection values = reencrypted(correction, id, owner);
-            copies.add(new RecordRow(id, owner, toVersionId, nextOrdinal++, remapped.get().firstPage(), values.type(),
-                    values.name(), values.nameFingerprint(), values.fields(), remapped.get().passageIds(), now, 0,
-                    correction.correctedAt(), correction.extractedType(), correction.extractedNameFingerprint()));
+            copies.add(new RecordRow(id, owner, toVersionId, nextOrdinal++, remapped.get().firstPage(),
+                    values.type(), values.name(), values.nameFingerprint(), values.fields(), remapped.get().passageIds(),
+                    now, 0, correction.correctedAt(), correction.extractedType(),
+                    correction.extractedNameFingerprint()));
+        }
+        int copied = copies.size();
+        int deleted = 0;
+        for (RecordRow tombstone : tombstones) {
+            Optional<RecordRow> match = matchTombstone(tombstone, fresh);
+            if (match.isPresent()) {
+                fresh.remove(match.get());
+                if (store.delete(match.get().id(), tombstone.deletedAt(), true)) {
+                    deleted++;
+                }
+                continue;
+            }
+            copies.add(tombstoneCopy(tombstone, owner, toVersionId, nextOrdinal++, now));
         }
         store.insert(copies);
-        return new Carried(matched, copies.size(), dropped);
+        return new Carried(matched, copied, dropped, deleted, copies.size() - copied);
+    }
+
+    /**
+     * The record of the new version a deleted record matches (Story 4.5 part B): first among those whose (type,
+     * fingerprint) equals its extracted key (its own key when it was never corrected), and only when none does among
+     * those that equal its own key; within each, the nearest first page wins, then the nearest ordinal (a same-page
+     * duplicate the GM kept is not the one taken), then the lowest ordinal.
+     */
+    private static Optional<RecordRow> matchTombstone(RecordRow tombstone, List<RecordRow> fresh) {
+        String extractedType = tombstone.corrected() ? tombstone.extractedType() : tombstone.type();
+        byte[] extractedFingerprint = tombstone.corrected() ? tombstone.extractedNameFingerprint()
+                : tombstone.nameFingerprint();
+        Optional<RecordRow> extracted = nearestTo(tombstone, fresh.stream().filter(row ->
+                sameKey(row, extractedType, extractedFingerprint)).toList());
+        return extracted.isPresent() ? extracted : nearestTo(tombstone, fresh.stream().filter(row ->
+                sameKey(row, tombstone.type(), tombstone.nameFingerprint())).toList());
+    }
+
+    /**
+     * A deleted record copied into the new version as a tombstone (Story 4.5 part B): a new id, no passage, its first
+     * page, its type key and name fingerprint, its correction's time and extracted key, deleted when it was and its point
+     * removed now (it is never indexed). Its name and fields are not read: an empty name and no field are stored,
+     * encrypted bound to the new row, since a tombstone is never shown.
+     */
+    private RecordRow tombstoneCopy(RecordRow tombstone, UUID owner, UUID toVersionId, int ordinal, Instant now) {
+        UUID id = Ids.newId();
+        return new RecordRow(id, owner, toVersionId, ordinal, tombstone.firstPage(), tombstone.type(),
+                vault.encryptText(name(id, owner), ""), tombstone.nameFingerprint(),
+                vault.encrypt(fields(id, owner), fieldsJson(List.of())), List.of(), now, 0, tombstone.correctedAt(),
+                tombstone.extractedType(), tombstone.extractedNameFingerprint(), tombstone.deletedAt(), now);
+    }
+
+    private static RecordStore.Reach reachOf(Reach reach) {
+        return reach == Reach.ALL ? RecordStore.Reach.ALL : RecordStore.Reach.LIVE;
     }
 
     /**
@@ -218,6 +291,14 @@ public class ExtractedRecordStore implements ExtractedRecords {
     private static Optional<RecordRow> nearest(RecordRow correction, List<RecordRow> candidates) {
         return candidates.stream().min(Comparator.<RecordRow>comparingInt(row ->
                         Math.abs(row.firstPage() - correction.firstPage()))
+                .thenComparingInt(RecordRow::ordinal).thenComparing(RecordRow::id));
+    }
+
+    /** As {@link #nearest}, but a page's tie goes to the ordinal nearest the deleted record's, then the lowest. */
+    private static Optional<RecordRow> nearestTo(RecordRow tombstone, List<RecordRow> candidates) {
+        return candidates.stream().min(Comparator.<RecordRow>comparingInt(row ->
+                        Math.abs(row.firstPage() - tombstone.firstPage()))
+                .thenComparingInt(row -> Math.abs(row.ordinal() - tombstone.ordinal()))
                 .thenComparingInt(RecordRow::ordinal).thenComparing(RecordRow::id));
     }
 

@@ -59,6 +59,9 @@ import tools.jackson.databind.JsonNode;
  *       first: those the worker
  *       returned in its order, then the others by name and id; then every other id in the worker's order. At most
  *       {@value Searches#MAX_RESULTS} are stored, each as a passage or a record with its version and tier.</li>
+ *   <li>Story 4.5 part B: of the ids not placed as records, those of records the GM deleted
+ *       ({@link Scopes#deletedRecords}, whose point the index may still hold until its removal ends) are dropped before
+ *       the passages are checked, so the search completes without them.</li>
  * </ul>
  *
  * Lines carry ids, counts and codes, never the query or a passage's text.
@@ -113,7 +116,7 @@ public class SearchJobs implements JobHandler {
 
     @Override
     public void completed(JobRef job, JsonNode result) {
-        List<UUID> ids = ids(result);
+        List<UUID> returned = ids(result);
         Optional<SearchRow> found = pending(job, "completed");
         if (found.isEmpty()) {
             return;
@@ -122,17 +125,23 @@ public class SearchJobs implements JobHandler {
         ResolvedScope scope = searches.scopeOf(search, false);
         String type = search.recordType();
         Map<UUID, ScopedRecord> records = new LinkedHashMap<>();
-        if (!ids.isEmpty()) {
-            scopes.records(scope, ids).forEach(record -> records.put(record.recordId(), record));
+        if (!returned.isEmpty()) {
+            scopes.records(scope, returned).forEach(record -> records.put(record.recordId(), record));
         }
-        List<UUID> passageIds = ids.stream().filter(id -> !records.containsKey(id)).toList();
+        // Story 4.5 part B: of the ids not placed as records, those of records the GM deleted (whose point the index
+        // still held) are dropped, not refused, before the passages are checked. Read after the records, so a delete
+        // committed in between drops the record instead of failing the search.
+        List<UUID> unplaced = returned.stream().filter(id -> !records.containsKey(id)).toList();
+        Set<UUID> deleted = unplaced.isEmpty() ? Set.of() : scopes.deletedRecords(scope, unplaced);
+        List<UUID> ids = returned.stream().filter(id -> !deleted.contains(id)).toList();
+        List<UUID> passageIds = unplaced.stream().filter(id -> !deleted.contains(id)).toList();
         List<CitedPlace> places = passageIds.isEmpty() ? List.of() : scopes.references(scope, passageIds);
         long wrongType = type == null ? 0 : places.size() + records.values().stream()
                 .filter(record -> !type.equals(record.recordType())).count();
         if (places.size() != passageIds.size() || wrongType > 0) {
             store.endSearch(search.id(), SearchRow.FAILED, REFUSED_CODE);
             log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("searchId", search.id())
-                    .addKeyValue("ids", ids.size()).addKeyValue("refused", passageIds.size() - places.size())
+                    .addKeyValue("ids", returned.size()).addKeyValue("refused", passageIds.size() - places.size())
                     .addKeyValue("wrongType", wrongType).addKeyValue("reason", REFUSED_CODE)
                     .log("search.result_refused");
             return;
@@ -161,7 +170,8 @@ public class SearchJobs implements JobHandler {
         log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("searchId", search.id())
                 .addKeyValue("results", rows.size())
                 .addKeyValue("records", rows.stream().filter(SearchResultRow::record).count())
-                .addKeyValue("exactNames", named.size()).log("search.done");
+                .addKeyValue("exactNames", named.size()).addKeyValue("deletedRecords", deleted.size())
+                .log("search.done");
     }
 
     /**
