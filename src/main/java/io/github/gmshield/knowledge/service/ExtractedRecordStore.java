@@ -1,6 +1,7 @@
 package io.github.gmshield.knowledge.service;
 
 import io.github.gmshield.knowledge.data.RecordCorrection;
+import io.github.gmshield.knowledge.data.RecordRelationStore;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.library.service.Library;
@@ -48,7 +49,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * 4.5 part B a deleted record (a tombstone) is read only by {@link #located(Collection, Reach)} and
  * {@link #read(Collection, Reach)} with {@link Reach#ALL}, and by {@link #deleted}; {@link #pointsRemoved}
  * marks its point gone, and {@link #carryCorrections} carries tombstones over too, never reading their name or fields.
- * Nothing here logs a name or a field.
+ * From Story 5.5 part A {@link #carryCorrections} also moves the overrides of the old version's records to the records
+ * of the new version they match ({@link RecordRelations#carry}). Nothing here logs a name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -59,11 +61,13 @@ public class ExtractedRecordStore implements ExtractedRecords {
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     private final RecordStore store;
+    private final RecordRelationStore relations;
     private final Vault vault;
     private final Clock clock;
 
-    ExtractedRecordStore(RecordStore store, Vault vault, ObjectProvider<Clock> clock) {
+    ExtractedRecordStore(RecordStore store, RecordRelationStore relations, Vault vault, ObjectProvider<Clock> clock) {
         this.store = store;
+        this.relations = relations;
         this.vault = vault;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -193,7 +197,7 @@ public class ExtractedRecordStore implements ExtractedRecords {
         List<RecordRow> corrections = store.ofVersion(fromVersionId).stream().filter(RecordRow::corrected).toList();
         List<RecordRow> tombstones = store.tombstones(fromVersionId);
         if (corrections.isEmpty() && tombstones.isEmpty()) {
-            return new Carried(0, 0, 0, 0, 0);
+            return new Carried(0, 0, 0, 0, 0, carryOverrides(fromVersionId, toVersionId));
         }
         List<RecordRow> newRecords = store.ofVersion(toVersionId);
         List<RecordRow> fresh = new ArrayList<>(newRecords.stream().filter(row -> !row.corrected()).toList());
@@ -239,7 +243,24 @@ public class ExtractedRecordStore implements ExtractedRecords {
             copies.add(tombstoneCopy(tombstone, owner, toVersionId, nextOrdinal++, now));
         }
         store.insert(copies);
-        return new Carried(matched, copied, dropped, deleted, copies.size() - copied);
+        return new Carried(matched, copied, dropped, deleted, copies.size() - copied,
+                carryOverrides(fromVersionId, toVersionId));
+    }
+
+    /**
+     * The overrides of the old version's live records moved to the new version's records (Story 5.5 part A, Q2), once
+     * the corrections are carried, as {@link RecordRelations#carry} says: by the old record's (type key, name
+     * fingerprint), the nearest first page winning, then the lowest ordinal.
+     */
+    private int carryOverrides(UUID fromVersionId, UUID toVersionId) {
+        List<RecordRow> newRecords = new ArrayList<>();
+        return RecordRelations.carry(store, relations, fromVersionId, toVersionId, old -> {
+            if (newRecords.isEmpty()) {
+                newRecords.addAll(store.ofVersion(toVersionId));
+            }
+            return nearest(old, newRecords.stream().filter(row -> sameKey(row, old.type(), old.nameFingerprint()))
+                    .toList());
+        });
     }
 
     /**

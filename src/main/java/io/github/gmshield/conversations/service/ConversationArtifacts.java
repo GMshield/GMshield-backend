@@ -30,15 +30,21 @@ public interface ConversationArtifacts {
     void deleteSaved(UUID campaignId, UUID conversationId, Set<UUID> ids);
 
     /**
-     * An artifact saved from a conversation as its deletion's dialog lists it: its id, its newest version's name and its
-     * record type's key. {@code toString} names the id and the type only.
+     * An artifact saved from a conversation as its deletion's dialog lists it: its id, its newest version's name, its
+     * record type's key and (Story 5.5 part A) whether it overrides a record. {@code toString} names the id and the type
+     * only.
      */
-    record SavedArtifact(UUID id, String name, String recordType) {
+    record SavedArtifact(UUID id, String name, String recordType, boolean overrides) {
 
         public SavedArtifact {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(name, "name");
             Objects.requireNonNull(recordType, "recordType");
+        }
+
+        /** An artifact that overrides nothing. */
+        public SavedArtifact(UUID id, String name, String recordType) {
+            this(id, name, recordType, false);
         }
 
         @Override

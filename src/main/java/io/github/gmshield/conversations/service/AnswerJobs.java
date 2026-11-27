@@ -175,8 +175,9 @@ public class AnswerJobs implements JobHandler {
             if (content.content() != null) {
                 fields.add(new JobRecord.Field(ScopedRecordContent.CONTENT_FIELD, content.content()));
             }
+            // Story 5.5 part A: the overrides the scope marked, both sides in the turn's frozen scope.
             return new JobRecord(record.recordId(), record.tier().word(), record.recordType(), record.name(), fields,
-                    record.page(), record.sectionPath());
+                    record.page(), record.sectionPath(), content.overrides(), content.overriddenBy());
         }).toList();
     }
 

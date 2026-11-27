@@ -3,6 +3,7 @@ package io.github.gmshield.artifacts.web;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.artifacts.service.Artifacts;
 import io.github.gmshield.conversations.service.TurnReference;
+import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
@@ -26,6 +27,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -54,6 +56,14 @@ import org.springframework.web.bind.annotation.RestController;
  * the shape of a turn's references, each {@code removed} as of the answer; empty for one written by hand). The save
  * itself is {@link DraftSaveController}. From Story 5.4 part B (contract 1.49.0) {@code conversationId} is null as
  * soon as that conversation's deletion starts.
+ *
+ * <p>Story 5.5 part A (contract 1.50.0): a {@code PUT} on {@code .../override} marks the artifact as overriding one
+ * record of the system tier of its campaign's scope (or points its mark to another), and a {@code DELETE} removes the
+ * mark (204, safe to repeat); both apply from the next question. A record that is no target is
+ * {@code artifact.override_target} (400), one another artifact of the campaign overrides {@code artifact.override_taken}
+ * (409, {@code params.artifactId} naming it). {@code .../override-targets} lists the records an artifact of the
+ * campaign can override, alphabetical, filtered by type and name. Every artifact answer carries {@code overrides}, null
+ * for none.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -64,6 +74,8 @@ class ArtifactController {
     static final String VERSIONS = ARTIFACT + "/versions";
     static final String VERSION = VERSIONS + "/{number}";
     static final String RESTORE = VERSION + "/restore";
+    static final String OVERRIDE = ARTIFACT + "/override";
+    static final String OVERRIDE_TARGETS = "/api/v1/campaigns/{campaignId}/override-targets";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -105,10 +117,35 @@ class ArtifactController {
         }
     }
 
+    @Schema(name = "ArtifactOverride", requiredProperties = {"recordId", "name", "recordType", "systemId", "removed"},
+            description = "The record an artifact overrides in its campaign (contract 1.50.0)")
+    record OverrideView(
+            @Schema(description = "The record's id; its page is /search/records/{recordId} in the campaign",
+                    format = "uuid") String recordId,
+            @Schema(description = "The record's name, as extracted or corrected", example = "Bola de Fogo") String name,
+            @Schema(description = "The key of the record's type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "spell")
+            String recordType,
+            @Schema(description = "The campaign's system's id", format = "uuid") String systemId,
+            @Schema(description = "True when the mark has no effect: the record was deleted, its version superseded"
+                    + " or its material left the system tier of the campaign's scope. Point the mark to another record,"
+                    + " or remove it") boolean removed) {
+
+        static OverrideView of(Artifacts.Overridden overridden) {
+            return overridden == null ? null : new OverrideView(overridden.recordId().toString(), overridden.name(),
+                    overridden.recordType(), overridden.systemId().toString(), overridden.removed());
+        }
+
+        @Override
+        public String toString() {
+            return "OverrideView[recordId=" + recordId + ", removed=" + removed + "]";
+        }
+    }
+
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
-        "version", "currentVersion", "createdAt", "conversationId", "references"}, description = "An artifact with its"
-            + " newest version, or one of its versions when asked by number (contract 1.42.0; currentVersion and"
-            + " versions from 1.44.0; conversationId and references from 1.48.0)")
+        "version", "currentVersion", "createdAt", "conversationId", "references", "overrides"}, description = "An"
+            + " artifact with its newest version, or one of its versions when asked by number (contract 1.42.0;"
+            + " currentVersion and versions from 1.44.0; conversationId and references from 1.48.0; overrides from"
+            + " 1.50.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
@@ -137,7 +174,11 @@ class ArtifactController {
                     + " removed is worked out as of this answer (a source deleted since reads as removed, and the"
                     + " artifact's content is unchanged). Kept by every edit and restore. Empty for an artifact written"
                     + " by hand"), schema = @Schema(ref = "#/components/schemas/TurnSourceReference"))
-            List<ReferenceView> references) {
+            List<ReferenceView> references,
+            @Schema(description = "The record of its campaign's system the artifact overrides (contract 1.50.0): in"
+                    + " this campaign, an answer that reaches that record reads the artifact first, as replacing it. Not"
+                    + " versioned: every version shows the artifact's current mark. Null for none",
+                    types = {"object", "null"}, implementation = OverrideView.class) OverrideView overrides) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
@@ -145,7 +186,8 @@ class ArtifactController {
                     .toList(), artifact.content(), artifact.version(), artifact.currentVersion(),
                     artifact.createdAt().toString(),
                     artifact.conversationId() == null ? null : artifact.conversationId().toString(),
-                    artifact.references().stream().map(ReferenceView::of).toList());
+                    artifact.references().stream().map(ReferenceView::of).toList(),
+                    OverrideView.of(artifact.overrides()));
         }
 
         @Override
@@ -573,6 +615,135 @@ class ArtifactController {
             throw notFound();
         }
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @Schema(name = "ArtifactOverrideChange", requiredProperties = "recordId",
+            description = "The record an artifact overrides from now on (contract 1.50.0)")
+    record OverrideBody(
+            @Schema(description = "The record's id: a record of the system tier of the campaign's scope, as"
+                    + " listOverrideTargets lists them", format = "uuid") String recordId) {
+    }
+
+    @Schema(name = "OverrideTarget", requiredProperties = {"id", "name", "recordType", "materialName"},
+            description = "A record an artifact of the campaign can override (contract 1.50.0)")
+    record TargetView(
+            @Schema(description = "The record's id", format = "uuid") String id,
+            @Schema(description = "The record's name", example = "Bola de Fogo") String name,
+            @Schema(description = "The key of the record's type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "spell")
+            String recordType,
+            @Schema(description = "The name of the material it was extracted from", example = "Livro do Jogador")
+            String materialName) {
+
+        @Override
+        public String toString() {
+            return "TargetView[id=" + id + ", recordType=" + recordType + "]";
+        }
+    }
+
+    @Schema(name = "OverrideTargetPage", requiredProperties = {"items", "total"},
+            description = "A page of the records an artifact of the campaign can override (contract 1.50.0)")
+    record TargetPageView(
+            @ArraySchema(schema = @Schema(implementation = TargetView.class)) List<TargetView> items,
+            @Schema(description = "How many records match in all, whatever the page", format = "int64", minimum = "0",
+                    example = "12") long total) {
+    }
+
+    @PutMapping(path = OVERRIDE, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "setArtifactOverride", summary = "The GM marks one of the account's campaigns' artifacts as"
+            + " overriding one record of the campaign's system (contract 1.50.0), answering the artifact as"
+            + " getArtifact does. From the next question, in this campaign only, an answer that reaches that record"
+            + " reads the artifact first, as replacing it, and the record follows as an alternative. An artifact"
+            + " overrides at most one record: a mark it had points to the new record. artifact.override_target (400)"
+            + " for a record that is not a live record of the system tier of the campaign's scope (another system's,"
+            + " a campaign material's, a deleted one, another account's, unknown or malformed, or none);"
+            + " artifact.override_taken (409) for a record another artifact of the campaign overrides already, with"
+            + " params.artifactId naming it; request.invalid (400) for a malformed body;" + NOT_FOUND
+            + " nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> setArtifactOverride(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody OverrideBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        // A missing or malformed id is a record that is no target: the same refusal, after the artifact is found.
+        UUID record = parse(body.recordId()).orElse(null);
+        Artifacts.Artifact marked = artifacts.override(campaign, artifact, record)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(marked));
+    }
+
+    @DeleteMapping(path = OVERRIDE)
+    @Operation(operationId = "removeArtifactOverride", summary = "The GM removes the mark of one of the account's"
+            + " campaigns' artifacts (contract 1.50.0; 204, no body): from the next question the record is no longer"
+            + " replaced, and the artifact stays an ordinary source of its campaign. An artifact with no mark answers"
+            + " 204 too, so repeating it is safe." + NOT_FOUND + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The artifact overrides nothing"))
+    ResponseEntity<Void> removeArtifactOverride(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (!artifacts.removeOverride(campaign, artifact)) {
+            throw notFound();
+        }
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @GetMapping(path = OVERRIDE_TARGETS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listOverrideTargets", summary = "The records an artifact of one of the account's"
+            + " campaigns can override (contract 1.50.0): the live records of one record type in the system tier of the"
+            + " campaign's scope (its stored settings), alphabetical by name, a page at a time with the total; q keeps"
+            + " those whose name contains it, case and accents ignored. A record type the system does not have lists"
+            + " none. request.not_found (404) for a campaign that is not the account's (unknown, another account's,"
+            + " malformed or being deleted); request.invalid (400) for a missing or malformed recordType, a q over 200"
+            + " characters, a limit outside 1 to 50 or an offset outside 0 to 100000;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "recordType", in = ParameterIn.QUERY, required = true, description = "The record"
+                        + " type key of the records listed", schema = @Schema(type = "string",
+                        pattern = "^[a-z][a-z0-9_]{0,31}$")),
+                @Parameter(name = "q", in = ParameterIn.QUERY, description = "Only the records whose name contains"
+                        + " this, case and accents ignored; at most 200 characters, blank for all",
+                        schema = @Schema(type = "string", maxLength = 200)),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the first to skip, 0 to"
+                        + " 100000, for a numbered page", schema = @Schema(type = "integer", format = "int32",
+                        minimum = "0", maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<TargetPageView> listOverrideTargets(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(hidden = true) @RequestParam(value = "recordType", required = false) String recordType,
+            @Parameter(hidden = true) @RequestParam(value = "q", required = false) String query,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        if (recordType == null || !KEY.matcher(recordType).matches()
+                || (query != null && query.strip().codePointCount(0, query.strip().length())
+                > RecordRelations.MAX_QUERY)) {
+            throw invalid();
+        }
+        int size = limit(limit);
+        int from = offset(offset, null);
+        RecordRelations.TargetPage page = artifacts.targets(campaign, recordType, query, from, size)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new TargetPageView(page.items().stream()
+                .map(target -> new TargetView(target.id().toString(), target.name(), target.recordType(),
+                        target.materialName())).toList(), page.total()));
     }
 
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */

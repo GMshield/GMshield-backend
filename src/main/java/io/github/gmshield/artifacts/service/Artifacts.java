@@ -8,6 +8,7 @@ import io.github.gmshield.artifacts.data.VersionTaken;
 import io.github.gmshield.conversations.service.Conversations;
 import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
+import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.Scopes;
@@ -83,6 +84,14 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       and the whole transaction rolls back, the artifact and its index job included).</li>
  * </ul>
  *
+ * <p>Story 5.5 part A: {@link #override} marks the artifact as overriding one record of the system tier of its
+ * campaign's scope, or points its mark to another, and {@link #removeOverride} drops the mark (safe to repeat), each in
+ * one transaction through {@link RecordRelations}, which refuses a record that is no target
+ * ({@code artifact.override_target}, 400) or that another live artifact of the campaign overrides
+ * ({@code artifact.override_taken}, 409). {@link #targets} lists the records it can override. Every artifact read
+ * carries its mark ({@link Artifact#overrides}, null for none), {@code removed} when it has no effect. The mark is not
+ * versioned: an edit or a restore keeps it.
+ *
  * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
  * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
  * and its references, by number, each marked {@code removed} when read as an answer's are
@@ -120,6 +129,7 @@ public class Artifacts {
     private static final Logger log = LoggerFactory.getLogger(Artifacts.class);
 
     private final ArtifactRecords records;
+    private final RecordRelations relations;
     private final ArtifactVersionStore versions;
     private final ArtifactReferenceStore references;
     private final Library library;
@@ -131,11 +141,13 @@ public class Artifacts {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
-    Artifacts(ArtifactRecords records, ArtifactVersionStore versions, ArtifactReferenceStore references,
+    Artifacts(ArtifactRecords records, RecordRelations relations, ArtifactVersionStore versions,
+              ArtifactReferenceStore references,
               Library library, Vault vault, ArtifactIndexing indexing, Scopes scopes,
               ObjectProvider<Conversations> conversations, ObjectProvider<SystemDeletion> deletions,
               ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.records = records;
+        this.relations = relations;
         this.versions = versions;
         this.references = references;
         this.library = library;
@@ -175,33 +187,65 @@ public class Artifacts {
      * One artifact with one of its versions, the newest unless an earlier one was asked for: its id, its campaign, the
      * version's type key, name, fields and content (null for none), the version's number, the number of the artifact's
      * newest version (Story 5.2; the same as {@code version} unless an earlier one is read), when the artifact was
-     * written, and (Story 5.4 part A) the conversation it was saved from (null for none) and its references by number
-     * (empty for an artifact written by hand). {@code toString} names ids and counts only.
+     * written, (Story 5.4 part A) the conversation it was saved from (null for none) and its references by number
+     * (empty for an artifact written by hand), and (Story 5.5 part A) the record it overrides (null for none).
+     * {@code toString} names ids and counts only.
      */
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
                            String content, int version, int currentVersion, Instant createdAt, UUID conversationId,
-                           List<TurnReference> references) {
+                           List<TurnReference> references, Overridden overrides) {
         public Artifact {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
         }
 
+        /** An artifact that overrides nothing. */
+        public Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields, String content,
+                        int version, int currentVersion, Instant createdAt, UUID conversationId,
+                        List<TurnReference> references) {
+            this(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt, conversationId,
+                    references, null);
+        }
+
         /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
         Artifact unlinked() {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    null, references);
+                    null, references, overrides);
         }
 
         /** This artifact with its references (Story 5.4 part A). */
         Artifact withReferences(List<TurnReference> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, found);
+                    conversationId, found, overrides);
+        }
+
+        /** This artifact with the record it overrides (Story 5.5 part A; null for none). */
+        Artifact withOverride(Overridden mark) {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    conversationId, references, mark);
         }
 
         @Override
         public String toString() {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
                     + version + ", currentVersion=" + currentVersion + ", references=" + references.size() + "]";
+        }
+    }
+
+    /**
+     * The record an artifact overrides (Story 5.5 part A): its id, name and type key, its campaign's system's id, and
+     * whether the mark has no effect ({@code removed}: the record is tombstoned, of a superseded version or out of the
+     * campaign's scope). {@code toString} names ids only.
+     */
+    public record Overridden(UUID recordId, String name, String recordType, UUID systemId, boolean removed) {
+
+        static Overridden of(RecordRelations.Mark mark) {
+            return new Overridden(mark.recordId(), mark.name(), mark.recordType(), mark.systemId(), mark.removed());
+        }
+
+        @Override
+        public String toString() {
+            return "Overridden[recordId=" + recordId + ", recordType=" + recordType + ", removed=" + removed + "]";
         }
     }
 
@@ -518,6 +562,64 @@ public class Artifacts {
     }
 
     /**
+     * The GM marks the owner's artifact {@code artifactId} of the campaign {@code campaignId} as overriding the record
+     * {@code recordId} (Story 5.5 part A), as the class says, replacing its mark if it had one. Answers the artifact with
+     * its newest version and its mark, or empty when the campaign is not the owner's or not readable, or the artifact is
+     * not the campaign's (nothing changes then).
+     */
+    public Optional<Artifact> override(UUID campaignId, UUID artifactId, UUID recordId) {
+        UUID owner = OwnerContext.require();
+        Optional<Artifact> marked = writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .flatMap(identity -> relations.override(identity.campaignId(), identity.id(), recordId)
+                        .map(mark -> newest(identity, owner))));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", marked.isPresent()).log("artifacts.override_set");
+        return marked;
+    }
+
+    /**
+     * The GM removes the owner's artifact {@code artifactId}'s mark (Story 5.5 part A), whether it had one or not; true
+     * when the artifact is the campaign's, false when the campaign is not the owner's or not readable, or the artifact is
+     * not the campaign's (nothing changes then).
+     */
+    public boolean removeOverride(UUID campaignId, UUID artifactId) {
+        UUID owner = OwnerContext.require();
+        boolean found = Boolean.TRUE.equals(writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .map(identity -> relations.removeOverride(identity.campaignId(), identity.id())).orElse(false)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("found", found).log("artifacts.override_removed");
+        return found;
+    }
+
+    /**
+     * The records an artifact of the owner's campaign {@code campaignId} can override (Story 5.5 part A,
+     * {@link RecordRelations#targets}): of the type key {@code recordType}, whose name contains {@code query} (case and
+     * accents ignored; null or blank for all), the {@code offset} first skipped (0 to {@value #MAX_OFFSET}), at most
+     * {@code limit} (1 to {@value #MAX_LIMIT}). Empty when the campaign is not the owner's or not readable.
+     */
+    public Optional<RecordRelations.TargetPage> targets(UUID campaignId, String recordType, String query, int offset,
+                                                        int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new IllegalArgumentException("artifacts.limit_invalid");
+        }
+        if (offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("artifacts.offset_invalid");
+        }
+        return relations.targets(campaignId, recordType, query, offset, limit);
+    }
+
+    /** The artifact {@code identity} with its newest version, as {@link #get} answers it, in the caller's transaction. */
+    private Artifact newest(ArtifactRecords.Identity identity, UUID owner) {
+        ArtifactVersionRow newest = versions.latest(identity.id())
+                .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+        return linked(open(vault, identity, newest, newest.number(), owner)
+                .withReferences(referencesOf(identity.id(), identity.campaignId(), owner)));
+    }
+
+    /**
      * The next version of the artifact {@code identity} (Story 5.2), in the caller's transaction: {@code seen} must be
      * its newest number, read again once that version is locked (behind its unended index jobs' locks, as
      * {@link ArtifactIndexing#lockUnended} says); a number taken first by another write is stale too. Then the version,
@@ -556,15 +658,18 @@ public class Artifacts {
 
     /**
      * The artifact as an answer shows it (Story 5.4 part B): its conversation only while that conversation is
-     * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise.
+     * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise. From Story 5.5
+     * part A with its mark ({@link RecordRelations#mark}), null for none.
      */
     private Artifact linked(Artifact artifact) {
-        UUID conversationId = artifact.conversationId();
+        Artifact marked = artifact.withOverride(relations.mark(artifact.campaignId(), artifact.id())
+                .map(Overridden::of).orElse(null));
+        UUID conversationId = marked.conversationId();
         if (conversationId == null || conversations.getObject().ready(Set.of(conversationId))
                 .contains(conversationId)) {
-            return artifact;
+            return marked;
         }
-        return artifact.unlinked();
+        return marked.unlinked();
     }
 
     private int newestNumber(UUID id) {

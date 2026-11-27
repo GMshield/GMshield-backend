@@ -218,10 +218,15 @@ public interface ExtractedRecords {
      * What a carry-over did (Story 4.5): the corrections that matched a new record, those copied into the new version,
      * and those dropped because none of their pages has a passage in it; from part B, the new records deleted because a
      * deleted record matched them ({@code deleted}), and the deleted records that matched none, copied in as tombstones
-     * ({@code tombstoned}).
+     * ({@code tombstoned}); from Story 5.5 part A, the overrides moved to a matching new record ({@code overrides}).
      */
     @NamedInterface("service")
-    record Carried(int matched, int copied, int dropped, int deleted, int tombstoned) {
+    record Carried(int matched, int copied, int dropped, int deleted, int tombstoned, int overrides) {
+
+        /** A carry-over that moved no override. */
+        public Carried(int matched, int copied, int dropped, int deleted, int tombstoned) {
+            this(matched, copied, dropped, deleted, tombstoned, 0);
+        }
     }
 
     /**
@@ -236,7 +241,9 @@ public interface ExtractedRecords {
      * deleted records are carried over the same way, after the corrections, among the new records no correction took: a
      * deleted record matches by its extracted key first (its own key when it was never corrected), then by its own key,
      * and the matched new record is deleted too, its point counted as removed (it was never indexed); one that matches
-     * none is copied in as a tombstone with its keys and no passage, so a later reprocess still finds it. Answers the
+     * none is copied in as a tombstone with its keys and no passage, so a later reprocess still finds it. From Story 5.5
+     * part A the overrides of the version's live records then move to the new record each matches by its (type key,
+     * name fingerprint), as a correction's does; one with no match stays on the old record and goes with it. Answers the
      * counts.
      */
     Carried carryCorrections(UUID fromVersionId, UUID toVersionId,

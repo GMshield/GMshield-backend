@@ -970,6 +970,48 @@ class ArtifactsFlowTest {
         assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
     }
 
+    // --- override (Story 5.5 part A; the matrix with a system's records is in RecordsFlowTest)
+
+    @Test
+    void anArtifactOverridesNothingUntilMarkedAndItsMarkRoutesAnswerOnlyItsOwnCampaign() throws Exception {
+        Gm gm = signUp();
+        String id = create(gm, gm.campaign(), "spell", "Bola de Fogo (casa)");
+        String path = artifacts(gm.campaign()) + "/" + id;
+        JsonNode read = json(get(gm, path));
+        assertThat(read.has("overrides")).isTrue();
+        assertThat(read.path("overrides").isNull()).isTrue();
+
+        // Removing a mark it does not have is no error, and repeating it neither.
+        for (int i = 0; i < 2; i++) {
+            HttpResponse<String> removed = send(gm, "DELETE", path + "/override", null);
+            assertThat(removed.statusCode()).as(removed.body()).isEqualTo(204);
+            assertThat(removed.headers().firstValue("Cache-Control")).hasValue("no-store");
+        }
+        // With no system material, nothing is a target: an unknown id, a malformed one, none, or the artifact itself.
+        for (String body : List.of("{\"recordId\":\"" + Ids.newId() + "\"}", "{\"recordId\":\"x\"}", "{}",
+                "{\"recordId\":\"" + id + "\"}")) {
+            HttpResponse<String> refused = send(gm, "PUT", path + "/override", body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("artifact.override_target");
+        }
+        JsonNode targets = json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/override-targets?recordType=spell"));
+        assertThat(targets.path("items")).isEmpty();
+        assertThat(targets.path("total").asLong()).isZero();
+
+        // Another campaign's artifact and another owner's are not found on PUT and DELETE, nor are another owner's
+        // campaign's targets; a deleting artifact is not found on PUT and DELETE.
+        Gm them = signUp();
+        String theirs = create(them, them.campaign(), "spell", "Deles");
+        for (String other : List.of(artifacts(gm.campaign()) + "/" + theirs, artifacts(them.campaign()) + "/" + id)) {
+            assertNotFound(send(gm, "PUT", other + "/override", "{\"recordId\":\"" + Ids.newId() + "\"}"));
+            assertNotFound(send(gm, "DELETE", other + "/override", null));
+        }
+        assertNotFound(get(gm, "/api/v1/campaigns/" + them.campaign() + "/override-targets?recordType=spell"));
+        assertThat(send(gm, "DELETE", path, null).statusCode()).isEqualTo(202);
+        assertNotFound(send(gm, "DELETE", path + "/override", null));
+        assertNotFound(send(gm, "PUT", path + "/override", "{\"recordId\":\"" + Ids.newId() + "\"}"));
+    }
+
     // --- helpers
 
     private void edit(Gm gm, String id, int version, String type, String name) throws Exception {

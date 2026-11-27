@@ -2641,6 +2641,329 @@ class RecordsFlowTest {
                 .isEqualTo("Espada de Kael");
     }
 
+    // --- Story 5.5 part A: an artifact overrides a system record
+
+    private static final Map<String, Object> FIREBALL_HOUSE = Map.of("recordType", "spell", "name",
+            "Bola de Fogo (casa)", "fields", List.of(Map.of("name", "Dano", "value", "6d6 fogo")));
+
+    @Test
+    void anArtifactOverridesASystemRecordInItsCampaignOnlyAndAnAnswerReadsTheMarkOnBothSides() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Relâmpago", 1, List.of(new Field("Dano", "8d6"))),
+                        record("spell", "Bola de Fogo", 1, List.of(new Field("Dano", "8d6 fogo")))));
+        String fireball = recordOf(book.versionId(), "Bola de Fogo");
+        String lightning = recordOf(book.versionId(), "Relâmpago");
+        String house = artifact(gm, gm.campaign(), FIREBALL_HOUSE);
+        UUID other = campaignOf(gm, "Outra mesa");
+        String targets = "/api/v1/campaigns/" + gm.campaign() + "/override-targets?recordType=spell";
+
+        // The picker lists the system tier's spells alphabetically, and folds case and accents in its filter.
+        JsonNode listed = ok(get(targets, gm.session()));
+        assertThat(listed.path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Bola de Fogo", "Relâmpago");
+        assertThat(listed.path("total").asLong()).isEqualTo(2);
+        assertThat(listed.path("items").get(0).propertyNames()).containsExactlyInAnyOrder("id", "name", "recordType",
+                "materialName");
+        assertThat(listed.path("items").get(0).path("id").asString()).isEqualTo(fireball);
+        assertThat(listed.path("items").get(0).path("materialName").asString()).isEqualTo("Livro.pdf");
+        assertThat(ok(get(targets + "&q=RELAMP", gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(lightning);
+        assertThat(ok(get(targets + "&limit=1&offset=1", gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(lightning);
+        assertThat(ok(get(targets.replace("spell", "item"), gm.session())).path("total").asLong()).isZero();
+
+        // Matrix row "Override".
+        HttpResponse<String> marked = send("PUT", artifactPath(gm, house) + "/override", gm.session(),
+                Map.of("recordId", fireball));
+        JsonNode mark = ok(marked).path("overrides");
+        assertThat(mark.path("recordId").asString()).isEqualTo(fireball);
+        assertThat(mark.path("name").asString()).isEqualTo("Bola de Fogo");
+        assertThat(mark.path("recordType").asString()).isEqualTo("spell");
+        assertThat(mark.path("systemId").asString()).isEqualTo(gm.system().toString());
+        assertThat(mark.path("removed").asBoolean()).isFalse();
+        assertThat(ok(get(artifactPath(gm, house), gm.session())).path("overrides")).isEqualTo(mark);
+        endIngestion();
+        Answer answer = asked(gm, "Como funciona a Bola de Fogo?");
+        JsonNode alone = ok(readRecords(answer, List.of(fireball))).path("records").get(0);
+        assertThat(alone.path("overriddenBy").asString()).isEqualTo(house);
+        assertThat(alone.has("overrides")).isFalse();
+        JsonNode both = ok(readRecords(answer, List.of(house, fireball, lightning))).path("records");
+        assertThat(both.get(0).path("overrides").asString()).isEqualTo(fireball);
+        assertThat(both.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(both.get(1).path("overriddenBy").asString()).isEqualTo(house);
+        assertThat(both.get(1).path("tier").asString()).isEqualTo("system");
+        assertThat(both.get(2).has("overriddenBy")).isFalse();
+        assertThat(both.get(2).has("overrides")).isFalse();
+        done(answer);
+
+        // Matrix row "Other campaign": the same system's record, with no mark.
+        endIngestion();
+        Answer elsewhere = askedIn(gm, other, "Como funciona a Bola de Fogo?");
+        JsonNode plain = ok(readRecords(elsewhere, List.of(fireball))).path("records").get(0);
+        assertThat(plain.has("overriddenBy")).isFalse();
+        done(elsewhere);
+
+        // The mark is not versioned: an edit keeps it.
+        HttpResponse<String> edited = send("PATCH", artifactPath(gm, house), gm.session(), Map.of("version", 1,
+                "recordType", "spell", "name", "Bola de Fogo (mesa)", "fields", List.of()));
+        assertThat(ok(edited).path("overrides").path("recordId").asString()).isEqualTo(fireball);
+        // Pointing it to another record replaces it.
+        assertThat(ok(send("PUT", artifactPath(gm, house) + "/override", gm.session(), Map.of("recordId",
+                lightning))).path("overrides").path("recordId").asString()).isEqualTo(lightning);
+
+        // Matrix row "Removed": 204, again 204, and the next question has no mark.
+        HttpResponse<String> removed = send("DELETE", artifactPath(gm, house) + "/override", gm.session(), null);
+        assertThat(removed.statusCode()).as(removed.body()).isEqualTo(204);
+        assertThat(send("DELETE", artifactPath(gm, house) + "/override", gm.session(), null).statusCode())
+                .isEqualTo(204);
+        assertThat(ok(get(artifactPath(gm, house), gm.session())).path("overrides").isNull()).isTrue();
+        endIngestion();
+        Answer after = asked(gm, "Como funciona o Relâmpago?");
+        JsonNode unmarked = ok(readRecords(after, List.of(house, lightning))).path("records");
+        assertThat(unmarked.get(0).has("overrides")).isFalse();
+        assertThat(unmarked.get(1).has("overriddenBy")).isFalse();
+        assertNoLineNames("Bola de Fogo", "Relâmpago", "6d6 fogo");
+    }
+
+    @Test
+    void aRecordOutOfTheSystemTierIsNoTargetAndASecondArtifactOfTheCampaignIsRefusedNamingTheFirst()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Bola de Fogo", 1, List.of())));
+        Ingested adventure = accepted(gm, metadata("Aventura.pdf", "campaign", gm.campaign().toString()),
+                List.of(record("spell", "Bola de Gelo", 1, List.of())));
+        UUID otherSystem = createSystem(gm, "Outro sistema");
+        Ingested foreign = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()),
+                List.of(record("spell", "Bola de Lava", 1, List.of())));
+        Ingested deletedBook = accepted(gm, metadata("Livro 3.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Bola de Ácido", 1, List.of())));
+        String fireball = recordOf(book.versionId(), "Bola de Fogo");
+        String acid = recordOf(deletedBook.versionId(), "Bola de Ácido");
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + acid, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+        // Its point's removal would hold the ingestion lane.
+        endIngestion();
+        Gm them = signUp();
+        Ingested theirs = accepted(them, metadata("Deles.pdf", "system", them.system().toString()), spells("Luz"));
+        String house = artifact(gm, gm.campaign(), FIREBALL_HOUSE);
+        String override = artifactPath(gm, house) + "/override";
+
+        // Matrix row "Out of scope": none is listed, and each is refused.
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/override-targets?recordType=spell", gm.session()))
+                .path("items")).extracting(item -> item.path("id").asString()).containsExactly(fireball);
+        for (String refused : List.of(recordOf(adventure.versionId(), "Bola de Gelo"),
+                recordOf(foreign.versionId(), "Bola de Lava"), acid, recordOf(theirs.versionId(), "Luz"),
+                Ids.newId().toString(), "not-a-uuid", house)) {
+            assertProblem(send("PUT", override, gm.session(), Map.of("recordId", refused)), 400,
+                    "artifact.override_target");
+        }
+        assertProblem(send("PUT", override, gm.session(), Map.of()), 400, "artifact.override_target");
+        assertThat(ok(get(artifactPath(gm, house), gm.session())).path("overrides").isNull()).isTrue();
+
+        // Matrix row "Taken": a second artifact of the campaign is refused, naming the first.
+        ok(send("PUT", override, gm.session(), Map.of("recordId", fireball)));
+        String second = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Outra regra", "fields",
+                List.of()));
+        JsonNode taken = assertProblem(send("PUT", artifactPath(gm, second) + "/override", gm.session(),
+                Map.of("recordId", fireball)), 409, "artifact.override_taken");
+        assertThat(taken.path("params").path("artifactId").asString()).isEqualTo(house);
+        // The first one marking it again is no conflict; another campaign's artifact may override it too.
+        ok(send("PUT", override, gm.session(), Map.of("recordId", fireball)));
+        UUID other = campaignOf(gm, "Outra mesa");
+        String elsewhere = artifact(gm, other, FIREBALL_HOUSE);
+        ok(send("PUT", "/api/v1/campaigns/" + other + "/artifacts/" + elsewhere + "/override", gm.session(),
+                Map.of("recordId", fireball)));
+        // Once the first is deleted, its mark has no effect and takes nothing.
+        assertThat(send("DELETE", artifactPath(gm, house), gm.session(), null).statusCode()).isEqualTo(202);
+        assertThat(ok(send("PUT", artifactPath(gm, second) + "/override", gm.session(), Map.of("recordId",
+                fireball))).path("overrides").path("recordId").asString()).isEqualTo(fireball);
+
+        // Matrix row "Other owner": 404 on every route, and nothing changes.
+        String targets = "/api/v1/campaigns/" + gm.campaign() + "/override-targets?recordType=spell";
+        assertProblem(get(targets, them.session()), 404, "request.not_found");
+        assertProblem(send("PUT", artifactPath(gm, second) + "/override", them.session(), Map.of("recordId",
+                fireball)), 404, "request.not_found");
+        assertProblem(send("DELETE", artifactPath(gm, second) + "/override", them.session(), null), 404,
+                "request.not_found");
+        assertThat(ok(get(artifactPath(gm, second), gm.session())).path("overrides").path("recordId").asString())
+                .isEqualTo(fireball);
+        // Malformed reads of the picker.
+        for (String bad : List.of("", "?recordType=Spell", "?recordType=spell&limit=0", "?recordType=spell&offset=-1",
+                "?recordType=spell&q=" + "a".repeat(201))) {
+            assertProblem(get("/api/v1/campaigns/" + gm.campaign() + "/override-targets" + bad, gm.session()), 400,
+                    "request.invalid");
+        }
+    }
+
+    @Test
+    void aMarkWhoseRecordIsDeletedOrOutOfScopeShowsRemovedAndHasNoEffectAndTheCampaignTierOffSetsNone()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Bola de Fogo", 1, List.of()), record("spell", "Relâmpago", 1, List.of())));
+        String fireball = recordOf(book.versionId(), "Bola de Fogo");
+        String lightning = recordOf(book.versionId(), "Relâmpago");
+        String house = artifact(gm, gm.campaign(), FIREBALL_HOUSE);
+        String storm = artifact(gm, gm.campaign(), Map.of("recordType", "spell", "name", "Relâmpago (casa)",
+                "fields", List.of()));
+        ok(send("PUT", artifactPath(gm, house) + "/override", gm.session(), Map.of("recordId", fireball)));
+        ok(send("PUT", artifactPath(gm, storm) + "/override", gm.session(), Map.of("recordId", lightning)));
+
+        // Matrix row "Campaign tier off": no mark on either side.
+        String scope = "/api/v1/campaigns/" + gm.campaign() + "/scope";
+        Map<String, Object> off = new LinkedHashMap<>();
+        off.put("version", ok(get(scope, gm.session())).path("version").asLong());
+        off.put("campaignTier", false);
+        off.put("systemTier", true);
+        off.put("otherTier", false);
+        off.put("modelKnowledge", false);
+        off.put("materialsOff", List.of());
+        JsonNode stored = ok(send("PUT", scope, gm.session(), off));
+        endIngestion();
+        Answer answer = asked(gm, "Como funciona a Bola de Fogo?");
+        assertThat(ok(readRecords(answer, List.of(fireball))).path("records").get(0).has("overriddenBy")).isFalse();
+        done(answer);
+        off.put("version", stored.path("version").asLong());
+        off.put("campaignTier", true);
+        ok(send("PUT", scope, gm.session(), off));
+
+        // Matrix row "Target gone": a tombstoned record shows removed, and an answer that still reads it has no mark.
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + fireball, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+        JsonNode gone = ok(get(artifactPath(gm, house), gm.session())).path("overrides");
+        assertThat(gone.path("recordId").asString()).isEqualTo(fireball);
+        assertThat(gone.path("removed").asBoolean()).isTrue();
+        endIngestion();
+        Answer later = asked(gm, "Como funciona a Bola de Fogo?");
+        JsonNode read = ok(readRecords(later, List.of(house, fireball))).path("records");
+        assertThat(read.get(0).has("overrides")).isFalse();
+        assertThat(read.get(1).has("overriddenBy")).isFalse();
+        done(later);
+
+        // A material switched off: its record is out of scope, and the mark shows removed until it is back.
+        scope(gm, false, List.of(UUID.fromString(book.materialId())));
+        assertThat(ok(get(artifactPath(gm, storm), gm.session())).path("overrides").path("removed").asBoolean())
+                .isTrue();
+        scope(gm, false, List.of());
+        assertThat(ok(get(artifactPath(gm, storm), gm.session())).path("overrides").path("removed").asBoolean())
+                .isFalse();
+    }
+
+    @Test
+    void aReprocessCarriesTheMarkToTheMatchingNewRecordAndOneWithNoMatchShowsRemoved() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Bola de Fogo", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Relâmpago", List.of(), List.of(p.get(3)), 2)));
+        accept(gm, first);
+        String oldFireball = recordOf(first.versionId(), "Bola de Fogo");
+        String house = artifact(gm, gm.campaign(), FIREBALL_HOUSE);
+        String storm = artifact(gm, gm.campaign(), Map.of("recordType", "spell", "name", "Relâmpago (casa)",
+                "fields", List.of()));
+        ok(send("PUT", artifactPath(gm, house) + "/override", gm.session(), Map.of("recordId", oldFireball)));
+        ok(send("PUT", artifactPath(gm, storm) + "/override", gm.session(), Map.of("recordId",
+                recordOf(first.versionId(), "Relâmpago"))));
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        // The new extraction finds "Bola de Fogo" again, but no "Relâmpago".
+        store(gm, second, List.of(new Extracted("spell", "Bola de Fogo", List.of(), List.of(q.get(0)), 1)));
+        accept(gm, second);
+
+        String newFireball = recordOf(second.versionId(), "Bola de Fogo");
+        JsonNode carried = ok(get(artifactPath(gm, house), gm.session())).path("overrides");
+        assertThat(carried.path("recordId").asString()).isEqualTo(newFireball);
+        assertThat(carried.path("removed").asBoolean()).isFalse();
+        JsonNode stranded = ok(get(artifactPath(gm, storm), gm.session())).path("overrides");
+        assertThat(stranded.path("name").asString()).isEqualTo("Relâmpago");
+        assertThat(stranded.path("removed").asBoolean()).isTrue();
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "overrides", 1));
+        endIngestion();
+        Answer answer = asked(gm, "Como funciona a Bola de Fogo?");
+        assertThat(ok(readRecords(answer, List.of(newFireball))).path("records").get(0).path("overriddenBy")
+                .asString()).isEqualTo(house);
+    }
+
+    @Test
+    void aReprocessCarriesTheMarkOfACorrectedRecordWithItsCorrectionWhileAnotherRecordIsDeleted() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Bola de Fogo", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Relâmpago", List.of(), List.of(p.get(3)), 2)));
+        accept(gm, first);
+        String system = "/api/v1/systems/" + gm.system() + "/records/";
+        String oldFireball = recordOf(first.versionId(), "Bola de Fogo");
+        // The overridden record is corrected (renamed), and the other record of the version deleted.
+        ok(correct(system + oldFireball, gm.session(), 0, "Bola de Fogo Maior", "spell", List.of()));
+        assertThat(send("DELETE", system + recordOf(first.versionId(), "Relâmpago"), gm.session(), null).statusCode())
+                .isEqualTo(204);
+        String house = artifact(gm, gm.campaign(), FIREBALL_HOUSE);
+        ok(send("PUT", artifactPath(gm, house) + "/override", gm.session(), Map.of("recordId", oldFireball)));
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        store(gm, second, List.of(
+                new Extracted("spell", "Bola de Fogo", List.of(), List.of(q.get(0)), 1),
+                new Extracted("spell", "Relâmpago", List.of(), List.of(q.get(3)), 2)));
+        accept(gm, second);
+
+        // The correction went to the record read again, and the mark with it.
+        String newFireball = recordOf(second.versionId(), "Bola de Fogo Maior");
+        JsonNode carried = ok(get(artifactPath(gm, house), gm.session())).path("overrides");
+        assertThat(carried.path("recordId").asString()).isEqualTo(newFireball);
+        assertThat(carried.path("name").asString()).isEqualTo("Bola de Fogo Maior");
+        assertThat(carried.path("removed").asBoolean()).isFalse();
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "matched", 1) && hasPair(event, "deleted", 1) && hasPair(event, "overrides", 1));
+    }
+
+    @Test
+    void aConversationsDeletionDialogSaysWhichSavedArtifactOverridesARecord() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("spell", "Bola de Fogo", 1, List.of())));
+        String fireball = recordOf(book.versionId(), "Bola de Fogo");
+        endIngestion();
+        Answer draft = drafted(gm, "Crie uma versão da Bola de Fogo para a mesa");
+        ok(readRecords(draft, List.of(fireball)));
+        // A source reference, so the draft is not silent and is offered for saving.
+        events(draft, List.of(delta("## Bola de Fogo (mesa)\n\n- Dano: 6d6"), recordCitation(fireball, 3)));
+        done(draft);
+        HttpResponse<String> savedDraft = send("POST", "/api/v1/turns/" + draft.turnId() + "/artifact", gm.session(),
+                Map.of("name", "Bola de Fogo (mesa)", "recordType", "spell"));
+        assertThat(savedDraft.statusCode()).as(savedDraft.body()).isEqualTo(201);
+        String saved = json(savedDraft).path("id").asString();
+        String deletion = "/api/v1/conversations/" + draft.conversationId() + "/deletion";
+        assertThat(ok(get(deletion, gm.session())).path("artifacts").get(0).path("overrides").asBoolean()).isFalse();
+
+        ok(send("PUT", artifactPath(gm, saved) + "/override", gm.session(), Map.of("recordId", fireball)));
+
+        JsonNode row = ok(get(deletion, gm.session())).path("artifacts").get(0);
+        assertThat(row.path("id").asString()).isEqualTo(saved);
+        assertThat(row.path("overrides").asBoolean()).isTrue();
+    }
+
+    private static String artifactPath(Gm gm, String artifact) {
+        return "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + artifact;
+    }
+
+    /** Another campaign of the GM's system; its id. */
+    private UUID campaignOf(Gm gm, String name) throws Exception {
+        HttpResponse<String> campaign = send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", name,
+                "systemId", gm.system().toString()));
+        assertThat(campaign.statusCode()).as(campaign.body()).isEqualTo(201);
+        return UUID.fromString(json(campaign).path("id").asString());
+    }
+
     /** A new artifact of the campaign, written through the public API; its id. */
     private String artifact(Gm gm, UUID campaign, Map<String, Object> body) throws Exception {
         HttpResponse<String> created = send("POST", "/api/v1/campaigns/" + campaign + "/artifacts", gm.session(),
@@ -2659,7 +2982,12 @@ class RecordsFlowTest {
     }
 
     private Answer asked(Gm gm, String question) throws Exception {
-        HttpResponse<String> asked = send("POST", "/api/v1/campaigns/" + gm.campaign() + "/turns", gm.session(),
+        return askedIn(gm, gm.campaign(), question);
+    }
+
+    /** A question of the GM's campaign {@code campaign} (Story 5.5 part A: another campaign of the system). */
+    private Answer askedIn(Gm gm, UUID campaign, String question) throws Exception {
+        HttpResponse<String> asked = send("POST", "/api/v1/campaigns/" + campaign + "/turns", gm.session(),
                 Map.of("question", question));
         assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
         UUID turnId = UUID.fromString(json(asked).path("id").asString());

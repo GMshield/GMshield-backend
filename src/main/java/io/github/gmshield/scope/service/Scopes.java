@@ -150,6 +150,12 @@ import tools.jackson.databind.node.ObjectNode;
  *       #citedRecords} drops it as any id out of the scope, so that answer completes without it. {@link
  *       #removedArtifacts} names the artifacts among some ids that are deleting or gone, so a stored reference to one
  *       reads as removed.</li>
+ *   <li>Story 5.5 part A (overrides): {@link #recordContents} and {@link #citedRecords} mark what an override links,
+ *       from {@link CampaignOverrides} (a port the {@code knowledge} module implements), only when both sides are in the
+ *       scope: an artifact of the scope names the record it overrides ({@link ScopedRecordContent#overrides}) when that
+ *       record is in the scope's system tier, and a system-tier record names the artifact that overrides it
+ *       ({@link ScopedRecordContent#overriddenBy}) when that artifact is one of the scope's (the campaign tier on). The
+ *       scope stays the only decider; the worker copies these marks.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -185,11 +191,12 @@ public class Scopes {
     private final RecordTypeKeys recordTypeKeys;
     private final TermMatches termMatches;
     private final CampaignArtifacts artifacts;
+    private final CampaignOverrides overridesOf;
     private final Vault vault;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
     Scopes(Library library, ScopeReads reads, ExtractedRecords records, RecordTypeKeys recordTypeKeys,
-           TermMatches termMatches, CampaignArtifacts artifacts, Vault vault,
+           TermMatches termMatches, CampaignArtifacts artifacts, CampaignOverrides overridesOf, Vault vault,
            ObjectProvider<PlatformTransactionManager> transactions) {
         this.library = library;
         this.reads = reads;
@@ -197,6 +204,7 @@ public class Scopes {
         this.recordTypeKeys = recordTypeKeys;
         this.termMatches = termMatches;
         this.artifacts = artifacts;
+        this.overridesOf = overridesOf;
         this.vault = vault;
         this.transactions = transactions;
     }
@@ -676,7 +684,49 @@ public class Scopes {
                         .stream().map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList()));
             }
         }
+        withOverrides(scope, found);
         return Optional.of(wanted.stream().map(found::get).filter(Objects::nonNull).toList());
+    }
+
+    /**
+     * Sets the overrides of the records read (Story 5.5 part A), from the port, in place: an artifact's
+     * {@code overrides} when the record it overrides is in the scope's system tier, and a system-tier record's
+     * {@code overriddenBy} when the artifact that overrides it is one of the scope's artifacts (the campaign tier is on
+     * and it is live). Nothing is asked when the scope has no artifact. Runs in the caller's read transaction.
+     */
+    private void withOverrides(ResolvedScope scope, Map<UUID, ScopedRecordContent> found) {
+        Set<UUID> ofCampaign = scope.artifacts();
+        if (ofCampaign.isEmpty() || found.isEmpty()) {
+            return;
+        }
+        List<UUID> artifactIds = found.values().stream().filter(content -> content.record().artifact())
+                .map(content -> content.record().recordId()).toList();
+        List<UUID> systemIds = found.values().stream().filter(content -> !content.record().artifact()
+                && content.record().tier() == Tier.SYSTEM).map(content -> content.record().recordId()).toList();
+        Map<UUID, UUID> overrides = artifactIds.isEmpty() ? Map.of()
+                : overridesOf.overrides(scope.campaignId(), artifactIds);
+        Set<UUID> inSystemTier = overrides.isEmpty() ? Set.of() : systemRecords(scope, overrides.values());
+        Map<UUID, UUID> overriddenBy = systemIds.isEmpty() ? Map.of()
+                : overridesOf.overriddenBy(scope.campaignId(), systemIds);
+        found.replaceAll((id, content) -> {
+            UUID target = content.record().artifact() ? overrides.get(id) : null;
+            UUID artifact = content.record().artifact() || content.record().tier() != Tier.SYSTEM ? null
+                    : overriddenBy.get(id);
+            UUID kept = target != null && inSystemTier.contains(target) ? target : null;
+            UUID by = artifact != null && ofCampaign.contains(artifact) ? artifact : null;
+            return kept == null && by == null ? content : content.withOverrides(kept, by);
+        });
+    }
+
+    /**
+     * The ids among these of live records of the scope's system tier (Story 5.5 part A): their version is an allowed
+     * source of that tier and their key one of the system's record types. Runs in the caller's read transaction.
+     */
+    private Set<UUID> systemRecords(ResolvedScope scope, Collection<UUID> ids) {
+        Set<UUID> system = Set.copyOf(scope.sources(Tier.SYSTEM));
+        Set<String> keys = scope.recordTypes();
+        return records.located(ids).stream().filter(record -> system.contains(record.versionId())
+                && keys.contains(record.type())).map(ExtractedRecords.Located::id).collect(Collectors.toSet());
     }
 
     /**

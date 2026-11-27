@@ -12,6 +12,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.knowledge.data.InMemoryOntologyStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordRelationStore;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
@@ -45,7 +46,8 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
                  InMemoryLibraryStore library, InMemoryDeletionStore deletions, InMemoryScopeStore scopes,
                  InMemoryKnowledgeStore knowledge, InMemoryRecordStore records, InMemoryOntologyStore ontology,
                  InMemoryArtifactVersionStore artifactVersions, InMemoryArtifactIndexStore artifactIndex,
-                 InMemoryArtifactReferenceStore artifactReferences, InMemoryMaterialStore materials,
+                 InMemoryArtifactReferenceStore artifactReferences, InMemoryRecordRelationStore recordRelations,
+                 InMemoryMaterialStore materials,
                  InMemoryUploadStorage uploads, InMemoryIndexStore index,
                  InMemoryConversationStore conversations, InMemoryTurnReferenceStore references,
                  InMemorySearchStore searches, MutableClock clock, Vault vault) {
@@ -113,7 +115,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
      * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type,
      * record (Story 4.2, its passage links inside each row), proposal, term and term alias (Story 4.4), artifact (a
      * record of a campaign, kept apart in memory) and record version (Story 5.1), artifact index and artifact index
-     * removal (Story 5.1 part B), artifact reference (Story 5.4 part A); material,
+     * removal (Story 5.1 part B), artifact reference (Story 5.4 part A), record relation (Story 5.5 part A); material,
      * material version, material system, ingestion step, version file, page layer, page outcome, passage, outline,
      * page view, upload, index change, index removal; conversation and its deleting marks, turn, event batch, turn
      * reference, search, search result; job and job output. Every owner's rows.
@@ -137,6 +139,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
         tables.put("artifact index", copy(twins.artifactIndex().rows));
         tables.put("artifact index removal", copy(twins.artifactIndex().removalRows));
         tables.put("artifact reference", copy(twins.artifactReferences().rows));
+        tables.put("record relation", copy(twins.recordRelations().rows));
         tables.put("material", copy(twins.materials().materials));
         tables.put("material version", copy(twins.materials().versions));
         tables.put("material system", copy(twins.materials().systems));

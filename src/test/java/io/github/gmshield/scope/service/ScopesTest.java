@@ -60,6 +60,8 @@ class ScopesTest {
     private final AtomicInteger jobsAsked = new AtomicInteger();
     /** The campaigns' artifacts, as the artifacts module would answer (Story 5.1 part B). */
     private final StubCampaignArtifacts artifacts = new StubCampaignArtifacts();
+    /** The campaigns' overrides, as the knowledge module would answer (Story 5.5 part A). */
+    private final StubCampaignOverrides overrides = new StubCampaignOverrides();
     private ScopeFixture fixture;
     private Scopes scopes;
 
@@ -80,7 +82,7 @@ class ScopesTest {
                     return ids.stream().filter(failed::contains).collect(Collectors.toSet());
                 },
                 beans.getBeanProvider(PlatformTransactionManager.class)), TestMaterials.NO_RECORDS,
-                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, artifacts, vault,
+                TestMaterials.CORE_KEYS, TestMaterials.NO_TERMS, artifacts, overrides, vault,
                 beans.getBeanProvider(PlatformTransactionManager.class));
         fixture = new ScopeFixture(library, libraryStore, materials, index, vault, transactions);
     }
@@ -1142,6 +1144,27 @@ class ScopesTest {
         ScopeFixture.Starter them = fixture.starter();
         assertThatThrownBy(() -> as(them.owner(), () -> scopes.recordContents(scope, List.of(artifact))))
                 .isInstanceOf(ApiException.class);
+    }
+
+    /**
+     * Story 5.5 part A: the port's mark reaches a records read only when both sides are in the scope. Here the record it
+     * names is no record of the scope's system tier (the records reads are empty), so the artifact names none.
+     */
+    @Test
+    void anArtifactNamesTheRecordItOverridesOnlyWhenThatRecordIsInTheScopesSystemTier() {
+        Library2 lib = twoTiers();
+        UUID artifact = Ids.newId();
+        artifacts.put(lib.gm().owner(), lib.gm().campaign(), kael(artifact, "item"));
+        overrides.put(lib.gm().owner(), lib.gm().campaign(), artifact, Ids.newId());
+        ResolvedScope scope = as(lib.gm().owner(), () -> scopes.resolveSources(lib.gm().campaign(),
+                ScopeSettings.STARTING));
+
+        List<ScopedRecordContent> read = as(lib.gm().owner(), () -> scopes.recordContents(scope, List.of(artifact)));
+
+        assertThat(read).singleElement().satisfies(content -> {
+            assertThat(content.overrides()).isNull();
+            assertThat(content.overriddenBy()).isNull();
+        });
     }
 
     private static List<String> fieldNames(JsonNode node) {
