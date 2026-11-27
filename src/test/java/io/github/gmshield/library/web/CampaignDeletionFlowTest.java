@@ -84,6 +84,8 @@ import tools.jackson.databind.json.JsonMapper;
  * <p>Story 5.6 part A: a campaign an artifact is shared into, once deleted, is no target and not listed, and its pass
  * removes the shares into it before the campaign row; an artifact's own campaign deleted takes its shares, and the
  * campaign it was shared into reads it no more.
+ *
+ * <p>Story 6.1: a deleted campaign's Shields go before its row, which their key names; the other campaigns' stay.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -294,6 +296,10 @@ class CampaignDeletionFlowTest {
         assertThat(deletion.sweep()).isEqualTo(1);
 
         assertThat(library.campaigns).doesNotContainKey(target).containsKeys(sibling, gm.campaign());
+        // Story 6.1: the target's Shields went before its row (their key names it); the others' stay.
+        assertThat(library.shields.values()).noneMatch(shield -> shield.campaignId().equals(target))
+                .anyMatch(shield -> shield.campaignId().equals(sibling))
+                .anyMatch(shield -> shield.campaignId().equals(gm.campaign()));
         // Story 3.5: the target's scope settings went with it; the sibling's stay.
         assertThat(scopes.rows).doesNotContainKey(target).containsKey(sibling);
         assertThat(scopes.rows.get(sibling).scope().materialsOff()).containsExactly(ofSystem.materialId());

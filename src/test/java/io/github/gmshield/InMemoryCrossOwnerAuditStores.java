@@ -113,7 +113,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     }
 
     /**
-     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, deletion, scope, record type,
+     * A copy of these in-memory tables, by name: system, campaign and their deleting marks, shield (Story 6.1), deletion, scope, record type,
      * record (Story 4.2, its passage links inside each row), proposal, term and term alias (Story 4.4), artifact (a
      * record of a campaign, kept apart in memory) and record version (Story 5.1), artifact index and artifact index
      * removal (Story 5.1 part B), artifact reference (Story 5.4 part A), record relation (Story 5.5 part A), artifact
@@ -128,6 +128,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
         tables.put("campaign", copy(twins.library().campaigns));
         tables.put("system deleting", copy(twins.library().deleting));
         tables.put("campaign deleting", copy(twins.library().deletingCampaigns));
+        tables.put("shield", copy(twins.library().shields));
         tables.put("deletion", copy(twins.deletions().rows));
         tables.put("scope", copy(twins.scopes().rows));
         tables.put("record type", copy(twins.knowledge().recordTypes));
@@ -172,7 +173,7 @@ final class InMemoryCrossOwnerAuditStores implements CrossOwnerAuditStores {
     public Map<String, List<String>> held() {
         return Map.ofEntries(Map.entry("system", List.of("system")), Map.entry("record type", List.of("recordType")),
                 Map.entry("record", List.of("record")), Map.entry("artifact", List.of("artifact")),
-                Map.entry("campaign", List.of("campaign")),
+                Map.entry("campaign", List.of("campaign")), Map.entry("shield", List.of("shield", "firstShield")),
                 Map.entry("proposal", List.of("proposal", "termProposal")), Map.entry("term", List.of("term")),
                 Map.entry("material", List.of("material", "imageSetMaterial")),
                 Map.entry("material version", List.of("version", "superseded", "imageSet")),

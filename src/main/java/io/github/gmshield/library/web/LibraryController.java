@@ -544,7 +544,7 @@ class LibraryController {
     }
 
     /** A malformed id is no different from an unknown one. */
-    private static Optional<UUID> parse(String id) {
+    static Optional<UUID> parse(String id) {
         return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
     }
 
@@ -560,7 +560,7 @@ class LibraryController {
     }
 
     /** A page's size: the default without one, else 1 to 50, or {@code request.invalid}. */
-    private static int limit(String limit) {
+    static int limit(String limit) {
         if (limit == null) {
             return Library.DEFAULT_LIMIT;
         }
@@ -571,7 +571,7 @@ class LibraryController {
     }
 
     /** The cursor of a page: none, or an id, else {@code request.invalid}. */
-    private static UUID cursor(String cursor) {
+    static UUID cursor(String cursor) {
         return cursor == null ? null : parse(cursor).orElseThrow(LibraryController::invalid);
     }
 
@@ -579,7 +579,7 @@ class LibraryController {
      * The position a page starts at: 0 without one, else 0 to {@value Library#MAX_OFFSET}; {@code request.invalid} for
      * anything else, and for a position above 0 together with a cursor (a page starts at one or the other).
      */
-    private static int offset(String offset, UUID cursor) {
+    static int offset(String offset, UUID cursor) {
         if (offset == null) {
             return 0;
         }
@@ -590,19 +590,19 @@ class LibraryController {
         return Integer.parseInt(offset);
     }
 
-    private static String text(UUID id) {
+    static String text(UUID id) {
         return id == null ? null : id.toString();
     }
 
-    private static ApiException invalid() {
+    static ApiException invalid() {
         return new ApiException(ApiProblem.forStatus(400));
     }
 
-    private static ApiException notFound() {
+    static ApiException notFound() {
         return new ApiException(ApiProblem.forStatus(404));
     }
 
-    private static <T> ResponseEntity<T> found(Optional<T> body) {
+    static <T> ResponseEntity<T> found(Optional<T> body) {
         return body.map(value -> ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(value))
                 .orElseThrow(LibraryController::notFound);
     }

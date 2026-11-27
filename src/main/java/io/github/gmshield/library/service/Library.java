@@ -4,6 +4,7 @@ import io.github.gmshield.library.data.CampaignChange;
 import io.github.gmshield.library.data.CampaignRow;
 import io.github.gmshield.library.data.LibraryConflict;
 import io.github.gmshield.library.data.LibraryStore;
+import io.github.gmshield.library.data.ShieldRow;
 import io.github.gmshield.library.data.SystemChange;
 import io.github.gmshield.library.data.SystemRow;
 import io.github.gmshield.shared.service.ApiException;
@@ -71,6 +72,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>Story 4.1: both paths that create a system (the starter system and {@link #createSystem}) publish
  * {@link SystemCreated} inside the transaction that inserts it, so a listener's rows (the core record types of
  * {@code knowledge}) exist with the system or not at all.
+ *
+ * <p>Story 6.1: both paths that create a campaign (the starter campaign and {@link #createCampaign}) insert its first
+ * Shield, unnamed, in the same transaction, so a campaign never exists without one ({@link Shields}).
  */
 @Service
 public class Library {
@@ -154,7 +158,8 @@ public class Library {
     }
 
     /**
-     * A first sign-in's starter library: one system and one campaign of it, named in the account's language,
+     * A first sign-in's starter library: one system and one campaign of it, named in the account's language, and the
+     * campaign's first Shield, unnamed (Story 6.1),
      * for the owner of the work. Runs only inside the caller's transaction, so that the account and its starter
      * library exist together or not at all. Publishes {@link SystemCreated} in that transaction (Story 4.1).
      */
@@ -173,6 +178,7 @@ public class Library {
         store.insertCampaign(new CampaignRow(campaignId, owner, systemId,
                 vault.encryptText(binding(CAMPAIGN, FIELD_NAME, campaignId, owner), names[1]),
                 campaignFingerprint(names[1]), null, null, 0, now));
+        store.insertShield(ShieldRow.unnamed(Ids.newId(), owner, campaignId, now));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("systemId", systemId).addKeyValue("campaignId", campaignId)
                 .log("library.starter_created");
     }
@@ -365,7 +371,8 @@ public class Library {
 
     /**
      * A new campaign of the owner's system {@code systemId} (Story 3.2), named {@code typedName}: it becomes the current
-     * campaign. Empty, and nothing is stored, for an unknown system, another owner's or one being deleted. Throws
+     * campaign, with its first Shield, unnamed (Story 6.1). Empty, and nothing is stored, for an unknown system, another
+     * owner's or one being deleted. Throws
      * {@code request.campaign_name_invalid} (400) for a name outside its limits and {@code request.campaign_name_taken}
      * (409) when another campaign of the system has the same name; nothing is stored then.
      */
@@ -385,6 +392,7 @@ public class Library {
                 store.insertCampaign(row);
                 return row;
             });
+            store.insertShield(ShieldRow.unnamed(Ids.newId(), owner, id, now));
             return new Campaign(id, name, open(system), false, row.version());
         }));
         created.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", id)
@@ -500,8 +508,8 @@ public class Library {
         return vault.fingerprint(SYSTEM, FIELD_NAME, form);
     }
 
-    /** A system's or a campaign's name, trimmed, or {@code invalid}. */
-    private static String name(String typed, ApiProblem invalid) {
+    /** A system's, a campaign's or a Shield's name, trimmed, or {@code invalid}. */
+    static String name(String typed, ApiProblem invalid) {
         String name = typed == null ? "" : typed.strip();
         int length = name.codePointCount(0, name.length());
         if (length < 1 || length > NAME_MAX) {
@@ -519,14 +527,14 @@ public class Library {
         return value.isEmpty() ? null : value;
     }
 
-    private static void checkLimit(int limit) {
+    static void checkLimit(int limit) {
         if (limit < 1 || limit > MAX_LIMIT) {
             throw new IllegalArgumentException("library.limit_invalid");
         }
     }
 
     /** A list starts at a cursor or at a position, never both, and no position is below zero or past the cap. */
-    private static void checkOffset(UUID cursor, int offset) {
+    static void checkOffset(UUID cursor, int offset) {
         if (offset < 0 || offset > MAX_OFFSET || (offset > 0 && cursor != null)) {
             throw new IllegalArgumentException("library.offset_invalid");
         }
@@ -571,6 +579,8 @@ public class Library {
                 case NAME_TAKEN -> LibraryProblems.SYSTEM_NAME_TAKEN;
                 case CAMPAIGN_NAME_TAKEN -> LibraryProblems.CAMPAIGN_NAME_TAKEN;
                 case STALE_VERSION -> LibraryProblems.STALE_VERSION;
+                case SHIELD_NAME_TAKEN -> LibraryProblems.SHIELD_NAME_TAKEN;
+                case UNNAMED_SHIELD_TAKEN -> throw conflict;
             });
         }
     }

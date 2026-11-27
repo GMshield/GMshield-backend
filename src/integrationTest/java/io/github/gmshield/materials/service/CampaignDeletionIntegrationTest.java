@@ -174,10 +174,14 @@ class CampaignDeletionIntegrationTest {
         assertThat(count("turn", "id in (?, ?)", turn, again)).isZero();
         assertThat(count("turn", "id = ?", siblingTurn)).isOne();
         assertThat(count("campaign", "id = ?", target)).isOne();
+        assertThat(count("shield", "campaign_id = ?", target)).isOne();
 
         assertThat(deletion.run(a.id(), deletionId)).isTrue();
 
         assertThat(count("campaign", "id = ?", target)).isZero();
+        // Story 6.1: its Shield went before its row, which shield_campaign_fkey names; the sibling's stays.
+        assertThat(count("shield", "campaign_id = ?", target)).isZero();
+        assertThat(count("shield", "campaign_id = ?", sibling)).isOne();
         assertThat(count("conversation", "campaign_id = ?", target)).isZero();
         assertThat(count("turn_event_batch", "turn_id = ?", turn)).isZero();
         assertThat(count("turn_reference", "turn_id = ?", turn)).isZero();
