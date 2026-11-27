@@ -52,6 +52,14 @@ class RecordEntity {
     @Column(name = "conversation_id", updatable = false)
     private UUID conversationId;
 
+    /**
+     * The Shield holding a note (Story 6.2 part A, V54); null for every other artifact, for a note no Shield holds and
+     * for an extracted record. From Story 6.2 part B a move writes it ({@link #moveTo}), from one Shield to another of
+     * the same campaign, never to or from null.
+     */
+    @Column(name = "shield_id")
+    private UUID shieldId;
+
     @Column(name = "ordinal", updatable = false)
     private Integer ordinal;
 
@@ -123,6 +131,7 @@ class RecordEntity {
         this.ownerId = row.ownerId();
         this.campaignId = row.campaignId();
         this.conversationId = row.conversationId();
+        this.shieldId = row.shieldId();
         this.recordType = row.type();
         this.createdAt = row.createdAt();
     }
@@ -203,12 +212,28 @@ class RecordEntity {
         this.deletedAt = at;
     }
 
+    /** Whether it is a note a Shield holds (Story 6.2 part A). */
+    boolean held() {
+        return campaignId != null && shieldId != null;
+    }
+
+    /**
+     * Moves a note a Shield holds to the Shield {@code shield} of its campaign (Story 6.2 part B; the caller checked
+     * it). Hibernate raises the version when it writes it.
+     */
+    void moveTo(UUID shield) {
+        if (!held() || shield == null) {
+            throw new IllegalStateException("knowledge.not_a_held_note");
+        }
+        this.shieldId = shield;
+    }
+
     /** The row of an artifact (Story 5.1); only an artifact read calls it, and only on a row with a campaign. */
     ArtifactRow artifact() {
         if (campaignId == null) {
             throw new IllegalStateException("knowledge.not_an_artifact");
         }
-        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt, conversationId);
+        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt, conversationId, shieldId);
     }
 
     /** The row of an extracted record; only a read that filters through a version calls it. */

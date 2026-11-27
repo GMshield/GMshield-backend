@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -40,9 +41,15 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ({@code request.shield_name_taken}, 409). A rename names the version it was made on ({@code request.stale_version},
  * 409, when it is stale). Lists are oldest first. Logs carry ids, counts and versions only.
  *
- * <p>Part B: a Shield's deletion is synchronous, since a Shield holds nothing yet (6.2 and 6.4 bring its notes and rolls,
- * and the counts of the preview). The campaign's only Shield cannot be deleted ({@code request.last_shield}, 409). The
- * deletion locks the campaign's row before it counts, so two deletions at once cannot leave a campaign with none.
+ * <p>Part B: the campaign's only Shield cannot be deleted ({@code request.last_shield}, 409). The deletion locks the
+ * campaign's row before it counts, so two deletions at once cannot leave a campaign with none.
+ *
+ * <p>Story 6.2 part B: a Shield holds notes, so its deletion is the recorded, resumable process
+ * ({@link SystemDeletion#deleteShield}). Under the campaign's lock the Shield is found live and not the last, becomes
+ * deleting (its name free at once) and the deletion is recorded, in one transaction that also marks its live notes
+ * deleting; from the commit it is "not found" to every read and count here. The preview counts its live notes
+ * ({@link SystemDeletion#previewShield}); rolls stay 0 until Story 6.4. {@link #lockedShield} gives the {@code artifacts}
+ * module the live Shield under the same lock, so a note is never created in, or moved into, a Shield being deleted.
  */
 @Service
 public class Shields {
@@ -53,13 +60,15 @@ public class Shields {
 
     private final LibraryStore store;
     private final Vault vault;
+    private final ObjectProvider<SystemDeletion> deletion;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
-    Shields(LibraryStore store, Vault vault, ObjectProvider<PlatformTransactionManager> transactions,
-            ObjectProvider<Clock> clock) {
+    Shields(LibraryStore store, Vault vault, ObjectProvider<SystemDeletion> deletion,
+            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.store = store;
         this.vault = vault;
+        this.deletion = deletion;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -109,6 +118,21 @@ public class Shields {
     public Optional<Shield> shield(UUID campaignId, UUID shieldId) {
         return reading(() -> store.findCampaign(campaignId)
                 .flatMap(campaign -> store.findShield(campaign.id(), shieldId)).map(this::open));
+    }
+
+    /**
+     * The owner's live Shield {@code shieldId} of the campaign {@code campaignId}, found under the campaign's row lock
+     * (Story 6.2 part B), which the caller's transaction (which must exist) holds until it ends: a Shield's deletion
+     * takes the same lock, so while it is held the Shield found here cannot become deleting. Empty for any id
+     * {@link #shield} does not find, and for a Shield that became deleting while this waited for the lock.
+     */
+    public Optional<Shield> lockedShield(UUID campaignId, UUID shieldId) {
+        OwnerContext.require();
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("library.transaction_required");
+        }
+        return store.lockCampaign(campaignId).flatMap(campaign -> store.findShield(campaign.id(), shieldId))
+                .map(this::open);
     }
 
     /**
@@ -169,8 +193,8 @@ public class Shields {
     }
 
     /**
-     * What goes with a Shield if it is deleted: how many notes and rolls (none until Stories 6.2 and 6.4 store them), and
-     * whether it is its campaign's only Shield, which cannot be deleted.
+     * What goes with a Shield if it is deleted: how many live notes (Story 6.2 part B) and rolls (none until Story 6.4
+     * stores them), and whether it is its campaign's only live Shield, which cannot be deleted.
      */
     public record ShieldDeletion(long notes, long rolls, boolean last) {
     }
@@ -182,29 +206,38 @@ public class Shields {
     public Optional<ShieldDeletion> shieldDeletion(UUID campaignId, UUID shieldId) {
         return reading(() -> store.findCampaign(campaignId)
                 .flatMap(campaign -> store.findShield(campaign.id(), shieldId))
-                .map(row -> new ShieldDeletion(0, 0, store.shieldCount(row.campaignId()) <= 1L)));
+                .map(row -> new ShieldDeletion(deletion.getObject().previewShield(row.id()), 0,
+                        store.shieldCount(row.campaignId()) <= 1L)));
     }
 
     /**
-     * Deletes the owner's Shield {@code shieldId} of the campaign {@code campaignId}: true once it is gone, false for any
-     * id {@link #shield} does not find. Throws {@code request.last_shield} (409) when it is the campaign's only Shield;
-     * nothing changes then. The campaign's row is locked before the Shields are counted.
+     * Starts the deletion of the owner's Shield {@code shieldId} of the campaign {@code campaignId} (Story 6.2 part B),
+     * as the class says: true once it is recorded (from the commit the Shield and its notes are not found; the pass
+     * removes them), false for any id {@link #shield} does not find, a deleting Shield included. Throws
+     * {@code request.last_shield} (409) when it is the campaign's only live Shield; nothing changes then. The campaign's
+     * row is locked before the Shields are counted.
      */
     public boolean deleteShield(UUID campaignId, UUID shieldId) {
-        boolean deleted = Boolean.TRUE.equals(writing(() -> {
+        Instant now = now();
+        boolean recorded = Boolean.TRUE.equals(writing(() -> {
             if (store.lockCampaign(campaignId).isEmpty() || store.findShield(campaignId, shieldId).isEmpty()) {
                 return Boolean.FALSE;
             }
             if (store.shieldCount(campaignId) <= 1L) {
                 throw new ApiException(LibraryProblems.LAST_SHIELD);
             }
-            return store.deleteShield(campaignId, shieldId);
+            if (!store.markShieldDeleting(campaignId, shieldId, now)) {
+                throw new IllegalStateException("library.shield_vanished");
+            }
+            if (!deletion.getObject().deleteShield(shieldId)) {
+                // Marked but not recorded, no pass would ever remove it: the mark rolls back.
+                throw new IllegalStateException("library.shield_deletion_not_recorded");
+            }
+            return Boolean.TRUE;
         }));
-        if (deleted) {
-            log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("campaignId", campaignId)
-                    .addKeyValue("shieldId", shieldId).log("library.shield_deleted");
-        }
-        return deleted;
+        log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("campaignId", campaignId)
+                .addKeyValue("shieldId", shieldId).addKeyValue("recorded", recorded).log("library.shield_delete");
+        return recorded;
     }
 
     /**

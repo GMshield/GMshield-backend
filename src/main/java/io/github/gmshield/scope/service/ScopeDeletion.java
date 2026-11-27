@@ -53,7 +53,8 @@ class ScopeDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.versionId() != null || going.ofOneConversation() || going.ofOneArtifact()) {
+        if (going.versionId() != null || going.ofOneConversation() || going.ofOneArtifact()
+                || going.ofOneShield()) {
             return;
         }
         new TransactionTemplate(transactions.getObject()).executeWithoutResult(status -> {

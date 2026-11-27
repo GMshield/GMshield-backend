@@ -2053,13 +2053,68 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `ShieldDeletion{notes, rolls, last}`: the counts are 0 until Stories 6.2 and 6.4 store notes and rolls, and `last`
     is true when the campaign has exactly one Shield. `DELETE .../shields/{shieldId}` deletes it at once (204, no
     recorded deletion process: a Shield holds nothing yet) and refuses the campaign's only Shield with
-    `request.last_shield` (409), changing nothing. `Shields.deleteShield` locks the campaign's row first
+    `request.last_shield` (409), changing nothing (from Story 6.2 part B, the recorded process below, 202).
+    `Shields.deleteShield` locks the campaign's row first
     (`LibraryStore.lockCampaign`, JPQL `PESSIMISTIC_WRITE`; the in-memory store holds a lock until the transaction
     ends), then counts, so two deletions at once leave one Shield (one 204, one 409). Not found is as above on both
     routes, an already deleted Shield included; both are rows of the cross-owner audit.
   - Log lines (ids and versions only): `library.shield_created`, `library.shield_renamed`, `library.shield_deleted`,
     `library.first_shield_created`, `library.first_shield_raced`. Deploy order: backend, then frontend (the 1.54.0
     frontend shows no Shields; the 1.55.0 frontend cannot delete one). Internal contract and worker unchanged.
+
+- **Notes in a Shield (`artifacts` and `knowledge`, Story 6.2 part A, public contract 1.57.0, migration V54).** A note is
+  an artifact of the campaign of record type `note` that also names the Shield holding it.
+  - **V54** `record.shield_id` (nullable, owned by `knowledge`), with the key (owner, shield) to `shield` (no cascade:
+    a campaign's or a system's deletion removes the campaign's artifacts before its Shields), the check
+    `record_shield_check` (a held row is an artifact of type `note`) and the partial index `record_owner_shield`
+    (owner, shield, id). `note` artifacts written before V54 keep a null Shield. The migration's header has the way
+    back.
+  - **Rules** (`artifacts.service.Artifacts#createNote`, `#notes`). A note is written through the same path as
+    `Artifacts.create` (type `note`, no fields, version 1 and its index job, in one transaction), once
+    `library.service.Shields#shield` finds the Shield in that campaign. Another owner's campaign or Shield, an unknown
+    or malformed id, a Shield of another campaign and a campaign being deleted are all `request.not_found`. A held note
+    stays a note: an edit or a restore to another type is `request.note_type_fixed` (409), and nothing is stored. It
+    is the campaign's artifact everywhere else (the artifacts list and tab, sharing, relations, export) and a source
+    of the campaign tier through `CampaignArtifacts`, with no code of its own.
+  - **API** (`ShieldNoteController`, both `no-store`, both rows of the cross-owner audit):
+    `POST /api/v1/campaigns/{id}/shields/{shieldId}/notes` `{name, content}` (201, `Artifact`) and `GET` on the same
+    path (the Shield's live notes newest first, `limit`, `cursor` or `offset`, `NotePage{items, nextCursor, total}`).
+    `Artifact` and `ArtifactSummary` carry `shieldId` (null for no Shield, and in a read from a campaign the note is
+    shared into).
+  - Log lines (ids and counts only): `artifacts.note_created`, `artifacts.notes_listed`, `artifacts.retype_refused`.
+    Deploy order: backend, then frontend. Internal contract and worker unchanged.
+
+- **Move a note, and delete a Shield with its notes (Story 6.2 part B, public contract 1.58.0, migration V55).**
+  - **V55** `shield.deleting_at` (null for a live Shield), and `deletion_kind_check` allows `shield` too. The
+    migration's header has the way back (let every pending `shield` deletion finish first).
+  - **Move** (`Artifacts#move`, `PUT /api/v1/campaigns/{campaignId}/artifacts/{artifactId}/shield` `{shieldId}`, 200
+    `Artifact` with the new `shieldId`, `no-store`, a row of the cross-owner audit). It creates no version, no index job
+    and no change to the content (`ArtifactRecords#moveNote` writes `record.shield_id` on the locked row; V54's check
+    still holds); moving a note to its own Shield answers it unchanged. A note no Shield holds, a Shield of another
+    campaign, a deleting or unknown Shield and another owner's ids are `request.not_found` (404); a malformed body is
+    `request.invalid` (400). No move between campaigns.
+  - **The campaign lock.** `Artifacts#createNote` and `#move` find the Shield through
+    `library.service.Shields#lockedShield`, which locks the campaign's row (`LibraryStore.lockCampaign`) and answers the
+    live Shield under that lock. A Shield's deletion takes the same lock, so a note never lands in a Shield being
+    deleted, and no `record_shield_fkey` failure reaches the client.
+  - **Deleting a Shield** is now the recorded, resumable process (`SystemDeletion#deleteShield`, deletion kind
+    `shield`). `Shields#deleteShield`, under the campaign lock: the live Shield (404 otherwise), not the last live one
+    (`request.last_shield`, 409), then `LibraryStore.markShieldDeleting` (sets `deleting_at`; a named Shield's
+    fingerprint becomes its id, so its name is free at once) and the deletion record, whose prepare
+    (`ArtifactsDeletion`, `Going.ofShield`) marks the Shield's live notes deleting (with the locks a GM's delete of one
+    artifact takes) and cancels their index jobs, in the same transaction. `DELETE .../shields/{shieldId}` answers 202
+    with no body (was 204). From the commit the Shield is out of every Shield read and count, and its notes out of the
+    lists, search and the campaign tier. The pass removes every note the Shield holds, live or deleting, as one
+    artifact's deletion does (one `index.artifact_removal` job each), then `library` deletes the Shield's row and ends
+    the record (`library.shield_deleted`, `removed`). A failed pass is retried by the sweep; a campaign's or a system's
+    deletion that overtakes it removes everything, and the Shield's pass then ends without work.
+  - **Preview.** `ShieldDeletion.notes` is the Shield's live notes, counted by the handlers
+    (`SystemDeletion#previewShield`); `rolls` stays 0 until Story 6.4. `library` still depends only on `shared` and
+    `vault`.
+  - Log lines (ids and counts only): `artifacts.note_moved` (`found`, `moved`), `library.shield_delete` (`recorded`),
+    `library.shield_deleting`, `library.shield_deleted` (`removed`), `artifacts.deletion_prepared` (`marked`). Deploy
+    order: backend, then frontend (the 1.57.0 frontend reads the 202 as a success too). Internal contract and worker
+    unchanged.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

@@ -106,6 +106,15 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code artifact.export_too_large} (400), and one while 2 others render {@code artifact.export_busy} (503). The
  * answer is an attachment (RFC 6266 {@code filename*}), {@code no-store} and {@code nosniff}; a refusal stays problem
  * JSON (no {@code produces}).
+ *
+ * <p>Story 6.2 part A (contract 1.57.0): every artifact answer and list row carries {@code shieldId}, the Shield holding
+ * a note written there ({@link ShieldNoteController}); null for every other artifact. An edit or a restore of such a
+ * note to another type is {@code request.note_type_fixed} (409), and nothing is stored.
+ *
+ * <p>Story 6.2 part B (contract 1.58.0): a {@code PUT} on {@code .../shield} moves a note a Shield holds to another live
+ * Shield of the same campaign, keeping its versions (no new version, no index job, no change to its content); its own
+ * Shield answers it unchanged. A note no Shield holds, a Shield of another campaign, a deleting or unknown Shield and
+ * another account's ids are {@code request.not_found} (404).
  */
 @RestController
 @Tag(name = "artifacts")
@@ -124,6 +133,8 @@ class ArtifactController {
     static final String RELATION = RELATIONS + "/{recordId}";
     static final String RELATION_TARGETS = ARTIFACT + "/relation-targets";
     static final String SHARING = ARTIFACT + "/sharing";
+    /** Story 6.2 part B: the Shield holding a note. */
+    static final String SHIELD = ARTIFACT + "/shield";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -143,6 +154,8 @@ class ArtifactController {
             + " 20,000 after trimming); request.invalid (400) without a field for a malformed body;";
     private static final String STALE = " request.stale_version (409) when version is not the artifact's newest (it"
             + " changed elsewhere, as in another tab); nothing is stored then;";
+    private static final String NOTE_TYPE_FIXED = " request.note_type_fixed (409) when the artifact is a note a Shield"
+            + " holds (shieldId set) and the record type would not be note (contract 1.57.0); nothing is stored then;";
     private static final String NOT_FOUND = " request.not_found (404) for a campaign that is not the account's, and for"
             + " an artifact that is not this campaign's (unknown, another account's, another campaign's or malformed);"
             + " none is told apart;";
@@ -261,10 +274,10 @@ class ArtifactController {
 
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
         "version", "currentVersion", "createdAt", "conversationId", "references", "overrides", "related", "sharedWith",
-        "sharedFrom"},
+        "sharedFrom", "shieldId"},
             description = "An artifact with its newest version, or one of its versions when asked by number (contract"
             + " 1.42.0; currentVersion and versions from 1.44.0; conversationId and references from 1.48.0; overrides"
-            + " from 1.50.0; related from 1.51.0; sharedWith and sharedFrom from 1.52.0)")
+            + " from 1.50.0; related from 1.51.0; sharedWith and sharedFrom from 1.52.0; shieldId from 1.57.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
@@ -312,7 +325,11 @@ class ArtifactController {
                     + " its own campaign, where alone it is changed. Such a read is read-only: it has no overrides, no"
                     + " related, no sharedWith and a null conversationId, and every other artifact route answers"
                     + " request.not_found there. Null in its own campaign",
-                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom) {
+                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom,
+            @Schema(description = "The Shield of its campaign holding the artifact, a note written in that Shield"
+                    + " (contract 1.57.0): its recordType is always note, and an edit or a restore to another type is"
+                    + " request.note_type_fixed (409). Null for an artifact no Shield holds, and in a read from another"
+                    + " campaign (sharedFrom set)", types = {"string", "null"}, format = "uuid") String shieldId) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
@@ -324,7 +341,8 @@ class ArtifactController {
                     OverrideView.of(artifact.overrides()),
                     artifact.related().stream().map(RelatedView::of).toList(),
                     artifact.sharedWith().stream().map(SharedWithView::of).toList(),
-                    SharedFromView.of(artifact.sharedFrom()));
+                    SharedFromView.of(artifact.sharedFrom()),
+                    artifact.shieldId() == null ? null : artifact.shieldId().toString());
         }
 
         @Override
@@ -401,7 +419,8 @@ class ArtifactController {
     }
 
     @Schema(name = "ArtifactSummary", requiredProperties = {"id", "recordType", "name", "version", "createdAt",
-        "sharedFrom"}, description = "An artifact in a list (contract 1.42.0; sharedFrom from 1.53.0)")
+        "sharedFrom", "shieldId"}, description = "An artifact in a list (contract 1.42.0; sharedFrom from 1.53.0;"
+            + " shieldId from 1.57.0)")
     record SummaryView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "The key of its record type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item")
@@ -413,11 +432,15 @@ class ArtifactController {
             @Schema(description = "Set for an artifact of another of the account's campaigns shared into the listed"
                     + " one (contract 1.53.0): its own campaign, where alone it is changed. getArtifact answers it"
                     + " read-only from the listed campaign. Null for the listed campaign's own artifacts",
-                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom) {
+                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom,
+            @Schema(description = "The Shield of its campaign holding it, a note's (contract 1.57.0); null for an"
+                    + " artifact no Shield holds and for one shared into the listed campaign",
+                    types = {"string", "null"}, format = "uuid") String shieldId) {
 
         static SummaryView of(Artifacts.Summary summary) {
             return new SummaryView(summary.id().toString(), summary.recordType(), summary.name(), summary.version(),
-                    summary.createdAt().toString(), SharedFromView.of(summary.sharedFrom()));
+                    summary.createdAt().toString(), SharedFromView.of(summary.sharedFrom()),
+                    summary.shieldId() == null ? null : summary.shieldId().toString());
         }
 
         @Override
@@ -797,7 +820,7 @@ class ArtifactController {
             + " earlier version is kept. The edit applies from the next question (the new version is indexed). version"
             + " names the newest version the GM saw. An edit that changes nothing (the same record type, name, fields"
             + " and content, after trimming) answers that version as it is and stores nothing." + LIMITS + STALE
-            + NOT_FOUND + SESSION_SUMMARY,
+            + NOTE_TYPE_FIXED + NOT_FOUND + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")))
     ResponseEntity<ArtifactView> updateArtifact(
@@ -823,7 +846,8 @@ class ArtifactController {
             + " account's campaigns' artifacts (contract 1.44.0): its record type, name, fields and content are copied"
             + " as the artifact's next version; nothing is deleted. version names the newest version the GM saw."
             + " request.invalid (400) with params.field recordType when the version's record type is no longer one of"
-            + " the system's; request.invalid (400) without a field for a malformed body;" + STALE + NOT_FOUND
+            + " the system's; request.invalid (400) without a field for a malformed body;" + STALE + NOTE_TYPE_FIXED
+            + NOT_FOUND
             + " request.not_found (404) too for a number the artifact does not have, or a malformed one;"
             + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
@@ -1185,6 +1209,39 @@ class ArtifactController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(shared));
     }
 
+    @Schema(name = "NoteShield", requiredProperties = "shieldId",
+            description = "The Shield a note moves to (contract 1.58.0)")
+    record ShieldBody(
+            @Schema(description = "The id of a live Shield of the note's campaign", format = "uuid") String shieldId) {
+    }
+
+    @PutMapping(path = SHIELD, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "moveNote", summary = "The GM moves a note one of the account's Shields holds to another"
+            + " Shield of the same campaign (contract 1.58.0), answering the note as getArtifact does, with the new"
+            + " shieldId. It keeps its versions: no version is created, nothing is indexed again and its content does"
+            + " not change; its own Shield answers it unchanged. request.invalid (400) for a malformed body;"
+            + NOT_FOUND + " request.not_found (404) too for an artifact no Shield holds, and for a Shield that is not"
+            + " a live Shield of the note's campaign (another campaign's, being deleted, unknown or malformed);"
+            + " nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> moveNote(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The note's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody ShieldBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null || body.shieldId() == null) {
+            throw invalid();
+        }
+        // A malformed Shield id is a Shield that exists nowhere.
+        UUID shield = parse(body.shieldId()).orElseThrow(ArtifactController::notFound);
+        Artifacts.Artifact moved = artifacts.move(campaign, artifact, shield).orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(moved));
+    }
+
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */
     private static Optional<Integer> number(String text) {
         return text != null && NUMBER.matcher(text).matches() ? Optional.of(Integer.parseInt(text))
@@ -1200,12 +1257,12 @@ class ArtifactController {
     }
 
     /** A malformed id is no different from an unknown one. */
-    private static Optional<UUID> parse(String id) {
+    static Optional<UUID> parse(String id) {
         return id != null && UUID_TEXT.matcher(id).matches() ? Optional.of(UUID.fromString(id)) : Optional.empty();
     }
 
     /** A page's size: the default without one, else 1 to 50, or {@code request.invalid}. */
-    private static int limit(String limit) {
+    static int limit(String limit) {
         if (limit == null) {
             return Artifacts.DEFAULT_LIMIT;
         }
@@ -1219,7 +1276,7 @@ class ArtifactController {
      * The position a page starts at: 0 without one, else 0 to {@value Artifacts#MAX_OFFSET}; {@code request.invalid}
      * for anything else, and for a position above 0 together with a cursor (a page starts at one or the other).
      */
-    private static int offset(String offset, Object cursor) {
+    static int offset(String offset, Object cursor) {
         if (offset == null) {
             return 0;
         }
@@ -1230,11 +1287,11 @@ class ArtifactController {
         return Integer.parseInt(offset);
     }
 
-    private static ApiException invalid() {
+    static ApiException invalid() {
         return new ApiException(ApiProblem.forStatus(400));
     }
 
-    private static ApiException notFound() {
+    static ApiException notFound() {
         return new ApiException(ApiProblem.forStatus(404));
     }
 }

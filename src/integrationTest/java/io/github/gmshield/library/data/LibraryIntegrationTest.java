@@ -289,8 +289,18 @@ class LibraryIntegrationTest {
         }
 
         @Override
-        public boolean deleteShield(UUID campaignId, UUID id) {
-            return real.deleteShield(campaignId, id);
+        public boolean markShieldDeleting(UUID campaignId, UUID id, Instant at) {
+            return real.markShieldDeleting(campaignId, id, at);
+        }
+
+        @Override
+        public boolean shieldDeleting(UUID id) {
+            return real.shieldDeleting(id);
+        }
+
+        @Override
+        public boolean deleteDeletingShield(UUID id) {
+            return real.deleteDeletingShield(id);
         }
     }
 
@@ -1029,8 +1039,9 @@ class LibraryIntegrationTest {
         assertThat(preview.path("rolls").asLong()).isZero();
 
         HttpResponse<String> deleted = send("DELETE", path + "/" + combat, gm.session(), Map.of());
-        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
-        assertThat(count("select count(*) from shield where id = ?", combat)).isZero();
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        // Story 6.2 part B: deleting at once, its row gone once its pass ran.
+        assertThat(count("select count(*) from shield where id = ? and deleting_at is null", combat)).isZero();
         assertThat(ok(get(path + "/" + first + "/deletion", gm.session())).path("last").asBoolean()).isTrue();
         HttpResponse<String> refused = send("DELETE", path + "/" + first, gm.session(), Map.of());
         assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
@@ -1078,8 +1089,9 @@ class LibraryIntegrationTest {
                 assertThat(json(response).path("code").asString()).isEqualTo("request.last_shield");
             }
         }
-        assertThat(statuses).containsExactlyInAnyOrder(204, 409);
-        assertThat(count("select count(*) from shield where campaign_id = ?", gm.campaignId())).isEqualTo(1);
+        assertThat(statuses).containsExactlyInAnyOrder(202, 409);
+        assertThat(count("select count(*) from shield where campaign_id = ? and deleting_at is null", gm.campaignId()))
+                .isEqualTo(1);
         assertThat(ok(get(path, gm.session())).path("total").asLong()).isEqualTo(1);
     }
 

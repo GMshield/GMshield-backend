@@ -30,6 +30,7 @@ import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.Shields;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.CampaignArtifacts;
 import io.github.gmshield.scope.service.ScopeSettings;
@@ -123,6 +124,13 @@ import tools.jackson.databind.json.JsonMapper;
  * filter, the cursor and the offset, counted in its total and types; the other owner's store reads answer none of
  * them, and {@code ArtifactShareStore#ofAll} reads the shares of many artifacts on PostgreSQL.
  *
+ * <p>Story 6.2 part A (V54): a note written in a Shield is a {@code record} row of type {@code note} naming its Shield,
+ * with its version 1 and index job; the Shield's notes page in SQL (newest first, by cursor and offset, with the total),
+ * leaving out another Shield's, a plain note and a deleting one; the key refuses another owner's Shield and an unknown
+ * one, and the check a held row of another type or without a campaign, so a retype is refused by the service and by the
+ * table; the note is a source of the campaign tier on PostgreSQL; and a campaign's deletion removes its notes before its
+ * Shields, which the key would otherwise refuse.
+ *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
  */
@@ -189,6 +197,8 @@ class ArtifactsIntegrationTest {
     private Scopes scopes;
     @Autowired
     private ArtifactShareStore shares;
+    @Autowired
+    private Shields shieldsOf;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID system, UUID campaign) {
@@ -1273,6 +1283,252 @@ class ArtifactsIntegrationTest {
         assertThat(after.types()).containsExactly(new Artifacts.TypeCount("item", 1), new Artifacts.TypeCount("note",
                 1));
         freeTheIngestionLane();
+    }
+
+    // --- Story 6.2 part A
+
+    @Test
+    void aNoteInAShieldIsStoredWithItsShieldPagesInSqlAndTheKeyAndCheckHoldOnPostgres() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        Owner b = owner();
+        UUID first = firstShield(a, a.campaign());
+        UUID combat = as(a.id(), () -> shieldsOf.createShield(a.campaign(), "Combate")).orElseThrow().id();
+        UUID bShield = firstShield(b, b.campaign());
+        UUID plain = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("note", "Solta", List.of(),
+                null))).orElseThrow().id();
+        List<UUID> made = new java.util.ArrayList<>();
+        for (String name : List.of("Um", "Dois", "Três")) {
+            made.add(as(a.id(), () -> artifacts.createNote(a.campaign(), first, name, "Texto de " + name))
+                    .orElseThrow().id());
+        }
+        UUID other = as(a.id(), () -> artifacts.createNote(a.campaign(), combat, "Outra", null)).orElseThrow().id();
+
+        // The row: an artifact of type note naming its Shield, with version 1 and its index job.
+        Map<String, Object> row = jdbc.sql("select campaign_id, shield_id, type, version_id from record where id = ?")
+                .param(made.get(0)).query().singleRow();
+        assertThat(row).containsEntry("campaign_id", a.campaign()).containsEntry("shield_id", first)
+                .containsEntry("type", "note");
+        assertThat(row.get("version_id")).isNull();
+        assertThat(count("record_version", "record_id = ?", made.get(0))).isOne();
+        assertThat(count("artifact_index", "record_id = ?", made.get(0))).isOne();
+        assertThat(jdbc.sql("select shield_id from record where id = ?").param(plain).query().singleRow()
+                .get("shield_id")).isNull();
+
+        // The Shield's notes, newest first, a page at a time in SQL, with the total; the others left out.
+        Artifacts.NotePage page = as(a.id(), () -> artifacts.notes(a.campaign(), first, null, 0, 2)).orElseThrow();
+        assertThat(page.items()).extracting(Artifacts.Summary::id).containsExactly(made.get(2), made.get(1));
+        assertThat(page.items()).extracting(Artifacts.Summary::name).containsExactly("Três", "Dois");
+        assertThat(page.items()).allMatch(summary -> first.equals(summary.shieldId()));
+        assertThat(page.total()).isEqualTo(3);
+        assertThat(page.nextCursor()).isEqualTo(made.get(1));
+        assertThat(as(a.id(), () -> artifacts.notes(a.campaign(), first, made.get(1), 0, 2)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(made.get(0));
+        assertThat(as(a.id(), () -> artifacts.notes(a.campaign(), first, null, 2, 2)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(made.get(0));
+        assertThat(as(a.id(), () -> artifacts.notes(a.campaign(), combat, null, 0, 20)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(other);
+        // Another owner, or a Shield of another campaign: nothing found.
+        assertThat(as(b.id(), () -> artifacts.notes(a.campaign(), first, null, 0, 20))).isEmpty();
+        assertThat(as(b.id(), () -> artifacts.notes(b.campaign(), first, null, 0, 20))).isEmpty();
+        assertThat(as(b.id(), () -> artifacts.createNote(b.campaign(), first, "Tomada", null))).isEmpty();
+        assertThat(as(a.id(), () -> artifacts.notes(a.campaign(), bShield, null, 0, 20))).isEmpty();
+        as(b.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(records.notesOf(a.campaign(), first, null, 0, 20)).isEmpty();
+            assertThat(records.noteCount(a.campaign(), first)).isZero();
+            return null;
+        }));
+
+        // The key holds the Shield within its owner; the check keeps a held row an artifact of type note.
+        assertThatThrownBy(() -> jdbc.sql("insert into record (id, owner_id, campaign_id, type, shield_id, created_at)"
+                + " values (?, ?, ?, 'note', ?, now())").params(Ids.newId(), b.id(), b.campaign(), first).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record (id, owner_id, campaign_id, type, shield_id, created_at)"
+                + " values (?, ?, ?, 'note', ?, now())").params(Ids.newId(), a.id(), a.campaign(), Ids.newId())
+                .update()).isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record (id, owner_id, campaign_id, type, shield_id, created_at)"
+                + " values (?, ?, ?, 'item', ?, now())").params(Ids.newId(), a.id(), a.campaign(), first).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("update record set type = 'rule' where id = ?").param(made.get(0)).update())
+                .isInstanceOf(DataIntegrityViolationException.class);
+        // The service refuses the retype first, and nothing is stored.
+        assertThatThrownBy(() -> as(a.id(), () -> artifacts.update(a.campaign(), made.get(0), 1,
+                new Artifacts.Written("rule", "Um", List.of(), null)))).isInstanceOf(ApiException.class)
+                .satisfies(refused -> assertThat(((ApiException) refused).problem().code())
+                        .isEqualTo("request.note_type_fixed"));
+        assertThat(count("record_version", "record_id = ?", made.get(0))).isOne();
+        Artifacts.Artifact edited = as(a.id(), () -> artifacts.update(a.campaign(), made.get(0), 1,
+                new Artifacts.Written("note", "Um", List.of(), "Outro texto"))).orElseThrow();
+        assertThat(edited.version()).isEqualTo(2);
+        assertThat(edited.shieldId()).isEqualTo(first);
+        assertThat(jdbc.sql("select shield_id from record where id = ?").param(made.get(0)).query(UUID.class).single())
+                .isEqualTo(first);
+
+        // A source of the campaign tier, on PostgreSQL.
+        assertThat(as(a.id(), () -> scopes.resolveSources(a.campaign(), new ScopeSettings(true, false, false, false,
+                java.util.Set.of())).artifacts())).contains(made.get(0), other, plain);
+
+        // A deleting note leaves the Shield's list and its total.
+        assertThat(as(a.id(), () -> artifacts.delete(a.campaign(), made.get(2)))).isTrue();
+        Artifacts.NotePage after = as(a.id(), () -> artifacts.notes(a.campaign(), first, null, 0, 20)).orElseThrow();
+        assertThat(after.items()).extracting(Artifacts.Summary::id).containsExactly(made.get(1), made.get(0));
+        assertThat(after.total()).isEqualTo(2);
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void aCampaignsDeletionRemovesItsNotesBeforeItsShields() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        UUID other = as(a.id(), () -> library.createCampaign(a.system(), "Mesa que vai")).orElseThrow().id();
+        UUID shield = firstShield(a, other);
+        UUID note = as(a.id(), () -> artifacts.createNote(other, shield, "Vai junto", "Texto")).orElseThrow().id();
+        UUID ownShield = firstShield(a, a.campaign());
+        UUID staying = as(a.id(), () -> artifacts.createNote(a.campaign(), ownShield, "Fica", null)).orElseThrow()
+                .id();
+
+        assertThat(as(a.id(), () -> deletion.deleteCampaign(other))).isTrue();
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+
+        assertThat(count("campaign", "id = ?", other)).isZero();
+        assertThat(count("shield", "id = ?", shield)).isZero();
+        assertThat(count("record", "id = ?", note)).isZero();
+        assertThat(count("record_version", "record_id = ?", note)).isZero();
+        assertThat(count("record", "id = ?", staying)).isOne();
+        freeTheIngestionLane();
+    }
+
+    // --- Story 6.2 part B
+
+    @Test
+    void aMoveWritesOnlyTheShieldAndV55LetsAShieldsDeletionPassRemoveItsNotesThenItsRowOnPostgres() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        UUID first = firstShield(a, a.campaign());
+        UUID combat = as(a.id(), () -> shieldsOf.createShield(a.campaign(), "Combate")).orElseThrow().id();
+        UUID moved = as(a.id(), () -> artifacts.createNote(a.campaign(), first, "Pistas", "Um")).orElseThrow().id();
+        as(a.id(), () -> artifacts.update(a.campaign(), moved, 1, new Artifacts.Written("note", "Pistas", List.of(),
+                "Dois"))).orElseThrow();
+        long jobs = count("artifact_index", "record_id = ?", moved);
+
+        // The move: only record.shield_id changes; no version and no index job.
+        Artifacts.Artifact after = as(a.id(), () -> artifacts.move(a.campaign(), moved, combat)).orElseThrow();
+        assertThat(after.shieldId()).isEqualTo(combat);
+        assertThat(after.version()).isEqualTo(2);
+        assertThat(jdbc.sql("select shield_id from record where id = ?").param(moved).query(UUID.class).single())
+                .isEqualTo(combat);
+        assertThat(count("record_version", "record_id = ?", moved)).isEqualTo(2);
+        assertThat(count("artifact_index", "record_id = ?", moved)).isEqualTo(jobs);
+
+        // V55: the kind check takes 'shield', and the Shield has its deleting time.
+        assertThat(migration("V55__shield_deletion.sql")).contains("'shield'");
+        assertThat(jdbc.sql("select deleting_at from shield where id = ?").param(combat).query().singleRow()
+                .get("deleting_at")).isNull();
+
+        // Combat holds the moved note, a second one, and one the GM deleted (still deleting).
+        UUID second = as(a.id(), () -> artifacts.createNote(a.campaign(), combat, "Ordem", null)).orElseThrow().id();
+        UUID gmDeleted = as(a.id(), () -> artifacts.createNote(a.campaign(), combat, "Apagada", null)).orElseThrow()
+                .id();
+        assertThat(as(a.id(), () -> artifacts.delete(a.campaign(), gmDeleted))).isTrue();
+        UUID kept = as(a.id(), () -> artifacts.createNote(a.campaign(), first, "Fica", null)).orElseThrow().id();
+        UUID openJob = jdbc.sql("select job_id from artifact_index where record_id = ?").param(second)
+                .query(UUID.class).single();
+        assertThat(as(a.id(), () -> shieldsOf.shieldDeletion(a.campaign(), combat)).orElseThrow().notes())
+                .isEqualTo(2);
+
+        assertThat(as(a.id(), () -> shieldsOf.deleteShield(a.campaign(), combat))).isTrue();
+
+        // The GM's transaction: the Shield deleting with its name freed, its live notes deleting, the open index job
+        // cancelled, the deletion recorded.
+        Map<String, Object> shield = jdbc.sql("select deleting_at, name_fingerprint from shield where id = ?")
+                .param(combat).query().singleRow();
+        assertThat(shield.get("deleting_at")).isNotNull();
+        assertThat((byte[]) shield.get("name_fingerprint")).hasSize(16);
+        assertThat(jdbc.sql("select count(*) from record where id in (?, ?) and deleted_at is not null")
+                .params(moved, second).query(Long.class).single()).isEqualTo(2);
+        assertThat(jdbc.sql("select state from job where id = ?").param(openJob).query(String.class).single())
+                .isEqualTo("cancelled");
+        assertThat(jdbc.sql("select kind from deletion where target_id = ?").param(combat).query(String.class)
+                .single()).isEqualTo("shield");
+        assertThat(as(a.id(), () -> shieldsOf.shields(a.campaign(), null, 0, 20)).orElseThrow().items())
+                .extracting(Shields.Shield::id).containsExactly(first);
+        assertThat(as(a.id(), () -> scopes.resolveSources(a.campaign(), new ScopeSettings(true, false, false, false,
+                java.util.Set.of())).artifacts())).contains(kept).doesNotContain(moved, second, gmDeleted);
+        // Its name is free in the campaign at once.
+        assertThat(as(a.id(), () -> shieldsOf.createShield(a.campaign(), "Combate"))).isPresent();
+
+        // The pass: every note it holds goes (the GM's deleted one too), one removal job each, then its row.
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+
+        for (UUID id : List.of(moved, second, gmDeleted)) {
+            assertThat(count("record", "id = ?", id)).isZero();
+            assertThat(count("record_version", "record_id = ?", id)).isZero();
+            assertThat(count("artifact_index", "record_id = ?", id)).isZero();
+            assertThat(count("artifact_index_removal", "artifact_id = ?", id)).isOne();
+        }
+        assertThat(count("shield", "id = ?", combat)).isZero();
+        assertThat(count("deletion", "target_id = ? and done_at is null", combat)).isZero();
+        assertThat(count("deletion", "target_id = ? and done_at is null", gmDeleted)).isZero();
+        assertThat(count("record", "id = ?", kept)).isOne();
+        freeTheIngestionLane();
+    }
+
+    @Test
+    void aCreateOrAMoveWaitingBehindAShieldsDeletionFindsTheShieldGoneInsteadOfFailingOnTheKey() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        UUID first = firstShield(a, a.campaign());
+        UUID going = as(a.id(), () -> shieldsOf.createShield(a.campaign(), "Vai")).orElseThrow().id();
+        UUID note = as(a.id(), () -> artifacts.createNote(a.campaign(), first, "Pistas", null)).orElseThrow().id();
+
+        // The deletion's transaction holds the campaign's lock until both writes wait for it, then commits.
+        java.util.concurrent.CountDownLatch deleted = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CompletableFuture<Boolean> deleting = java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> OwnerContext.callAs(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+                    boolean started = shieldsOf.deleteShield(a.campaign(), going);
+                    deleted.countDown();
+                    try {
+                        assertThat(release.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return started;
+                })));
+        assertThat(deleted.await(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        long waitingBefore = waitingOnLocks();
+        java.util.concurrent.CompletableFuture<Optional<Artifacts.Artifact>> created =
+                java.util.concurrent.CompletableFuture.supplyAsync(() -> OwnerContext.callAs(a.id(),
+                        () -> artifacts.createNote(a.campaign(), going, "Tarde", null)));
+        java.util.concurrent.CompletableFuture<Optional<Artifacts.Artifact>> moved =
+                java.util.concurrent.CompletableFuture.supplyAsync(() -> OwnerContext.callAs(a.id(),
+                        () -> artifacts.move(a.campaign(), note, going)));
+        long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (waitingOnLocks() < waitingBefore + 2 && System.nanoTime() < until) {
+            Thread.sleep(20);
+        }
+        assertThat(waitingOnLocks()).isGreaterThanOrEqualTo(waitingBefore + 2);
+        release.countDown();
+
+        assertThat(deleting.get(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(created.get(30, java.util.concurrent.TimeUnit.SECONDS)).isEmpty();
+        assertThat(moved.get(30, java.util.concurrent.TimeUnit.SECONDS)).isEmpty();
+        assertThat(count("record", "shield_id = ?", going)).isZero();
+        assertThat(jdbc.sql("select shield_id from record where id = ?").param(note).query(UUID.class).single())
+                .isEqualTo(first);
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+        assertThat(count("shield", "id = ?", going)).isZero();
+        freeTheIngestionLane();
+    }
+
+    /** How many sessions of this database wait for a lock now. */
+    private long waitingOnLocks() {
+        return jdbc.sql("select count(*) from pg_stat_activity where datname = current_database()"
+                + " and wait_event_type = 'Lock'").query(Long.class).single();
+    }
+
+    private UUID firstShield(Owner owner, UUID campaign) throws Exception {
+        return as(owner.id(), () -> shieldsOf.shields(campaign, null, 0, 1)).orElseThrow().items().getFirst().id();
     }
 
     /** A record of the owner's system, of its own ready version: its id and that version. */

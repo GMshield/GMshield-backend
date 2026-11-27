@@ -219,6 +219,9 @@ class ArtifactsFlowTest {
         assertThat(body.path("conversationId").isNull()).isTrue();
         assertThat(body.path("references").isArray()).isTrue();
         assertThat(body.path("references")).isEmpty();
+        // Story 6.2 part A: no Shield holds an artifact written here.
+        assertThat(body.has("shieldId")).isTrue();
+        assertThat(body.path("shieldId").isNull()).isTrue();
 
         HttpResponse<String> read = get(gm, artifacts(gm.campaign()) + "/" + id);
         assertThat(read.statusCode()).as(read.body()).isEqualTo(200);

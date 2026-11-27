@@ -26,8 +26,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * campaign's Shields, with their name key (campaign, fingerprint), the one unnamed Shield per campaign, their version
  * and the (owner, campaign) reference, which refuses to delete a campaign that still has Shields; from Story 6.1 part B
  * a per-campaign lock that {@link #lockCampaign} holds until its transaction ends, so that Shield deletions of one
- * campaign run one after the other (the campaign's own deletion does not take it). A write undoes itself when its
- * transaction rolls back.
+ * campaign run one after the other (the campaign's own deletion does not take it); from Story 6.2 part B a Shield's
+ * deleting state (every Shield read and count skips a deleting one, and its name is freed). A write undoes itself when
+ * its transaction rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
 
@@ -44,6 +45,11 @@ public class InMemoryLibraryStore implements LibraryStore {
     public final Map<UUID, ShieldRow> shields = new ConcurrentHashMap<>();
     /** Per-campaign locks for Shield deletions (Story 6.1 part B), each held from {@link #lockCampaign} until its transaction ends. */
     private final Map<UUID, ReentrantLock> campaignLocks = new ConcurrentHashMap<>();
+    /**
+     * Like {@code record_shield_fkey} (Story 6.2 part B): when set, whether a Shield still holds a note, so deleting its
+     * row is refused as the database refuses it.
+     */
+    public volatile java.util.function.Predicate<UUID> shieldHasNotes;
     /** Set it to make the next campaign insert fail, as a database failure would. */
     public final AtomicBoolean failNextCampaign = new AtomicBoolean();
 
@@ -395,14 +401,14 @@ public class InMemoryLibraryStore implements LibraryStore {
     public Optional<ShieldRow> findShield(UUID campaignId, UUID id) {
         UUID owner = OwnerContext.require();
         return Optional.ofNullable(shields.get(id))
-                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId));
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId) && !row.deleting());
     }
 
     @Override
     public List<ShieldRow> shields(UUID campaignId, UUID after, int limit) {
         UUID owner = OwnerContext.require();
         return shields.values().stream()
-                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId)
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId) && !row.deleting()
                         && (after == null || row.id().compareTo(after) > 0))
                 .sorted(Comparator.comparing(ShieldRow::id)).limit(Math.max(limit, 0)).toList();
     }
@@ -483,13 +489,38 @@ public class InMemoryLibraryStore implements LibraryStore {
     }
 
     @Override
-    public synchronized boolean deleteShield(UUID campaignId, UUID id) {
+    public synchronized boolean markShieldDeleting(UUID campaignId, UUID id, Instant at) {
         Optional<ShieldRow> found = findShield(campaignId, id);
         if (found.isEmpty()) {
             return false;
         }
-        ShieldRow row = found.get();
+        ShieldRow before = found.get();
+        ownerFor(before.ownerId());
+        byte[] fingerprint = before.unnamed() ? null : SystemRow.idBytes(id);
+        ShieldRow after = new ShieldRow(id, before.ownerId(), campaignId, before.name(), fingerprint,
+                before.version() + 1, before.createdAt(), at);
+        shields.put(id, after);
+        RollbackUndo.onRollback(() -> shields.put(id, before));
+        return true;
+    }
+
+    @Override
+    public boolean shieldDeleting(UUID id) {
+        UUID owner = OwnerContext.require();
+        ShieldRow row = shields.get(id);
+        return row != null && row.ownerId().equals(owner) && row.deleting();
+    }
+
+    @Override
+    public synchronized boolean deleteDeletingShield(UUID id) {
+        if (!shieldDeleting(id)) {
+            return false;
+        }
+        ShieldRow row = shields.get(id);
         ownerFor(row.ownerId());
+        if (shieldHasNotes != null && shieldHasNotes.test(id)) {
+            throw new IllegalStateException("record_shield_fkey");
+        }
         shields.remove(id);
         RollbackUndo.onRollback(() -> shields.put(id, row));
         return true;
