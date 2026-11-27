@@ -57,6 +57,23 @@ public final class CoreRecordTypes {
         return name;
     }
 
+    /**
+     * The name the interface shows for the core type {@code key} (Story 5.7, an export's labels): {@link #NAMES_PT_BR}'s
+     * in pt-BR, else the stored English name with a capital first letter ("Character sheet"), as the frontend writes
+     * them; empty for a key that is not core.
+     */
+    public static Optional<String> shownName(String key, boolean portuguese) {
+        int index = KEYS.indexOf(key);
+        if (index < 0) {
+            return Optional.empty();
+        }
+        if (portuguese) {
+            return Optional.of(NAMES_PT_BR.get(index));
+        }
+        String english = NAMES.get(key);
+        return Optional.of(Character.toUpperCase(english.charAt(0)) + english.substring(1));
+    }
+
     /** The core types' names in both languages (Story 4.4): the stored English ones and {@link #NAMES_PT_BR}. */
     static List<String> namesInEveryLanguage() {
         List<String> all = new java.util.ArrayList<>(NAMES.values());

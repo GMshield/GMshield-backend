@@ -289,6 +289,9 @@ class CrossOwnerAuditFlowTest {
             // an artifact's sharing with other campaigns of its system (Story 5.6 part A)
             route("PUT", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/sharing", "campaignId", "campaign",
                     "artifactId", "artifact").json("{\"campaignIds\":[]}").own("campaignId"),
+            // an export of a campaign's artifacts (Story 5.7 part A): the artifact is named in the query
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/export", "campaignId", "campaign")
+                    .query("ids={artifact}&format=txt").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -630,7 +633,11 @@ class CrossOwnerAuditFlowTest {
                 new Probe("campaignIds in PUT /campaigns/{campaignId}/artifacts/{artifactId}/sharing", "campaign", 400,
                         "artifact.share_target", "otherCampaign", 200, false,
                         id -> json("PUT", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
-                                + "/sharing", "{\"campaignIds\":[\"" + id + "\"]}")));
+                                + "/sharing", "{\"campaignIds\":[\"" + id + "\"]}")),
+                // Story 5.7 part A: exporting another account's artifact is refused as an unknown artifact is.
+                probe("ids in GET /campaigns/{campaignId}/artifacts/export", "artifact", 404, "request.not_found", 200,
+                        id -> new Request("GET", "/api/v1/campaigns/" + campaign + "/artifacts/export?format=txt&ids="
+                                + id, null, List.of())));
     }
 
     @Test
@@ -1150,7 +1157,12 @@ class CrossOwnerAuditFlowTest {
                     : items.get(held));
         }
         if (route.query() != null) {
-            path += "?" + route.query();
+            // Story 5.7: a query names items too, its {key} placeholders filled as the body's are.
+            String query = route.query();
+            for (Map.Entry<String, String> value : values.entrySet()) {
+                query = query.replace("{" + value.getKey() + "}", value.getValue());
+            }
+            path += "?" + query;
         }
         List<String> headers = new ArrayList<>(route.headers());
         HttpRequest.BodyPublisher body = null;

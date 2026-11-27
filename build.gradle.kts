@@ -9,6 +9,7 @@ plugins {
 
 val springModulithVersion = "2.2.0-RC1"
 val springdocVersion = "3.2.0"
+val pdfboxVersion = "3.0.8"
 
 group = "io.github.gmshield"
 version = "0.1.0"
@@ -53,6 +54,8 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
     implementation("org.springframework.modulith:spring-modulith-starter-core")
     implementation("org.springdoc:springdoc-openapi-starter-webmvc-api:$springdocVersion")
+    // Story 5.7: the artifact exports (PDF, and JPG from the PDF's pages), rendered in memory (see README.md).
+    implementation("org.apache.pdfbox:pdfbox:$pdfboxVersion")
     runtimeOnly("org.flywaydb:flyway-database-postgresql")
     runtimeOnly("org.postgresql:postgresql")
 
