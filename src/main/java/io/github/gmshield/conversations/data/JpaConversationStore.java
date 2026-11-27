@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.data;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.OptimisticLockException;
+import jakarta.persistence.Query;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -40,6 +41,10 @@ import org.springframework.stereotype.Repository;
  *
  * <p>Story 5.3 part B: {@code turn.proposal_name} and {@code turn.proposal_type} are written by one bulk update only
  * ({@link #markProposed}).
+ *
+ * <p>Story 5.4 part A: {@code turn.saved_record_id} and {@code turn.save_declined_at} are written by bulk updates only
+ * ({@link #markSaved}, {@link #markSaveDeclined}, {@link #clearSaveDeclined}), each conditional on the column it guards,
+ * one text per case (Sonar S2077 wants no text assembled at run time).
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
@@ -56,6 +61,17 @@ class JpaConversationStore implements ConversationStore {
     private static final String SAVED_CAMPAIGNS = "select distinct c.campaignId" + SAVED;
     private static final String SAVED_TURNS = "select t" + SAVED_OF + " order by t.bookmarkedAt desc, t.id desc";
     private static final String SAVED_COUNT = "select count(t)" + SAVED_OF;
+
+    /** A save of a never-saved turn, and of one whose saved artifact was deleted (Story 5.4 part A). */
+    private static final String SAVE_FIRST = "update Turn t set t.savedRecordId = :record, t.saveDeclinedAt = :at"
+            + " where t.id = :id and t.savedRecordId is null";
+    private static final String SAVE_AGAIN = "update Turn t set t.savedRecordId = :record, t.saveDeclinedAt = :at"
+            + " where t.id = :id and t.savedRecordId = :expected";
+    /** "Salvar como artefato" (Story 5.4 part A): on a turn never saved, and on one whose saved artifact was deleted. */
+    private static final String REOPEN_UNSAVED = "update Turn t set t.saveDeclinedAt = null, t.savedRecordId = null"
+            + " where t.id = :id and t.savedRecordId is null and t.saveDeclinedAt is not null";
+    private static final String REOPEN_GONE = "update Turn t set t.saveDeclinedAt = null, t.savedRecordId = null"
+            + " where t.id = :id and t.savedRecordId = :stale";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -283,6 +299,44 @@ class JpaConversationStore implements ConversationStore {
         // As markBookmarked: one bulk update after the owner's row was read (Story 5.3 part B).
         return em().createQuery("update Turn t set t.proposalName = :name, t.proposalType = :type where t.id = :id")
                 .setParameter("name", name).setParameter("type", type).setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean markSaved(UUID turnId, UUID expected, UUID recordId, Instant at) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        // As markBookmarked: one bulk update after the owner's row was read (Story 5.4 part A). A second save waits on
+        // the first's row lock, then finds the column set and changes nothing.
+        Query update = em().createQuery(expected == null ? SAVE_FIRST : SAVE_AGAIN)
+                .setParameter("record", recordId).setParameter("at", at).setParameter("id", turnId);
+        if (expected != null) {
+            update.setParameter("expected", expected);
+        }
+        return update.executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean markSaveDeclined(UUID turnId, Instant at) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        return em().createQuery("update Turn t set t.saveDeclinedAt = :at where t.id = :id"
+                + " and t.saveDeclinedAt is null").setParameter("at", at).setParameter("id", turnId)
+                .executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean clearSaveDeclined(UUID turnId, UUID stale) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        Query update = em().createQuery(stale == null ? REOPEN_UNSAVED : REOPEN_GONE)
+                .setParameter("id", turnId);
+        if (stale != null) {
+            update.setParameter("stale", stale);
+        }
+        return update.executeUpdate() > 0;
     }
 
     @Override

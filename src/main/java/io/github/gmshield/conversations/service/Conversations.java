@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.node.ObjectNode;
 
@@ -137,6 +138,23 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@code turn}/{@code proposal_name}) before its {@code done}. The {@link Ending} read for the stream
  *       ({@link #ending}) and for {@link #turns} carries it, and {@code done} shows it only when the turn is neither
  *       stopped nor silent ({@link TurnEvents#doneData}). Nothing is written to the library.</li>
+ *   <li>Story 5.4 part A, saving a draft. A draft turn that is done and neither stopped nor silent (the
+ *       {@link #bookmark} rule, plus its kind) is offered for saving; nothing else ever is. Its {@link Saving save state}
+ *       is worked out when it is read ({@link #turns}): {@code saved} while the artifact it was saved as is live in its
+ *       campaign ({@link Scopes#removedArtifacts}), {@code declined} once the GM declined it or that artifact is
+ *       deleting or gone, {@code offered} otherwise. {@link #saveable} reads what the {@code artifacts} module saves
+ *       (the conversation, its campaign, the draft's text joined from its stored deltas and its references with their
+ *       versions and materials), or refuses with {@code conversation.turn_not_saveable} or
+ *       {@code conversation.turn_saved}; {@link #markSaved} records the save in the caller's transaction, or refuses
+ *       with {@code conversation.turn_saved} (409) so that transaction rolls back. {@link #declineSave} ("Agora não")
+ *       and {@link #reopenSave} ("Salvar como artefato") are safe to repeat, and refuse a turn that is not offered or
+ *       is saved. None changes the turn's events: the conversation keeps the agent's text. Every refusal and
+ *       {@code request.not_found} is as {@link #bookmark}'s.</li>
+ *   <li>Story 5.4 part B, a conversation's saved artifacts. {@link #deletion} also lists the live artifacts saved from
+ *       the conversation, read through the {@link ConversationArtifacts} port the {@code artifacts} module implements
+ *       (this module never depends on that one), and {@link #delete(UUID, Set)} takes the ticked ones with the
+ *       conversation in one transaction: a conversation not found deletes none of them. {@link #ready} tells which
+ *       conversations are {@code ready}, so an artifact never links to a deleting one.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -182,12 +200,14 @@ public class Conversations {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<AnswerJobs> answers;
     private final ObjectProvider<SystemDeletion> deletions;
+    private final ObjectProvider<ConversationArtifacts> savedArtifacts;
     private final Clock clock;
 
     Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes,
                   CampaignScopes campaignScopes, Jobs jobs, Vault vault,
                   ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<AnswerJobs> answers,
-                  ObjectProvider<SystemDeletion> deletions, ObjectProvider<Clock> clock) {
+                  ObjectProvider<SystemDeletion> deletions, ObjectProvider<ConversationArtifacts> savedArtifacts,
+                  ObjectProvider<Clock> clock) {
         this.store = store;
         this.referenceStore = referenceStore;
         this.library = library;
@@ -198,6 +218,7 @@ public class Conversations {
         this.transactions = transactions;
         this.answers = answers;
         this.deletions = deletions;
+        this.savedArtifacts = savedArtifacts;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
@@ -210,6 +231,16 @@ public class Conversations {
 
     /** A campaign's conversation and how many questions it holds (Story 3.2). */
     public record OfCampaign(UUID id, long questions) {
+    }
+
+    /**
+     * What goes with a conversation if it is deleted (Story 3.10 part B): how many questions it shows, and (Story 5.4
+     * part B) its live saved artifacts, oldest first, which its delete may take.
+     */
+    public record Deletion(long questions, List<ConversationArtifacts.SavedArtifact> artifacts) {
+        public Deletion {
+            artifacts = List.copyOf(artifacts);
+        }
     }
 
     /** A recorded turn: its id, its conversation and its language (null when unsure). */
@@ -244,6 +275,54 @@ public class Conversations {
     public record Turn(UUID id, UUID conversationId, String language) {
     }
 
+    /** Where an offered draft's save card stands (Story 5.4 part A). */
+    public enum SaveState {
+        OFFERED("offered"), DECLINED("declined"), SAVED("saved");
+
+        private final String word;
+
+        SaveState(String word) {
+            this.word = word;
+        }
+
+        /** Its word, as the API has it. */
+        public String word() {
+            return word;
+        }
+    }
+
+    /** An offered draft's save state (Story 5.4 part A), and the artifact it was saved as (only when saved). */
+    public record Saving(SaveState state, UUID artifactId) {
+    }
+
+    /**
+     * One source reference of a draft as a save copies it (Story 5.4 part A): the reference, decrypted, and the
+     * version and material it names (null for an artifact's). {@code toString} names the number only.
+     */
+    public record SavedSource(UUID versionId, UUID materialId, TurnReference reference) {
+        @Override
+        public String toString() {
+            return "SavedSource[number=" + reference.number() + "]";
+        }
+    }
+
+    /**
+     * What a save of the owner's offered draft reads (Story 5.4 part A): its turn, conversation and campaign, the draft's
+     * text (its joined deltas, as Markdown), its references by number, and the artifact its save state names (null when
+     * never saved; else one deleted since). {@code toString} names ids and counts only.
+     */
+    public record Saveable(UUID turnId, UUID conversationId, UUID campaignId, String draft, List<SavedSource> sources,
+                           UUID savedRecordId) {
+        public Saveable {
+            sources = List.copyOf(sources);
+        }
+
+        @Override
+        public String toString() {
+            return "Saveable[turnId=" + turnId + ", sources=" + sources.size() + "]";
+        }
+    }
+
     /**
      * A conversation as a list shows it (Story 3.10): its name ({@link #nameOf}), how many questions it holds, when it
      * was made and when its newest question was asked, and its version.
@@ -274,10 +353,10 @@ public class Conversations {
     /**
      * A stored turn (Story 3.10): its question and language, when it was asked, and its stored events in order, each
      * with its data as the stream sends it ({@code done}'s built now from its references); from Story 5.3 part A, its
-     * kind.
+     * kind; from Story 5.4 part A, its save state (null unless it is an offered draft).
      */
     public record StoredTurn(UUID id, String question, String language, Instant createdAt, List<StoredEvent> events,
-                             boolean bookmarked, TurnKind kind) {
+                             boolean bookmarked, TurnKind kind, Saving saving) {
         public StoredTurn {
             events = List.copyOf(events);
         }
@@ -388,7 +467,7 @@ public class Conversations {
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
                     settings.modelKnowledge(), settings.materialsOff(), now, null, null, null, asked.word(), null,
-                    null)));
+                    null, null, null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
                     .addKeyValue("turnId", turnId).addKeyValue("kind", asked.word())
@@ -469,8 +548,13 @@ public class Conversations {
      * language and stored events as the stream sends them; empty for a conversation that is not the owner's.
      */
     public Optional<List<StoredTurn>> turns(UUID id) {
-        return reading(() -> visible(id).map(conversation -> store.newestTurns(conversation.id(), MAX_TURNS).stream()
-                .map(this::stored).toList()));
+        return reading(() -> visible(id).map(conversation -> {
+            List<TurnRow> rows = store.newestTurns(conversation.id(), MAX_TURNS);
+            // Story 5.4 part A: one look-up of the saved drafts' artifacts.
+            Set<UUID> gone = scopes.removedArtifacts(conversation.campaignId(), rows.stream()
+                    .map(TurnRow::savedRecordId).filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet()));
+            return rows.stream().map(row -> stored(row, gone)).toList();
+        }));
     }
 
     /**
@@ -502,26 +586,67 @@ public class Conversations {
     }
 
     /**
-     * What goes with the owner's conversation if it is deleted (Story 3.10 part B): how many questions it holds; empty
-     * for a conversation that is not the owner's (a deleting one included).
+     * What goes with the owner's conversation if it is deleted (Story 3.10 part B): how many questions it holds, and
+     * (Story 5.4 part B) the live artifacts saved from it, oldest first ({@link ConversationArtifacts#saved}), which its
+     * delete may take; empty for a conversation that is not the owner's (a deleting one included).
      */
-    public Optional<Long> deletion(UUID id) {
-        return reading(() -> visible(id).map(row -> store.turnCount(row.id())));
+    public Optional<Deletion> deletion(UUID id) {
+        return reading(() -> visible(id).map(row -> new Deletion(store.turnCount(row.id()),
+                savedArtifacts.getObject().saved(row.id()))));
     }
 
     /**
-     * Deletes the owner's conversation (Story 3.10 part B), as the class says: true when its deletion was recorded now;
-     * false (nothing changes) for a conversation that is not the owner's, a deleting one included.
+     * Deletes the owner's conversation (Story 3.10 part B), as the class says, keeping every artifact saved from it:
+     * {@link #delete(UUID, Set)} with none ticked.
      */
     public boolean delete(UUID id) {
+        return delete(id, Set.of());
+    }
+
+    /**
+     * Deletes the owner's conversation (Story 3.10 part B), as the class says, with (Story 5.4 part B) the artifacts
+     * saved from it among {@code artifactIds}: in one transaction, the conversation's deletion is recorded
+     * ({@link SystemDeletion#deleteConversation}), then each id that is one of its live saved artifacts starts its
+     * recorded deletion ({@link ConversationArtifacts#deleteSaved}; any other id is ignored). True when it was recorded now;
+     * false (nothing changes, those artifacts' deletions roll back too) for a conversation that is not the owner's, a
+     * deleting one included.
+     */
+    public boolean delete(UUID id, Set<UUID> artifactIds) {
         UUID owner = OwnerContext.require();
-        if (reading(() -> visible(id)).isEmpty()) {
-            return false;
+        Set<UUID> ticked = Set.copyOf(artifactIds);
+        Boolean recorded = new TransactionTemplate(transactions.getObject()).execute(status -> {
+            Optional<ConversationRow> found = visible(id);
+            if (found.isEmpty()) {
+                return false;
+            }
+            ConversationRow row = found.get();
+            if (!deletions.getObject().deleteConversation(row.id())) {
+                // Recorded already (another tab's delete won): not found, and no artifact is touched.
+                status.setRollbackOnly();
+                return false;
+            }
+            // In the same transaction: an artifact deletion that fails rolls the conversation's back too.
+            savedArtifacts.getObject().deleteSaved(row.campaignId(), row.id(), ticked);
+            return true;
+        });
+        boolean started = Boolean.TRUE.equals(recorded);
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("conversationId", id).addKeyValue("recorded", started)
+                .addKeyValue("artifactsTicked", ticked.size()).log("conversation.delete");
+        return started;
+    }
+
+    /**
+     * Which of these ids are the owner's {@code ready} conversations (Story 5.4 part B: an artifact links to the
+     * conversation it was saved from only then); one that is deleting, gone, of a campaign not readable, another
+     * owner's or unknown is left out.
+     */
+    public Set<UUID> ready(Set<UUID> ids) {
+        OwnerContext.require();
+        if (ids.isEmpty()) {
+            return Set.of();
         }
-        boolean recorded = deletions.getObject().deleteConversation(id);
-        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("conversationId", id).addKeyValue("recorded", recorded)
-                .log("conversation.delete");
-        return recorded;
+        return reading(() -> ids.stream().filter(Objects::nonNull).filter(id -> visible(id).isPresent())
+                .collect(Collectors.toUnmodifiableSet()));
     }
 
     /**
@@ -583,20 +708,40 @@ public class Conversations {
                 row.version());
     }
 
-    /** A stored turn with its events as the stream sends them; a {@code done}'s data built now (Story 2.5). */
-    private StoredTurn stored(TurnRow row) {
+    /**
+     * A stored turn with its events as the stream sends them; a {@code done}'s data built now (Story 2.5). {@code gone}
+     * holds the saved drafts' artifacts that are deleting or gone (Story 5.4 part A).
+     */
+    private StoredTurn stored(TurnRow row, Set<UUID> gone) {
         List<TurnEvent> events = storedEvents(row.id(), 0);
+        List<TurnReference> references = references(row.id());
         List<StoredEvent> stored = new ArrayList<>();
         for (TurnEvent event : events) {
             ObjectNode data = TurnEvent.DONE.equals(event.type())
-                    ? TurnEvents.doneData(new Ending(references(row.id()), row.modelKnowledge(), row.modelKnowledge()
+                    ? TurnEvents.doneData(new Ending(references, row.modelKnowledge(), row.modelKnowledge()
                             && events.stream().anyMatch(Conversations::modelTier), proposal(row)), event.stopped())
                     : TurnEvents.data(event);
             stored.add(new StoredEvent(event.sequence(), event.type(), data));
         }
         return new StoredTurn(row.id(), vault.decryptText(question(row.id(), row.ownerId()), row.question()),
                 row.language(), row.createdAt(), stored, row.bookmarkedAt() != null,
-                TurnKind.of(row.kind()).orElse(TurnKind.QUESTION));
+                TurnKind.of(row.kind()).orElse(TurnKind.QUESTION),
+                offered(row, events, references) ? saving(row, gone) : null);
+    }
+
+    /**
+     * The save state of an offered draft (Story 5.4 part A), as the class says; {@code gone} holds the artifacts that
+     * are deleting or gone among those it may name.
+     */
+    private static Saving saving(TurnRow row, Set<UUID> gone) {
+        UUID saved = row.savedRecordId();
+        if (saved != null && !gone.contains(saved)) {
+            return new Saving(SaveState.SAVED, saved);
+        }
+        if (saved != null || row.saveDeclinedAt() != null) {
+            return new Saving(SaveState.DECLINED, null);
+        }
+        return new Saving(SaveState.OFFERED, null);
     }
 
     /** The turn's stored proposal, its name decrypted (Story 5.3 part B); null when it has none. */
@@ -778,12 +923,120 @@ public class Conversations {
         if (turn.stoppedAt() != null) {
             return false;
         }
-        List<TurnEvent> events = storedEvents(turn.id(), 0);
-        if (events.isEmpty() || !TurnEvent.DONE.equals(events.getLast().type()) || events.getLast().stopped()) {
+        return done(turn, storedEvents(turn.id(), 0), references(turn.id()));
+    }
+
+    /** {@link #done(TurnRow)}, given the turn's stored events and references. */
+    private static boolean done(TurnRow turn, List<TurnEvent> events, List<TurnReference> references) {
+        if (turn.stoppedAt() != null || events.isEmpty() || !TurnEvent.DONE.equals(events.getLast().type())
+                || events.getLast().stopped()) {
             return false;
         }
-        return !references(turn.id()).isEmpty()
-                || turn.modelKnowledge() && events.stream().anyMatch(Conversations::modelTier);
+        return !references.isEmpty() || turn.modelKnowledge() && events.stream().anyMatch(Conversations::modelTier);
+    }
+
+    /**
+     * Whether the turn is offered for saving (Story 5.4 part A): a {@link TurnKind#DRAFT draft} that is {@link #done}
+     * (not stopped, not silent), given its stored events and references.
+     */
+    private static boolean offered(TurnRow turn, List<TurnEvent> events, List<TurnReference> references) {
+        return TurnRow.DRAFT.equals(turn.kind()) && done(turn, events, references);
+    }
+
+    /**
+     * What a save of the owner's turn reads (Story 5.4 part A), as the class says, in the caller's transaction or a read
+     * of its own: {@code request.not_found} for a turn that is not the owner's or is of a deleting conversation;
+     * {@code conversation.turn_not_saveable} for one that is not offered; {@code conversation.turn_saved} for one saved
+     * as a live artifact.
+     */
+    public Saveable saveable(UUID turnId) {
+        return reading(() -> {
+            Offered offered = offeredDraft(turnId);
+            if (offered.saving().state() == SaveState.SAVED) {
+                throw ConversationProblems.turnSaved();
+            }
+            TurnRow turn = offered.turn();
+            Map<Integer, TurnReferenceRow> rows = new HashMap<>();
+            referenceStore.references(turn.id()).forEach(row -> rows.put(row.number(), row));
+            List<SavedSource> sources = offered.references().stream().map(reference -> {
+                TurnReferenceRow row = rows.get(reference.number());
+                return new SavedSource(row == null ? null : row.versionId(), row == null ? null : row.materialId(),
+                        reference);
+            }).toList();
+            return new Saveable(turn.id(), turn.conversationId(), offered.campaignId(), answerText(offered.events()),
+                    sources, turn.savedRecordId());
+        });
+    }
+
+    /**
+     * Records the save of the owner's draft read by {@link #saveable} as the artifact {@code recordId} (Story 5.4 part
+     * A), in the caller's transaction, which must exist; {@code conversation.turn_saved} (409) when another save got
+     * there first, so the caller's transaction rolls back.
+     */
+    public void markSaved(Saveable saveable, UUID recordId) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("conversations.transaction_required");
+        }
+        OwnerContext.require();
+        if (!store.markSaved(saveable.turnId(), saveable.savedRecordId(), recordId, now())) {
+            throw ConversationProblems.turnSaved();
+        }
+    }
+
+    /** Declines the save of the owner's offered draft (Story 5.4 part A, "Agora não"), as the class says. */
+    public void declineSave(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            Offered offered = offeredDraft(turnId);
+            return switch (offered.saving().state()) {
+                case SAVED -> throw ConversationProblems.turnSaved();
+                case DECLINED -> false;
+                case OFFERED -> store.markSaveDeclined(offered.turn().id(), now());
+            };
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.save_declined");
+    }
+
+    /** Offers the owner's declined draft for saving again (Story 5.4 part A, "Salvar como artefato"), as the class says. */
+    public void reopenSave(UUID turnId) {
+        UUID owner = OwnerContext.require();
+        boolean changed = writing(() -> {
+            Offered offered = offeredDraft(turnId);
+            return switch (offered.saving().state()) {
+                case SAVED -> throw ConversationProblems.turnSaved();
+                case OFFERED -> false;
+                // A saved artifact deleted since is let go, so a new save may follow.
+                case DECLINED -> store.clearSaveDeclined(offered.turn().id(), offered.turn().savedRecordId());
+            };
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId).addKeyValue("changed", changed)
+                .log("conversation.save_reopened");
+    }
+
+    /** An offered draft as read now: its row, campaign, events, references and save state. */
+    private record Offered(TurnRow turn, UUID campaignId, List<TurnEvent> events, List<TurnReference> references,
+                           Saving saving) {
+    }
+
+    /**
+     * The owner's offered draft (Story 5.4 part A), in the caller's transaction: {@code request.not_found} for a turn
+     * that is not the owner's or is of a deleting conversation, {@code conversation.turn_not_saveable} for one that is
+     * not offered. A done draft never runs again, so no lock is needed: one seen done stays done.
+     */
+    private Offered offeredDraft(UUID turnId) {
+        TurnRow turn = (turnId == null ? Optional.<TurnRow>empty() : shown(turnId))
+                .orElseThrow(ConversationProblems::notFound);
+        ConversationRow conversation = store.findConversation(turn.conversationId())
+                .orElseThrow(ConversationProblems::notFound);
+        List<TurnEvent> events = storedEvents(turn.id(), 0);
+        List<TurnReference> references = references(turn.id());
+        if (!offered(turn, events, references)) {
+            throw ConversationProblems.turnNotSaveable();
+        }
+        Set<UUID> gone = turn.savedRecordId() == null ? Set.of()
+                : scopes.removedArtifacts(conversation.campaignId(), Set.of(turn.savedRecordId()));
+        return new Offered(turn, conversation.campaignId(), events, references, saving(turn, gone));
     }
 
     /** Whether the turn has ended (Story 3.11): stopped, or its last stored event is {@code done} or {@code error}. */

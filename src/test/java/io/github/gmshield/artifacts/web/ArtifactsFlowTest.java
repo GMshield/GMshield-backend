@@ -9,7 +9,9 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
@@ -82,6 +84,11 @@ import tools.jackson.databind.json.JsonMapper;
  * another owner's or another campaign's artifact is not found to a delete and nothing changes; a deleting artifact
  * leaves both deletion dialogs' counts and the type-in-use guard, and a campaign's deletion still removes it. The claim
  * wait and the removal job are {@code ArtifactIndexingTest}'s, the answers {@code RecordsFlowTest}'s.
+ *
+ * <p>Story 5.4 part A: an artifact written by hand reads with no conversation and no references; a saved draft's copied
+ * references (stored here as a save stores them, sealed under the artifact) are read decrypted and in order, each
+ * removed as of the read (an unknown version, a deleted cited artifact), kept by an edit and a restore and by a version
+ * read, and removed with the artifact by its deletion's pass. The save itself is {@code ConversationFlowTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -140,6 +147,8 @@ class ArtifactsFlowTest {
     @Autowired
     private InMemoryArtifactIndexStore index;
     @Autowired
+    private InMemoryArtifactReferenceStore references;
+    @Autowired
     private InMemoryLibraryStore library;
     @Autowired
     private ExtractedRecords extracted;
@@ -173,6 +182,11 @@ class ArtifactsFlowTest {
         assertThat(body.path("content").asString()).isEqualTo("Forjada nas montanhas do norte.\nBrilha perto de orcs.");
         assertThat(body.path("version").asInt()).isEqualTo(1);
         assertThat(body.path("createdAt").asString()).isNotBlank();
+        // Story 5.4 part A: written by hand, so no conversation and no references.
+        assertThat(body.has("conversationId")).isTrue();
+        assertThat(body.path("conversationId").isNull()).isTrue();
+        assertThat(body.path("references").isArray()).isTrue();
+        assertThat(body.path("references")).isEmpty();
 
         HttpResponse<String> read = get(gm, artifacts(gm.campaign()) + "/" + id);
         assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
@@ -753,6 +767,85 @@ class ArtifactsFlowTest {
         assertThat(versionsOf(theirs)).isEqualTo(1);
         assertThat(json(get(a, artifacts(a.campaign()) + "/" + theirs)).path("name").asString())
                 .isEqualTo("Espada de Kael");
+    }
+
+    // --- a saved draft's references (Story 5.4 part A)
+
+    @Test
+    void aSavedDraftsReferencesAreReadAsOfNowAndKeptByAnEditARestoreAndAVersionRead() throws Exception {
+        Gm gm = signUp();
+        String cited = create(gm, gm.campaign(), "creature", "Esqueleto");
+        String id = create(gm, gm.campaign(), "encounter", "Emboscada");
+        UUID artifact = UUID.fromString(id);
+        UUID passage = Ids.newId();
+        UUID version = Ids.newId();
+        UUID record = Ids.newId();
+        // As a save stores them: a passage's place (its version unknown here, so removed), a record's and an artifact's.
+        OwnerContext.runAs(gm.id(), () -> references.insert(List.of(
+                reference(gm, artifact, 1, version, passage, null, null, null),
+                reference(gm, artifact, 2, version, passage, record, "spell", null),
+                reference(gm, artifact, 3, null, null, UUID.fromString(cited), "creature", 1))));
+        String path = artifacts(gm.campaign()) + "/" + id;
+
+        JsonNode read = json(get(gm, path)).path("references");
+
+        assertThat(read).hasSize(3);
+        assertThat(read.get(0).path("kind").asString()).isEqualTo("passage");
+        assertThat(read.get(0).path("materialName").asString()).isEqualTo("SRD Livro");
+        assertThat(read.get(0).path("sectionPath").toString()).isEqualTo("[\"Magias\",\"Fire Bolt\"]");
+        assertThat(read.get(0).path("page").asInt()).isEqualTo(3);
+        assertThat(read.get(0).path("passageIds").toString()).isEqualTo("[\"" + passage + "\"]");
+        assertThat(read.get(0).path("tier").asString()).isEqualTo("system");
+        // A version that is gone reads as removed.
+        assertThat(read.get(0).path("removed").asBoolean()).isTrue();
+        assertThat(read.get(0).has("recordId")).isFalse();
+        assertThat(read.get(1).path("kind").asString()).isEqualTo("record");
+        assertThat(read.get(1).path("recordId").asString()).isEqualTo(record.toString());
+        assertThat(read.get(1).path("name").asString()).isEqualTo("Nome 2");
+        assertThat(read.get(1).path("fields").toString()).isEqualTo("[{\"name\":\"Dano\",\"value\":\"1d10\"}]");
+        assertThat(read.get(2).path("kind").asString()).isEqualTo("artifact");
+        assertThat(read.get(2).path("artifactId").asString()).isEqualTo(cited);
+        assertThat(read.get(2).path("artifactVersion").asInt()).isEqualTo(1);
+        assertThat(read.get(2).path("removed").asBoolean()).isFalse();
+        assertThat(read.get(2).has("materialName")).isFalse();
+        assertThat(read.get(2).has("page")).isFalse();
+
+        // An edit and a restore keep them; so does reading the earlier version.
+        edit(gm, id, 1, "note", "Emboscada II");
+        assertThat(json(get(gm, path)).path("references")).isEqualTo(read);
+        HttpResponse<String> restored = send(gm, "POST", path + "/versions/1/restore", "{\"version\":2}");
+        assertThat(restored.statusCode()).as(restored.body()).isEqualTo(200);
+        assertThat(json(restored).path("references")).isEqualTo(read);
+        assertThat(json(get(gm, path + "/versions/1")).path("references")).isEqualTo(read);
+
+        // The cited artifact deleted: its reference reads as removed, the content unchanged.
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + cited, null).statusCode()).isEqualTo(202);
+        assertThat(json(get(gm, path)).path("references").get(2).path("removed").asBoolean()).isTrue();
+
+        // The artifact deleted: its pass removes its references with it.
+        assertThat(send(gm, "DELETE", path, null).statusCode()).isEqualTo(202);
+        deletion.sweep();
+        assertThat(references.rows.values()).noneMatch(row -> row.recordId().equals(artifact));
+    }
+
+    /** A saved draft's reference as {@code Artifacts.saveDraft} stores it: each value sealed under the artifact. */
+    private ArtifactReferenceRow reference(Gm gm, UUID artifact, int number, UUID version, UUID passage, UUID cited,
+                                           String type, Integer artifactVersion) {
+        Binding name = new Binding("artifact_reference", "record_name:" + number, artifact, gm.id());
+        Binding fields = new Binding("artifact_reference", "record_fields:" + number, artifact, gm.id());
+        byte[] recordName = cited == null ? null : vault.encryptText(name, "Nome " + number);
+        byte[] recordFields = cited == null ? null
+                : vault.encrypt(fields, "[{\"name\":\"Dano\",\"value\":\"1d10\"}]".getBytes(StandardCharsets.UTF_8));
+        if (artifactVersion != null) {
+            return new ArtifactReferenceRow(artifact, gm.id(), number, null, null, null, null, null, null, "campaign",
+                    null, type, recordName, recordFields, cited, artifactVersion, Instant.now());
+        }
+        return new ArtifactReferenceRow(artifact, gm.id(), number, version, Ids.newId(), 3, List.of(passage),
+                vault.encryptText(new Binding("artifact_reference", "material_name:" + number, artifact, gm.id()),
+                        "SRD Livro"),
+                vault.encrypt(new Binding("artifact_reference", "section_path:" + number, artifact, gm.id()),
+                        "[\"Magias\",\"Fire Bolt\"]".getBytes(StandardCharsets.UTF_8)), "system", cited, type,
+                recordName, recordFields, null, null, Instant.now());
     }
 
     // --- delete (Story 5.2 part B)

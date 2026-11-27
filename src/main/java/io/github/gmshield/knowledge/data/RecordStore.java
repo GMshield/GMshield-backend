@@ -184,6 +184,12 @@ public interface RecordStore {
      */
     List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit);
 
+    /**
+     * The current owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its
+     * deletion's dialog), oldest first (by when they were written, then id); a deleting one is left out.
+     */
+    List<ArtifactRow> artifactsOfConversation(UUID conversationId);
+
     /** How many artifacts the current owner's campaign has (Story 5.1), of the type key {@code type} when not null. */
     long artifactCount(UUID campaignId, String type);
 

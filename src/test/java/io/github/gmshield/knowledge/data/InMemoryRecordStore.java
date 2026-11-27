@@ -272,7 +272,8 @@ public class InMemoryRecordStore implements RecordStore {
         if (!TYPE.matcher(type).matches()) {
             throw new IllegalStateException("check refused");
         }
-        ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt());
+        ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt(),
+                row.conversationId());
         artifacts.put(id, changed);
         RollbackUndo.onRollback(() -> artifacts.put(id, row));
         return Optional.of(changed);
@@ -303,6 +304,15 @@ public class InMemoryRecordStore implements RecordStore {
         return ofCampaign(campaignId, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
                 .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())
                 .skip(offset).limit(limit).toList();
+    }
+
+    @Override
+    public List<ArtifactRow> artifactsOfConversation(UUID conversationId) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && conversationId.equals(row.conversationId()) && live(row))
+                .sorted(Comparator.comparing(ArtifactRow::createdAt).thenComparing(ArtifactRow::id,
+                        InMemoryRecordStore::unsigned)).toList();
     }
 
     @Override

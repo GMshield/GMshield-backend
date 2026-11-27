@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.gmshield.artifacts.service.Artifacts;
 import io.github.gmshield.conversations.data.ConversationConflict;
 import io.github.gmshield.conversations.data.ConversationStore;
 import io.github.gmshield.conversations.data.TurnRow;
@@ -15,6 +16,7 @@ import io.github.gmshield.jobs.service.JobRecordReads;
 import io.github.gmshield.knowledge.service.Proposals;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.PassageRow;
@@ -84,6 +86,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * Story 5.3 part B (V48): a draft's claim with its {@code recordTypeNames}, its proposal stored with the done event, the
  * name encrypted at rest ({@code turn}/{@code proposal_name}) beside the plain type, read back in its ending and its
  * stored turns, and the check that sets the type only with a name.
+ * Story 5.4 part A (V49): a saved draft's artifact records its conversation, the turn names the artifact, the draft's
+ * references are copied into {@code artifact_reference} sealed under the artifact, a second save rolls back whole, the
+ * artifact's deletion sets the turn's link to null and takes the references (the turn reads declined), and the
+ * conversation's deletion keeps a saved artifact with its link set to null.
  */
 @SpringBootTest(properties = {"GMSHIELD_MODE=test", "gmshield.jobs.sweep.enabled=false",
     "gmshield.materials.upload-sweep.enabled=false",
@@ -122,6 +128,10 @@ class ConversationIntegrationTest {
     private OntologyProposals proposals;
     @Autowired
     private Proposals decisions;
+    @Autowired
+    private Artifacts artifacts;
+    @Autowired
+    private SystemDeletion deletion;
 
     @Test
     void aQuestionItsBatchesItsUsageAndItsEndAreStoredOnPostgres() {
@@ -967,6 +977,196 @@ class ConversationIntegrationTest {
                 .hasStackTraceContaining("turn_proposal_type_check");
     }
 
+    @Test
+    void aSavedDraftIsAnArtifactOfItsConversationWithItsReferencesSealedAndBothLinksGoToNullOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID passage = citedPassage(owner, campaign);
+        Conversations.Asked draft = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Um encontro para a cripta", null, null, TurnKind.DRAFT));
+        answer(draft.turnId(), "## Encontro na cripta\n\nTrês esqueletos.", passage);
+        assertThat(saving(owner, draft).state()).isEqualTo(Conversations.SaveState.OFFERED);
+
+        Artifacts.Artifact saved = OwnerContext.callAs(owner, () -> artifacts.saveDraft(draft.turnId(),
+                "Emboscada na Cripta", "encounter", null)).orElseThrow();
+
+        // V49: the artifact records its conversation; the turn names the artifact, its card closed.
+        assertThat(jdbc.sql("select conversation_id from record where id = :id").param("id", saved.id())
+                .query(UUID.class).single()).isEqualTo(draft.conversationId());
+        Map<String, Object> turn = jdbc.sql("select saved_record_id, save_declined_at from turn where id = :id")
+                .param("id", draft.turnId()).query().singleRow();
+        assertThat(turn.get("saved_record_id")).isEqualTo(saved.id());
+        assertThat(turn.get("save_declined_at")).isNotNull();
+        assertThat(saved.content()).isEqualTo("## Encontro na cripta\n\nTrês esqueletos.");
+        assertThat(saving(owner, draft)).isEqualTo(new Conversations.Saving(Conversations.SaveState.SAVED,
+                saved.id()));
+        // The references by value, each value sealed again under the artifact.
+        Map<String, Object> reference = jdbc.sql("select * from artifact_reference where record_id = :id")
+                .param("id", saved.id()).query().singleRow();
+        assertThat(reference).containsEntry("number", 1).containsEntry("page", 4).containsEntry("tier", "campaign");
+        byte[] materialName = (byte[]) reference.get("material_name");
+        assertThat(new String(materialName, StandardCharsets.ISO_8859_1)).doesNotContain("Livro");
+        assertThat(vault.decryptText(new Binding("artifact_reference", "material_name:1", saved.id(), owner),
+                materialName)).isEqualTo("Livro");
+        assertThat(as(owner, () -> artifacts.get(campaign, saved.id())).orElseThrow().references())
+                .singleElement().satisfies(read -> {
+                    assertThat(read.materialName()).isEqualTo("Livro");
+                    assertThat(read.passageIds()).containsExactly(passage);
+                    assertThat(read.removed()).isFalse();
+                });
+        // One draft, one artifact: a second save rolls back whole.
+        assertThatThrownBy(() -> OwnerContext.callAs(owner, () -> artifacts.saveDraft(draft.turnId(), "Outra",
+                "encounter", null))).isInstanceOfSatisfying(ApiException.class, refused ->
+                assertThat(refused.problem().code()).isEqualTo("conversation.turn_saved"));
+        assertThat(jdbc.sql("select count(*) from record where owner_id = :owner and campaign_id is not null")
+                .param("owner", owner).query(Long.class).single()).isOne();
+
+        // The artifact deleted (its row removed by the pass): the turn's link goes to null, its references with it,
+        // and the turn reads declined.
+        assertThat(as(owner, () -> artifacts.delete(campaign, saved.id()))).isTrue();
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+        assertThat(jdbc.sql("select count(*) from record where id = :id").param("id", saved.id()).query(Long.class)
+                .single()).isZero();
+        assertThat(jdbc.sql("select count(*) from artifact_reference where record_id = :id").param("id", saved.id())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select saved_record_id from turn where id = :id").param("id", draft.turnId())
+                .query(UUID.class).optional()).isEmpty();
+        assertThat(saving(owner, draft).state()).isEqualTo(Conversations.SaveState.DECLINED);
+
+        // Offered again and saved again; then the conversation's deletion keeps the artifact, its link set to null.
+        OwnerContext.runAs(owner, () -> conversations.reopenSave(draft.turnId()));
+        Artifacts.Artifact again = OwnerContext.callAs(owner, () -> artifacts.saveDraft(draft.turnId(), "Cripta",
+                "encounter", "Editado.")).orElseThrow();
+        assertThat(as(owner, () -> conversations.delete(draft.conversationId()))).isTrue();
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+        assertThat(jdbc.sql("select count(*) from conversation where id = :id").param("id", draft.conversationId())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select conversation_id from record where id = :id").param("id", again.id())
+                .query(UUID.class).optional()).isEmpty();
+        Artifacts.Artifact kept = as(owner, () -> artifacts.get(campaign, again.id())).orElseThrow();
+        assertThat(kept.conversationId()).isNull();
+        assertThat(kept.content()).isEqualTo("Editado.");
+        assertThat(kept.references()).hasSize(1);
+        // The checks: a conversation only on an artifact; a reference of one kind.
+        assertThatThrownBy(() -> jdbc.sql("insert into artifact_reference (record_id, owner_id, number, created_at)"
+                + " values (:record, :owner, 9, now())").param("record", again.id()).param("owner", owner).update())
+                .hasStackTraceContaining("artifact_reference_kind_check");
+    }
+
+    @Test
+    void aSavedDraftCitingAnArtifactCopiesItsReferenceAndTheRowsGoWithTheArtifactsRowOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID passage = citedPassage(owner, campaign);
+        UUID cited = OwnerContext.callAs(owner, () -> artifacts.create(campaign, new Artifacts.Written("item",
+                "Espada de Kael", List.of(new Artifacts.Field("Dano", "1d8 cortante")), null))).orElseThrow().id();
+        Conversations.Asked draft = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Uma ficha para a espada", null, null, TurnKind.DRAFT));
+        UUID job = jdbc.sql("select job_id from turn where id = :id").param("id", draft.turnId())
+                .query(UUID.class).single();
+        JobClaims.Claim claim = claims.claim(job, null, List.of("azure-openai"));
+        claims.events(job, claim.claimId(), claim.grant(), new JobEventBatch(claim.claimId(), 1,
+                List.of(JobEvent.delta("## Espada\n\nCausa 1d8."), JobEvent.citation(passage, 9),
+                        JobEvent.recordCitation(cited, 19))), List.of());
+        claims.report(job, claim.claimId(), claim.grant(), "done", null, null);
+        List<TurnReference> turnReferences = as(owner, () -> conversations.references(draft.turnId()));
+        assertThat(turnReferences).extracting(TurnReference::kind).containsExactly("passage", "artifact");
+
+        Artifacts.Artifact saved = OwnerContext.callAs(owner, () -> artifacts.saveDraft(draft.turnId(), "Espada",
+                "item", null)).orElseThrow();
+
+        // Both kinds pass the table's check, and read back as the turn's references.
+        assertThat(saved.references()).isEqualTo(turnReferences);
+        Map<String, Object> copied = jdbc.sql("select artifact_id, artifact_version, cited_record_id, version_id,"
+                + " record_type, record_name from artifact_reference where record_id = :id and number = 2")
+                .param("id", saved.id()).query().singleRow();
+        assertThat(copied).containsEntry("artifact_id", cited).containsEntry("artifact_version", 1)
+                .containsEntry("record_type", "item");
+        assertThat(copied.get("cited_record_id")).isNull();
+        assertThat(copied.get("version_id")).isNull();
+        assertThat(vault.decryptText(new Binding("artifact_reference", "record_name:2", saved.id(), owner),
+                (byte[]) copied.get("record_name"))).isEqualTo("Espada de Kael");
+        assertThat(as(owner, () -> artifacts.get(campaign, saved.id())).orElseThrow().references())
+                .isEqualTo(turnReferences);
+
+        // The artifact's row removed (its index rows and versions first): its references go with it (ON DELETE
+        // CASCADE), and the turn's link goes to null.
+        jdbc.sql("delete from artifact_index where record_id = :id").param("id", saved.id()).update();
+        jdbc.sql("delete from record_version where record_id = :id").param("id", saved.id()).update();
+        jdbc.sql("delete from record where id = :id").param("id", saved.id()).update();
+        assertThat(jdbc.sql("select count(*) from artifact_reference where record_id = :id").param("id", saved.id())
+                .query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("select saved_record_id from turn where id = :id").param("id", draft.turnId())
+                .query(UUID.class).optional()).isEmpty();
+    }
+
+    @Test
+    void aDeclineIsKeptOnceAndADeletingSavedArtifactIsLetGoByAReopenOrANewSaveOnPostgres() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            return library.currentCampaign().orElseThrow().id();
+        });
+        UUID passage = citedPassage(owner, campaign);
+
+        // "Agora não" twice: the first time is kept.
+        Conversations.Asked declined = doneDraft(owner, campaign, passage);
+        OwnerContext.runAs(owner, () -> conversations.declineSave(declined.turnId()));
+        Object first = jdbc.sql("select save_declined_at from turn where id = :id").param("id", declined.turnId())
+                .query().singleValue();
+        assertThat(first).isNotNull();
+        OwnerContext.runAs(owner, () -> conversations.declineSave(declined.turnId()));
+        assertThat(jdbc.sql("select save_declined_at from turn where id = :id").param("id", declined.turnId())
+                .query().singleValue()).isEqualTo(first);
+        assertThat(saving(owner, declined).state()).isEqualTo(Conversations.SaveState.DECLINED);
+
+        // Saved, then its artifact deleted but not yet removed: "Salvar como artefato" clears both columns.
+        Conversations.Asked reopened = doneDraft(owner, campaign, passage);
+        UUID gone = OwnerContext.callAs(owner, () -> artifacts.saveDraft(reopened.turnId(), "Cripta", "encounter",
+                null)).orElseThrow().id();
+        assertThat(as(owner, () -> artifacts.delete(campaign, gone))).isTrue();
+        assertThat(jdbc.sql("select saved_record_id from turn where id = :id").param("id", reopened.turnId())
+                .query(UUID.class).single()).isEqualTo(gone);
+        assertThat(saving(owner, reopened).state()).isEqualTo(Conversations.SaveState.DECLINED);
+        OwnerContext.runAs(owner, () -> conversations.reopenSave(reopened.turnId()));
+        Map<String, Object> cleared = jdbc.sql("select saved_record_id, save_declined_at from turn where id = :id")
+                .param("id", reopened.turnId()).query().singleRow();
+        assertThat(cleared.get("saved_record_id")).isNull();
+        assertThat(cleared.get("save_declined_at")).isNull();
+        assertThat(saving(owner, reopened).state()).isEqualTo(Conversations.SaveState.OFFERED);
+
+        // Saved, its artifact deleted but not yet removed, then saved again straight from declined: the new one.
+        Conversations.Asked again = doneDraft(owner, campaign, passage);
+        UUID old = OwnerContext.callAs(owner, () -> artifacts.saveDraft(again.turnId(), "Cripta", "encounter", null))
+                .orElseThrow().id();
+        assertThat(as(owner, () -> artifacts.delete(campaign, old))).isTrue();
+        UUID fresh = OwnerContext.callAs(owner, () -> artifacts.saveDraft(again.turnId(), "Cripta II", "encounter",
+                null)).orElseThrow().id();
+        assertThat(fresh).isNotEqualTo(old);
+        assertThat(jdbc.sql("select saved_record_id from turn where id = :id").param("id", again.turnId())
+                .query(UUID.class).single()).isEqualTo(fresh);
+        assertThat(saving(owner, again)).isEqualTo(new Conversations.Saving(Conversations.SaveState.SAVED, fresh));
+    }
+
+    /** A draft of the owner's campaign, claimed, streamed with a citation of {@code passage} and reported done. */
+    private Conversations.Asked doneDraft(UUID owner, UUID campaign, UUID passage) {
+        Conversations.Asked draft = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Um encontro para a cripta", null, null, TurnKind.DRAFT));
+        answer(draft.turnId(), "## Encontro na cripta", passage);
+        return draft;
+    }
+
+    private Conversations.Saving saving(UUID owner, Conversations.Asked asked) {
+        return as(owner, () -> conversations.turns(asked.conversationId())).orElseThrow().stream()
+                .filter(turn -> turn.id().equals(asked.turnId())).findFirst().orElseThrow().saving();
+    }
+
     private static void sleep() {
         try {
             Thread.sleep(2);
@@ -1038,7 +1238,8 @@ class ConversationIntegrationTest {
         Conversations.OfCampaign ofCampaign = as(owner, () -> conversations.ofCampaign(campaign)).orElseThrow();
         assertThat(ofCampaign.id()).isEqualTo(conversation);
         assertThat(ofCampaign.questions()).isEqualTo(questions);
-        assertThat(as(owner, () -> conversations.deletion(conversation)).orElseThrow()).isEqualTo(questions);
+        assertThat(as(owner, () -> conversations.deletion(conversation)).orElseThrow().questions())
+                .isEqualTo(questions);
     }
 
     @Test
@@ -1084,7 +1285,7 @@ class ConversationIntegrationTest {
                 UUID turnId = Ids.newId();
                 store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
                         Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
-                        java.util.Set.of(), start.plusSeconds(number), null, null, null, null, null, null));
+                        java.util.Set.of(), start.plusSeconds(number), null, null, null, null, null, null, null, null));
                 ids.add(turnId);
             }
             return ids;

@@ -1,11 +1,16 @@
 package io.github.gmshield.artifacts.service;
 
+import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
+import io.github.gmshield.artifacts.data.ArtifactReferenceStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.artifacts.data.VersionTaken;
+import io.github.gmshield.conversations.service.Conversations;
+import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
+import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
@@ -20,14 +25,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.JsonNodeFactory;
@@ -65,7 +73,21 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       ({@link ArtifactRecords#markDeleting}) and its deletion recorded ({@link SystemDeletion#deleteArtifact}, whose
  *       handler cancels those jobs). From the commit every call here answers it as not found; the recorded, resumable
  *       deletion then removes its versions, index rows and identity, and its points through one removal job.</li>
+ *   <li>{@link #saveDraft} (Story 5.4 part A): the GM's "Salvar" on a draft's save confirmation. In one transaction:
+ *       the draft read ({@link Conversations#saveable}: the owner's offered draft, else {@code request.not_found},
+ *       {@code conversation.turn_not_saveable} or {@code conversation.turn_saved}), the artifact created in the
+ *       conversation's campaign as {@link #create} does (its limits and refusals, with no fields; the content is the
+ *       draft's text unless the GM sent another), recording its conversation, its references copied from the draft's
+ *       by value ({@code artifact_reference}, each value sealed again under the artifact, entity {@value #REFERENCE}),
+ *       and the turn marked saved ({@link Conversations#markSaved}: a second save is {@code conversation.turn_saved},
+ *       and the whole transaction rolls back, the artifact and its index job included).</li>
  * </ul>
+ *
+ * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
+ * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
+ * and its references, by number, each marked {@code removed} when read as an answer's are
+ * ({@link Scopes#removedVersions} for a passage's or a record's, {@link Scopes#removedArtifacts} in its campaign for an
+ * artifact's). An edit or a restore keeps them: they belong to the artifact, not to a version.
  *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
  */
@@ -74,6 +96,12 @@ public class Artifacts {
 
     /** The entity the vault binds a version's values to. */
     static final String ENTITY = "record_version";
+    /** The entity the vault binds a saved draft's copied references to (Story 5.4 part A). */
+    static final String REFERENCE = "artifact_reference";
+    static final String FIELD_MATERIAL_NAME = "material_name";
+    static final String FIELD_SECTION_PATH = "section_path";
+    static final String FIELD_RECORD_NAME = "record_name";
+    static final String FIELD_RECORD_FIELDS = "record_fields";
     static final String FIELD_NAME = "name";
     static final String FIELD_FIELDS = "fields";
     static final String FIELD_CONTENT = "content";
@@ -93,21 +121,28 @@ public class Artifacts {
 
     private final ArtifactRecords records;
     private final ArtifactVersionStore versions;
+    private final ArtifactReferenceStore references;
     private final Library library;
     private final Vault vault;
     private final ArtifactIndexing indexing;
+    private final Scopes scopes;
+    private final ObjectProvider<Conversations> conversations;
     private final ObjectProvider<SystemDeletion> deletions;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
-    Artifacts(ArtifactRecords records, ArtifactVersionStore versions, Library library, Vault vault,
-              ArtifactIndexing indexing, ObjectProvider<SystemDeletion> deletions,
+    Artifacts(ArtifactRecords records, ArtifactVersionStore versions, ArtifactReferenceStore references,
+              Library library, Vault vault, ArtifactIndexing indexing, Scopes scopes,
+              ObjectProvider<Conversations> conversations, ObjectProvider<SystemDeletion> deletions,
               ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.records = records;
         this.versions = versions;
+        this.references = references;
         this.library = library;
         this.vault = vault;
         this.indexing = indexing;
+        this.scopes = scopes;
+        this.conversations = conversations;
         this.deletions = deletions;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
@@ -139,19 +174,34 @@ public class Artifacts {
     /**
      * One artifact with one of its versions, the newest unless an earlier one was asked for: its id, its campaign, the
      * version's type key, name, fields and content (null for none), the version's number, the number of the artifact's
-     * newest version (Story 5.2; the same as {@code version} unless an earlier one is read) and when the artifact was
-     * written. {@code toString} names ids and counts only.
+     * newest version (Story 5.2; the same as {@code version} unless an earlier one is read), when the artifact was
+     * written, and (Story 5.4 part A) the conversation it was saved from (null for none) and its references by number
+     * (empty for an artifact written by hand). {@code toString} names ids and counts only.
      */
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
-                           String content, int version, int currentVersion, Instant createdAt) {
+                           String content, int version, int currentVersion, Instant createdAt, UUID conversationId,
+                           List<TurnReference> references) {
         public Artifact {
             fields = List.copyOf(fields);
+            references = List.copyOf(references);
+        }
+
+        /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
+        Artifact unlinked() {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    null, references);
+        }
+
+        /** This artifact with its references (Story 5.4 part A). */
+        Artifact withReferences(List<TurnReference> found) {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    conversationId, found);
         }
 
         @Override
         public String toString() {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
-                    + version + ", currentVersion=" + currentVersion + "]";
+                    + version + ", currentVersion=" + currentVersion + ", references=" + references.size() + "]";
         }
     }
 
@@ -202,22 +252,7 @@ public class Artifacts {
      */
     public Optional<Artifact> create(UUID campaignId, Written written) {
         UUID owner = OwnerContext.require();
-        Optional<Artifact> created = writing(() -> library.campaign(campaignId).map(campaign -> {
-            String recordType = records.checkedType(campaign.system().id(), written.recordType());
-            ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields().stream()
-                    .map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
-            String content = content(written.content());
-            Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
-            ArtifactRecords.Identity identity = records.create(campaign.id(), recordType, now);
-            List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
-                    .toList();
-            UUID id = identity.id();
-            versions.insert(sealed(id, owner, FIRST_VERSION, recordType, checked.name(), fields, content, now));
-            // Story 5.1 part B: its index job, in the same transaction.
-            indexing.start(id, FIRST_VERSION, now);
-            return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION,
-                    FIRST_VERSION, now);
-        }));
+        Optional<Artifact> created = writing(() -> created(campaignId, written, null, List.of(), owner));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("found", created.isPresent())
                 .addKeyValue("artifactId", created.map(Artifact::id).orElse(null))
@@ -225,6 +260,59 @@ public class Artifacts {
                 .addKeyValue("content", created.map(artifact -> artifact.content() != null).orElse(false))
                 .log("artifacts.created");
         return created;
+    }
+
+    /**
+     * The GM's "Salvar" on the save confirmation of the owner's draft turn {@code turnId} (Story 5.4 part A), as the
+     * class says: {@code name} and {@code recordType} as {@link #create} checks them, and {@code content} the draft's
+     * text as the GM left it (null: the draft's text as stored). Answers the artifact as stored, or empty when the
+     * conversation's campaign is not readable (nothing is stored then).
+     */
+    public Optional<Artifact> saveDraft(UUID turnId, String name, String recordType, String content) {
+        UUID owner = OwnerContext.require();
+        Optional<Artifact> saved = writing(() -> {
+            Conversations.Saveable saveable = conversations.getObject().saveable(turnId);
+            Written written = new Written(recordType, name, List.of(), content == null ? saveable.draft() : content);
+            Optional<Artifact> created = created(saveable.campaignId(), written, saveable.conversationId(),
+                    saveable.sources(), owner);
+            created.ifPresent(artifact -> conversations.getObject().markSaved(saveable, artifact.id()));
+            return created;
+        });
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("turnId", turnId)
+                .addKeyValue("found", saved.isPresent())
+                .addKeyValue("artifactId", saved.map(Artifact::id).orElse(null))
+                .addKeyValue("edited", content != null)
+                .addKeyValue("references", saved.map(artifact -> artifact.references().size()).orElse(0))
+                .log("artifacts.draft_saved");
+        return saved;
+    }
+
+    /**
+     * A new artifact of the owner's campaign {@code campaignId}, in the caller's transaction, as {@link #create} says:
+     * from Story 5.4 part A saved from the conversation {@code conversationId} (null: written by hand) with these
+     * references copied. Empty when the campaign is not the owner's or not readable.
+     */
+    private Optional<Artifact> created(UUID campaignId, Written written, UUID conversationId,
+                                       List<Conversations.SavedSource> sources, UUID owner) {
+        return library.campaign(campaignId).map(campaign -> {
+            String recordType = records.checkedType(campaign.system().id(), written.recordType());
+            ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields().stream()
+                    .map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
+            String content = content(written.content());
+            Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+            ArtifactRecords.Identity identity = records.create(campaign.id(), recordType, now, conversationId);
+            List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
+                    .toList();
+            UUID id = identity.id();
+            versions.insert(sealed(id, owner, FIRST_VERSION, recordType, checked.name(), fields, content, now));
+            // Story 5.4 part A: the draft's references, by value, sealed again under the artifact.
+            references.insert(sources.stream().map(source -> sealedReference(id, owner, source, now)).toList());
+            // Story 5.1 part B: its index job, in the same transaction.
+            indexing.start(id, FIRST_VERSION, now);
+            return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION,
+                    FIRST_VERSION, now, conversationId, sources.isEmpty() ? List.of()
+                    : referencesOf(id, campaign.id(), owner));
+        });
     }
 
     /**
@@ -290,7 +378,8 @@ public class Artifacts {
                             .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
                     Optional<ArtifactVersionRow> shown = number == null || number == newest.number()
                             ? Optional.of(newest) : versions.find(identity.id(), number);
-                    return shown.map(version -> open(vault, identity, version, newest.number(), owner));
+                    return shown.map(version -> linked(open(vault, identity, version, newest.number(), owner)
+                            .withReferences(referencesOf(identity.id(), identity.campaignId(), owner))));
                 }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("artifactId", artifactId).addKeyValue("version", number)
@@ -320,7 +409,8 @@ public class Artifacts {
                         Artifact current = open(vault, identity, newest, owner);
                         if (current.recordType().equals(recordType) && current.name().equals(checked.name())
                                 && current.fields().equals(fields) && Objects.equals(current.content(), content)) {
-                            return Optional.of(current);
+                            return Optional.of(linked(current.withReferences(referencesOf(identity.id(),
+                                    identity.campaignId(), owner))));
                         }
                     }
                     return next(identity, owner, version, recordType, checked.name(), fields, content);
@@ -459,8 +549,22 @@ public class Artifacts {
         }
         records.retype(id, recordType).orElseThrow(() -> new IllegalStateException("artifacts.identity_missing"));
         indexing.start(id, number, now);
-        return Optional.of(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number, number,
-                identity.createdAt()));
+        return Optional.of(linked(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number,
+                number, identity.createdAt(), identity.conversationId(), referencesOf(id, identity.campaignId(),
+                owner))));
+    }
+
+    /**
+     * The artifact as an answer shows it (Story 5.4 part B): its conversation only while that conversation is
+     * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise.
+     */
+    private Artifact linked(Artifact artifact) {
+        UUID conversationId = artifact.conversationId();
+        if (conversationId == null || conversations.getObject().ready(Set.of(conversationId))
+                .contains(conversationId)) {
+            return artifact;
+        }
+        return artifact.unlinked();
     }
 
     private int newestNumber(UUID id) {
@@ -493,7 +597,87 @@ public class Artifacts {
                 vault.decryptText(binding(FIELD_NAME, id, owner), version.name()),
                 fieldsOf(vault.decrypt(binding(FIELD_FIELDS, id, owner), version.fields())),
                 stored == null ? null : vault.decryptText(binding(FIELD_CONTENT, id, owner), stored),
-                version.number(), currentVersion, identity.createdAt());
+                version.number(), currentVersion, identity.createdAt(), identity.conversationId(), List.of());
+    }
+
+    /**
+     * A draft's reference copied by value under the artifact {@code id} (Story 5.4 part A): each stored value sealed
+     * again, bound to {@value #REFERENCE}, its field with the reference's number, the artifact and the owner.
+     */
+    private ArtifactReferenceRow sealedReference(UUID id, UUID owner, Conversations.SavedSource source, Instant at) {
+        TurnReference reference = source.reference();
+        int number = reference.number();
+        TurnReference.Cited cited = reference.record();
+        byte[] recordName = cited == null ? null
+                : vault.encryptText(referenceBinding(FIELD_RECORD_NAME, number, id, owner), cited.name());
+        byte[] recordFields = cited == null ? null : vault.encrypt(referenceBinding(FIELD_RECORD_FIELDS, number, id,
+                owner), fieldsJson(cited.fields().stream().map(field -> new Field(field.name(), field.value()))
+                .toList()));
+        if (TurnReference.ARTIFACT.equals(reference.kind())) {
+            return new ArtifactReferenceRow(id, owner, number, null, null, null, null, null, null, reference.tier(),
+                    null, cited.type(), recordName, recordFields, cited.id(), cited.artifactVersion(), at);
+        }
+        ArrayNode path = JsonNodeFactory.instance.arrayNode();
+        reference.sectionPath().forEach(path::add);
+        return new ArtifactReferenceRow(id, owner, number, source.versionId(), source.materialId(), reference.page(),
+                reference.passageIds(),
+                vault.encryptText(referenceBinding(FIELD_MATERIAL_NAME, number, id, owner), reference.materialName()),
+                vault.encrypt(referenceBinding(FIELD_SECTION_PATH, number, id, owner), JSON.writeValueAsBytes(path)),
+                reference.tier(), cited == null ? null : cited.id(), cited == null ? null : cited.type(), recordName,
+                recordFields, null, null, at);
+    }
+
+    /**
+     * The owner's artifact {@code id}'s references (Story 5.4 part A), decrypted, by number, each {@code removed} as of
+     * now as an answer's: a passage's or a record's when its version is removed, an artifact's when it is not live in
+     * the campaign {@code campaignId}. Empty for one written by hand. Runs in the caller's transaction.
+     */
+    private List<TurnReference> referencesOf(UUID id, UUID campaignId, UUID owner) {
+        List<ArtifactReferenceRow> rows = references.of(id);
+        if (rows.isEmpty()) {
+            return List.of();
+        }
+        Set<UUID> removedVersions = scopes.removedVersions(rows.stream().map(ArtifactReferenceRow::versionId)
+                .filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet()));
+        Set<UUID> removedArtifacts = scopes.removedArtifacts(campaignId, rows.stream()
+                .filter(ArtifactReferenceRow::artifact).map(ArtifactReferenceRow::artifactId)
+                .collect(Collectors.toUnmodifiableSet()));
+        List<TurnReference> found = new ArrayList<>(rows.size());
+        for (ArtifactReferenceRow row : rows) {
+            int number = row.number();
+            UUID citedId = row.artifact() ? row.artifactId() : row.citedRecordId();
+            TurnReference.Cited cited = citedId == null ? null : new TurnReference.Cited(citedId, row.recordType(),
+                    vault.decryptText(referenceBinding(FIELD_RECORD_NAME, number, id, owner), row.recordName()),
+                    fieldsOf(vault.decrypt(referenceBinding(FIELD_RECORD_FIELDS, number, id, owner),
+                            row.recordFields())).stream().map(field -> new TurnReference.Field(field.name(),
+                            field.value())).toList(), row.artifactVersion());
+            if (row.artifact()) {
+                found.add(new TurnReference(number, null, List.of(), 0, List.of(),
+                        removedArtifacts.contains(row.artifactId()), row.tier(), cited));
+                continue;
+            }
+            found.add(new TurnReference(number,
+                    vault.decryptText(referenceBinding(FIELD_MATERIAL_NAME, number, id, owner), row.materialName()),
+                    pathOf(vault.decrypt(referenceBinding(FIELD_SECTION_PATH, number, id, owner), row.sectionPath())),
+                    row.page(), row.passageIds(), removedVersions.contains(row.versionId()), row.tier(), cited));
+        }
+        return List.copyOf(found);
+    }
+
+    private static List<String> pathOf(byte[] json) {
+        List<String> path = new ArrayList<>();
+        try {
+            for (JsonNode part : JSON.readTree(json)) {
+                path.add(part.asString());
+            }
+        } finally {
+            Arrays.fill(json, (byte) 0);
+        }
+        return List.copyOf(path);
+    }
+
+    static Binding referenceBinding(String field, int number, UUID artifactId, UUID owner) {
+        return new Binding(REFERENCE, field + ":" + number, artifactId, Objects.requireNonNull(owner, "owner"));
     }
 
     /** The content trimmed, null when blank or absent, or {@code request.invalid} naming it when it is too long. */

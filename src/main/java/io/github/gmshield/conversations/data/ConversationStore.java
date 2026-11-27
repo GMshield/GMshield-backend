@@ -125,6 +125,29 @@ public interface ConversationStore {
     boolean markProposed(UUID turnId, byte[] name, String type);
 
     /**
+     * Marks the owner's turn saved as the artifact {@code recordId} at {@code at} (Story 5.4 part A): one bulk update,
+     * after the owner's row was read, that sets {@code saved_record_id} and {@code save_declined_at} only while
+     * {@code saved_record_id} is still {@code expected} (null: never saved; else the id of an artifact that was deleted
+     * since). True when this call changed the row; false when another save got there first, or for an unknown turn or
+     * another owner's.
+     */
+    boolean markSaved(UUID turnId, UUID expected, UUID recordId, Instant at);
+
+    /**
+     * Sets the owner's turn's {@code save_declined_at} to {@code at} when it is null (Story 5.4 part A, "Agora não"), as
+     * {@link #markDismissed}: true when this call changed the row.
+     */
+    boolean markSaveDeclined(UUID turnId, Instant at);
+
+    /**
+     * Opens the owner's turn's save card again (Story 5.4 part A, "Salvar como artefato"): one bulk update that clears
+     * {@code save_declined_at} and {@code saved_record_id} only while {@code saved_record_id} is still {@code stale}
+     * (null, or the id of an artifact that was deleted), so a save committed meanwhile is never undone. True when this
+     * call changed the row.
+     */
+    boolean clearSaveDeclined(UUID turnId, UUID stale);
+
+    /**
      * The campaigns of the current owner's listed saved turns (Story 3.12): bookmarked, not dismissed, of a
      * {@code ready} conversation.
      */

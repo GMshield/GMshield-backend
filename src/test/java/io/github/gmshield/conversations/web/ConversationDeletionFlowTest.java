@@ -9,6 +9,7 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
@@ -19,6 +20,7 @@ import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.InMemoryJobStream;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.MutableClock;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.DeletionRow;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
@@ -77,7 +79,10 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code ConversationDeletionIntegrationTest}. Story 3.11: a deleting conversation's turns are not found on both
  * dismissal routes, and a dismissed turn goes with its conversation. Story 3.12: the same on both bookmark routes; a
  * saved turn leaves the saved list when its conversation or campaign starts being deleted, and goes with its row; a
- * conversation marked deleting while the list is read is left out of that page and its total.
+ * conversation marked deleting while the list is read is left out of that page and its total. Story 5.4 part B: every
+ * row of its matrix (keep all, delete some, select all, none saved, a foreign id, one gone meanwhile, a bad body, not
+ * found, another owner), the dialog's list (oldest first, newest names, no deleting artifact) and a kept artifact's
+ * conversation null from the delete on.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -140,6 +145,10 @@ class ConversationDeletionFlowTest {
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryConversationStore conversations;
+    @Autowired
+    private InMemoryRecordStore records;
+    @Autowired
+    private InMemoryArtifactVersionStore artifactVersions;
     @Autowired
     private InMemoryTurnReferenceStore references;
     @Autowired
@@ -500,6 +509,284 @@ class ConversationDeletionFlowTest {
         }
     }
 
+    // --- Story 5.4 part B: a conversation that has saved artifacts
+
+    @Test
+    void theDialogListsTheLiveSavedArtifactsOldestFirstAndKeepAllKeepsThemWithNoLink() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        tick();
+        UUID troll = saved(gm, drafted(gm, conversation, source), "Troll", "creature");
+        tick();
+        // A saved artifact deleted since is not listed; one of another conversation and one written by hand neither.
+        UUID gone = saved(gm, drafted(gm, conversation, source), "Velho", "note");
+        assertThat(send(gm, "DELETE", artifactPath(gm, gone)).statusCode()).isEqualTo(202);
+        UUID otherTurn = drafted(gm, null, source);
+        UUID elsewhere = saved(gm, otherTurn, "Outra", "note");
+        UUID handWritten = handWritten(gm, "Kael");
+        // A later edit renames it: the dialog lists the newest version's name.
+        assertThat(send(gm, "PATCH", artifactPath(gm, troll), "{\"version\":1,\"recordType\":\"creature\","
+                + "\"name\":\"Troll das Pedras\",\"fields\":[]}").statusCode()).isEqualTo(200);
+        assertThat(json(get(gm, artifactPath(gm, crypt))).path("conversationId").asString())
+                .isEqualTo(conversation.toString());
+
+        HttpResponse<String> preview = get(gm, "/api/v1/conversations/" + conversation + "/deletion");
+
+        assertThat(preview.statusCode()).as(preview.body()).isEqualTo(200);
+        JsonNode dialog = json(preview);
+        assertThat(dialog.path("questions").asLong()).isEqualTo(3);
+        assertThat(ids(dialog.path("artifacts"))).containsExactly(crypt.toString(), troll.toString());
+        assertThat(dialog.path("artifacts").get(0).path("name").asString()).isEqualTo("Cripta");
+        assertThat(dialog.path("artifacts").get(0).path("recordType").asString()).isEqualTo("encounter");
+        assertThat(dialog.path("artifacts").get(1).path("name").asString()).isEqualTo("Troll das Pedras");
+        assertThat(dialog.path("artifacts").get(1).path("recordType").asString()).isEqualTo("creature");
+        assertThat(ids(json(get(gm, "/api/v1/conversations/" + conversations.turns.get(otherTurn).conversationId()
+                + "/deletion")).path("artifacts"))).containsExactly(elsewhere.toString());
+
+        // Matrix row "Keep all": nothing ticked.
+        HttpResponse<String> deleted = deleteWith(gm, conversation, "{\"artifactIds\":[]}");
+
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(deleted.body()).isEmpty();
+        assertThat(deleted.headers().firstValue("Cache-Control")).hasValue("no-store");
+        assertNotFound(get(gm, "/api/v1/conversations/" + conversation));
+        // At once, before the pass: both stay with their versions, and neither names the deleting conversation.
+        for (UUID kept : List.of(crypt, troll)) {
+            HttpResponse<String> read = get(gm, artifactPath(gm, kept));
+            assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+            assertThat(json(read).path("conversationId").isNull()).isTrue();
+        }
+        assertThat(json(get(gm, artifactPath(gm, troll) + "/versions")).path("total").asLong()).isEqualTo(2);
+        assertThat(json(get(gm, artifactPath(gm, elsewhere))).path("conversationId").asString())
+                .isEqualTo(conversations.turns.get(otherTurn).conversationId().toString());
+        assertThat(records.deletingArtifacts).contains(gone).doesNotContain(crypt, troll, elsewhere, handWritten);
+
+        deletion.sweep();
+
+        assertThat(conversations.conversations).doesNotContainKey(conversation);
+        assertThat(records.artifacts).containsKeys(crypt, troll, elsewhere, handWritten).doesNotContainKey(gone);
+        assertThat(json(get(gm, artifactPath(gm, crypt))).path("conversationId").isNull()).isTrue();
+        assertThat(ids(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("items")))
+                .contains(crypt.toString(), troll.toString(), elsewhere.toString(), handWritten.toString());
+    }
+
+    @Test
+    void theTickedArtifactsGoWithTheConversationAndTheOthersStayUnchanged() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        UUID troll = saved(gm, drafted(gm, conversation, source), "Troll", "creature");
+
+        // Matrix row "Delete some": "Cripta" ticked, "Troll" not.
+        HttpResponse<String> deleted = deleteWith(gm, conversation, "{\"artifactIds\":[\"" + crypt + "\"]}");
+
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(records.deletingArtifacts).contains(crypt).doesNotContain(troll);
+        assertNotFound(get(gm, artifactPath(gm, crypt)));
+        assertThat(ids(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("items")))
+                .containsExactly(troll.toString());
+        HttpResponse<String> kept = get(gm, artifactPath(gm, troll));
+        assertThat(kept.statusCode()).isEqualTo(200);
+        assertThat(json(kept).path("name").asString()).isEqualTo("Troll");
+        assertThat(json(kept).path("version").asInt()).isEqualTo(1);
+        assertThat(json(kept).path("conversationId").isNull()).isTrue();
+        // The edit and restore answers name no deleting conversation either: unchanged, renamed, then version 1 back.
+        HttpResponse<String> unchanged = send(gm, "PATCH", artifactPath(gm, troll), "{\"version\":1,"
+                + "\"recordType\":\"creature\",\"name\":\"Troll\",\"fields\":[],\"content\":"
+                + JSON.writeValueAsString(json(kept).path("content").asString()) + "}");
+        assertThat(unchanged.statusCode()).as(unchanged.body()).isEqualTo(200);
+        assertThat(json(unchanged).path("version").asInt()).isEqualTo(1);
+        assertThat(json(unchanged).path("conversationId").isNull()).isTrue();
+        HttpResponse<String> renamed = send(gm, "PATCH", artifactPath(gm, troll), "{\"version\":1,"
+                + "\"recordType\":\"creature\",\"name\":\"Troll das Pedras\",\"fields\":[]}");
+        assertThat(renamed.statusCode()).as(renamed.body()).isEqualTo(200);
+        assertThat(json(renamed).path("version").asInt()).isEqualTo(2);
+        assertThat(json(renamed).path("conversationId").isNull()).isTrue();
+        HttpResponse<String> restored = send(gm, "POST", artifactPath(gm, troll) + "/versions/1/restore",
+                "{\"version\":2}");
+        assertThat(restored.statusCode()).as(restored.body()).isEqualTo(200);
+        assertThat(json(restored).path("version").asInt()).isEqualTo(3);
+        assertThat(json(restored).path("conversationId").isNull()).isTrue();
+        assertThat(deletions.rows.values()).filteredOn(row -> row.targetId().equals(crypt))
+                .singleElement().extracting(DeletionRow::kind).isEqualTo(DeletionRow.ARTIFACT);
+
+        deletion.sweep();
+
+        assertThat(records.artifacts).doesNotContainKey(crypt).containsKey(troll);
+        assertThat(artifactVersions.rows.values()).noneMatch(row -> row.recordId().equals(crypt))
+                .anyMatch(row -> row.recordId().equals(troll));
+        assertThat(conversations.conversations).doesNotContainKey(conversation);
+    }
+
+    @Test
+    void selectingAllTakesEveryArtifactWithTheConversation() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        UUID troll = saved(gm, drafted(gm, conversation, source), "Troll", "creature");
+
+        HttpResponse<String> deleted = deleteWith(gm, conversation, "{\"artifactIds\":[\"" + crypt + "\",\""
+                + troll + "\",\"" + crypt + "\"]}");
+
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertThat(records.deletingArtifacts).contains(crypt, troll);
+        assertNotFound(get(gm, artifactPath(gm, crypt)));
+        assertNotFound(get(gm, artifactPath(gm, troll)));
+        assertThat(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("total").asLong())
+                .isZero();
+
+        deletion.sweep();
+
+        assertThat(records.artifacts).doesNotContainKeys(crypt, troll);
+        assertThat(conversations.conversations).doesNotContainKey(conversation);
+    }
+
+    @Test
+    void aConversationWithNoLiveSavedArtifactListsNone() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID answered = answered(gm, null, "questions", source);
+        UUID plain = conversations.turns.get(answered).conversationId();
+        UUID draftTurn = drafted(gm, null, source);
+        UUID withDeleted = conversations.turns.get(draftTurn).conversationId();
+        UUID gone = saved(gm, draftTurn, "Velho", "note");
+        assertThat(send(gm, "DELETE", artifactPath(gm, gone)).statusCode()).isEqualTo(202);
+
+        for (UUID conversation : List.of(plain, withDeleted)) {
+            JsonNode dialog = json(get(gm, "/api/v1/conversations/" + conversation + "/deletion"));
+            assertThat(dialog.path("questions").asLong()).isEqualTo(1);
+            assertThat(dialog.path("artifacts").isArray()).isTrue();
+            assertThat(dialog.path("artifacts")).isEmpty();
+        }
+        // The plain delete keeps working, as an empty artifactIds.
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + plain).statusCode()).isEqualTo(202);
+        assertNotFound(get(gm, "/api/v1/conversations/" + plain));
+        deletion.sweep();
+    }
+
+    @Test
+    void theOldDeleteKeepsEverySavedArtifact() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+
+        // The 1.48.0 frontend's delete.
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(202);
+
+        assertThat(records.deletingArtifacts).doesNotContain(crypt);
+        assertThat(json(get(gm, artifactPath(gm, crypt))).path("conversationId").isNull()).isTrue();
+        deletion.sweep();
+        assertThat(get(gm, artifactPath(gm, crypt)).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void anIdThatIsNotOneOfTheConversationsLiveArtifactsIsIgnored() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        // Matrix row "Gone meanwhile": deleted in another tab.
+        UUID gone = saved(gm, drafted(gm, conversation, source), "Velho", "note");
+        assertThat(send(gm, "DELETE", artifactPath(gm, gone)).statusCode()).isEqualTo(202);
+        // Matrix row "Foreign id": another conversation's, one written by hand, and another owner's.
+        UUID elsewhere = saved(gm, drafted(gm, null, source), "Outra", "note");
+        UUID handWritten = handWritten(gm, "Kael");
+        Gm other = signUp();
+        UUID theirTurn = drafted(other, null, source(other));
+        UUID theirs = saved(other, theirTurn, "Deles", "note");
+        UUID theirConversation = conversations.turns.get(theirTurn).conversationId();
+
+        HttpResponse<String> deleted = deleteWith(gm, conversation, "{\"artifactIds\":[\"" + gone + "\",\""
+                + elsewhere + "\",\"" + handWritten + "\",\"" + theirs + "\",\"" + Ids.newId() + "\"]}");
+
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
+        assertNotFound(get(gm, "/api/v1/conversations/" + conversation));
+        assertThat(records.deletingArtifacts).contains(gone).doesNotContain(crypt, elsewhere, handWritten, theirs);
+        List<UUID> named = List.of(gone, crypt, elsewhere, handWritten, theirs);
+        assertThat(deletions.rows.values()).filteredOn(row -> named.contains(row.targetId()))
+                .extracting(DeletionRow::targetId).containsExactly(gone);
+        assertThat(get(gm, artifactPath(gm, crypt)).statusCode()).isEqualTo(200);
+        assertThat(get(gm, artifactPath(gm, elsewhere)).statusCode()).isEqualTo(200);
+        assertThat(get(gm, artifactPath(gm, handWritten)).statusCode()).isEqualTo(200);
+        assertThat(get(other, artifactPath(other, theirs)).statusCode()).isEqualTo(200);
+        assertThat(get(other, "/api/v1/conversations/" + theirConversation).statusCode()).isEqualTo(200);
+        deletion.sweep();
+    }
+
+    @Test
+    void aMalformedBodyIsRefusedOnArtifactIdsAndNothingIsDeleted() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        List<String> tooMany = new ArrayList<>();
+        tooMany.add(crypt.toString());
+        while (tooMany.size() < 65) {
+            tooMany.add(Ids.newId().toString());
+        }
+        List<String> bodies = List.of(JSON.writeValueAsString(Map.of("artifactIds", tooMany)),
+                "{\"artifactIds\":[\"" + crypt + "\",\"nope\"]}", "{\"artifactIds\":[\"" + crypt + "\",7]}",
+                "{\"artifactIds\":[null]}", "{\"artifactIds\":\"" + crypt + "\"}", "{\"artifactIds\":null}", "{}",
+                "[]", "null", "nope", "{\"artifactIds\":[", "");
+
+        for (String body : bodies) {
+            HttpResponse<String> refused = deleteWith(gm, conversation, body);
+            assertThat(refused.statusCode()).as(body + " -> " + refused.body()).isEqualTo(400);
+            JsonNode problem = json(refused);
+            assertThat(problem.path("code").asString()).as(body).isEqualTo("request.invalid");
+            assertThat(problem.path("params").path("field").asString()).as(body).isEqualTo("artifactIds");
+        }
+        assertThat(get(gm, "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(200);
+        assertThat(get(gm, artifactPath(gm, crypt)).statusCode()).isEqualTo(200);
+        assertThat(records.deletingArtifacts).doesNotContain(crypt);
+        assertThat(deletions.rows.values()).noneMatch(row -> row.targetId().equals(conversation)
+                || row.targetId().equals(crypt));
+        // 64 ids are taken.
+        HttpResponse<String> taken = deleteWith(gm, conversation, JSON.writeValueAsString(Map.of("artifactIds",
+                tooMany.subList(0, 64))));
+        assertThat(taken.statusCode()).as(taken.body()).isEqualTo(202);
+        assertThat(records.deletingArtifacts).contains(crypt);
+        deletion.sweep();
+    }
+
+    @Test
+    void aConversationNotFoundDeletesNoArtifact() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm);
+        UUID cryptTurn = drafted(gm, null, source);
+        UUID conversation = conversations.turns.get(cryptTurn).conversationId();
+        UUID crypt = saved(gm, cryptTurn, "Cripta", "encounter");
+        String ticked = "{\"artifactIds\":[\"" + crypt + "\"]}";
+
+        // Matrix row "Other owner": account B posts to A's conversation.
+        Gm other = signUp();
+        assertNotFound(deleteWith(other, conversation, ticked));
+        assertNotFound(deleteWith(gm, Ids.newId(), ticked));
+        assertNotFound(send(gm, "POST", "/api/v1/conversations/nope/deletion", ticked));
+        assertThat(records.deletingArtifacts).doesNotContain(crypt);
+        assertThat(get(gm, "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(200);
+
+        // Not checked here: a deletion another tab recorded first (covered in ConversationDeletionIntegrationTest).
+
+        // Matrix row "Not found": deleted in another tab first.
+        assertThat(send(gm, "DELETE", "/api/v1/conversations/" + conversation).statusCode()).isEqualTo(202);
+        assertNotFound(deleteWith(gm, conversation, ticked));
+        assertThat(records.deletingArtifacts).doesNotContain(crypt);
+        assertThat(get(gm, artifactPath(gm, crypt)).statusCode()).isEqualTo(200);
+        deletion.sweep();
+    }
+
     // --- helpers
 
     /** The clock moves on, so what is asked next comes later. */
@@ -509,6 +796,61 @@ class ConversationDeletionFlowTest {
 
     private static String listPath(Gm gm) {
         return "/api/v1/campaigns/" + gm.campaign() + "/conversations?area=questions";
+    }
+
+    private static final String PROPOSED = "{\"outcome\":\"done\",\"result\":{\"proposal\":"
+            + "{\"name\":\"Emboscada na Cripta\",\"recordType\":\"encounter\"}}}";
+
+    /**
+     * A draft asked in the conversation (or a new questions conversation), claimed, streamed with a delta and a citation
+     * and done with a proposal (Story 5.4 part B), as {@code ConversationFlowTest.doneDraft} builds one.
+     */
+    private UUID drafted(Gm gm, UUID conversation, Source source) throws Exception {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("question", "Um encontro para a cripta");
+        if (conversation != null) {
+            body.put("conversationId", conversation.toString());
+        } else {
+            body.put("area", "questions");
+        }
+        body.put("kind", "draft");
+        HttpResponse<String> asked = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/turns",
+                JSON.writeValueAsString(body));
+        assertThat(asked.statusCode()).as(asked.body()).isEqualTo(201);
+        UUID turnId = UUID.fromString(json(asked).path("id").asString());
+        Claim claim = claim(conversations.turns.get(turnId).jobId());
+        HttpResponse<String> posted = sendAsWorker("POST", claim.path("events"), "{\"batch\":1,\"events\":["
+                + "{\"type\":\"delta\",\"text\":\"## Emboscada\\n\\nTrês esqueletos.\"},{\"type\":\"citation\","
+                + "\"passageId\":\"" + source.passageId() + "\",\"offset\":4}],\"usage\":[]}", claim.grant());
+        assertThat(posted.statusCode()).as(posted.body()).isEqualTo(200);
+        HttpResponse<String> reported = sendAsWorker("POST", claim.path("outcome"), PROPOSED, claim.grant());
+        assertThat(reported.statusCode()).as(reported.body()).isEqualTo(204);
+        return turnId;
+    }
+
+    /** The draft saved as an artifact named {@code name} of the type {@code recordType}; its id. */
+    private UUID saved(Gm gm, UUID turnId, String name, String recordType) throws Exception {
+        HttpResponse<String> saved = send(gm, "POST", "/api/v1/turns/" + turnId + "/artifact",
+                JSON.writeValueAsString(Map.of("name", name, "recordType", recordType)));
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(201);
+        return UUID.fromString(json(saved).path("id").asString());
+    }
+
+    /** An artifact of the GM's campaign written by hand; its id. */
+    private UUID handWritten(Gm gm, String name) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/artifacts",
+                JSON.writeValueAsString(Map.of("name", name, "recordType", "character_sheet", "fields", List.of())));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return UUID.fromString(json(created).path("id").asString());
+    }
+
+    private static String artifactPath(Gm gm, UUID artifactId) {
+        return "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + artifactId;
+    }
+
+    /** The conversation's deletion with this body (Story 5.4 part B). */
+    private HttpResponse<String> deleteWith(Gm gm, UUID conversation, String body) throws Exception {
+        return send(gm, "POST", "/api/v1/conversations/" + conversation + "/deletion", body);
     }
 
     /** Asks in the conversation (or a new one of the area), claims, posts a delta and a citation, reports done. */

@@ -17,12 +17,16 @@ import java.util.UUID;
  * From Story 5.3 part B (V48), a finished draft's proposal: its suggested name ({@code proposal_name}, a vault
  * ciphertext) and record type key ({@code proposal_type}, plain), both null when it has none; the type is set only with
  * a name.
+ * From Story 5.4 part A (V49), a draft's save state: the artifact it was saved as ({@code saved_record_id}; null when
+ * never saved, or once that artifact is gone) and when its save card was closed ({@code save_declined_at}: by "Agora
+ * não", or by a save; null while it is offered).
  * {@code toString} names ids only.
  */
 public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, byte[] question, String language,
                       boolean campaignTier, boolean systemTier, boolean otherTier, boolean modelKnowledge,
                       Set<UUID> materialsOff, Instant createdAt, Instant stoppedAt, Instant dismissedAt,
-                      Instant bookmarkedAt, String kind, byte[] proposalName, String proposalType) {
+                      Instant bookmarkedAt, String kind, byte[] proposalName, String proposalType,
+                      UUID savedRecordId, Instant saveDeclinedAt) {
 
     /** The kind of a turn the GM asked as a question (Story 5.3 part A): the default. */
     public static final String QUESTION = "question";
@@ -63,35 +67,37 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
                 && Objects.equals(language, that.language) && Objects.equals(createdAt, that.createdAt)
                 && Objects.equals(stoppedAt, that.stoppedAt) && Objects.equals(dismissedAt, that.dismissedAt)
                 && Objects.equals(bookmarkedAt, that.bookmarkedAt) && Objects.equals(kind, that.kind)
-                && Arrays.equals(proposalName, that.proposalName) && Objects.equals(proposalType, that.proposalType);
+                && Arrays.equals(proposalName, that.proposalName) && Objects.equals(proposalType, that.proposalType)
+                && Objects.equals(savedRecordId, that.savedRecordId)
+                && Objects.equals(saveDeclinedAt, that.saveDeclinedAt);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, ownerId, conversationId, jobId, Arrays.hashCode(question), language, campaignTier,
                 systemTier, otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt,
-                kind, Arrays.hashCode(proposalName), proposalType);
+                kind, Arrays.hashCode(proposalName), proposalType, savedRecordId, saveDeclinedAt);
     }
 
     /** This row, stopped at {@code at}. */
     public TurnRow stopped(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, at, dismissedAt, bookmarkedAt, kind,
-                proposalName, proposalType);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt);
     }
 
     /** This row, dismissed at {@code at} (Story 3.11; null: shown again). */
     public TurnRow dismissed(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, at, bookmarkedAt, kind,
-                proposalName, proposalType);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt);
     }
 
     /** This row, bookmarked at {@code at} (Story 3.12; null: not saved). */
     public TurnRow bookmarked(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, at, kind,
-                proposalName, proposalType);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt);
     }
 
     /**
@@ -101,7 +107,17 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
     public TurnRow proposed(byte[] name, String type) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind, name,
-                type);
+                type, savedRecordId, saveDeclinedAt);
+    }
+
+    /**
+     * This row with its save state (Story 5.4 part A): the artifact it was saved as (null for none) and when its card
+     * was closed (null while offered).
+     */
+    public TurnRow saving(UUID savedRecord, Instant declinedAt) {
+        return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind,
+                proposalName, proposalType, savedRecord, declinedAt);
     }
 
     @Override

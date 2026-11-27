@@ -84,8 +84,11 @@ public class ArtifactRecords {
         }
     }
 
-    /** An artifact's identity: its id, its campaign, its record type's key and when it was written. */
-    public record Identity(UUID id, UUID campaignId, String recordType, Instant createdAt) {
+    /**
+     * An artifact's identity: its id, its campaign, its record type's key, when it was written and (Story 5.4 part A)
+     * the conversation it was saved from (null for one written by hand, or once that conversation is deleted).
+     */
+    public record Identity(UUID id, UUID campaignId, String recordType, Instant createdAt, UUID conversationId) {
     }
 
     /** A record type key in use in a campaign's artifacts, and how many of them have it. */
@@ -141,11 +144,19 @@ public class ArtifactRecords {
      * {@code at}; in the caller's transaction, which must exist. Answers its identity, with its new id.
      */
     public Identity create(UUID campaignId, String recordType, Instant at) {
+        return create(campaignId, recordType, at, null);
+    }
+
+    /**
+     * {@link #create(UUID, String, Instant)}, saved from the owner's conversation {@code conversationId} of that campaign
+     * (Story 5.4 part A; checked by the caller), or written by hand when it is null.
+     */
+    public Identity create(UUID campaignId, String recordType, Instant at, UUID conversationId) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException("knowledge.transaction_required");
         }
         UUID owner = OwnerContext.require();
-        ArtifactRow row = new ArtifactRow(Ids.newId(), owner, campaignId, recordType, at);
+        ArtifactRow row = new ArtifactRow(Ids.newId(), owner, campaignId, recordType, at, conversationId);
         store.insertArtifact(row);
         return identity(row);
     }
@@ -216,6 +227,16 @@ public class ArtifactRecords {
                 .toList();
     }
 
+    /**
+     * The owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its deletion's
+     * dialog lists them), oldest first; a deleting one is left out.
+     */
+    public List<Identity> ofConversation(UUID conversationId) {
+        OwnerContext.require();
+        return conversationId == null ? List.of() : store.artifactsOfConversation(conversationId).stream()
+                .map(ArtifactRecords::identity).toList();
+    }
+
     /** How many artifacts the owner's campaign has, of the type key {@code recordType} when it is not null. */
     public long count(UUID campaignId, String recordType) {
         OwnerContext.require();
@@ -266,7 +287,7 @@ public class ArtifactRecords {
     }
 
     private static Identity identity(ArtifactRow row) {
-        return new Identity(row.id(), row.campaignId(), row.type(), row.createdAt());
+        return new Identity(row.id(), row.campaignId(), row.type(), row.createdAt(), row.conversationId());
     }
 
     /** Whether a trimmed text has 1 to {@code max} code points. */

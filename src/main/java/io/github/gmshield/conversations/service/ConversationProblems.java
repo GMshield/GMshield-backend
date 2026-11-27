@@ -23,6 +23,17 @@ public final class ConversationProblems {
     static final ApiProblem TURN_NOT_DONE =
             ApiProblem.of(409, "conversation", "turn_not_done", "Turn not done");
 
+    /**
+     * A save, a decline or a reopen of a turn that is not offered for saving (Story 5.4 part A): not a draft, or a
+     * draft that is running, stopped, failed or silent.
+     */
+    static final ApiProblem TURN_NOT_SAVEABLE =
+            ApiProblem.of(409, "conversation", "turn_not_saveable", "Turn not saveable");
+
+    /** A save, a decline or a reopen of a draft saved already (Story 5.4 part A): one draft makes one artifact. */
+    static final ApiProblem TURN_SAVED =
+            ApiProblem.of(409, "conversation", "turn_saved", "Turn saved");
+
     private ConversationProblems() {
     }
 
@@ -57,6 +68,16 @@ public final class ConversationProblems {
     /** A bookmark of a turn whose answer is not done (Story 3.12). */
     public static ApiException turnNotDone() {
         return new ApiException(TURN_NOT_DONE);
+    }
+
+    /** A save, a decline or a reopen of a turn that is not offered for saving (Story 5.4 part A). */
+    public static ApiException turnNotSaveable() {
+        return new ApiException(TURN_NOT_SAVEABLE);
+    }
+
+    /** A save, a decline or a reopen of a draft saved already (Story 5.4 part A). */
+    public static ApiException turnSaved() {
+        return new ApiException(TURN_SAVED);
     }
 
     /** A rename on a version the conversation has left (Story 3.10). */
