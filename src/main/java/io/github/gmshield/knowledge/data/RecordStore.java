@@ -197,6 +197,24 @@ public interface RecordStore {
     long noteCount(UUID campaignId, UUID shieldId);
 
     /**
+     * The ids of every note the current owner's Shield {@code shieldId} holds, deleting ones too (Story 6.2 part B: what
+     * the Shield's deletion removes), by id.
+     */
+    List<UUID> allNoteIdsOf(UUID shieldId);
+
+    /** How many live notes the current owner's Shield {@code shieldId} holds (Story 6.2 part B: its deletion's dialog). */
+    long liveNoteCountOf(UUID shieldId);
+
+    /**
+     * Moves the current owner's live note {@code id}, which a Shield holds, to the Shield {@code shieldId} of the same
+     * campaign (Story 6.2 part B; the caller checked it), with its row locked for the caller's transaction, which must
+     * exist, as {@link #retypeArtifact} locks it and reads it again; a note already in that Shield is not written.
+     * Answers the row as it was before the move (read under the lock), or empty for a note no Shield holds, a deleting
+     * one, any other artifact, an extracted record's id, an unknown one or another owner's.
+     */
+    Optional<ArtifactRow> moveNote(UUID id, UUID shieldId);
+
+    /**
      * The current owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its
      * deletion's dialog), oldest first (by when they were written, then id); a deleting one is left out.
      */

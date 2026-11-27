@@ -118,7 +118,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public long count(Going going) {
-        if (going.ofOneItem()) {
+        if (going.ofOneItem() || going.ofOneShield()) {
             return 0;
         }
         return going(going).stream()
@@ -129,7 +129,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
 
     @Override
     public Optional<Instant> prepare(Going going) {
-        if (going.ofOneConversation() || going.ofOneArtifact()) {
+        if (going.ofOneConversation() || going.ofOneArtifact() || going.ofOneShield()) {
             return Optional.empty();
         }
         Instant now = now();
@@ -164,7 +164,7 @@ class SystemMaterialsDeletion implements SystemDeletionHandler {
     @Override
     public void remove(Going going) {
         UUID owner = OwnerContext.require();
-        if (going.ofOneConversation() || going.ofOneArtifact()) {
+        if (going.ofOneConversation() || going.ofOneArtifact() || going.ofOneShield()) {
             return;
         }
         if (going.versionId() != null) {

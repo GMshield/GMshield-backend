@@ -54,9 +54,10 @@ class RecordEntity {
 
     /**
      * The Shield holding a note (Story 6.2 part A, V54); null for every other artifact, for a note no Shield holds and
-     * for an extracted record.
+     * for an extracted record. From Story 6.2 part B a move writes it ({@link #moveTo}), from one Shield to another of
+     * the same campaign, never to or from null.
      */
-    @Column(name = "shield_id", updatable = false)
+    @Column(name = "shield_id")
     private UUID shieldId;
 
     @Column(name = "ordinal", updatable = false)
@@ -209,6 +210,22 @@ class RecordEntity {
             throw new IllegalStateException("knowledge.not_an_artifact");
         }
         this.deletedAt = at;
+    }
+
+    /** Whether it is a note a Shield holds (Story 6.2 part A). */
+    boolean held() {
+        return campaignId != null && shieldId != null;
+    }
+
+    /**
+     * Moves a note a Shield holds to the Shield {@code shield} of its campaign (Story 6.2 part B; the caller checked
+     * it). Hibernate raises the version when it writes it.
+     */
+    void moveTo(UUID shield) {
+        if (!held() || shield == null) {
+            throw new IllegalStateException("knowledge.not_a_held_note");
+        }
+        this.shieldId = shield;
     }
 
     /** The row of an artifact (Story 5.1); only an artifact read calls it, and only on a row with a campaign. */

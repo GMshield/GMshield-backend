@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -42,7 +43,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *
  * <p>Story 6.2 part A: a note can be held by one Shield of its campaign ({@code record.shield_id}, V54; the caller checks
  * the Shield). Such a note is created with the Shield ({@link #create(UUID, String, Instant, UUID, UUID)}) and listed by
- * it ({@link #notesOf}); every other read answers it as the campaign's artifact it is, with its Shield.
+ * it ({@link #notesOf}); every other read answers it as the campaign's artifact it is, with its Shield. Part B: it moves
+ * to another Shield of its campaign ({@link #moveNote}), and a Shield's deletion counts its live notes and removes them
+ * all ({@link #liveNoteCountOf}, {@link #allNoteIdsOf}).
  */
 @Service
 public class ArtifactRecords {
@@ -263,6 +266,43 @@ public class ArtifactRecords {
     public long noteCount(UUID campaignId, UUID shieldId) {
         OwnerContext.require();
         return store.noteCount(campaignId, shieldId);
+    }
+
+    /**
+     * The ids of every note the owner's Shield {@code shieldId} holds, deleting ones too (Story 6.2 part B: what the
+     * Shield's deletion removes).
+     */
+    public List<UUID> allNoteIdsOf(UUID shieldId) {
+        OwnerContext.require();
+        return store.allNoteIdsOf(shieldId);
+    }
+
+    /** How many live notes the owner's Shield {@code shieldId} holds (Story 6.2 part B: its deletion's dialog). */
+    public long liveNoteCountOf(UUID shieldId) {
+        OwnerContext.require();
+        return store.liveNoteCountOf(shieldId);
+    }
+
+    /** A note's move (Story 6.2 part B): the note as it is now, and whether it changed Shield (false: it was there). */
+    public record Moved(Identity note, boolean moved) {
+    }
+
+    /**
+     * Moves the owner's live note {@code id}, which a Shield holds, to the Shield {@code shieldId} of the same campaign
+     * (Story 6.2 part B; the caller checked the Shield and holds its campaign's lock), with its row locked and read again,
+     * in the caller's transaction, which must exist; a note already there is not written. Answers the note as it is now
+     * and whether it moved, or empty for a note no Shield holds, a deleting one or any id that is not one of the owner's
+     * artifacts. Its type and versions do not change.
+     */
+    public Optional<Moved> moveNote(UUID id, UUID shieldId) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("knowledge.transaction_required");
+        }
+        OwnerContext.require();
+        UUID target = Objects.requireNonNull(shieldId, "shieldId");
+        return store.moveNote(id, target).map(before -> new Moved(identity(new ArtifactRow(before.id(),
+                before.ownerId(), before.campaignId(), before.type(), before.createdAt(), before.conversationId(),
+                target)), !target.equals(before.shieldId())));
     }
 
     /**

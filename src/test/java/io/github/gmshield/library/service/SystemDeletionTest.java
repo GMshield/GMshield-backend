@@ -12,6 +12,7 @@ import io.github.gmshield.library.data.CampaignRow;
 import io.github.gmshield.library.data.DeletionRow;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
+import io.github.gmshield.library.data.ShieldRow;
 import io.github.gmshield.library.data.SystemRow;
 import io.github.gmshield.shared.data.InMemoryTransactionManager;
 import io.github.gmshield.shared.service.Ids;
@@ -33,7 +34,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * (waiting for the latest claim lapse), and done once the handlers' removal ends, with nothing of library's touched.
  * Story 3.10 part B: a conversation's deletion is the same, its id kept opaque, waiting for the claims its prepare
  * answers; a second delete records nothing. Story 5.2 part B: an artifact's deletion, recorded inside the caller's
- * transaction, schedules its one-shot pass only once that transaction commits, and never when it rolls back.
+ * transaction, schedules its one-shot pass only once that transaction commits, and never when it rolls back. Story 6.2
+ * part B: a Shield's deletion is recorded once, its preview counts the handlers' artifacts part, and its pass deletes
+ * the Shield's row after the handlers' removal; a campaign's deletion that overtakes it takes the Shield, and the
+ * Shield's pass then ends with no removal.
  */
 class SystemDeletionTest {
 
@@ -316,5 +320,80 @@ class SystemDeletionTest {
             return null;
         }));
         verify(schedule, never()).once(any(), any());
+    }
+
+    @Test
+    void aShieldsDeletionIsRecordedOnceCountsThroughTheHandlersAndItsPassRemovesTheRowAfterTheirRemoval() {
+        Recording handler = new Recording();
+        SystemDeletion deletion = deletion(handler);
+        UUID owner = Ids.newId();
+        UUID system = Ids.newId();
+        UUID campaign = Ids.newId();
+        insert(owner, system, campaign);
+        UUID first = Ids.newId();
+        UUID going = Ids.newId();
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            store.insertShield(ShieldRow.unnamed(first, owner, campaign, NOW));
+            store.insertShield(new ShieldRow(going, owner, campaign, new byte[] {4}, new byte[32], 0, NOW));
+            return null;
+        }));
+        // No handler here counts an ARTIFACTS part: no note goes.
+        assertThat(OwnerContext.callAs(owner, () -> deletion.previewShield(going))).isZero();
+
+        Boolean recorded = OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(store.markShieldDeleting(campaign, going, NOW)).isTrue();
+            return deletion.deleteShield(going);
+        }));
+        assertThat(recorded).isTrue();
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteShield(going))).isFalse();
+        assertThat(handler.prepared).containsExactly(SystemDeletionHandler.Going.ofShield(going));
+        DeletionRow row = deletions.rows.values().stream().findFirst().orElseThrow();
+        assertThat(row.kind()).isEqualTo(DeletionRow.SHIELD);
+        assertThat(row.targetId()).isEqualTo(going);
+        // Deleting: out of every read, its name freed (its fingerprint now its 16-byte id).
+        assertThat(OwnerContext.callAs(owner, () -> store.findShield(campaign, going))).isEmpty();
+        assertThat(OwnerContext.callAs(owner, () -> store.shieldCount(campaign))).isOne();
+        assertThat(store.shields.get(going).nameFingerprint()).hasSize(16);
+
+        assertThat(deletion.run(owner, row.id())).isTrue();
+
+        assertThat(handler.removed).containsExactly(SystemDeletionHandler.Going.ofShield(going));
+        assertThat(store.shields).doesNotContainKey(going).containsKey(first);
+        assertThat(store.campaigns).containsKey(campaign);
+        assertThat(deletions.rows.get(row.id()).doneAt()).isEqualTo(NOW);
+        assertThat(deletion.run(owner, row.id())).isFalse();
+    }
+
+    @Test
+    void aCampaignsDeletionThatOvertakesAShieldsDeletionTakesTheShieldAndTheShieldsPassEndsWithoutWork() {
+        Recording handler = new Recording();
+        SystemDeletion deletion = deletion(handler);
+        UUID owner = Ids.newId();
+        UUID system = Ids.newId();
+        UUID campaign = Ids.newId();
+        insert(owner, system, campaign);
+        UUID first = Ids.newId();
+        UUID going = Ids.newId();
+        OwnerContext.callAs(owner, () -> new TransactionTemplate(transactions).execute(status -> {
+            store.insertShield(ShieldRow.unnamed(first, owner, campaign, NOW));
+            store.insertShield(new ShieldRow(going, owner, campaign, new byte[] {4}, new byte[32], 0, NOW));
+            assertThat(store.markShieldDeleting(campaign, going, NOW)).isTrue();
+            return deletion.deleteShield(going);
+        }));
+        assertThat(OwnerContext.callAs(owner, () -> deletion.deleteCampaign(campaign))).isTrue();
+        DeletionRow ofShield = deletions.rows.values().stream()
+                .filter(row -> row.kind().equals(DeletionRow.SHIELD)).findFirst().orElseThrow();
+        DeletionRow ofCampaign = deletions.rows.values().stream()
+                .filter(row -> row.kind().equals(DeletionRow.CAMPAIGN)).findFirst().orElseThrow();
+
+        assertThat(deletion.run(owner, ofCampaign.id())).isTrue();
+        assertThat(store.shields).doesNotContainKeys(first, going);
+        assertThat(store.campaigns).doesNotContainKey(campaign);
+        handler.removed.clear();
+
+        assertThat(deletion.run(owner, ofShield.id())).isTrue();
+        assertThat(handler.removed).isEmpty();
+        assertThat(deletions.rows.get(ofShield.id()).doneAt()).isEqualTo(NOW);
+        assertThat(deletions.rows.get(ofCampaign.id()).doneAt()).isEqualTo(NOW);
     }
 }

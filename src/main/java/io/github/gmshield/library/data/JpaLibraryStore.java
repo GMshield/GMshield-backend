@@ -32,6 +32,9 @@ import org.springframework.stereotype.Repository;
  * {@code (campaign_id, name_fingerprint)} or the one unnamed Shield's partial index refuses is a {@link LibraryConflict}.
  * Part B: a Shield's deletion first locks its campaign's row ({@code PESSIMISTIC_WRITE}), so two deletions cannot both
  * count two Shields and leave none.
+ *
+ * <p>Story 6.2 part B: every Shield read and count takes live Shields only ({@code deleting_at} null, V55); a deleting
+ * Shield is reached by its deletion's methods and by the campaigns' deletions ({@link #deleteShieldsOf}).
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
@@ -88,14 +91,22 @@ class JpaLibraryStore implements LibraryStore {
     /** Story 6.1: the unique key on a Shield's name fingerprint within its campaign, and the one unnamed Shield (V53). */
     static final String SHIELD_NAME_KEY = "shield_campaign_name_fingerprint_key";
     static final String UNNAMED_SHIELD_KEY = "shield_campaign_unnamed_key";
-    private static final String SHIELD_BY_ID = "select s from LibraryShield s where s.id = :id and s.campaignId = :campaign";
-    private static final String SHIELDS = "select s from LibraryShield s where s.campaignId = :campaign order by s.id";
+    /** Story 6.2 part B: only a live Shield is read and counted; the deletion's methods alone reach a deleting one. */
+    private static final String LIVE_SHIELD = " and s.deletingAt is null";
+    private static final String SHIELD_BY_ID = "select s from LibraryShield s where s.id = :id and s.campaignId = :campaign"
+            + LIVE_SHIELD;
+    private static final String SHIELDS = "select s from LibraryShield s where s.campaignId = :campaign" + LIVE_SHIELD
+            + " order by s.id";
     private static final String SHIELDS_AFTER = "select s from LibraryShield s where s.campaignId = :campaign"
-            + " and s.id > :after order by s.id";
-    private static final String SHIELD_COUNT = "select count(s) from LibraryShield s where s.campaignId = :campaign";
+            + " and s.id > :after" + LIVE_SHIELD + " order by s.id";
+    private static final String SHIELD_COUNT = "select count(s) from LibraryShield s where s.campaignId = :campaign"
+            + LIVE_SHIELD;
     private static final String SHIELD_NAME_TAKEN = "select s.id from LibraryShield s where s.campaignId = :campaign"
             + " and s.nameFingerprint = :fingerprint and s.id <> :except";
+    /** Every Shield of the campaigns, deleting ones too (a campaign's or a system's deletion). */
     private static final String SHIELDS_OF = "select s from LibraryShield s where s.campaignId in :campaigns";
+    private static final String DELETING_SHIELD = "select s from LibraryShield s where s.id = :id"
+            + " and s.deletingAt is not null";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -465,14 +476,34 @@ class JpaLibraryStore implements LibraryStore {
     }
 
     @Override
-    public boolean deleteShield(UUID campaignId, UUID id) {
+    public boolean markShieldDeleting(UUID campaignId, UUID id, Instant at) {
         Optional<ShieldEntity> found = shield(campaignId, id);
+        found.ifPresent(entity -> {
+            entity.markDeleting(at);
+            flushChecked(em());
+        });
+        return found.isPresent();
+    }
+
+    @Override
+    public boolean shieldDeleting(UUID id) {
+        return deletingShield(id).isPresent();
+    }
+
+    @Override
+    public boolean deleteDeletingShield(UUID id) {
+        Optional<ShieldEntity> found = deletingShield(id);
         found.ifPresent(entity -> {
             EntityManager em = em();
             em.remove(entity);
             em.flush();
         });
         return found.isPresent();
+    }
+
+    private Optional<ShieldEntity> deletingShield(UUID id) {
+        return em().createQuery(DELETING_SHIELD, ShieldEntity.class).setParameter("id", id).getResultList().stream()
+                .findFirst();
     }
 
     private Optional<ShieldEntity> shield(UUID campaignId, UUID id) {

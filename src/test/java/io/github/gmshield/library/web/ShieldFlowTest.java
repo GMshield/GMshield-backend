@@ -58,8 +58,10 @@ import tools.jackson.databind.json.JsonMapper;
  * and {@link SystemDeletionFlowTest}.
  *
  * <p>Part B: the deletion preview ({@code notes} and {@code rolls} 0, {@code last} for the campaign's only Shield), the
- * deletion (204, the list one shorter), the refusal of the last Shield ({@code request.last_shield}, 409, the row kept),
- * an already deleted Shield (404), and the same not found on both routes.
+ * deletion (from Story 6.2 part B the recorded process: 202, the list one shorter at once, its name free at once, its
+ * row gone after the pass), the refusal of the last Shield ({@code request.last_shield}, 409, the row kept), an already
+ * deleted Shield (404), and the same not found on both routes. The deletion of a Shield holding notes is
+ * {@code ShieldNoteFlowTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -369,10 +371,9 @@ class ShieldFlowTest {
         assertThat(ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion")).path("last").asBoolean()).isFalse();
 
         HttpResponse<String> deleted = send(gm, "DELETE", shields(gm.campaign()) + "/" + combat, "");
-        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(202);
         assertThat(deleted.headers().firstValue("Cache-Control")).hasValue("no-store");
         assertThat(deleted.body()).isEmpty();
-        assertThat(library.shields).doesNotContainKey(combat).containsKey(first);
         JsonNode list = ok(get(gm, shields(gm.campaign())));
         assertThat(list.path("total").asLong()).isEqualTo(1);
         assertThat(list.path("items")).extracting(item -> item.path("id").asString()).containsExactly(first.toString());
@@ -380,6 +381,14 @@ class ShieldFlowTest {
         notFound(get(gm, shields(gm.campaign()) + "/" + combat));
         notFound(get(gm, shields(gm.campaign()) + "/" + combat + "/deletion"));
         notFound(send(gm, "DELETE", shields(gm.campaign()) + "/" + combat, ""));
+        // Its name is free at once.
+        UUID again = UUID.fromString(json(send(gm, "POST", shields(gm.campaign()), "{\"name\":\"Combate\"}"))
+                .path("id").asString());
+        // The pass (scheduled, or the sweep) removes its row and ends the deletion.
+        deletion.sweep();
+        assertThat(library.shields).doesNotContainKey(combat).containsKeys(first, again);
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + again, "").statusCode()).isEqualTo(202);
+        deletion.sweep();
 
         // The campaign's only Shield: the preview says so, and its deletion is refused with nothing changed.
         JsonNode last = ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion"));
@@ -397,7 +406,7 @@ class ShieldFlowTest {
         // A new Shield makes the first one deletable again; the new one, named, keeps the campaign's one Shield.
         UUID next = UUID.fromString(json(send(gm, "POST", shields(gm.campaign()), "{\"name\":\"Exploração\"}"))
                 .path("id").asString());
-        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + first, "").statusCode()).isEqualTo(204);
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + first, "").statusCode()).isEqualTo(202);
         assertThat(ok(get(gm, shields(gm.campaign()))).path("items")).extracting(item -> item.path("id").asString())
                 .containsExactly(next.toString());
         assertThat(ok(get(gm, shields(gm.campaign()) + "/" + next + "/deletion")).path("last").asBoolean()).isTrue();

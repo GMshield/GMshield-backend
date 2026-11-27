@@ -22,6 +22,10 @@ import java.util.UUID;
  * <p>From Story 6.1 a campaign has Shields ({@code shield}, V53): the methods below take a campaign id that the caller has
  * found ready in the same transaction; they never check the campaign's state themselves. {@link #deleteShieldsOf} alone
  * reaches the Shields of any campaign of the owner, for the deletions.
+ *
+ * <p>From Story 6.2 part B (V55) a Shield is live or deleting: every Shield read and count here sees live Shields only; a
+ * deleting one is reached through its deletion's methods ({@link #shieldDeleting}, {@link #deleteDeletingShield}) and
+ * through {@link #deleteShieldsOf}.
  */
 public interface LibraryStore {
 
@@ -233,9 +237,23 @@ public interface LibraryStore {
      */
     Optional<CampaignRow> lockCampaign(UUID id);
 
+    // --- Shield deletion as a recorded process (Story 6.2 part B, V55)
+
     /**
-     * Deletes the current owner's Shield {@code id} of the campaign {@code campaignId}; false when there is no such
-     * Shield. Joins the caller's transaction, which must exist.
+     * The current owner's live Shield {@code id} of the campaign {@code campaignId} becomes deleting at {@code at}: from
+     * the commit every Shield read and count above leaves it out, and a named Shield's name fingerprint becomes its own
+     * id (16 bytes), so its name is free in its campaign at once. False for any other id, a deleting one included.
+     * Joins the caller's transaction, which must exist (and in which the caller locked the campaign).
      */
-    boolean deleteShield(UUID campaignId, UUID id);
+    boolean markShieldDeleting(UUID campaignId, UUID id, Instant at);
+
+    /** Whether the current owner's Shield {@code id} is deleting, whatever its campaign's state (false once it is gone). */
+    boolean shieldDeleting(UUID id);
+
+    /**
+     * Deletes the current owner's deleting Shield {@code id}, which no note may name any more; false when there is no
+     * such Shield (a campaign's or a system's deletion may have taken it). Joins the caller's transaction, which must
+     * exist.
+     */
+    boolean deleteDeletingShield(UUID id);
 }

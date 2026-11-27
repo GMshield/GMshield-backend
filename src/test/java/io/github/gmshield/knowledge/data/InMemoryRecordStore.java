@@ -28,7 +28,8 @@ import java.util.regex.Pattern;
  * that against the table). The campaign key is PostgreSQL's alone. From Story 5.2 part B an artifact the GM deleted is
  * kept in {@link #deletingArtifacts} until its row goes, and every artifact read leaves it out unless its
  * {@link Reach} is {@link Reach#ALL}, as the JPA store does. From Story 6.2 part A it keeps V54's check (a note a Shield
- * holds is of type {@code note}); the Shield key is PostgreSQL's alone.
+ * holds is of type {@code note}); the Shield key is PostgreSQL's alone. From Story 6.2 part B it moves a held note to
+ * another Shield, and lists and counts a Shield's notes by the Shield alone.
  */
 public class InMemoryRecordStore implements RecordStore {
 
@@ -319,6 +320,35 @@ public class InMemoryRecordStore implements RecordStore {
     @Override
     public long noteCount(UUID campaignId, UUID shieldId) {
         return ofShield(campaignId, shieldId).count();
+    }
+
+    @Override
+    public List<UUID> allNoteIdsOf(UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner) && shieldId.equals(row.shieldId()))
+                .map(ArtifactRow::id).sorted().toList();
+    }
+
+    @Override
+    public long liveNoteCountOf(UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner) && shieldId.equals(row.shieldId())
+                && live(row)).count();
+    }
+
+    @Override
+    public synchronized Optional<ArtifactRow> moveNote(UUID id, UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        ArtifactRow row = artifacts.get(id);
+        if (row == null || !row.ownerId().equals(owner) || !live(row) || row.shieldId() == null) {
+            return Optional.empty();
+        }
+        if (!shieldId.equals(row.shieldId())) {
+            artifacts.put(id, new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), row.type(), row.createdAt(),
+                    row.conversationId(), shieldId));
+            RollbackUndo.onRollback(() -> artifacts.put(id, row));
+        }
+        return Optional.of(row);
     }
 
     @Override

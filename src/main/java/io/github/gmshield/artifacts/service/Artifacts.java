@@ -135,6 +135,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * everywhere else (its list, sharing, relations, export, the campaign tier). An edit or a restore that would give it
  * another type is {@code request.note_type_fixed} (409), and nothing is stored.
  *
+ * <p>Story 6.2 part B: {@link #move} moves a held note to another live Shield of its campaign, with no new version and
+ * no index job. Both it and {@link #createNote} find the Shield under its campaign's row lock
+ * ({@link Shields#lockedShield}), which a Shield's deletion takes too, so a note never lands in a Shield being deleted.
+ *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -441,8 +445,9 @@ public class Artifacts {
         UUID owner = OwnerContext.require();
         Written written = new Written(ArtifactRecords.NOTE, name, List.of(), content);
         Optional<Artifact> created = writing(() -> library.campaign(campaignId).flatMap(campaign ->
-                shields.shield(campaign.id(), shieldId).map(shield -> created(campaign, written, null, List.of(), owner,
-                        shield.id()))));
+                // Story 6.2 part B: the Shield under its campaign's lock, so a note never lands in a Shield being deleted.
+                shields.lockedShield(campaign.id(), shieldId).map(shield -> created(campaign, written, null, List.of(),
+                        owner, shield.id()))));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("shieldId", shieldId).addKeyValue("found", created.isPresent())
                 .addKeyValue("artifactId", created.map(Artifact::id).orElse(null))
@@ -934,6 +939,43 @@ public class Artifacts {
                 .addKeyValue("shared", shared.map(artifact -> artifact.sharedWith().size()).orElse(0))
                 .log("artifacts.shared");
         return shared;
+    }
+
+    /**
+     * Moves the owner's note {@code artifactId} of the campaign {@code campaignId}, which a Shield holds, to the
+     * campaign's Shield {@code shieldId} (Story 6.2 part B), as the class says: no version, no index job and no change
+     * to its content; moving it to its own Shield answers it unchanged. Answers the note with its newest version, or
+     * empty (nothing changes) when the campaign is not the owner's or not readable, the artifact is not the campaign's
+     * or no Shield holds it, or the target is not a live Shield of that campaign. The target is found under the
+     * campaign's lock ({@link Shields#lockedShield}), so a note never moves into a Shield being deleted.
+     */
+    public Optional<Artifact> move(UUID campaignId, UUID artifactId, UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        boolean[] moved = {false};
+        Optional<Artifact> found = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                records.find(campaign.id(), artifactId).filter(identity -> identity.shieldId() != null)
+                        .flatMap(identity -> shields.lockedShield(campaign.id(), shieldId).flatMap(target -> {
+                            UUID id = identity.id();
+                            // The lock an edit and a delete take: one that waited on a delete (its own or its
+                            // Shield's) finds the note gone, its versions too once that deletion's pass ran.
+                            Optional<ArtifactVersionRow> newest = versions.latest(id);
+                            if (newest.isEmpty()) {
+                                return Optional.<Artifact>empty();
+                            }
+                            versions.lock(id, newest.get().number());
+                            // Decided on the row the move locks and reads again: whether it is still a live held
+                            // note, and whether it was already in the target (then nothing is written).
+                            Optional<ArtifactRecords.Moved> result = records.moveNote(id, target.id());
+                            if (result.isEmpty()) {
+                                return Optional.<Artifact>empty();
+                            }
+                            moved[0] = result.get().moved();
+                            return Optional.of(newest(result.get().note(), owner));
+                        }))));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("shieldId", shieldId)
+                .addKeyValue("found", found.isPresent()).addKeyValue("moved", moved[0]).log("artifacts.note_moved");
+        return found;
     }
 
     /**

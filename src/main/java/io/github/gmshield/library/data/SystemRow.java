@@ -1,5 +1,6 @@
 package io.github.gmshield.library.data;
 
+import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Objects;
@@ -47,5 +48,14 @@ public record SystemRow(UUID id, UUID ownerId, byte[] name, byte[] nameFingerpri
 
     static byte[] copy(byte[] bytes) {
         return bytes == null ? null : bytes.clone();
+    }
+
+    /**
+     * An id as 16 bytes, the name fingerprint of a row being deleted (Story 6.2 part B, a Shield): never a keyed
+     * fingerprint's 32, so it frees the name and takes no other.
+     */
+    public static byte[] idBytes(UUID id) {
+        return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits())
+                .array();
     }
 }

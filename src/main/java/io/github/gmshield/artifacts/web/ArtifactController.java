@@ -110,6 +110,11 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 6.2 part A (contract 1.57.0): every artifact answer and list row carries {@code shieldId}, the Shield holding
  * a note written there ({@link ShieldNoteController}); null for every other artifact. An edit or a restore of such a
  * note to another type is {@code request.note_type_fixed} (409), and nothing is stored.
+ *
+ * <p>Story 6.2 part B (contract 1.58.0): a {@code PUT} on {@code .../shield} moves a note a Shield holds to another live
+ * Shield of the same campaign, keeping its versions (no new version, no index job, no change to its content); its own
+ * Shield answers it unchanged. A note no Shield holds, a Shield of another campaign, a deleting or unknown Shield and
+ * another account's ids are {@code request.not_found} (404).
  */
 @RestController
 @Tag(name = "artifacts")
@@ -128,6 +133,8 @@ class ArtifactController {
     static final String RELATION = RELATIONS + "/{recordId}";
     static final String RELATION_TARGETS = ARTIFACT + "/relation-targets";
     static final String SHARING = ARTIFACT + "/sharing";
+    /** Story 6.2 part B: the Shield holding a note. */
+    static final String SHIELD = ARTIFACT + "/shield";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -1200,6 +1207,39 @@ class ArtifactController {
         Artifacts.Artifact shared = artifacts.share(campaign, artifact, targets)
                 .orElseThrow(ArtifactController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(shared));
+    }
+
+    @Schema(name = "NoteShield", requiredProperties = "shieldId",
+            description = "The Shield a note moves to (contract 1.58.0)")
+    record ShieldBody(
+            @Schema(description = "The id of a live Shield of the note's campaign", format = "uuid") String shieldId) {
+    }
+
+    @PutMapping(path = SHIELD, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "moveNote", summary = "The GM moves a note one of the account's Shields holds to another"
+            + " Shield of the same campaign (contract 1.58.0), answering the note as getArtifact does, with the new"
+            + " shieldId. It keeps its versions: no version is created, nothing is indexed again and its content does"
+            + " not change; its own Shield answers it unchanged. request.invalid (400) for a malformed body;"
+            + NOT_FOUND + " request.not_found (404) too for an artifact no Shield holds, and for a Shield that is not"
+            + " a live Shield of the note's campaign (another campaign's, being deleted, unknown or malformed);"
+            + " nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> moveNote(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The note's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody ShieldBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null || body.shieldId() == null) {
+            throw invalid();
+        }
+        // A malformed Shield id is a Shield that exists nowhere.
+        UUID shield = parse(body.shieldId()).orElseThrow(ArtifactController::notFound);
+        Artifacts.Artifact moved = artifacts.move(campaign, artifact, shield).orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(moved));
     }
 
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */

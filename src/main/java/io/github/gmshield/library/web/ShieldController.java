@@ -34,8 +34,12 @@ import org.springframework.web.bind.annotation.RestController;
  * Another owner's campaign or Shield, an unknown or malformed id, a Shield of another campaign and a campaign being
  * deleted are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  *
- * <p>Part B: what goes with a Shield if it is deleted (its notes and rolls, none yet, and whether it is the campaign's
- * last), and its deletion (204), which refuses the campaign's only Shield with {@code request.last_shield} (409).
+ * <p>Part B: what goes with a Shield if it is deleted (its notes and rolls, and whether it is the campaign's last), and
+ * its deletion, which refuses the campaign's only Shield with {@code request.last_shield} (409).
+ *
+ * <p>Story 6.2 part B (contract 1.58.0): the preview counts the Shield's live notes, and its deletion is the recorded,
+ * resumable process (202, no body, as a campaign's): from then on the Shield and its notes are not found, and the notes
+ * are removed in the background with their index points.
  */
 @RestController
 @Tag(name = "library")
@@ -110,7 +114,7 @@ class ShieldController {
 
     @Schema(name = "ShieldDeletion", requiredProperties = {"notes", "rolls", "last"})
     record ShieldDeletionView(
-            @Schema(description = "How many notes of the Shield go with it (0 until notes exist)", format = "int64",
+            @Schema(description = "How many live notes of the Shield go with it (contract 1.58.0)", format = "int64",
                     minimum = "0", example = "0") long notes,
             @Schema(description = "How many stored rolls of the Shield go with it (0 until rolls are stored)",
                     format = "int64", minimum = "0", example = "0") long rolls,
@@ -223,9 +227,10 @@ class ShieldController {
 
     @GetMapping(path = SHIELD_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getShieldDeletion", summary = "What goes with one Shield of one of the account's campaigns"
-            + " if it is deleted: how many notes and stored rolls (0 until they exist), and whether it is the campaign's"
-            + " only Shield (last), which cannot be deleted. request.not_found (404) for any other id (unknown, another"
-            + " account's, malformed, already deleted, a Shield of another campaign or of a campaign being deleted);"
+            + " if it is deleted: how many live notes (contract 1.58.0) and stored rolls (0 until they exist), and"
+            + " whether it is the campaign's only Shield (last), which cannot be deleted. request.not_found (404) for"
+            + " any other id (unknown, another account's, malformed, already deleted, a Shield of another campaign or"
+            + " of a campaign being deleted);"
             + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")))
@@ -239,14 +244,16 @@ class ShieldController {
     }
 
     @DeleteMapping(path = SHIELD)
-    @Operation(operationId = "deleteShield", summary = "Deletes one Shield of one of the account's campaigns (204, no"
-            + " body): from now on it is not found, and nothing else of the campaign changes. Cannot be undone."
-            + " request.last_shield (409) when it is the campaign's only Shield, request.not_found (404) for any other id"
-            + " (unknown, another account's, malformed, already deleted, a Shield of another campaign or of a campaign"
+    @Operation(operationId = "deleteShield", summary = "Deletes one Shield of one of the account's campaigns (202, no"
+            + " body, from contract 1.58.0; 204 before): from now on it and its notes are not found (lists, search and the"
+            + " campaign tier), its name is free in its campaign, and its notes are removed in the background with"
+            + " their index points; nothing else of the campaign changes. Cannot be undone. request.last_shield (409)"
+            + " when it is the campaign's only Shield, request.not_found (404) for any other id (unknown, another"
+            + " account's, malformed, already deleted or being deleted, a Shield of another campaign or of a campaign"
             + " being deleted); nothing changes then;" + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")),
-            responses = @ApiResponse(responseCode = "204", description = "The Shield was deleted"))
+            responses = @ApiResponse(responseCode = "202", description = "The deletion started"))
     ResponseEntity<Void> deleteShield(
             @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("id") String id,
@@ -257,6 +264,6 @@ class ShieldController {
         if (!shields.deleteShield(campaignId, shield)) {
             throw LibraryController.notFound();
         }
-        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
     }
 }

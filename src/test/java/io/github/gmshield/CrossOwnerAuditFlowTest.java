@@ -309,6 +309,9 @@ class CrossOwnerAuditFlowTest {
                     .own("id"),
             route("POST", "/api/v1/campaigns/{id}/shields/{shieldId}/notes", "id", "campaign", "shieldId", "shield")
                     .json("{\"name\":\"Tomado\",\"content\":\"Tomado\"}").own("id"),
+            // a note moved to another Shield of its campaign (Story 6.2 part B): the Shield is named in the body
+            route("PUT", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/shield", "campaignId", "campaign",
+                    "artifactId", "artifact").json("{\"shieldId\":\"{shield}\"}").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

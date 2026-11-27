@@ -18,6 +18,9 @@ import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.knowledge.data.ArtifactRow;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
+import io.github.gmshield.library.data.DeletionRow;
+import io.github.gmshield.library.data.InMemoryDeletionStore;
+import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.materials.data.MaterialTestStores;
@@ -40,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -66,6 +70,15 @@ import tools.jackson.databind.json.JsonMapper;
  * is in no Shield's list, a held note shared into another campaign reads there with no Shield, and a deleted note
  * leaves its Shield's list at once. The cross-owner rows are also {@code CrossOwnerAuditFlowTest}'s, the key on
  * PostgreSQL {@code ArtifactsIntegrationTest}'s.
+ *
+ * <p>Story 6.2 part B, every backend row of its I/O matrix: a move to another Shield of the campaign keeps the note's
+ * versions and creates no version and no index job, and a move to its own Shield answers it unchanged; a Shield of
+ * another campaign, a deleting or unknown Shield, a note no Shield holds and a malformed body are refused with the note
+ * unchanged; the deletion preview counts the live notes; a Shield deleted with its notes is gone at once with them
+ * (lists, reads, the campaign tier), and its pass removes their rows and versions with one removal job each before the
+ * Shield's row (the in-memory store refuses the row while a note names it, as the key does); the last live Shield is
+ * refused while another is deleting; a note created in, or moved into, a deleting Shield is not found; a campaign
+ * deleted meanwhile ends both deletions; and another owner's move or deletion is not found.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -125,11 +138,22 @@ class ShieldNoteFlowTest {
     @Autowired
     private Scopes scopes;
     @Autowired
+    private InMemoryLibraryStore library;
+    @Autowired
+    private InMemoryDeletionStore deletions;
+    @Autowired
     private Vault vault;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
     record Gm(UUID id, String session, UUID campaign, UUID system) {
+    }
+
+    /** As {@code record_shield_fkey}: a Shield's row cannot go while a note still names it. */
+    @BeforeEach
+    void shieldKey() {
+        library.shieldHasNotes = shield -> records.artifacts.values().stream()
+                .anyMatch(row -> shield.equals(row.shieldId()));
     }
 
     // --- create
@@ -426,6 +450,207 @@ class ShieldNoteFlowTest {
         // Its removal takes its notes as artifacts.
         deletion.sweep();
         assertThat(records.artifacts.values()).noneMatch(row -> row.campaignId().equals(bOther));
+    }
+
+    // --- move (part B)
+
+    @Test
+    void aMoveToAnotherShieldKeepsTheVersionsAndCreatesNoVersionAndNoIndexJob() throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID combat = shield(gm, "Combate");
+        String id = note(gm, first, "Pistas");
+        String staying = note(gm, first, "Fica");
+        HttpResponse<String> edited = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id,
+                "{\"version\":1,\"recordType\":\"note\",\"name\":\"Pistas\",\"fields\":[],\"content\":\"Duas\"}");
+        assertThat(edited.statusCode()).as(edited.body()).isEqualTo(200);
+        int jobs = index.rows.size();
+
+        HttpResponse<String> moved = send(gm, "PUT", artifacts(gm.campaign()) + "/" + id + "/shield",
+                "{\"shieldId\":\"" + combat + "\"}");
+
+        assertThat(moved.statusCode()).as(moved.body()).isEqualTo(200);
+        assertThat(moved.headers().firstValue("Cache-Control")).hasValue("no-store");
+        JsonNode note = json(moved);
+        assertThat(note.path("shieldId").asString()).isEqualTo(combat.toString());
+        assertThat(note.path("version").asInt()).isEqualTo(2);
+        assertThat(note.path("currentVersion").asInt()).isEqualTo(2);
+        assertThat(note.path("content").asString()).isEqualTo("Duas");
+        assertThat(note.path("recordType").asString()).isEqualTo("note");
+        assertThat(ok(get(gm, artifacts(gm.campaign()) + "/" + id))).isEqualTo(note);
+        assertThat(records.artifacts.get(UUID.fromString(id)).shieldId()).isEqualTo(combat);
+        assertThat(ids(ok(get(gm, notes(gm.campaign(), first))))).containsExactly(staying);
+        assertThat(ids(ok(get(gm, notes(gm.campaign(), combat))))).containsExactly(id);
+        JsonNode history = ok(get(gm, artifacts(gm.campaign()) + "/" + id + "/versions"));
+        assertThat(history.path("total").asLong()).isEqualTo(2);
+        assertThat(versionsOf(id)).isEqualTo(2);
+        assertThat(index.rows).hasSize(jobs);
+
+        // To its own Shield: answered unchanged.
+        HttpResponse<String> again = send(gm, "PUT", artifacts(gm.campaign()) + "/" + id + "/shield",
+                "{\"shieldId\":\"" + combat + "\"}");
+        assertThat(again.statusCode()).as(again.body()).isEqualTo(200);
+        assertThat(json(again)).isEqualTo(note);
+        assertThat(versionsOf(id)).isEqualTo(2);
+        assertThat(index.rows).hasSize(jobs);
+    }
+
+    @Test
+    void aMoveToAShieldOfAnotherCampaignADeletingOrUnknownShieldOrOfAnUnheldArtifactIsNotFound() throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID combat = shield(gm, "Combate");
+        UUID going = shield(gm, "Vai");
+        String id = note(gm, first, "Pistas");
+        UUID other = campaign(gm, "Outra mesa");
+        UUID otherShield = UUID.fromString(ok(get(gm, shields(other))).path("items").get(0).path("id").asString());
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + going, null).statusCode()).isEqualTo(202);
+        HttpResponse<String> loose = send(gm, "POST", artifacts(gm.campaign()),
+                "{\"recordType\":\"note\",\"name\":\"Solta\",\"fields\":[]}");
+        String unheld = json(loose).path("id").asString();
+        JsonNode before = ok(get(gm, artifacts(gm.campaign()) + "/" + id));
+
+        for (String target : List.of(otherShield.toString(), going.toString(), UUID.randomUUID().toString(), "123")) {
+            notFound(send(gm, "PUT", artifacts(gm.campaign()) + "/" + id + "/shield",
+                    "{\"shieldId\":\"" + target + "\"}"));
+        }
+        // A note no Shield holds, an unknown note and the note from another campaign of the owner.
+        notFound(send(gm, "PUT", artifacts(gm.campaign()) + "/" + unheld + "/shield",
+                "{\"shieldId\":\"" + combat + "\"}"));
+        notFound(send(gm, "PUT", artifacts(gm.campaign()) + "/" + UUID.randomUUID() + "/shield",
+                "{\"shieldId\":\"" + combat + "\"}"));
+        notFound(send(gm, "PUT", artifacts(other) + "/" + id + "/shield", "{\"shieldId\":\"" + otherShield + "\"}"));
+        for (String body : List.of("not json", "null", "{}", "{\"shieldId\":null}")) {
+            HttpResponse<String> malformed = send(gm, "PUT", artifacts(gm.campaign()) + "/" + id + "/shield", body);
+            assertThat(malformed.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(malformed).path("code").asString()).isEqualTo("request.invalid");
+        }
+
+        assertThat(ok(get(gm, artifacts(gm.campaign()) + "/" + id))).isEqualTo(before);
+        assertThat(records.artifacts.get(UUID.fromString(id)).shieldId()).isEqualTo(first);
+        assertThat(records.artifacts.get(UUID.fromString(unheld)).shieldId()).isNull();
+    }
+
+    // --- a Shield's deletion with its notes (part B)
+
+    @Test
+    void thePreviewCountsTheLiveNotesAndADeletionTakesThemAtOnceAndItsPassRemovesThemBeforeTheShield()
+            throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID going = shield(gm, "Vai");
+        List<String> notes = new ArrayList<>();
+        for (String name : List.of("Um", "Dois", "Três")) {
+            notes.add(note(gm, going, name));
+        }
+        String deleted = note(gm, going, "Apagada");
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + deleted, null).statusCode()).isEqualTo(202);
+        String kept = note(gm, first, "Fica");
+
+        JsonNode preview = ok(get(gm, shields(gm.campaign()) + "/" + going + "/deletion"));
+        assertThat(preview.path("notes").asLong()).isEqualTo(3);
+        assertThat(preview.path("rolls").asLong()).isZero();
+        assertThat(preview.path("last").asBoolean()).isFalse();
+
+        HttpResponse<String> started = send(gm, "DELETE", shields(gm.campaign()) + "/" + going, null);
+
+        assertThat(started.statusCode()).as(started.body()).isEqualTo(202);
+        assertThat(started.body()).isEmpty();
+        // At once: the Shield is gone from the list and every read, and its notes from the artifacts and the tier.
+        assertThat(ids(ok(get(gm, shields(gm.campaign()))))).containsExactly(first.toString());
+        notFound(get(gm, shields(gm.campaign()) + "/" + going));
+        notFound(get(gm, shields(gm.campaign()) + "/" + going + "/deletion"));
+        notFound(get(gm, notes(gm.campaign(), going)));
+        notFound(send(gm, "DELETE", shields(gm.campaign()) + "/" + going, null));
+        assertThat(ids(ok(get(gm, artifacts(gm.campaign()))))).containsExactly(kept);
+        for (String id : notes) {
+            notFound(get(gm, artifacts(gm.campaign()) + "/" + id));
+        }
+        Set<UUID> tier = OwnerContext.callAs(gm.id(), () -> scopes.resolveSources(gm.campaign(),
+                new ScopeSettings(true, false, false, false, Set.of())).artifacts());
+        assertThat(tier).containsExactly(UUID.fromString(kept));
+        assertThat(deletions.rows.values()).filteredOn(row -> row.targetId().equals(going)).singleElement()
+                .satisfies(row -> assertThat(row.kind()).isEqualTo(DeletionRow.SHIELD));
+        assertThat(library.shields.get(going).deleting()).isTrue();
+
+        deletion.sweep();
+
+        // After the pass: no row or version of its notes (the deleted one included), one removal job each, no Shield.
+        for (String id : List.of(notes.get(0), notes.get(1), notes.get(2), deleted)) {
+            assertThat(records.artifacts).doesNotContainKey(UUID.fromString(id));
+            assertThat(versionsOf(id)).isZero();
+            assertThat(index.removalRows.values()).filteredOn(row -> row.artifactId().toString().equals(id))
+                    .hasSize(1);
+        }
+        assertThat(library.shields).doesNotContainKey(going).containsKey(first);
+        assertThat(deletions.rows.values()).filteredOn(row -> row.targetId().equals(going)).singleElement()
+                .satisfies(row -> assertThat(row.doneAt()).isNotNull());
+        assertThat(ids(ok(get(gm, notes(gm.campaign(), first))))).containsExactly(kept);
+        assertThat(records.artifacts).containsKey(UUID.fromString(kept));
+    }
+
+    @Test
+    void theLastLiveShieldIsRefusedWhileAnotherIsDeletingAndNoNoteLandsInADeletingShield() throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID going = shield(gm, "Vai");
+        String id = note(gm, first, "Pistas");
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + going, null).statusCode()).isEqualTo(202);
+
+        JsonNode last = ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion"));
+        assertThat(last.path("last").asBoolean()).isTrue();
+        assertThat(last.path("notes").asLong()).isOne();
+        HttpResponse<String> refused = send(gm, "DELETE", shields(gm.campaign()) + "/" + first, null);
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
+        assertThat(json(refused).path("code").asString()).isEqualTo("request.last_shield");
+
+        int stored = records.artifacts.size();
+        notFound(send(gm, "POST", notes(gm.campaign(), going), PISTAS));
+        notFound(send(gm, "PUT", artifacts(gm.campaign()) + "/" + id + "/shield", "{\"shieldId\":\"" + going + "\"}"));
+        assertThat(records.artifacts).hasSize(stored);
+        assertThat(records.artifacts.get(UUID.fromString(id)).shieldId()).isEqualTo(first);
+    }
+
+    @Test
+    void aCampaignDeletedWhileItsShieldsDeletionIsPendingEndsBoth() throws Exception {
+        Gm gm = signUp();
+        UUID other = campaign(gm, "Outra mesa");
+        UUID first = UUID.fromString(ok(get(gm, shields(other))).path("items").get(0).path("id").asString());
+        HttpResponse<String> made = send(gm, "POST", shields(other), "{\"name\":\"Vai\"}");
+        UUID going = UUID.fromString(json(made).path("id").asString());
+        String held = json(send(gm, "POST", notes(other, going), "{\"name\":\"Vai junto\"}")).path("id").asString();
+        String kept = json(send(gm, "POST", notes(other, first), "{\"name\":\"Fica\"}")).path("id").asString();
+        assertThat(send(gm, "DELETE", shields(other) + "/" + going, null).statusCode()).isEqualTo(202);
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + other, null).statusCode()).isEqualTo(202);
+
+        deletion.sweep();
+        deletion.sweep();
+
+        assertThat(records.artifacts).doesNotContainKeys(UUID.fromString(held), UUID.fromString(kept));
+        assertThat(library.shields).doesNotContainKeys(first, going);
+        assertThat(library.campaigns).doesNotContainKey(other);
+        assertThat(deletions.rows.values()).filteredOn(row -> row.targetId().equals(going)
+                || row.targetId().equals(other)).hasSize(2).allSatisfy(row -> assertThat(row.doneAt()).isNotNull());
+    }
+
+    @Test
+    void anotherOwnersMoveOrShieldDeletionIsNotFoundAndChangesNothing() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        UUID aFirst = firstShield(a);
+        UUID aCombat = shield(a, "Combate");
+        String aNote = note(a, aFirst, "Segredo");
+        UUID bShield = firstShield(b);
+
+        notFound(send(b, "PUT", artifacts(a.campaign()) + "/" + aNote + "/shield", "{\"shieldId\":\"" + aCombat + "\"}"));
+        notFound(send(b, "PUT", artifacts(b.campaign()) + "/" + aNote + "/shield", "{\"shieldId\":\"" + bShield + "\"}"));
+        notFound(send(a, "PUT", artifacts(a.campaign()) + "/" + aNote + "/shield", "{\"shieldId\":\"" + bShield + "\"}"));
+        notFound(send(b, "DELETE", shields(a.campaign()) + "/" + aCombat, null));
+        notFound(send(b, "DELETE", shields(b.campaign()) + "/" + aCombat, null));
+
+        assertThat(records.artifacts.get(UUID.fromString(aNote)).shieldId()).isEqualTo(aFirst);
+        assertThat(library.shields.get(aCombat).deleting()).isFalse();
+        assertThat(ok(get(a, shields(a.campaign()))).path("total").asLong()).isEqualTo(2);
     }
 
     // --- helpers

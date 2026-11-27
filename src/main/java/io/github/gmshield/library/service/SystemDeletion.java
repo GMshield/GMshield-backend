@@ -82,6 +82,15 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 6.1: a campaign's Shields go with it. {@code library} removes them itself, in the transaction that removes
  * the campaign rows (a campaign's or a system's deletion) and just before them, because their key names the campaign.
+ *
+ * <p>Story 6.2 part B: deleting one of the owner's Shields ({@link #deleteShield}) is the same process again, of kind
+ * {@code shield}, recorded as an artifact's is, in the GM's transaction: {@link Shields} locks the campaign, finds the
+ * Shield live and not the last, and marks it deleting first. Each handler is given {@code Going.ofShield} with the id
+ * alone: only {@code artifacts} acts on it, marking the Shield's live notes deleting at its prepare and removing every
+ * note the Shield holds at its removal, as it removes one artifact. Then {@code library} deletes the Shield's row and
+ * ends the record, in one transaction ({@link #endShield}). {@link #previewShield} counts its live notes through the
+ * handlers. A campaign's or a system's deletion meanwhile takes the Shield too: its own deletion then finds it gone and
+ * is marked done.
  */
 @Service
 public class SystemDeletion {
@@ -162,6 +171,24 @@ public class SystemDeletion {
             return new CampaignCounts(parts.getOrDefault(CONVERSATIONS, 0L), parts.getOrDefault(MATERIALS, 0L),
                     parts.getOrDefault(ARTIFACTS, 0L));
         }));
+    }
+
+    /**
+     * How many notes go with the owner's Shield {@code shieldId} (Story 6.2 part B), counted by the handlers (the
+     * {@value #ARTIFACTS} part): its live notes. {@link Shields} has found the Shield live; in the caller's transaction
+     * when there is one.
+     */
+    public long previewShield(UUID shieldId) {
+        return reading(() -> {
+            SystemDeletionHandler.Going going = SystemDeletionHandler.Going.ofShield(shieldId);
+            long notes = 0;
+            for (SystemDeletionHandler handler : handlers()) {
+                if (ARTIFACTS.equals(handler.part())) {
+                    notes += handler.count(going);
+                }
+            }
+            return notes;
+        });
     }
 
     /**
@@ -249,6 +276,16 @@ public class SystemDeletion {
      */
     public boolean deleteArtifact(UUID artifactId) {
         return recordDeletion(DeletionRow.ARTIFACT, artifactId, SystemDeletionHandler.Going.ofArtifact(artifactId));
+    }
+
+    /**
+     * Records the deletion of the owner's Shield {@code shieldId} (Story 6.2 part B), as the class says, in the caller's
+     * transaction, which holds its campaign's lock: {@link Shields} has found it live and not the campaign's last, and
+     * marked it deleting. The handlers' prepare marks its live notes deleting in that same transaction. Answers whether
+     * it was recorded now: false when its deletion was recorded already (nothing changes then).
+     */
+    public boolean deleteShield(UUID shieldId) {
+        return recordDeletion(DeletionRow.SHIELD, shieldId, SystemDeletionHandler.Going.ofShield(shieldId));
     }
 
     /**
@@ -388,6 +425,10 @@ public class SystemDeletion {
                     .log("library." + row.kind() + "_deleted");
             return true;
         }
+        if (prepared.going().ofOneShield()) {
+            endShield(owner, row);
+            return true;
+        }
         if (DeletionRow.CAMPAIGN.equals(row.kind())) {
             endCampaign(owner, row);
             return true;
@@ -408,13 +449,15 @@ public class SystemDeletion {
     }
 
     /**
-     * Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign. A
-     * material or a version (Story 3.4 part B), a conversation (Story 3.10 part B) or an artifact (Story 5.2 part B) is
-     * not library's to find: the handlers find what is left of it, and nothing when it is gone.
+     * Whether the deletion's target is still there, deleting: its system, or (kind {@code campaign}) its campaign, or
+     * (kind {@code shield}, Story 6.2 part B) its Shield. A material or a version (Story 3.4 part B), a conversation
+     * (Story 3.10 part B) or an artifact (Story 5.2 part B) is not library's to find: the handlers find what is left of
+     * it, and nothing when it is gone.
      */
     private boolean targetDeleting(DeletionRow row) {
         return switch (row.kind()) {
             case DeletionRow.CAMPAIGN -> store.campaignDeleting(row.targetId());
+            case DeletionRow.SHIELD -> store.shieldDeleting(row.targetId());
             case DeletionRow.MATERIAL, DeletionRow.VERSION, DeletionRow.CONVERSATION, DeletionRow.ARTIFACT -> true;
             default -> store.deleting(row.targetId());
         };
@@ -422,7 +465,7 @@ public class SystemDeletion {
 
     /**
      * What goes, collected again: the system and all its campaigns, or (kind {@code campaign}) the campaign alone, or
-     * (kinds {@code material}, {@code version}, {@code conversation} and {@code artifact}) that one id.
+     * (kinds {@code material}, {@code version}, {@code conversation}, {@code artifact} and {@code shield}) that one id.
      */
     private SystemDeletionHandler.Going goingOf(DeletionRow row) {
         return switch (row.kind()) {
@@ -431,6 +474,7 @@ public class SystemDeletion {
             case DeletionRow.VERSION -> SystemDeletionHandler.Going.ofVersion(row.targetId());
             case DeletionRow.CONVERSATION -> SystemDeletionHandler.Going.ofConversation(row.targetId());
             case DeletionRow.ARTIFACT -> SystemDeletionHandler.Going.ofArtifact(row.targetId());
+            case DeletionRow.SHIELD -> SystemDeletionHandler.Going.ofShield(row.targetId());
             default -> new SystemDeletionHandler.Going(row.targetId(), store.campaignIdsOfDeleting(row.targetId()));
         };
     }
@@ -452,6 +496,21 @@ public class SystemDeletion {
         }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", row.targetId())
                 .addKeyValue("deletionId", row.id()).addKeyValue("removed", removed).log("library.campaign_deleted");
+    }
+
+    /**
+     * The end of a Shield's deletion (Story 6.2 part B), once the handlers removed its notes: its row goes and the record
+     * is done, in one transaction. A campaign's or a system's deletion that took the Shield meanwhile removed the row
+     * already; the record ends all the same, logged {@code removed=false}.
+     */
+    private void endShield(UUID owner, DeletionRow row) {
+        boolean removed = Boolean.TRUE.equals(writing(() -> {
+            boolean deleted = store.deleteDeletingShield(row.targetId());
+            deletions.done(owner, row.id(), now());
+            return deleted;
+        }));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("shieldId", row.targetId())
+                .addKeyValue("deletionId", row.id()).addKeyValue("removed", removed).log("library.shield_deleted");
     }
 
     /** What goes with a campaign: the campaign alone, with no system part. */

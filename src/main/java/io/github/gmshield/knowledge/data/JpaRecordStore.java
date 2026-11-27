@@ -103,6 +103,11 @@ class JpaRecordStore implements RecordStore {
             + " and r.shieldId = :shield and r.id < :before" + LIVE + " order by r.id desc";
     private static final String NOTE_COUNT = "select count(r) from Record r where r.campaignId = :campaign"
             + " and r.shieldId = :shield" + LIVE;
+    /** Story 6.2 part B: every note of a Shield, deleting ones too (its deletion's removal), and its live count. */
+    private static final String ALL_NOTE_IDS = "select r.id from Record r where r.shieldId = :shield"
+            + " and r.campaignId is not null order by r.id";
+    private static final String LIVE_NOTE_COUNT = "select count(r) from Record r where r.shieldId = :shield"
+            + " and r.campaignId is not null" + LIVE;
     /** Story 5.4 part B: a conversation's live saved artifacts, oldest first (V49's record_owner_conversation). */
     private static final String ARTIFACTS_OF_CONVERSATION = "select r from Record r"
             + " where r.conversationId = :conversation and r.campaignId is not null" + LIVE
@@ -464,6 +469,27 @@ class JpaRecordStore implements RecordStore {
     public long noteCount(UUID campaignId, UUID shieldId) {
         return em().createQuery(NOTE_COUNT, Long.class).setParameter("campaign", campaignId)
                 .setParameter("shield", shieldId).getSingleResult();
+    }
+
+    @Override
+    public List<UUID> allNoteIdsOf(UUID shieldId) {
+        return em().createQuery(ALL_NOTE_IDS, UUID.class).setParameter("shield", shieldId).getResultList();
+    }
+
+    @Override
+    public long liveNoteCountOf(UUID shieldId) {
+        return em().createQuery(LIVE_NOTE_COUNT, Long.class).setParameter("shield", shieldId).getSingleResult();
+    }
+
+    @Override
+    public Optional<ArtifactRow> moveNote(UUID id, UUID shieldId) {
+        Optional<RecordEntity> found = lockedArtifact(id).filter(RecordEntity::held);
+        Optional<ArtifactRow> before = found.map(RecordEntity::artifact);
+        found.filter(entity -> !shieldId.equals(entity.artifact().shieldId())).ifPresent(entity -> {
+            entity.moveTo(shieldId);
+            flushChecked();
+        });
+        return before;
     }
 
     @Override

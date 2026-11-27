@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.library.data.CampaignRow;
+import io.github.gmshield.library.data.DeletionRow;
+import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryConflict;
 import io.github.gmshield.library.data.ShieldRow;
@@ -52,6 +54,7 @@ class ShieldsTest {
         }
     };
     private final InMemoryTransactionManager transactions = new InMemoryTransactionManager();
+    private final InMemoryDeletionStore deletions = new InMemoryDeletionStore();
     private final Vault vault = TestVaults.vault();
     private final Shields shields;
 
@@ -59,8 +62,11 @@ class ShieldsTest {
         StaticListableBeanFactory beans = new StaticListableBeanFactory();
         beans.addBean("transactions", transactions);
         beans.addBean("clock", Clock.fixed(NOW, ZoneOffset.UTC));
-        shields = new Shields(store, vault, beans.getBeanProvider(PlatformTransactionManager.class),
-                beans.getBeanProvider(Clock.class));
+        beans.addBean("deletion", new SystemDeletion(store, deletions, beans.getBeanProvider(SystemDeletionHandler.class),
+                beans.getBeanProvider(PlatformTransactionManager.class),
+                beans.getBeanProvider(SystemDeletionSweepSchedule.class), beans.getBeanProvider(Clock.class)));
+        shields = new Shields(store, vault, beans.getBeanProvider(SystemDeletion.class),
+                beans.getBeanProvider(PlatformTransactionManager.class), beans.getBeanProvider(Clock.class));
     }
 
     @Test
@@ -193,9 +199,17 @@ class ShieldsTest {
             results.add(outcome.get(10, TimeUnit.SECONDS));
         }
         assertThat(results).containsExactlyInAnyOrder("deleted", "request.last_shield");
-        assertThat(store.shields.values()).filteredOn(row -> row.campaignId().equals(campaign)).hasSize(1);
-        assertThat(OwnerContext.callAs(owner, () -> shields.shieldDeletion(campaign,
-                store.shields.values().iterator().next().id()))).hasValueSatisfying(deletion -> {
+        // Story 6.2 part B: the deleted one is deleting (its pass removes the row), with its deletion recorded.
+        assertThat(store.shields.values()).filteredOn(row -> row.campaignId().equals(campaign) && !row.deleting())
+                .hasSize(1);
+        ShieldRow gone = store.shields.values().stream().filter(ShieldRow::deleting).findFirst().orElseThrow();
+        assertThat(deletions.rows.values()).singleElement().satisfies(row -> {
+            assertThat(row.kind()).isEqualTo(DeletionRow.SHIELD);
+            assertThat(row.targetId()).isEqualTo(gone.id());
+        });
+        ShieldRow kept = store.shields.values().stream().filter(row -> !row.deleting()).findFirst().orElseThrow();
+        assertThat(OwnerContext.callAs(owner, () -> shields.shieldDeletion(campaign, kept.id())))
+                .hasValueSatisfying(deletion -> {
                     assertThat(deletion.last()).isTrue();
                     assertThat(deletion.notes()).isZero();
                     assertThat(deletion.rolls()).isZero();

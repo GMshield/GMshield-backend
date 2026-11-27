@@ -16,7 +16,9 @@ import org.slf4j.spi.LoggingEventBuilder;
  * either, and the module that owns them interprets the id. Story 3.10 part B adds one conversation, by its id alone in
  * the same way: only {@code conversations} acts on it, and every other handler ignores it, as it ignores a material
  * in a module that has none. Story 5.2 part B adds one artifact, by its id alone too: only {@code artifacts} acts on
- * it, and every other handler ignores it.
+ * it, and every other handler ignores it. Story 6.2 part B adds one Shield, by its id alone too: only {@code artifacts}
+ * acts on it (it counts and removes the notes the Shield holds), every other handler ignores it, and {@code library}
+ * removes the Shield's row last.
  *
  * <ul>
  *   <li>{@link #count}: how many of its own items go, for the confirmation dialog; inside a read-only transaction.</li>
@@ -35,10 +37,11 @@ public interface SystemDeletionHandler {
      * Story 3.4 part B, a material's deletion names only {@code materialId}, and a version's removal only
      * {@code versionId}: no system and no campaign go then. From Story 3.10 part B, a conversation's deletion names only
      * {@code conversationId}, an id {@code library} keeps opaque. From Story 5.2 part B, an artifact's deletion names
-     * only {@code artifactId}, opaque in the same way.
+     * only {@code artifactId}, opaque in the same way. From Story 6.2 part B, a Shield's deletion names only
+     * {@code shieldId}: nothing of its campaign goes but the notes the Shield holds.
      */
     record Going(UUID systemId, List<UUID> campaignIds, UUID materialId, UUID versionId, UUID conversationId,
-                 UUID artifactId) {
+                 UUID artifactId, UUID shieldId) {
 
         public Going {
             campaignIds = List.copyOf(campaignIds);
@@ -46,28 +49,34 @@ public interface SystemDeletionHandler {
 
         /** A system, or (null system) a campaign, and its campaigns going. */
         public Going(UUID systemId, List<UUID> campaignIds) {
-            this(systemId, campaignIds, null, null, null, null);
+            this(systemId, campaignIds, null, null, null, null, null);
         }
 
         /** One material going, with all its versions (Story 3.4 part B). */
         public static Going ofMaterial(UUID materialId) {
-            return new Going(null, List.of(), Objects.requireNonNull(materialId, "materialId"), null, null, null);
+            return new Going(null, List.of(), Objects.requireNonNull(materialId, "materialId"), null, null, null, null);
         }
 
         /** One version of a material going; the material stays (Story 3.4 part B). */
         public static Going ofVersion(UUID versionId) {
-            return new Going(null, List.of(), null, Objects.requireNonNull(versionId, "versionId"), null, null);
+            return new Going(null, List.of(), null, Objects.requireNonNull(versionId, "versionId"), null, null, null);
         }
 
         /** One conversation going, with its turns (Story 3.10 part B); nothing of its campaign goes. */
         public static Going ofConversation(UUID conversationId) {
             return new Going(null, List.of(), null, null, Objects.requireNonNull(conversationId, "conversationId"),
-                    null);
+                    null, null);
         }
 
         /** One artifact going, with all its versions (Story 5.2 part B); nothing of its campaign goes. */
         public static Going ofArtifact(UUID artifactId) {
-            return new Going(null, List.of(), null, null, null, Objects.requireNonNull(artifactId, "artifactId"));
+            return new Going(null, List.of(), null, null, null, Objects.requireNonNull(artifactId, "artifactId"),
+                    null);
+        }
+
+        /** One Shield going, with the notes it holds (Story 6.2 part B); nothing else of its campaign goes. */
+        public static Going ofShield(UUID shieldId) {
+            return new Going(null, List.of(), null, null, null, null, Objects.requireNonNull(shieldId, "shieldId"));
         }
 
         /** Whether one material or one version goes, and no system or campaign (Story 3.4 part B). */
@@ -86,8 +95,16 @@ public interface SystemDeletionHandler {
         }
 
         /**
+         * Whether one Shield goes, with its notes, and nothing else (Story 6.2 part B). It is not one of
+         * {@link #ofOneItem}: {@code library} removes the Shield's row once the handlers' removal ended.
+         */
+        public boolean ofOneShield() {
+            return shieldId != null;
+        }
+
+        /**
          * Whether one item goes, by its id alone (a material, a version, a conversation or an artifact), and no system
-         * or campaign: {@code library} has nothing of its own to remove then.
+         * or campaign: {@code library} has nothing of its own to remove then. A Shield (Story 6.2 part B) is not one.
          */
         public boolean ofOneItem() {
             return ofMaterials() || ofOneConversation() || ofOneArtifact();
@@ -96,10 +113,13 @@ public interface SystemDeletionHandler {
         /**
          * A handler's log line about what goes, so it matches the deletion's own lines: {@code systemId} when a system
          * goes, else {@code campaignId} for a single campaign; then how many campaigns. For a material or a version,
-         * {@code materialId} or {@code versionId} alone, for a conversation {@code conversationId} alone, and for an
-         * artifact {@code artifactId} alone. Ids and counts only.
+         * {@code materialId} or {@code versionId} alone, for a conversation {@code conversationId} alone, for an
+         * artifact {@code artifactId} alone, and for a Shield {@code shieldId} alone. Ids and counts only.
          */
         public LoggingEventBuilder about(LoggingEventBuilder event) {
+            if (shieldId != null) {
+                return event.addKeyValue("shieldId", shieldId);
+            }
             if (artifactId != null) {
                 return event.addKeyValue("artifactId", artifactId);
             }
@@ -127,7 +147,7 @@ public interface SystemDeletionHandler {
 
     /**
      * How many of this module's items go with the system, or with the campaign (0 for a material, a version, a
-     * conversation or an artifact).
+     * conversation or an artifact); from Story 6.2 part B, with a Shield (its live notes, for {@code artifacts}).
      */
     long count(Going going);
 

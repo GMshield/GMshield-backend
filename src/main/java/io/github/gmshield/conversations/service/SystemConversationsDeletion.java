@@ -84,7 +84,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public long count(Going going) {
-        if (going.ofOneItem()) {
+        if (going.ofOneItem() || going.ofOneShield()) {
             return 0;
         }
         return store.countConversationsOfCampaigns(going.campaignIds());
@@ -92,7 +92,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public Optional<Instant> prepare(Going going) {
-        if (going.ofMaterials() || going.ofOneArtifact()) {
+        if (going.ofMaterials() || going.ofOneArtifact() || going.ofOneShield()) {
             return Optional.empty();
         }
         if (going.ofOneConversation()) {
@@ -112,7 +112,7 @@ class SystemConversationsDeletion implements SystemDeletionHandler {
 
     @Override
     public void remove(Going going) {
-        if (going.ofMaterials() || going.ofOneArtifact()) {
+        if (going.ofMaterials() || going.ofOneArtifact() || going.ofOneShield()) {
             return;
         }
         UUID owner = OwnerContext.require();
