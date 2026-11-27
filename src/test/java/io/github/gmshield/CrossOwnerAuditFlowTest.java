@@ -304,6 +304,11 @@ class CrossOwnerAuditFlowTest {
                     .own("id"),
             route("DELETE", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield")
                     .own("id"),
+            // a Shield's notes and a new note in it (Story 6.2 part A)
+            route("GET", "/api/v1/campaigns/{id}/shields/{shieldId}/notes", "id", "campaign", "shieldId", "shield")
+                    .own("id"),
+            route("POST", "/api/v1/campaigns/{id}/shields/{shieldId}/notes", "id", "campaign", "shieldId", "shield")
+                    .json("{\"name\":\"Tomado\",\"content\":\"Tomado\"}").own("id"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

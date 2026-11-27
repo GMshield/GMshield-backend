@@ -2061,6 +2061,30 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `library.first_shield_created`, `library.first_shield_raced`. Deploy order: backend, then frontend (the 1.54.0
     frontend shows no Shields; the 1.55.0 frontend cannot delete one). Internal contract and worker unchanged.
 
+- **Notes in a Shield (`artifacts` and `knowledge`, Story 6.2 part A, public contract 1.57.0, migration V54).** A note is
+  an artifact of the campaign of record type `note` that also names the Shield holding it.
+  - **V54** `record.shield_id` (nullable, owned by `knowledge`), with the key (owner, shield) to `shield` (no cascade:
+    a campaign's or a system's deletion removes the campaign's artifacts before its Shields), the check
+    `record_shield_check` (a held row is an artifact of type `note`) and the partial index `record_owner_shield`
+    (owner, shield, id). `note` artifacts written before V54 keep a null Shield. The migration's header has the way
+    back.
+  - **Rules** (`artifacts.service.Artifacts#createNote`, `#notes`). A note is written through the same path as
+    `Artifacts.create` (type `note`, no fields, version 1 and its index job, in one transaction), once
+    `library.service.Shields#shield` finds the Shield in that campaign. Another owner's campaign or Shield, an unknown
+    or malformed id, a Shield of another campaign and a campaign being deleted are all `request.not_found`. A held note
+    stays a note: an edit or a restore to another type is `request.note_type_fixed` (409), and nothing is stored. It
+    is the campaign's artifact everywhere else (the artifacts list and tab, sharing, relations, export) and a source
+    of the campaign tier through `CampaignArtifacts`, with no code of its own.
+  - **API** (`ShieldNoteController`, both `no-store`, both rows of the cross-owner audit):
+    `POST /api/v1/campaigns/{id}/shields/{shieldId}/notes` `{name, content}` (201, `Artifact`) and `GET` on the same
+    path (the Shield's live notes newest first, `limit`, `cursor` or `offset`, `NotePage{items, nextCursor, total}`).
+    `Artifact` and `ArtifactSummary` carry `shieldId` (null for no Shield, and in a read from a campaign the note is
+    shared into).
+  - Not yet: moving a note to another Shield and deleting a Shield that holds notes (part B). Until then such a deletion
+    fails on `record_shield_fkey`. Log lines (ids and counts only): `artifacts.note_created`,
+    `artifacts.notes_listed`, `artifacts.retype_refused`. Deploy order: backend, then frontend. Internal contract and
+    worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

@@ -187,6 +187,16 @@ public interface RecordStore {
                                 int limit);
 
     /**
+     * The current owner's live notes of the campaign {@code campaignId} that the Shield {@code shieldId} holds (Story 6.2
+     * part A), newest first (by id, a UUIDv7): only those older than {@code before} when it is not null, the first
+     * {@code offset} skipped, at most {@code limit}.
+     */
+    List<ArtifactRow> notesOf(UUID campaignId, UUID shieldId, UUID before, int offset, int limit);
+
+    /** How many live notes of the current owner's campaign {@code campaignId} the Shield {@code shieldId} holds. */
+    long noteCount(UUID campaignId, UUID shieldId);
+
+    /**
      * The current owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its
      * deletion's dialog), oldest first (by when they were written, then id); a deleting one is left out.
      */

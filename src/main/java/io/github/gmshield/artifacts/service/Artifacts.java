@@ -12,6 +12,7 @@ import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
 import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.Shields;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.Scopes;
 import io.github.gmshield.shared.service.ApiException;
@@ -126,6 +127,14 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * ({@link Scopes#removedVersions} for a passage's or a record's, {@link Scopes#removedArtifacts} in its campaign for an
  * artifact's). An edit or a restore keeps them: they belong to the artifact, not to a version.
  *
+ * <p>Story 6.2 part A: a note can be held by one Shield of its campaign. {@link #createNote} writes it as {@link #create}
+ * does (type {@code note}, no fields, version 1 and its index job, in one transaction) once the Shield is found as one of
+ * the campaign's ({@link Shields#shield}: another campaign's, another owner's or an unknown one is not found, like an
+ * unknown campaign), and {@link #notes} lists the Shield's live notes newest first. Every read of the note answers its
+ * {@link Artifact#shieldId} (null in a read from a campaign it is shared into), and it stays the campaign's artifact
+ * everywhere else (its list, sharing, relations, export, the campaign tier). An edit or a restore that would give it
+ * another type is {@code request.note_type_fixed} (409), and nothing is stored.
+ *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -154,6 +163,12 @@ public class Artifacts {
     public static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");
     /**
+     * An edit or a restore that would give a note a Shield holds another type (Story 6.2 part A): a held note stays a
+     * note.
+     */
+    public static final ApiProblem NOTE_TYPE_FIXED = ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "note_type_fixed",
+            "A note in a Shield stays a note");
+    /**
      * A campaign that is no target of the artifact's sharing (Story 5.6 part A): not one of the owner's other readable
      * campaigns of its system.
      */
@@ -171,6 +186,7 @@ public class Artifacts {
     private final ArtifactShareStore shares;
     private final ArtifactSources sources;
     private final Library library;
+    private final Shields shields;
     private final Vault vault;
     private final ArtifactIndexing indexing;
     private final Scopes scopes;
@@ -181,7 +197,7 @@ public class Artifacts {
 
     Artifacts(ArtifactRecords records, RecordRelations relations, ArtifactVersionStore versions,
               ArtifactReferenceStore references, ArtifactShareStore shares, ArtifactSources sources,
-              Library library, Vault vault, ArtifactIndexing indexing, Scopes scopes,
+              Library library, Shields shields, Vault vault, ArtifactIndexing indexing, Scopes scopes,
               ObjectProvider<Conversations> conversations, ObjectProvider<SystemDeletion> deletions,
               ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
         this.records = records;
@@ -191,6 +207,7 @@ public class Artifacts {
         this.shares = shares;
         this.sources = sources;
         this.library = library;
+        this.shields = shields;
         this.vault = vault;
         this.indexing = indexing;
         this.scopes = scopes;
@@ -236,7 +253,7 @@ public class Artifacts {
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
                            String content, int version, int currentVersion, Instant createdAt, UUID conversationId,
                            List<TurnReference> references, Overridden overrides, List<RecordRelations.Related> related,
-                           List<SharedWith> sharedWith, SharedFrom sharedFrom) {
+                           List<SharedWith> sharedWith, SharedFrom sharedFrom, UUID shieldId) {
         public Artifact {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
@@ -244,51 +261,55 @@ public class Artifacts {
             sharedWith = List.copyOf(sharedWith);
         }
 
-        /** An artifact that overrides nothing, is related to nothing and is shared with no campaign. */
+        /**
+         * An artifact that overrides nothing, is related to nothing and is shared with no campaign, held by the Shield
+         * {@code shieldId} (Story 6.2 part A; null for none).
+         */
         public Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields, String content,
                         int version, int currentVersion, Instant createdAt, UUID conversationId,
-                        List<TurnReference> references) {
+                        List<TurnReference> references, UUID shieldId) {
             this(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt, conversationId,
-                    references, null, List.of(), List.of(), null);
+                    references, null, List.of(), List.of(), null, shieldId);
         }
 
         /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
         Artifact unlinked() {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    null, references, overrides, related, sharedWith, sharedFrom);
+                    null, references, overrides, related, sharedWith, sharedFrom, shieldId);
         }
 
         /** This artifact with its references (Story 5.4 part A). */
         Artifact withReferences(List<TurnReference> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, found, overrides, related, sharedWith, sharedFrom);
+                    conversationId, found, overrides, related, sharedWith, sharedFrom, shieldId);
         }
 
         /** This artifact with the record it overrides (Story 5.5 part A; null for none). */
         Artifact withOverride(Overridden mark) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, mark, related, sharedWith, sharedFrom);
+                    conversationId, references, mark, related, sharedWith, sharedFrom, shieldId);
         }
 
         /** This artifact with the records it is related to (Story 5.5 part B). */
         Artifact withRelated(List<RecordRelations.Related> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, overrides, found, sharedWith, sharedFrom);
+                    conversationId, references, overrides, found, sharedWith, sharedFrom, shieldId);
         }
 
         /** This artifact with the campaigns it is shared with (Story 5.6 part A). */
         Artifact withSharedWith(List<SharedWith> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, overrides, related, found, sharedFrom);
+                    conversationId, references, overrides, related, found, sharedFrom, shieldId);
         }
 
         /**
          * This artifact as a campaign it is shared into reads it (Story 5.6 part A): shared from {@code from}, with no
-         * conversation, no mark, no relation and no sharing of its own campaign's.
+         * conversation, no mark, no relation and no sharing of its own campaign's, and (Story 6.2 part A) no Shield,
+         * which is its own campaign's too.
          */
         Artifact sharedFrom(SharedFrom from) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    null, references, null, List.of(), List.of(), Objects.requireNonNull(from, "from"));
+                    null, references, null, List.of(), List.of(), Objects.requireNonNull(from, "from"), null);
         }
 
         @Override
@@ -296,7 +317,7 @@ public class Artifacts {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
                     + version + ", currentVersion=" + currentVersion + ", references=" + references.size()
                     + ", related=" + related.size() + ", sharedWith=" + sharedWith.size() + ", shared="
-                    + (sharedFrom != null) + "]";
+                    + (sharedFrom != null) + ", shieldId=" + shieldId + "]";
         }
     }
 
@@ -338,13 +359,15 @@ public class Artifacts {
 
     /**
      * An artifact as a list shows it: its id, type key, name, version and when it was written; from Story 5.6 part B,
-     * for an artifact shared into the listed campaign, its own campaign (null for one of the listed campaign's own).
+     * for an artifact shared into the listed campaign, its own campaign (null for one of the listed campaign's own);
+     * from Story 6.2 part A the Shield holding it (null for none, and for one shared into the listed campaign).
      */
     public record Summary(UUID id, String recordType, String name, int version, Instant createdAt,
-                          SharedFrom sharedFrom) {
+                          SharedFrom sharedFrom, UUID shieldId) {
         @Override
         public String toString() {
-            return "Summary[id=" + id + ", recordType=" + recordType + ", shared=" + (sharedFrom != null) + "]";
+            return "Summary[id=" + id + ", recordType=" + recordType + ", shared=" + (sharedFrom != null) + ", shieldId="
+                    + shieldId + "]";
         }
     }
 
@@ -362,6 +385,16 @@ public class Artifacts {
      */
     public record VersionPage(List<VersionSummary> items, Integer nextCursor, long total) {
         public VersionPage {
+            items = List.copyOf(items);
+        }
+    }
+
+    /**
+     * One page of a Shield's notes, newest first (Story 6.2 part A): its rows, the cursor of the next page (null on the
+     * last) and how many notes the Shield holds.
+     */
+    public record NotePage(List<Summary> items, UUID nextCursor, long total) {
+        public NotePage {
             items = List.copyOf(items);
         }
     }
@@ -387,7 +420,8 @@ public class Artifacts {
      */
     public Optional<Artifact> create(UUID campaignId, Written written) {
         UUID owner = OwnerContext.require();
-        Optional<Artifact> created = writing(() -> created(campaignId, written, null, List.of(), owner));
+        Optional<Artifact> created = writing(() -> library.campaign(campaignId)
+                .map(campaign -> created(campaign, written, null, List.of(), owner, null)));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("found", created.isPresent())
                 .addKeyValue("artifactId", created.map(Artifact::id).orElse(null))
@@ -395,6 +429,69 @@ public class Artifacts {
                 .addKeyValue("content", created.map(artifact -> artifact.content() != null).orElse(false))
                 .log("artifacts.created");
         return created;
+    }
+
+    /**
+     * A new note of the owner's campaign {@code campaignId}, held by its Shield {@code shieldId} (Story 6.2 part A), as
+     * the class says: {@code name} and {@code content} as {@link #create} checks them, of the type {@code note}, with no
+     * fields. Answers it as stored, or empty when the campaign is not the owner's or not readable, or the Shield is not
+     * one of that campaign's (nothing is stored then).
+     */
+    public Optional<Artifact> createNote(UUID campaignId, UUID shieldId, String name, String content) {
+        UUID owner = OwnerContext.require();
+        Written written = new Written(ArtifactRecords.NOTE, name, List.of(), content);
+        Optional<Artifact> created = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                shields.shield(campaign.id(), shieldId).map(shield -> created(campaign, written, null, List.of(), owner,
+                        shield.id()))));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("shieldId", shieldId).addKeyValue("found", created.isPresent())
+                .addKeyValue("artifactId", created.map(Artifact::id).orElse(null))
+                .addKeyValue("content", created.map(artifact -> artifact.content() != null).orElse(false))
+                .log("artifacts.note_created");
+        return created;
+    }
+
+    /**
+     * A page of the notes the Shield {@code shieldId} of the owner's campaign {@code campaignId} holds (Story 6.2 part
+     * A), newest first: after {@code cursor} (a note id of the previous page) or the {@code offset} first skipped (0 to
+     * {@value #MAX_OFFSET}), at most {@code limit} (1 to {@value #MAX_LIMIT}). Empty when the campaign is not the
+     * owner's or not readable, or the Shield is not one of that campaign's.
+     */
+    public Optional<NotePage> notes(UUID campaignId, UUID shieldId, UUID cursor, int offset, int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new IllegalArgumentException("artifacts.limit_invalid");
+        }
+        if (offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("artifacts.offset_invalid");
+        }
+        UUID owner = OwnerContext.require();
+        Optional<NotePage> found = reading(() -> library.campaign(campaignId).flatMap(campaign ->
+                shields.shield(campaign.id(), shieldId).map(shield -> {
+                    // One row past the page tells whether a next page exists.
+                    List<ArtifactRecords.Identity> rows = records.notesOf(campaign.id(), shield.id(), cursor, offset,
+                            limit + 1);
+                    List<ArtifactRecords.Identity> shown = rows.subList(0, Math.min(limit, rows.size()));
+                    Map<UUID, ArtifactVersionRow> latest = versions.latest(shown.stream()
+                            .map(ArtifactRecords.Identity::id).toList());
+                    List<Summary> items = new ArrayList<>(shown.size());
+                    for (ArtifactRecords.Identity identity : shown) {
+                        ArtifactVersionRow version = latest.get(identity.id());
+                        if (version == null) {
+                            throw new IllegalStateException("artifacts.version_missing");
+                        }
+                        items.add(new Summary(identity.id(), identity.recordType(),
+                                vault.decryptText(binding(FIELD_NAME, identity.id(), owner), version.name()),
+                                version.number(), identity.createdAt(), null, identity.shieldId()));
+                    }
+                    UUID next = rows.size() > limit ? shown.getLast().id() : null;
+                    return new NotePage(items, next, records.noteCount(campaign.id(), shield.id()));
+                })));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("shieldId", shieldId).addKeyValue("offset", offset).addKeyValue("limit", limit)
+                .addKeyValue("found", found.isPresent())
+                .addKeyValue("shown", found.map(page -> page.items().size()).orElse(0))
+                .addKeyValue("total", found.map(NotePage::total).orElse(0L)).log("artifacts.notes_listed");
+        return found;
     }
 
     /**
@@ -408,8 +505,8 @@ public class Artifacts {
         Optional<Artifact> saved = writing(() -> {
             Conversations.Saveable saveable = conversations.getObject().saveable(turnId);
             Written written = new Written(recordType, name, List.of(), content == null ? saveable.draft() : content);
-            Optional<Artifact> created = created(saveable.campaignId(), written, saveable.conversationId(),
-                    saveable.sources(), owner);
+            Optional<Artifact> created = library.campaign(saveable.campaignId()).map(campaign -> created(campaign,
+                    written, saveable.conversationId(), saveable.sources(), owner, null));
             created.ifPresent(artifact -> conversations.getObject().markSaved(saveable, artifact.id()));
             return created;
         });
@@ -423,31 +520,31 @@ public class Artifacts {
     }
 
     /**
-     * A new artifact of the owner's campaign {@code campaignId}, in the caller's transaction, as {@link #create} says:
-     * from Story 5.4 part A saved from the conversation {@code conversationId} (null: written by hand) with these
-     * references copied. Empty when the campaign is not the owner's or not readable.
+     * A new artifact of the owner's readable campaign {@code campaign}, in the caller's transaction, as {@link #create}
+     * says: from Story 5.4 part A saved from the conversation {@code conversationId} (null: written by hand) with these
+     * references copied, and from Story 6.2 part A held by the campaign's Shield {@code shieldId} (null: none; checked by
+     * the caller).
      */
-    private Optional<Artifact> created(UUID campaignId, Written written, UUID conversationId,
-                                       List<Conversations.SavedSource> sources, UUID owner) {
-        return library.campaign(campaignId).map(campaign -> {
-            String recordType = records.checkedType(campaign.system().id(), written.recordType());
-            ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields().stream()
-                    .map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
-            String content = content(written.content());
-            Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
-            ArtifactRecords.Identity identity = records.create(campaign.id(), recordType, now, conversationId);
-            List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
-                    .toList();
-            UUID id = identity.id();
-            versions.insert(sealed(id, owner, FIRST_VERSION, recordType, checked.name(), fields, content, now));
-            // Story 5.4 part A: the draft's references, by value, sealed again under the artifact.
-            references.insert(sources.stream().map(source -> sealedReference(id, owner, source, now)).toList());
-            // Story 5.1 part B: its index job, in the same transaction.
-            indexing.start(id, FIRST_VERSION, now);
-            return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION,
-                    FIRST_VERSION, now, conversationId, sources.isEmpty() ? List.of()
-                    : referencesOf(id, campaign.id(), owner));
-        });
+    private Artifact created(Library.Campaign campaign, Written written, UUID conversationId,
+                             List<Conversations.SavedSource> sources, UUID owner, UUID shieldId) {
+        String recordType = records.checkedType(campaign.system().id(), written.recordType());
+        ArtifactRecords.Checked checked = ArtifactRecords.checked(written.name(), written.fields().stream()
+                .map(field -> new ArtifactRecords.Field(field.name(), field.value())).toList());
+        String content = content(written.content());
+        Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+        ArtifactRecords.Identity identity = records.create(campaign.id(), recordType, now, conversationId,
+                shieldId);
+        List<Field> fields = checked.fields().stream().map(field -> new Field(field.name(), field.value()))
+                .toList();
+        UUID id = identity.id();
+        versions.insert(sealed(id, owner, FIRST_VERSION, recordType, checked.name(), fields, content, now));
+        // Story 5.4 part A: the draft's references, by value, sealed again under the artifact.
+        references.insert(sources.stream().map(source -> sealedReference(id, owner, source, now)).toList());
+        // Story 5.1 part B: its index job, in the same transaction.
+        indexing.start(id, FIRST_VERSION, now);
+        return new Artifact(id, campaign.id(), recordType, checked.name(), fields, content, FIRST_VERSION,
+                FIRST_VERSION, now, conversationId, sources.isEmpty() ? List.of()
+                : referencesOf(id, campaign.id(), owner), shieldId);
     }
 
     /**
@@ -485,10 +582,11 @@ public class Artifacts {
                 if (version == null) {
                     throw new IllegalStateException("artifacts.version_missing");
                 }
+                boolean own = campaign.id().equals(identity.campaignId());
                 items.add(new Summary(identity.id(), identity.recordType(),
                         vault.decryptText(binding(FIELD_NAME, identity.id(), owner), version.name()), version.number(),
-                        identity.createdAt(), campaign.id().equals(identity.campaignId()) ? null
-                        : sharedFrom.get(identity.id())));
+                        identity.createdAt(), own ? null : sharedFrom.get(identity.id()), own ? identity.shieldId()
+                        : null));
             }
             UUID next = rows.size() > limit ? shown.getLast().id() : null;
             return new Page(items, next, records.count(campaign.id(), shared, recordType),
@@ -886,6 +984,13 @@ public class Artifacts {
     private Optional<Artifact> next(ArtifactRecords.Identity identity, UUID owner, int seen, String recordType,
                                     String name, List<Field> fields, String content) {
         UUID id = identity.id();
+        // Story 6.2 part A: a note a Shield holds stays a note, whatever else the edit or restore changes.
+        if (identity.shieldId() != null && !ArtifactRecords.NOTE.equals(recordType)) {
+            log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", identity.campaignId())
+                    .addKeyValue("artifactId", id).addKeyValue("reason", "request.note_type_fixed")
+                    .log("artifacts.retype_refused");
+            throw new ApiException(NOTE_TYPE_FIXED);
+        }
         if (newestNumber(id) != seen) {
             throw new ApiException(STALE_VERSION);
         }
@@ -910,7 +1015,7 @@ public class Artifacts {
         indexing.start(id, number, now);
         return Optional.of(linked(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number,
                 number, identity.createdAt(), identity.conversationId(), referencesOf(id, identity.campaignId(),
-                owner))));
+                owner), identity.shieldId())));
     }
 
     /**
@@ -977,7 +1082,8 @@ public class Artifacts {
                 vault.decryptText(binding(FIELD_NAME, id, owner), version.name()),
                 fieldsOf(vault.decrypt(binding(FIELD_FIELDS, id, owner), version.fields())),
                 stored == null ? null : vault.decryptText(binding(FIELD_CONTENT, id, owner), stored),
-                version.number(), currentVersion, identity.createdAt(), identity.conversationId(), List.of());
+                version.number(), currentVersion, identity.createdAt(), identity.conversationId(), List.of(),
+                identity.shieldId());
     }
 
     /**

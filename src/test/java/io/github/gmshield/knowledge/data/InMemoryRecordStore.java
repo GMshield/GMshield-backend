@@ -27,7 +27,8 @@ import java.util.regex.Pattern;
  * {@link #artifacts}, so no read of an extracted record can see one, as no JPA read does (the integration tests check
  * that against the table). The campaign key is PostgreSQL's alone. From Story 5.2 part B an artifact the GM deleted is
  * kept in {@link #deletingArtifacts} until its row goes, and every artifact read leaves it out unless its
- * {@link Reach} is {@link Reach#ALL}, as the JPA store does.
+ * {@link Reach} is {@link Reach#ALL}, as the JPA store does. From Story 6.2 part A it keeps V54's check (a note a Shield
+ * holds is of type {@code note}); the Shield key is PostgreSQL's alone.
  */
 public class InMemoryRecordStore implements RecordStore {
 
@@ -248,7 +249,7 @@ public class InMemoryRecordStore implements RecordStore {
     public synchronized void insertArtifact(ArtifactRow row) {
         UUID owner = OwnerContext.require();
         if (!row.ownerId().equals(owner) || records.containsKey(row.id()) || artifacts.containsKey(row.id())
-                || !TYPE.matcher(row.type()).matches()) {
+                || !TYPE.matcher(row.type()).matches() || (row.shieldId() != null && !"note".equals(row.type()))) {
             throw new IllegalStateException("key or check refused");
         }
         artifacts.put(row.id(), row);
@@ -269,11 +270,12 @@ public class InMemoryRecordStore implements RecordStore {
         if (row == null || !row.ownerId().equals(owner) || !live(row)) {
             return Optional.empty();
         }
-        if (!TYPE.matcher(type).matches()) {
+        // V54's check: a held note stays a note.
+        if (!TYPE.matcher(type).matches() || (row.shieldId() != null && !"note".equals(type))) {
             throw new IllegalStateException("check refused");
         }
         ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt(),
-                row.conversationId());
+                row.conversationId(), row.shieldId());
         artifacts.put(id, changed);
         RollbackUndo.onRollback(() -> artifacts.put(id, row));
         return Optional.of(changed);
@@ -305,6 +307,18 @@ public class InMemoryRecordStore implements RecordStore {
         return ofCampaign(campaignId, shared, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
                 .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())
                 .skip(offset).limit(limit).toList();
+    }
+
+    @Override
+    public List<ArtifactRow> notesOf(UUID campaignId, UUID shieldId, UUID before, int offset, int limit) {
+        return ofShield(campaignId, shieldId).filter(row -> before == null || unsigned(row.id(), before) < 0)
+                .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())
+                .skip(offset).limit(limit).toList();
+    }
+
+    @Override
+    public long noteCount(UUID campaignId, UUID shieldId) {
+        return ofShield(campaignId, shieldId).count();
     }
 
     @Override
@@ -377,6 +391,13 @@ public class InMemoryRecordStore implements RecordStore {
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
                 && (row.campaignId().equals(campaignId) || shared.contains(row.id()))
                 && (type == null || row.type().equals(type)) && live(row));
+    }
+
+    /** The live notes of the campaign that the Shield holds (Story 6.2 part A). */
+    private java.util.stream.Stream<ArtifactRow> ofShield(UUID campaignId, UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && row.campaignId().equals(campaignId) && shieldId.equals(row.shieldId()) && live(row));
     }
 
     /** Whether the artifact is not deleting (Story 5.2 part B). */

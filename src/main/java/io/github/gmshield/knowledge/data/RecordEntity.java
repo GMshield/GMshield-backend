@@ -52,6 +52,13 @@ class RecordEntity {
     @Column(name = "conversation_id", updatable = false)
     private UUID conversationId;
 
+    /**
+     * The Shield holding a note (Story 6.2 part A, V54); null for every other artifact, for a note no Shield holds and
+     * for an extracted record.
+     */
+    @Column(name = "shield_id", updatable = false)
+    private UUID shieldId;
+
     @Column(name = "ordinal", updatable = false)
     private Integer ordinal;
 
@@ -123,6 +130,7 @@ class RecordEntity {
         this.ownerId = row.ownerId();
         this.campaignId = row.campaignId();
         this.conversationId = row.conversationId();
+        this.shieldId = row.shieldId();
         this.recordType = row.type();
         this.createdAt = row.createdAt();
     }
@@ -208,7 +216,7 @@ class RecordEntity {
         if (campaignId == null) {
             throw new IllegalStateException("knowledge.not_an_artifact");
         }
-        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt, conversationId);
+        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt, conversationId, shieldId);
     }
 
     /** The row of an extracted record; only a read that filters through a version calls it. */
