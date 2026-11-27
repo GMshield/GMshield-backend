@@ -10,8 +10,10 @@ import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.ArtifactIndexRow;
+import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -46,6 +48,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
+import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.net.URI;
@@ -85,7 +88,8 @@ import tools.jackson.databind.json.JsonMapper;
  * material and another owner's material (404), a version that left {@code discarded} during the wait (the pass fails,
  * the next prepares again), a running claim the removal waits for, and a failed {@code index.removal} started again by
  * the sweep. The same rows against PostgreSQL are in {@code MaterialDeletionIntegrationTest}. Story 5.2 part B: a
- * material's deletion touches no artifact identity, version or index row.
+ * material's deletion touches no artifact identity, version or index row. Story 5.4 part A: an artifact saved from a
+ * draft that cited the material keeps its content and its reference, which reads as a removed source.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -151,6 +155,8 @@ class MaterialDeletionFlowTest {
     private InMemoryArtifactVersionStore artifactVersions;
     @Autowired
     private InMemoryArtifactIndexStore artifactIndex;
+    @Autowired
+    private InMemoryArtifactReferenceStore artifactReferences;
     @Autowired
     private InMemoryJobStorage jobs;
     @Autowired
@@ -283,6 +289,42 @@ class MaterialDeletionFlowTest {
         int removals = index.removals.size();
         assertThat(deletion.sweep()).isZero();
         assertThat(index.removals).hasSize(removals);
+    }
+
+    @Test
+    void aSavedDraftsSourceReadsRemovedOnceItsMaterialIsDeletedAndTheArtifactKeepsItsContent() throws Exception {
+        Gm gm = signUp();
+        Made book = material(gm, gm.campaign(), "ready", 2, START.minusSeconds(60));
+        String artifacts = "/api/v1/campaigns/" + gm.campaign() + "/artifacts";
+        HttpResponse<String> created = sendJson(gm, "POST", artifacts, "{\"recordType\":\"encounter\","
+                + "\"name\":\"Emboscada\",\"fields\":[],\"content\":\"## Cripta\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        UUID artifact = UUID.fromString(json(created).path("id").asString());
+        UUID passage = materials.passages.values().stream().filter(row -> row.versionId().equals(book.versionId()))
+                .findFirst().orElseThrow().id();
+        // The draft's reference as a save copies it: sealed under the artifact.
+        as(gm.id(), () -> {
+            artifactReferences.insert(List.of(new ArtifactReferenceRow(artifact, gm.id(), 1, book.versionId(),
+                    book.materialId(), 1, List.of(passage),
+                    vault.encryptText(new Binding("artifact_reference", "material_name:1", artifact, gm.id()), "Livro"),
+                    vault.encrypt(new Binding("artifact_reference", "section_path:1", artifact, gm.id()),
+                            "[\"A\"]".getBytes(StandardCharsets.UTF_8)), "campaign", null, null, null, null, null,
+                    null, START)));
+            return null;
+        });
+        JsonNode before = json(get(gm, artifacts + "/" + artifact));
+        assertThat(before.path("references").get(0).path("removed").asBoolean()).isFalse();
+
+        // Matrix row "Source gone".
+        assertThat(send(gm, "DELETE", "/api/v1/materials/" + book.materialId()).statusCode()).isEqualTo(202);
+        assertThat(deletion.sweep()).isEqualTo(1);
+
+        JsonNode after = json(get(gm, artifacts + "/" + artifact));
+        assertThat(after.path("content").asString()).isEqualTo("## Cripta");
+        assertThat(after.path("references")).hasSize(1);
+        assertThat(after.path("references").get(0).path("removed").asBoolean()).isTrue();
+        assertThat(after.path("references").get(0).path("materialName").asString()).isEqualTo("Livro");
+        assertThat(artifactReferences.rows).containsKey(artifact + "/1");
     }
 
     @Test

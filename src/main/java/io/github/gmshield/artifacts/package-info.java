@@ -10,9 +10,12 @@
  * each version through a job ({@code jobs}: {@code index.artifact}, and {@code index.artifact_removal} when its campaign
  * goes) and implements the {@code scope} module's {@code CampaignArtifacts} port, so a campaign's artifacts are
  * campaign-tier sources of its questions. Story 5.2 part A edits an artifact as its next version, keeps every earlier
- * version, restores one as the newest and opens a cited one by its number.
+ * version, restores one as the newest and opens a cited one by its number. Story 5.4 part A saves a finished draft as an
+ * artifact ({@code web.DraftSaveController}, {@code service.Artifacts#saveDraft}): it reads the draft and marks the
+ * turn saved through {@code conversations :: service}, in the transaction that creates the artifact; nothing in
+ * {@code conversations} depends on this module.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Artifacts",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "knowledge :: service",
-                "jobs :: service", "scope :: service"})
+                "jobs :: service", "scope :: service", "conversations :: service"})
 package io.github.gmshield.artifacts;

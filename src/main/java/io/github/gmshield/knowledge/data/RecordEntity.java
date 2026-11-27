@@ -45,6 +45,13 @@ class RecordEntity {
     @Column(name = "campaign_id", updatable = false)
     private UUID campaignId;
 
+    /**
+     * The conversation an artifact was saved from (Story 5.4 part A, V49); null otherwise. Never written by an update:
+     * the database sets it to null when that conversation goes.
+     */
+    @Column(name = "conversation_id", updatable = false)
+    private UUID conversationId;
+
     @Column(name = "ordinal", updatable = false)
     private Integer ordinal;
 
@@ -115,6 +122,7 @@ class RecordEntity {
         this.id = row.id();
         this.ownerId = row.ownerId();
         this.campaignId = row.campaignId();
+        this.conversationId = row.conversationId();
         this.recordType = row.type();
         this.createdAt = row.createdAt();
     }
@@ -200,7 +208,7 @@ class RecordEntity {
         if (campaignId == null) {
             throw new IllegalStateException("knowledge.not_an_artifact");
         }
-        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt);
+        return new ArtifactRow(id, ownerId, campaignId, recordType, createdAt, conversationId);
     }
 
     /** The row of an extracted record; only a read that filters through a version calls it. */

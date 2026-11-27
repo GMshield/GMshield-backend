@@ -186,7 +186,8 @@ class ModuleBoundaryTest {
      * (it seeds the core types by listening to {@code SystemCreated}). Story 5.1: {@code artifacts} has one too, for the
      * artifacts of the campaigns going; from part B it also cancels their index jobs and removes their points, through
      * {@code jobs}, and {@code scope} reads the campaign's artifacts through its own port, which {@code artifacts}
-     * implements, so {@code scope} still depends on no module that holds them.
+     * implements, so {@code scope} still depends on no module that holds them. Story 5.4 part A: {@code artifacts} reads
+     * and marks a saved draft through {@code conversations}, which never depends on {@code artifacts}.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
@@ -202,6 +203,10 @@ class ModuleBoundaryTest {
         noClasses().that().resideInAPackage(base + ".scope..").should().dependOnClassesThat()
                 .resideInAnyPackage(base + ".artifacts..")
                 .because("scope reads artifacts through its CampaignArtifacts port only").check(application);
+        noClasses().that().resideInAPackage(base + ".conversations..").should().dependOnClassesThat()
+                .resideInAnyPackage(base + ".artifacts..", base + ".knowledge..")
+                .because("artifacts saves a draft through conversations, never the other way (Story 5.4 part A)")
+                .check(application);
         List<String> handlers = application.get(io.github.gmshield.library.service.SystemDeletionHandler.class)
                 .getAllSubclasses().stream().map(JavaClass::getPackageName).sorted().toList();
         assertThat(handlers).containsExactly(base + ".artifacts.service", base + ".conversations.service",

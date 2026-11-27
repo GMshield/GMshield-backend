@@ -25,6 +25,10 @@ import org.hibernate.annotations.TenantId;
  *
  * <p>Story 5.3 part B (V48): {@code proposal_name} and {@code proposal_type} are mapped not updatable, as
  * {@code bookmarked_at} is: only the store's bulk update ({@code JpaConversationStore#markProposed}) writes them.
+ *
+ * <p>Story 5.4 part A (V49): {@code saved_record_id} and {@code save_declined_at} are mapped not updatable too: only the
+ * store's bulk updates ({@code JpaConversationStore#markSaved}, {@code #markSaveDeclined}, {@code #clearSaveDeclined})
+ * write them, and the database sets {@code saved_record_id} to null when its artifact's row goes.
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -83,6 +87,12 @@ class TurnEntity {
     @Column(name = "proposal_type", updatable = false)
     private String proposalType;
 
+    @Column(name = "saved_record_id", updatable = false)
+    private UUID savedRecordId;
+
+    @Column(name = "save_declined_at", updatable = false)
+    private Instant saveDeclinedAt;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -105,6 +115,8 @@ class TurnEntity {
         this.kind = row.kind();
         this.proposalName = row.proposalName();
         this.proposalType = row.proposalType();
+        this.savedRecordId = row.savedRecordId();
+        this.saveDeclinedAt = row.saveDeclinedAt();
     }
 
     void stop(Instant at) {
@@ -115,7 +127,7 @@ class TurnEntity {
     TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind,
-                proposalName, proposalType);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt);
     }
 
     UUID id() {

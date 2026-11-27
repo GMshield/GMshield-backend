@@ -248,6 +248,60 @@ public class InMemoryConversationStore implements ConversationStore {
         return true;
     }
 
+    /**
+     * Story 5.4 part A: when set, the next {@link #markSaved} reports no change, as when another save committed between
+     * the turn's read and its update; it is cleared by that call.
+     */
+    public final java.util.concurrent.atomic.AtomicBoolean loseNextSave = new java.util.concurrent.atomic.AtomicBoolean();
+
+    @Override
+    public synchronized boolean markSaved(UUID turnId, UUID expected, UUID recordId, Instant at) {
+        if (loseNextSave.getAndSet(false)) {
+            return false;
+        }
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || !java.util.Objects.equals(found.get().savedRecordId(), expected)) {
+            return false;
+        }
+        return change(found.get(), found.get().saving(recordId, at));
+    }
+
+    @Override
+    public synchronized boolean markSaveDeclined(UUID turnId, Instant at) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || found.get().saveDeclinedAt() != null) {
+            return false;
+        }
+        return change(found.get(), found.get().saving(found.get().savedRecordId(), at));
+    }
+
+    @Override
+    public synchronized boolean clearSaveDeclined(UUID turnId, UUID stale) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty() || !java.util.Objects.equals(found.get().savedRecordId(), stale)
+                || stale == null && found.get().saveDeclinedAt() == null) {
+            return false;
+        }
+        return change(found.get(), found.get().saving(null, null));
+    }
+
+    /**
+     * Sets a save state's column to null as the database's {@code ON DELETE SET NULL} does when the artifact's row goes
+     * (Story 5.4 part A): every turn of the current owner saved as {@code recordId}.
+     */
+    public synchronized void artifactGone(UUID recordId) {
+        owned(turns).filter(row -> recordId.equals(row.savedRecordId())).toList()
+                .forEach(row -> change(row, row.saving(null, row.saveDeclinedAt())));
+    }
+
+    /** Replaces a turn's row, undone when its transaction rolls back. */
+    private boolean change(TurnRow before, TurnRow after) {
+        ownerFor(before.ownerId());
+        turns.put(before.id(), after);
+        RollbackUndo.onRollback(() -> turns.put(before.id(), before));
+        return true;
+    }
+
     /** As the JPA store's saved list: newest saved first, then by id, newest first. */
     private static final Comparator<TurnRow> SAVED = Comparator.comparing(TurnRow::bookmarkedAt)
             .thenComparing(TurnRow::id).reversed();

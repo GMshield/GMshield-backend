@@ -16,6 +16,12 @@ public class ArtifactTestStores {
 
     @Bean
     @Primary
+    InMemoryArtifactReferenceStore inMemoryArtifactReferences() {
+        return new InMemoryArtifactReferenceStore();
+    }
+
+    @Bean
+    @Primary
     InMemoryArtifactIndexStore inMemoryArtifactIndex(InMemoryArtifactVersionStore versions) {
         return new InMemoryArtifactIndexStore(versions);
     }

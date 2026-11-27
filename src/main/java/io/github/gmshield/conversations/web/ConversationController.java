@@ -65,6 +65,9 @@ import tools.jackson.databind.json.JsonMapper;
  * answers across all their campaigns ({@code /saved-answers}, paged by offset, the newest saved first).
  * From Story 5.3 part A, a turn's kind: a question, or a draft asked in the questions area, recorded with its
  * {@code content.draft} job and read back with its kind.
+ * From Story 5.4 part A, an offered draft's save state on each stored turn, and the GM's "Agora não" (PUT) and
+ * "Salvar como artefato" (DELETE) on {@code /turns/{turnId}/save-decline}; the save itself is the {@code artifacts}
+ * module's ({@code POST /turns/{turnId}/artifact}).
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -79,6 +82,7 @@ class ConversationController {
     static final String STOP = "/api/v1/turns/{turnId}/stop";
     static final String DISMISSAL = "/api/v1/turns/{turnId}/dismissal";
     static final String BOOKMARK = "/api/v1/turns/{turnId}/bookmark";
+    static final String SAVE_DECLINE = "/api/v1/turns/{turnId}/save-decline";
     static final String SAVED_ANSWERS = "/api/v1/saved-answers";
     static final String REFERENCE_PAGE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}";
     static final String REFERENCE_PICTURE = "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture";
@@ -298,19 +302,35 @@ class ConversationController {
                     schema = @Schema(implementation = StoredEventView.class)) List<StoredEventView> events,
             @Schema(description = "Whether the GM saved its answer (contract 1.32.0)") boolean bookmarked,
             @Schema(description = "What the GM asked for (contract 1.46.0): a question, or a draft written from the"
-                    + " campaign's sources", allowableValues = {"question", "draft"}) String kind) {
+                    + " campaign's sources", allowableValues = {"question", "draft"}) String kind,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            @Schema(description = "Where the draft's save confirmation stands (contract 1.48.0). Present only on a"
+                    + " draft that is done and neither stopped nor silent (the one kind of turn offered for saving);"
+                    + " absent on every other turn") SavingView saving) {
 
         static StoredTurnView of(Conversations.StoredTurn turn) {
             return new StoredTurnView(turn.id(), turn.question(), turn.language(), turn.createdAt().toString(),
                     turn.events().stream().map(event -> new StoredEventView(event.sequence(), event.type(),
                             JSON.convertValue(event.data(), OBJECT))).toList(), turn.bookmarked(),
-                    turn.kind().word());
+                    turn.kind().word(), turn.saving() == null ? null : new SavingView(turn.saving().state().word(),
+                            turn.saving().artifactId()));
         }
 
         @Override
         public String toString() {
             return "StoredTurnView[id=" + id + "]";
         }
+    }
+
+    @Schema(name = "TurnSaving", requiredProperties = {"state", "artifactId"},
+            description = "An offered draft's save state (contract 1.48.0), worked out when read")
+    record SavingView(
+            @Schema(description = "offered: the card is shown under the draft; declined: the GM chose \"Agora não\","
+                    + " or the artifact it was saved as was deleted since (\"Salvar como artefato\" offers it again);"
+                    + " saved: the draft is the artifact artifactId", allowableValues = {"offered", "declined", "saved"})
+            String state,
+            @Schema(description = "The artifact the draft was saved as, of the conversation's campaign; null unless"
+                    + " saved", types = {"string", "null"}, format = "uuid") UUID artifactId) {
     }
 
     @Schema(name = "ConversationTurns", requiredProperties = "items",
@@ -932,6 +952,43 @@ class ConversationController {
             @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("turnId") String turnId) {
         conversations.unbookmark(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    private static final String SAVE_DECLINE_REFUSED = " conversation.turn_not_saveable (409) for a turn that is not"
+            + " offered for saving (not a draft, or a draft still running, stopped, failed or silent);"
+            + " conversation.turn_saved (409) for a draft saved already (its artifact not deleted); nothing changes then."
+            + DISMISSAL_NOT_FOUND;
+
+    @PutMapping(path = SAVE_DECLINE)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "declineDraftSave", summary = "The GM's \"Agora não\" on a draft's save confirmation"
+            + " (contract 1.48.0; 204): from now on the turn's saving reads declined, and nothing is saved. The turn's"
+            + " events are unchanged. A draft declined already stays as it is (204 too), so repeating it is safe."
+            + SAVE_DECLINE_REFUSED,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The save is declined"))
+    ResponseEntity<Void> declineSave(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.declineSave(parse(turnId).orElseThrow(ConversationProblems::notFound));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @DeleteMapping(path = SAVE_DECLINE)
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @Operation(operationId = "reopenDraftSave", summary = "The GM's \"Salvar como artefato\" on a declined draft"
+            + " (contract 1.48.0; 204): the turn's saving reads offered again, and the card shows. A draft whose saved"
+            + " artifact was deleted is let go of it, so it can be saved again. A draft offered already stays as it is"
+            + " (204 too), so repeating it is safe." + SAVE_DECLINE_REFUSED,
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The save is offered"))
+    ResponseEntity<Void> reopenSave(
+            @Parameter(description = "The turn's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("turnId") String turnId) {
+        conversations.reopenSave(parse(turnId).orElseThrow(ConversationProblems::notFound));
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 

@@ -1,6 +1,7 @@
 package io.github.gmshield.artifacts.service;
 
 import io.github.gmshield.artifacts.data.ArtifactIndexStore;
+import io.github.gmshield.artifacts.data.ArtifactReferenceStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
@@ -35,6 +36,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * creates its removal job, the same way; it counts nothing. Both read the artifact whether deleting or not
  * ({@link ArtifactRecords#allOf}, {@link ArtifactRecords#allIdsOf}), so a campaign's or a system's deletion still takes
  * a deleting artifact; the dialogs count live artifacts only.
+ *
+ * <p>Story 5.4 part A: the removal deletes a saved draft's copied references ({@code artifact_reference}) with its
+ * versions, before its identity.
  */
 @Service
 class ArtifactsDeletion implements SystemDeletionHandler {
@@ -45,17 +49,19 @@ class ArtifactsDeletion implements SystemDeletionHandler {
 
     private final ArtifactRecords records;
     private final ArtifactVersionStore versions;
+    private final ArtifactReferenceStore references;
     private final ArtifactIndexStore index;
     private final ArtifactIndexing indexing;
     private final ArtifactIndexRemovals removals;
     private final Jobs jobs;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    ArtifactsDeletion(ArtifactRecords records, ArtifactVersionStore versions, ArtifactIndexStore index,
-                      ArtifactIndexing indexing, ArtifactIndexRemovals removals, Jobs jobs,
+    ArtifactsDeletion(ArtifactRecords records, ArtifactVersionStore versions, ArtifactReferenceStore references,
+                      ArtifactIndexStore index, ArtifactIndexing indexing, ArtifactIndexRemovals removals, Jobs jobs,
                       ObjectProvider<PlatformTransactionManager> transactions) {
         this.records = records;
         this.versions = versions;
+        this.references = references;
         this.index = index;
         this.indexing = indexing;
         this.removals = removals;
@@ -105,6 +111,7 @@ class ArtifactsDeletion implements SystemDeletionHandler {
             // Story 5.1 part B: one removal of each artifact's points, then its index rows before its versions.
             ids.forEach(removals::start);
             index.deleteOf(ids);
+            references.deleteOf(ids);
             versions.deleteOf(ids);
             return records.delete(ids);
         });

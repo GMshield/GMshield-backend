@@ -272,7 +272,8 @@ public class InMemoryRecordStore implements RecordStore {
         if (!TYPE.matcher(type).matches()) {
             throw new IllegalStateException("check refused");
         }
-        ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt());
+        ArtifactRow changed = new ArtifactRow(row.id(), row.ownerId(), row.campaignId(), type, row.createdAt(),
+                row.conversationId());
         artifacts.put(id, changed);
         RollbackUndo.onRollback(() -> artifacts.put(id, row));
         return Optional.of(changed);

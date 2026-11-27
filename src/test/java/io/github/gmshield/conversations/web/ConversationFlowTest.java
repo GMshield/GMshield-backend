@@ -15,6 +15,9 @@ import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
+import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
 import io.github.gmshield.conversations.data.EventBatchRow;
 import io.github.gmshield.conversations.data.InMemoryConversationStore;
@@ -33,6 +36,7 @@ import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.LibraryTestStores;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.limits.data.InMemoryUsageStore;
@@ -151,6 +155,13 @@ import tools.jackson.databind.json.JsonMapper;
  * that is not a key of the system stored as null; the malformed proposals refused with {@code job.result_invalid},
  * nothing changed; a name measured once trimmed; an approved type named in the claim, stored and exposed as its key and
  * logged as {@code approved}; and no proposed name, request, draft or approved key in a line.
+ *
+ * <p>Story 5.4 part A: every backend row of its I/O matrix: a done draft offered, saved as an artifact of its campaign
+ * with its Markdown, its two references copied by value (sealed again) and its conversation, the turn saved and its
+ * events unchanged; an edited save; the refusals on their fields with nothing stored; a running, stopped, silent or
+ * failed draft and an answer never offered (409 {@code conversation.turn_not_saveable} on every route); a second save
+ * {@code conversation.turn_saved}; "Agora não" and "Salvar como artefato", repeated; a deleted saved artifact read as
+ * declined and saved again; and another owner's turn not found.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -219,6 +230,12 @@ class ConversationFlowTest {
     private InMemoryConversationStore conversations;
     @Autowired
     private InMemoryTurnReferenceStore references;
+    @Autowired
+    private InMemoryArtifactReferenceStore artifactReferences;
+    @Autowired
+    private InMemoryArtifactVersionStore artifactVersions;
+    @Autowired
+    private InMemoryRecordStore records;
     @Autowired
     private InMemorySearchStore searchStore;
     @Autowired
@@ -3611,6 +3628,336 @@ class ConversationFlowTest {
         assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
                 + event.getKeyValuePairs()).doesNotContain("talento").doesNotContain("Talento")
                 .doesNotContain("Lâmina"));
+    }
+
+    // --- Story 5.4 part A: saving a draft through the save confirmation
+
+    private static final String DRAFTED = "## Emboscada na cripta\n\nTrês esqueletos guardam a porta.\n";
+
+    @Test
+    void aDoneDraftIsOfferedAndSavedAsAnArtifactWithItsMarkdownItsReferencesAndItsConversation() throws Exception {
+        Gm gm = signUp();
+        Source source = source(gm, gm.campaign(), List.of(1, 2));
+        UUID turnId = doneDraft(gm, source);
+        UUID conversation = conversations.turns.get(turnId).conversationId();
+        JsonNode offered = saving(gm, turnId);
+        assertThat(offered.path("state").asString()).isEqualTo("offered");
+        assertThat(offered.has("artifactId")).isTrue();
+        assertThat(offered.path("artifactId").isNull()).isTrue();
+
+        HttpResponse<String> saved = saveDraft(gm, turnId, "{\"name\":\"Emboscada na Cripta\","
+                + "\"recordType\":\"encounter\"}");
+
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(201);
+        assertThat(saved.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        JsonNode artifact = json(saved);
+        UUID artifactId = UUID.fromString(artifact.path("id").asString());
+        assertThat(artifact.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(artifact.path("name").asString()).isEqualTo("Emboscada na Cripta");
+        assertThat(artifact.path("recordType").asString()).isEqualTo("encounter");
+        assertThat(artifact.path("fields")).isEmpty();
+        // The draft's Markdown, as stored, is the content (trimmed); the superscripts stay behind.
+        assertThat(artifact.path("content").asString()).isEqualTo(DRAFTED.strip());
+        assertThat(artifact.path("conversationId").asString()).isEqualTo(conversation.toString());
+        assertThat(artifact.path("version").asInt()).isEqualTo(1);
+        JsonNode copied = artifact.path("references");
+        assertThat(copied).hasSize(2);
+        assertThat(copied.get(0).path("number").asInt()).isEqualTo(1);
+        assertThat(copied.get(0).path("kind").asString()).isEqualTo("passage");
+        assertThat(copied.get(0).path("materialName").asString()).isEqualTo(MATERIAL_NAME);
+        assertThat(strings(copied.get(0).path("sectionPath"))).isEqualTo(SECTION);
+        assertThat(copied.get(0).path("page").asInt()).isEqualTo(1);
+        assertThat(strings(copied.get(0).path("passageIds"))).containsExactly(source.passages().get(0).toString());
+        assertThat(copied.get(0).path("removed").asBoolean()).isFalse();
+        assertThat(copied.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(copied.get(1).path("page").asInt()).isEqualTo(2);
+        assertThat(copied.get(0).has("artifactId")).isFalse();
+        // The turn's references, for the same places.
+        assertThat(copied).isEqualTo(done(gm, turnId, null).path("references"));
+
+        // Saved: the turn names the artifact; its events keep the agent's text.
+        JsonNode state = saving(gm, turnId);
+        assertThat(state.path("state").asString()).isEqualTo("saved");
+        assertThat(state.path("artifactId").asString()).isEqualTo(artifactId.toString());
+        assertThat(streamAll(gm, turnId, null).stream().filter(event -> "delta".equals(event.name()))
+                .map(event -> JSON.readTree(event.data()).path("text").asString()).toList()).containsExactly(DRAFTED);
+        assertThat(conversations.turns.get(turnId).savedRecordId()).isEqualTo(artifactId);
+        // The artifact page reads the same, with its conversation and references.
+        JsonNode read = json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + artifactId));
+        assertThat(read.path("conversationId").asString()).isEqualTo(conversation.toString());
+        assertThat(read.path("references")).isEqualTo(copied);
+        assertThat(read.path("content").asString()).isEqualTo(DRAFTED.strip());
+        // Indexed as any artifact: one index job, created with it.
+        assertThat(jobs.rows.values()).anySatisfy(job -> {
+            assertThat(job.kind()).isEqualTo("index.artifact");
+            assertThat(job.ownerId()).isEqualTo(gm.id());
+        });
+        // The copies are sealed again under the artifact, never the turn's ciphertexts.
+        ArtifactReferenceRow row = artifactReferences.rows.get(artifactId + "/1");
+        assertThat(new String(row.materialName(), StandardCharsets.ISO_8859_1)).doesNotContain(MATERIAL_NAME);
+        assertThat(row.versionId()).isEqualTo(source.versionId());
+        assertThat(row.materialId()).isEqualTo(source.materialId());
+        assertThat(as(gm.id(), () -> vault.decryptText(new io.github.gmshield.vault.service.Binding(
+                "artifact_reference", "material_name:1", artifactId, gm.id()), row.materialName())))
+                .isEqualTo(MATERIAL_NAME);
+        assertThat(records.artifacts.get(artifactId).conversationId()).isEqualTo(conversation);
+
+        // Twice (another tab): one artifact; the second is turn_saved, and so are a decline and a reopen.
+        assertProblem(saveDraft(gm, turnId, "{\"name\":\"Outra\",\"recordType\":\"encounter\"}"), 409,
+                "conversation.turn_saved");
+        assertProblem(saveDecline(gm, "PUT", turnId.toString()), 409, "conversation.turn_saved");
+        assertProblem(saveDecline(gm, "DELETE", turnId.toString()), 409, "conversation.turn_saved");
+        assertThat(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("total").asLong())
+                .isOne();
+        assertThat(saving(gm, turnId).path("artifactId").asString()).isEqualTo(artifactId.toString());
+        // A line says it was saved, with ids and counts only.
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo("artifacts.draft_saved"));
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Emboscada").doesNotContain("esqueletos")
+                .doesNotContain(MATERIAL_NAME));
+    }
+
+    @Test
+    void anEditedSaveKeepsTheEditedValuesWhileTheTurnKeepsTheAgentsText() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1, 2)));
+
+        HttpResponse<String> saved = saveDraft(gm, turnId, "{\"name\":\"  Cripta  \",\"recordType\":\"creature\","
+                + "\"content\":\"## Cripta\\n\\nUm esqueleto.\"}");
+
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(201);
+        JsonNode artifact = json(saved);
+        assertThat(artifact.path("name").asString()).isEqualTo("Cripta");
+        assertThat(artifact.path("recordType").asString()).isEqualTo("creature");
+        assertThat(artifact.path("content").asString()).isEqualTo("## Cripta\n\nUm esqueleto.");
+        assertThat(artifact.path("references")).hasSize(2);
+        assertThat(streamAll(gm, turnId, null).stream().filter(event -> "delta".equals(event.name()))
+                .map(event -> JSON.readTree(event.data()).path("text").asString()).toList()).containsExactly(DRAFTED);
+        // The proposal on the turn's done is unchanged too.
+        assertThat(done(gm, turnId, null).path("proposal").path("name").asString()).isEqualTo("Emboscada na Cripta");
+    }
+
+    @Test
+    void aSaveOutsideItsLimitsIsRefusedOnItsFieldAndStoresNothing() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1)));
+
+        HttpResponse<String> noType = saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":null}");
+        assertProblem(noType, 400, "request.invalid");
+        assertThat(json(noType).path("params").path("field").asString()).isEqualTo("recordType");
+        HttpResponse<String> emptyType = saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":\"\"}");
+        assertThat(json(emptyType).path("params").path("field").asString()).isEqualTo("recordType");
+        HttpResponse<String> tooLong = saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":\"encounter\","
+                + "\"content\":\"" + "a".repeat(20_001) + "\"}");
+        assertProblem(tooLong, 400, "request.invalid");
+        assertThat(json(tooLong).path("params").path("field").asString()).isEqualTo("content");
+        HttpResponse<String> blankName = saveDraft(gm, turnId, "{\"name\":\"   \",\"recordType\":\"encounter\"}");
+        assertThat(json(blankName).path("params").path("field").asString()).isEqualTo("name");
+        assertProblem(saveDraft(gm, turnId, "nope"), 400, "request.invalid");
+        assertProblem(saveDraft(gm, turnId, "null"), 400, "request.invalid");
+
+        // Nothing stored: no artifact, no reference, the turn still offered.
+        assertThat(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("total").asLong())
+                .isZero();
+        assertThat(records.artifacts.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("offered");
+        assertThat(conversations.turns.get(turnId).savedRecordId()).isNull();
+        // 20,000 code points is the longest content.
+        assertThat(saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":\"encounter\",\"content\":\""
+                + "a".repeat(20_000) + "\"}").statusCode()).isEqualTo(201);
+    }
+
+    @Test
+    void onlyADoneDraftThatIsNeitherStoppedNorSilentIsOfferedSavedDeclinedOrReopened() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        String body = "{\"name\":\"Cripta\",\"recordType\":\"encounter\"}";
+        // Streaming: no saving, and every route refuses.
+        UUID running = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim runningClaim = claim(jobOf(running));
+        postEvents(runningClaim, 1, List.of(delta("## Cripta"), citation(passages.getFirst(), 0)), List.of());
+        // Stopped.
+        UUID stopped = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim stoppedClaim = claim(jobOf(stopped));
+        postEvents(stoppedClaim, 1, List.of(delta("## Cripta"), citation(passages.getFirst(), 0)), List.of());
+        assertThat(stopTurn(gm, stopped).statusCode()).isEqualTo(204);
+        // Silent.
+        UUID silent = turnId(askKind(gm, "Um dragão de gelo", null, null, "draft"));
+        Claim silentClaim = claim(jobOf(silent));
+        postEvents(silentClaim, 1, List.of(delta("Nada nas fontes serve.")), List.of());
+        assertThat(report(silentClaim, PROPOSED).statusCode()).isEqualTo(204);
+        // Failed.
+        UUID failed = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        assertThat(report(claim(jobOf(failed)), "{\"outcome\":\"failed\",\"code\":\"model.unavailable\"}")
+                .statusCode()).isEqualTo(204);
+        // An answer.
+        UUID answer = answered(gm, QUESTION, List.of(delta("Fire Bolt causa 1d10."), citation(passages.getFirst(), 0)));
+
+        for (UUID turnId : List.of(running, stopped, silent, failed, answer)) {
+            assertProblem(saveDraft(gm, turnId, body), 409, "conversation.turn_not_saveable");
+            assertProblem(saveDecline(gm, "PUT", turnId.toString()), 409, "conversation.turn_not_saveable");
+            assertProblem(saveDecline(gm, "DELETE", turnId.toString()), 409, "conversation.turn_not_saveable");
+            assertThat(conversations.turns.get(turnId).savedRecordId()).as(turnId.toString()).isNull();
+            assertThat(conversations.turns.get(turnId).saveDeclinedAt()).as(turnId.toString()).isNull();
+        }
+        UUID conversation = conversations.turns.get(running).conversationId();
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/turns")).path("items"))
+                .allSatisfy(item -> assertThat(item.has("saving")).as(item.path("id").asString()).isFalse());
+        assertThat(json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/artifacts")).path("total").asLong())
+                .isZero();
+
+        // Unknown, malformed and another owner's turns are not found.
+        Gm other = signUp();
+        UUID offered = doneDraft(gm, source(gm, gm.campaign(), List.of(1)));
+        for (String id : List.of(UUID.randomUUID().toString(), "nope", offered.toString())) {
+            Gm asking = id.equals(offered.toString()) ? other : gm;
+            assertNotFound(saveDraft(asking, id, body));
+            assertNotFound(saveDecline(asking, "PUT", id));
+            assertNotFound(saveDecline(asking, "DELETE", id));
+        }
+        assertThat(saving(gm, offered).path("state").asString()).isEqualTo("offered");
+    }
+
+    @Test
+    void agoraNaoDeclinesSalvarComoArtefatoOffersAgainAndBothAreSafeToRepeat() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1)));
+        UUID conversation = conversations.turns.get(turnId).conversationId();
+        long version = json(get(gm, "/api/v1/conversations/" + conversation)).path("version").asLong();
+
+        for (int time = 0; time < 2; time++) {
+            HttpResponse<String> declined = saveDecline(gm, "PUT", turnId.toString());
+            assertThat(declined.statusCode()).as(declined.body()).isEqualTo(204);
+            assertThat(declined.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        }
+        JsonNode state = saving(gm, turnId);
+        assertThat(state.path("state").asString()).isEqualTo("declined");
+        assertThat(state.path("artifactId").isNull()).isTrue();
+        Instant declinedAt = conversations.turns.get(turnId).saveDeclinedAt();
+        assertThat(declinedAt).isNotNull();
+
+        for (int time = 0; time < 2; time++) {
+            assertThat(saveDecline(gm, "DELETE", turnId.toString()).statusCode()).isEqualTo(204);
+        }
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("offered");
+        assertThat(conversations.turns.get(turnId).saveDeclinedAt()).isNull();
+        // Neither moves the conversation's version; the turn's events are unchanged.
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation)).path("version").asLong())
+                .isEqualTo(version);
+        assertThat(streamAll(gm, turnId, null).stream().filter(event -> "delta".equals(event.name())).count())
+                .isOne();
+
+        // A declined draft can still be saved (as from another tab that still shows the card).
+        assertThat(saveDecline(gm, "PUT", turnId.toString()).statusCode()).isEqualTo(204);
+        HttpResponse<String> saved = saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":\"encounter\"}");
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(201);
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("saved");
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage())
+                .isEqualTo("conversation.save_declined"));
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage())
+                .isEqualTo("conversation.save_reopened"));
+    }
+
+    @Test
+    void aDraftWhoseSavedArtifactIsDeletedReadsDeclinedAndCanBeSavedAgain() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1)));
+        String body = "{\"name\":\"Cripta\",\"recordType\":\"encounter\"}";
+        UUID first = UUID.fromString(json(saveDraft(gm, turnId, body)).path("id").asString());
+
+        // Being deleted (5.2 part B): declined.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + first, "")
+                .statusCode()).isEqualTo(202);
+        JsonNode state = saving(gm, turnId);
+        assertThat(state.path("state").asString()).isEqualTo("declined");
+        assertThat(state.path("artifactId").isNull()).isTrue();
+        // Gone, its row removed (PostgreSQL sets the turn's column to null): still declined, never offered again.
+        as(gm.id(), () -> {
+            conversations.artifactGone(first);
+            return null;
+        });
+        assertThat(conversations.turns.get(turnId).savedRecordId()).isNull();
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("declined");
+        assertThat(saveDecline(gm, "PUT", turnId.toString()).statusCode()).isEqualTo(204);
+
+        // "Salvar como artefato" offers it again, and a new save makes a new artifact.
+        assertThat(saveDecline(gm, "DELETE", turnId.toString()).statusCode()).isEqualTo(204);
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("offered");
+        HttpResponse<String> again = saveDraft(gm, turnId, body);
+        assertThat(again.statusCode()).as(again.body()).isEqualTo(201);
+        assertThat(saving(gm, turnId).path("artifactId").asString()).isEqualTo(json(again).path("id").asString())
+                .isNotEqualTo(first.toString());
+    }
+
+    @Test
+    void aDraftSavedWhileItsArtifactIsStillDeletingLetsGoOfItWhenOfferedAgain() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1)));
+        String body = "{\"name\":\"Cripta\",\"recordType\":\"encounter\"}";
+        UUID first = UUID.fromString(json(saveDraft(gm, turnId, body)).path("id").asString());
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + first, "")
+                .statusCode()).isEqualTo(202);
+
+        // Saved again straight from declined, while the first row still exists: the turn names the new one.
+        HttpResponse<String> again = saveDraft(gm, turnId, body);
+
+        assertThat(again.statusCode()).as(again.body()).isEqualTo(201);
+        UUID second = UUID.fromString(json(again).path("id").asString());
+        assertThat(conversations.turns.get(turnId).savedRecordId()).isEqualTo(second);
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("saved");
+    }
+
+    @Test
+    void aSaveThatLosesTheRaceAfterWritingTheArtifactRollsItAllBack() throws Exception {
+        Gm gm = signUp();
+        UUID turnId = doneDraft(gm, source(gm, gm.campaign(), List.of(1, 2)));
+        // Another save commits between this one's read of the turn and its update.
+        conversations.loseNextSave.set(true);
+
+        HttpResponse<String> lost = saveDraft(gm, turnId, "{\"name\":\"Cripta\",\"recordType\":\"encounter\"}");
+
+        assertProblem(lost, 409, "conversation.turn_saved");
+        // Nothing of the artifact written before the refusal is left: no identity, version, reference or index job.
+        assertThat(records.artifacts.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        assertThat(artifactVersions.rows.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        assertThat(artifactReferences.rows.values()).noneMatch(row -> row.ownerId().equals(gm.id()));
+        assertThat(jobs.rows.values()).noneMatch(job -> job.ownerId().equals(gm.id())
+                && job.kind().equals("index.artifact"));
+        assertThat(conversations.turns.get(turnId).savedRecordId()).isNull();
+        assertThat(saving(gm, turnId).path("state").asString()).isEqualTo("offered");
+    }
+
+    /** A draft, claimed, streamed with a citation of the first passage and, with two, the second; done with PROPOSED. */
+    private UUID doneDraft(Gm gm, Source source) throws Exception {
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(turnId));
+        List<Map<String, Object>> events = new ArrayList<>(List.of(delta(DRAFTED),
+                citation(source.passages().getFirst(), 22)));
+        if (source.passages().size() > 1) {
+            events.add(citation(source.passages().get(1), 54));
+        }
+        assertThat(postEvents(claim, 1, events, List.of()).statusCode()).isEqualTo(200);
+        assertThat(report(claim, PROPOSED).statusCode()).isEqualTo(204);
+        return turnId;
+    }
+
+    private HttpResponse<String> saveDraft(Gm gm, Object turnId, String body) throws Exception {
+        return send(gm, "POST", "/api/v1/turns/" + turnId + "/artifact", body);
+    }
+
+    private HttpResponse<String> saveDecline(Gm gm, String method, String turnId) throws Exception {
+        return send(gm, method, "/api/v1/turns/" + turnId + "/save-decline", "");
+    }
+
+    /** The stored turn's {@code saving}, as its conversation's turns read it (a missing node when absent). */
+    private JsonNode saving(Gm gm, UUID turnId) throws Exception {
+        UUID conversation = conversations.turns.get(turnId).conversationId();
+        for (JsonNode item : json(get(gm, "/api/v1/conversations/" + conversation + "/turns")).path("items")) {
+            if (item.path("id").asString().equals(turnId.toString())) {
+                return item.path("saving");
+            }
+        }
+        throw new AssertionError("turn not listed: " + turnId);
     }
 
     private HttpResponse<String> askKind(Gm gm, String question, UUID conversation, String area, String kind)

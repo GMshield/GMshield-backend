@@ -13,6 +13,8 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
+import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
@@ -221,6 +223,8 @@ class RecordsFlowTest {
     private InMemoryIndexStore index;
     @Autowired
     private Vault vault;
+    @Autowired
+    private InMemoryArtifactReferenceStore artifactReferences;
     @Autowired
     private IndexRemovalRetrySweep removalRetry;
     @Autowired
@@ -2590,6 +2594,51 @@ class RecordsFlowTest {
         assertProblem(worker(draft.path("terms"), null, "X-Job-Grant", question.claim().path("grant").asString()), 403,
                 "job.grant_refused");
         assertNoLineNames("Espada de Kael", "1d8 cortante", "Crie uma ficha");
+    }
+
+    // --- Story 5.4 part A: a saved draft keeps a record's and an artifact's references
+
+    @Test
+    void aSavedDraftCopiesItsRecordAndArtifactReferencesByValueAsTheTurnStoredThem() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("item", "Espada de Kael", 1, List.of(new Field("Dano", "1d6 cortante")))));
+        String system = recordOf(book.versionId(), "Espada de Kael");
+        String kael = artifact(gm, gm.campaign(), KAEL);
+        endIngestion();
+        Answer draft = drafted(gm, "Crie uma ficha de item para a Espada de Kael");
+        ok(readRecords(draft, List.of(kael, system)));
+        events(draft, List.of(delta("## Espada de Kael\n\n- Dano: 1d8 cortante"), recordCitation(system, 18),
+                recordCitation(kael, 36)));
+        done(draft);
+        JsonNode turnReferences = references(gm, draft);
+        assertThat(turnReferences).extracting(reference -> reference.path("kind").asString())
+                .containsExactly("record", "artifact");
+
+        HttpResponse<String> saved = send("POST", "/api/v1/turns/" + draft.turnId() + "/artifact", gm.session(),
+                Map.of("name", "Espada de Kael, a ficha", "recordType", "item"));
+
+        assertThat(saved.statusCode()).as(saved.body()).isEqualTo(201);
+        // The copies read exactly as the turn's references: the record's place, name and fields, the artifact's id,
+        // version, name and fields, each tier and removed.
+        assertThat(json(saved).path("references")).isEqualTo(turnReferences);
+        String id = json(saved).path("id").asString();
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + id, gm.session()))
+                .path("references")).isEqualTo(turnReferences);
+        // Stored by value, a record's and an artifact's row of their own kind, sealed under the new artifact.
+        ArtifactReferenceRow record = artifactReferences.rows.get(id + "/1");
+        ArtifactReferenceRow artifact = artifactReferences.rows.get(id + "/2");
+        assertThat(record.citedRecordId().toString()).isEqualTo(system);
+        assertThat(record.artifactId()).isNull();
+        assertThat(record.versionId()).isEqualTo(book.versionId());
+        assertThat(artifact.artifactId().toString()).isEqualTo(kael);
+        assertThat(artifact.artifactVersion()).isEqualTo(1);
+        assertThat(artifact.citedRecordId()).isNull();
+        assertThat(artifact.versionId()).isNull();
+        assertThat(new String(artifact.recordName(), StandardCharsets.ISO_8859_1)).doesNotContain("Kael");
+        assertThat(OwnerContext.callAs(gm.id(), () -> vault.decryptText(new io.github.gmshield.vault.service.Binding(
+                "artifact_reference", "record_name:2", UUID.fromString(id), gm.id()), artifact.recordName())))
+                .isEqualTo("Espada de Kael");
     }
 
     /** A new artifact of the campaign, written through the public API; its id. */

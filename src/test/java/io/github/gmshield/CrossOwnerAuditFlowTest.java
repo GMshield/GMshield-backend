@@ -10,6 +10,7 @@ import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -310,6 +311,11 @@ class CrossOwnerAuditFlowTest {
             route("GET", "/api/v1/turns/{turnId}/events", "turnId", "draftTurn").headers("Accept",
                     "text/event-stream"),
             route("POST", "/api/v1/turns/{turnId}/stop", "turnId", "waitingTurn"),
+            // a finished draft's save, its "Agora não" and its "Salvar como artefato" (Story 5.4 part A)
+            route("POST", "/api/v1/turns/{turnId}/artifact", "turnId", "draftTurn")
+                    .json("{\"name\":\"Tomado\",\"recordType\":\"encounter\"}"),
+            route("PUT", "/api/v1/turns/{turnId}/save-decline", "turnId", "draftTurn"),
+            route("DELETE", "/api/v1/turns/{turnId}/save-decline", "turnId", "draftTurn"),
             route("GET", "/api/v1/turns/{turnId}/references/{number}/pages/{page}", "turnId", "turn", "number", "1",
                     "page", "1"),
             route("GET", "/api/v1/turns/{turnId}/references/{number}/pages/{page}/picture", "turnId", "turn",
@@ -385,6 +391,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryArtifactIndexStore artifactIndex;
     @Autowired
+    private InMemoryArtifactReferenceStore artifactReferences;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -454,7 +462,8 @@ class CrossOwnerAuditFlowTest {
     void start() {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
-                    library, deletions, scopes, knowledge, records, ontology, artifactVersions, artifactIndex, materials,
+                    library, deletions, scopes, knowledge, records, ontology, artifactVersions, artifactIndex,
+                    artifactReferences, materials,
                     uploads, index, conversations, references, searches, clock, vault), START);
         }
         stores.start();

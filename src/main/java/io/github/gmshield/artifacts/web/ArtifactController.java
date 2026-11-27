@@ -2,6 +2,7 @@ package io.github.gmshield.artifacts.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.artifacts.service.Artifacts;
+import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
@@ -46,6 +47,11 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 5.2 part B (contract 1.45.0): a {@code DELETE} starts the artifact's recorded deletion (202, no body,
  * {@code no-store}). From then on it is not found on every route; a deleting artifact is {@code request.not_found} to
  * a second delete too.
+ *
+ * <p>Story 5.4 part A (contract 1.48.0): every artifact answer carries {@code conversationId} (the conversation a saved
+ * draft came from; null for one written by hand) and {@code references} (a saved draft's sources, copied by value, in
+ * the shape of a turn's references, each {@code removed} as of the answer; empty for one written by hand). The save
+ * itself is {@link DraftSaveController}.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -98,8 +104,9 @@ class ArtifactController {
     }
 
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
-        "version", "currentVersion", "createdAt"}, description = "An artifact with its newest version, or one of its"
-            + " versions when asked by number (contract 1.42.0; currentVersion and versions from 1.44.0)")
+        "version", "currentVersion", "createdAt", "conversationId", "references"}, description = "An artifact with its"
+            + " newest version, or one of its versions when asked by number (contract 1.42.0; currentVersion and"
+            + " versions from 1.44.0; conversationId and references from 1.48.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
@@ -117,19 +124,63 @@ class ArtifactController {
             @Schema(description = "The number of the artifact's newest version (contract 1.44.0): the same as version"
                     + " unless an earlier version is shown", format = "int32", minimum = "1", example = "1")
             int currentVersion,
-            @Schema(description = "When the artifact was written", format = "date-time") String createdAt) {
+            @Schema(description = "When the artifact was written", format = "date-time") String createdAt,
+            @Schema(description = "The conversation the artifact was saved from, a draft's (contract 1.48.0); its page"
+                    + " is that conversation's. Null for an artifact written by hand, and once that conversation is"
+                    + " deleted", types = {"string", "null"}, format = "uuid") String conversationId,
+            @ArraySchema(arraySchema = @Schema(description = "The sources of the draft the artifact was saved from"
+                    + " (contract 1.48.0), copied by value when it was saved, by number, in the shape of a turn's"
+                    + " references (a passage's, a record's or an artifact's) without their positions in the text."
+                    + " removed is worked out as of this answer (a source deleted since reads as removed, and the"
+                    + " artifact's content is unchanged). Kept by every edit and restore. Empty for an artifact written"
+                    + " by hand"), schema = @Schema(ref = "#/components/schemas/TurnSourceReference"))
+            List<ReferenceView> references) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
                     artifact.name(), artifact.fields().stream().map(field -> new FieldView(field.name(), field.value()))
                     .toList(), artifact.content(), artifact.version(), artifact.currentVersion(),
-                    artifact.createdAt().toString());
+                    artifact.createdAt().toString(),
+                    artifact.conversationId() == null ? null : artifact.conversationId().toString(),
+                    artifact.references().stream().map(ReferenceView::of).toList());
         }
 
         @Override
         public String toString() {
             return "ArtifactView[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
                     + version + ", currentVersion=" + currentVersion + "]";
+        }
+    }
+
+    /**
+     * One of a saved draft's references as the artifact answers it (Story 5.4 part A): the JSON of a turn's
+     * {@code TurnSourceReference}, whose schema the contract names; the fields a kind does not have are absent.
+     * {@code toString} names the number and the kind only.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    record ReferenceView(int number, String kind, String materialName, List<String> sectionPath, Integer page,
+                         List<String> passageIds, String recordId, String artifactId, Integer artifactVersion,
+                         String recordType, String name, List<FieldView> fields, boolean removed, String tier) {
+
+        static ReferenceView of(TurnReference reference) {
+            TurnReference.Cited cited = reference.record();
+            List<FieldView> fields = cited == null ? null : cited.fields().stream()
+                    .map(field -> new FieldView(field.name(), field.value())).toList();
+            if (TurnReference.ARTIFACT.equals(reference.kind())) {
+                return new ReferenceView(reference.number(), reference.kind(), null, null, null, null, null,
+                        cited.id().toString(), cited.artifactVersion(), cited.type(), cited.name(), fields,
+                        reference.removed(), reference.tier());
+            }
+            return new ReferenceView(reference.number(), reference.kind(), reference.materialName(),
+                    reference.sectionPath(), reference.page(), reference.passageIds().stream().map(UUID::toString)
+                    .toList(), cited == null ? null : cited.id().toString(), null, null,
+                    cited == null ? null : cited.type(), cited == null ? null : cited.name(), fields,
+                    reference.removed(), reference.tier());
+        }
+
+        @Override
+        public String toString() {
+            return "ReferenceView[number=" + number + ", kind=" + kind + "]";
         }
     }
 

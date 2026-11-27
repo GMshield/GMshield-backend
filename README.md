@@ -1832,6 +1832,34 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `typeDropped`, `nameLength`), never the name. Deploy order: backend, then worker (internal contract 1.26.0; its
     minimum stays 1.20.0); the 1.46.0 frontend ignores `proposal` until Story 5.4.
 
+- **Save a draft through the save confirmation (`artifacts`, `conversations`, Story 5.4 part A, public contract
+  1.48.0, migration V49).** A finished draft becomes an artifact only on the GM's "Salvar".
+  - **Offered.** A draft turn that is done, not stopped and not silent (the bookmark rule plus `kind = draft`). Its
+    `StoredTurn.saving {state: offered|declined|saved, artifactId|null}` is worked out when read: saved while
+    `turn.saved_record_id` names an artifact live in the campaign (`Scopes.removedArtifacts`), declined once declined or
+    once that artifact is deleting or gone, offered otherwise; absent on every other turn.
+  - **Saving.** `POST /api/v1/turns/{turnId}/artifact` (`DraftSaveController`, body `SavedDraft {name, recordType,
+    content?}`, 201 with the `Artifact`). `Artifacts.saveDraft` runs one transaction: `Conversations.saveable` (404,
+    409 `conversation.turn_not_saveable`, 409 `conversation.turn_saved`), the artifact created as `Artifacts.create`
+    does (its limits and refusals, no fields; the content the draft's joined deltas unless sent) with
+    `record.conversation_id`, its index job, the draft's references copied by value into `artifact_reference`, sealed
+    again under the artifact (binding `artifact_reference`/`<field>:<number>`), then `Conversations.markSaved`, a
+    conditional bulk update (409 `conversation.turn_saved` when another save got there first, rolling everything back).
+    The turn's events never change. `artifacts` depends on `conversations :: service`, never the other way
+    (`ModuleBoundaryTest`).
+  - **Declining.** `PUT /api/v1/turns/{turnId}/save-decline` ("Agora não") and `DELETE` ("Salvar como artefato"), 204
+    and safe to repeat; 409 for a turn not offered or saved. A reopen also lets go of a deleted saved artifact.
+  - **The artifact.** `Artifact.conversationId|null` and `references` (the `TurnSourceReference` shape, `removed` worked
+    out when read: `Scopes.removedVersions` for a passage's or a record's, `Scopes.removedArtifacts` for an artifact's);
+    kept by every edit and restore, empty for one written by hand.
+  - **V49.** `record.conversation_id` and `turn.saved_record_id`, each `ON DELETE SET NULL` on that column alone (a
+    conversation's deletion keeps its artifacts; an artifact's pass frees its turn), `turn.save_declined_at` (set by a
+    decline and by a save, so a turn whose artifact is gone reads declined), and `artifact_reference` (cascade-deleted
+    with its record; the deletion pass deletes it first). Additive; the migration's comment gives the drop statements.
+  - Log lines (ids and counts only): `artifacts.draft_saved` (`edited`, `references`), `conversation.save_declined`,
+    `conversation.save_reopened`. Deploy order: backend, then frontend (minimum public contract 1.48.0); internal
+    contract and worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
