@@ -118,6 +118,13 @@ public interface ConversationStore {
     boolean clearBookmarked(UUID turnId);
 
     /**
+     * Stores the owner's turn's proposal (Story 5.3 part B): {@code name} a vault ciphertext, {@code type} a record type
+     * key or null, by one bulk update after the owner's row was read: true when this call changed the row; false for an
+     * unknown turn or another owner's. Changes nothing else.
+     */
+    boolean markProposed(UUID turnId, byte[] name, String type);
+
+    /**
      * The campaigns of the current owner's listed saved turns (Story 3.12): bookmarked, not dismissed, of a
      * {@code ready} conversation.
      */

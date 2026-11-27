@@ -23,7 +23,8 @@ import org.springframework.stereotype.Service;
  * extracts the core types rule, spell and item ({@link #EXTRACTED_CORE}, named by their stored English names) and every
  * type the GM approved in the systems its material counts under; the other core types (creature, character sheet,
  * encounter, dungeon, note) are never extracted. An approved type's name is decrypted for the records step's input
- * only, where the model reads it as data. Nothing here logs a name.
+ * only, where the model reads it as data, and (Story 5.3 part B, {@link #named}) for a draft's input, where the
+ * proposal's model reads it as data too. Nothing here logs a name.
  */
 @Service
 class RecordTypeKeyStore implements RecordTypeKeys {
@@ -82,5 +83,22 @@ class RecordTypeKeyStore implements RecordTypeKeys {
             return Set.of();
         }
         return Set.copyOf(store.keys(systemId));
+    }
+
+    @Override
+    public List<Named> named(UUID systemId) {
+        UUID owner = OwnerContext.require();
+        if (systemId == null || library.system(systemId).isEmpty()) {
+            return List.of();
+        }
+        Set<String> keys = store.keys(systemId);
+        List<Named> found = new ArrayList<>();
+        CoreRecordTypes.KEYS.stream().filter(keys::contains)
+                .forEach(key -> found.add(new Named(key, CoreRecordTypes.name(key))));
+        for (RecordTypeRow row : store.approvedRecordTypes(systemId)) {
+            found.add(new Named(row.key(), vault.decryptText(new Binding(Ontology.RECORD_TYPE, Ontology.FIELD_NAME,
+                    row.id(), owner), row.name())));
+        }
+        return List.copyOf(found);
     }
 }

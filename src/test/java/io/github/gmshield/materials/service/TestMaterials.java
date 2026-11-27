@@ -140,6 +140,11 @@ public final class TestMaterials {
         public Set<String> keysOf(UUID systemId) {
             return Set.copyOf(CORE);
         }
+
+        @Override
+        public List<Named> named(UUID systemId) {
+            return RecordTypeKeys.CORE.stream().map(key -> new Named(key, key.replace('_', ' '))).toList();
+        }
     };
 
     /** {@link Materials#passage}, package-private since Story 2.2, for the HTTP flow tests of {@code materials.web}. */

@@ -235,6 +235,19 @@ public class InMemoryConversationStore implements ConversationStore {
         return true;
     }
 
+    @Override
+    public synchronized boolean markProposed(UUID turnId, byte[] name, String type) {
+        Optional<TurnRow> found = findTurn(turnId);
+        if (found.isEmpty()) {
+            return false;
+        }
+        TurnRow before = found.get();
+        ownerFor(before.ownerId());
+        turns.put(turnId, before.proposed(name, type));
+        RollbackUndo.onRollback(() -> turns.put(turnId, before));
+        return true;
+    }
+
     /** As the JPA store's saved list: newest saved first, then by id, newest first. */
     private static final Comparator<TurnRow> SAVED = Comparator.comparing(TurnRow::bookmarkedAt)
             .thenComparing(TurnRow::id).reversed();

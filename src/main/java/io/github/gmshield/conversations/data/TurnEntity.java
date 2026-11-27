@@ -22,6 +22,9 @@ import org.hibernate.annotations.TenantId;
  * ({@code JpaConversationStore#markBookmarked}, {@code #clearBookmarked}) change it.
  *
  * <p>Story 5.3 part A (V47): {@code kind}, written once with the turn ({@code question} or {@code draft}).
+ *
+ * <p>Story 5.3 part B (V48): {@code proposal_name} and {@code proposal_type} are mapped not updatable, as
+ * {@code bookmarked_at} is: only the store's bulk update ({@code JpaConversationStore#markProposed}) writes them.
  */
 @Entity(name = "Turn")
 @Table(name = "turn")
@@ -74,6 +77,12 @@ class TurnEntity {
     @Column(name = "kind", nullable = false, updatable = false)
     private String kind;
 
+    @Column(name = "proposal_name", updatable = false)
+    private byte[] proposalName;
+
+    @Column(name = "proposal_type", updatable = false)
+    private String proposalType;
+
     protected TurnEntity() {
         // for Hibernate
     }
@@ -94,6 +103,8 @@ class TurnEntity {
         this.dismissedAt = row.dismissedAt();
         this.bookmarkedAt = row.bookmarkedAt();
         this.kind = row.kind();
+        this.proposalName = row.proposalName();
+        this.proposalType = row.proposalType();
     }
 
     void stop(Instant at) {
@@ -103,7 +114,8 @@ class TurnEntity {
     /** The row, with the materials switched off frozen with it (read from {@code turn_material_off}). */
     TurnRow row(Set<UUID> materialsOff) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
-                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind);
+                otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind,
+                proposalName, proposalType);
     }
 
     UUID id() {

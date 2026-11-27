@@ -464,7 +464,22 @@ class ConversationController {
             @Schema(description = "Whether the model could answer from its own knowledge on this turn: the switch as"
                     + " frozen when the question was asked (Story 3.8)") boolean modelKnowledge,
             @ArraySchema(arraySchema = @Schema(description = "The source references, by number (1..n, each once)"),
-                    schema = @Schema(implementation = SourceReference.class)) List<SourceReference> references) {
+                    schema = @Schema(implementation = SourceReference.class)) List<SourceReference> references,
+            @Schema(description = "What a finished draft is (contract 1.47.0): the name and record type the worker"
+                    + " proposed for it, to suggest when it is saved. Only on a draft's done that is neither stopped"
+                    + " nor silent, and only when the worker proposed one; never on an answer")
+            DraftProposal proposal) {
+    }
+
+    @Schema(name = "TurnDraftProposal", requiredProperties = {"name", "recordType"},
+            description = "A finished draft's proposal (contract 1.47.0): a suggestion only; nothing is saved")
+    record DraftProposal(
+            @Schema(description = "The suggested name, in the request's language: 1 to 120 code points, not blank",
+                    minLength = 1, maxLength = 120) String name,
+            @Schema(description = "The suggested record type key, one of the campaign system's record types when the"
+                    + " draft finished; null for none. A client shows its own translation of a core key, and the name"
+                    + " of the system's record type with that key otherwise", types = {"string", "null"},
+                    pattern = "^[a-z][a-z0-9_]{0,31}$") String recordType) {
     }
 
     @Schema(name = "TurnErrorEvent", requiredProperties = "code",

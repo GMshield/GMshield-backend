@@ -79,7 +79,9 @@ class JobClaimController {
                     + " a job of kind content.draft (a draft the GM asked for in the questions area) has the same input"
                     + " as question.answer {question, tiers, recordTypes, history, ...}, reads passages, records and"
                     + " terms within its turn's scope as question.answer does, posts its draft as answer events and"
-                    + " calls a model; it writes nothing to the library")
+                    + " calls a model; it writes nothing to the library. From contract 1.26.0 a content.draft input"
+                    + " also carries recordTypeNames: each recordTypes key with the name of the campaign system's record"
+                    + " type (data for the model that proposes the draft's type)")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")
@@ -136,7 +138,13 @@ class JobClaimController {
                     + " library.search result's ids may name records of the scope next to passages. From contract"
                     + " 1.20.0 an ingestion records step's result may carry proposals (at most 20, each a kind"
                     + " record_type or term, a name of at most 120 code points, a definition of at most 500 and at most"
-                    + " 3 examples, each a passageId and a quote of at most 200), checked against the cited passages")
+                    + " 3 examples, each a passageId and a quote of at most 200), checked against the cited passages."
+                    + " From contract 1.26.0 a content.draft result may carry proposal {name, recordType}: the draft's"
+                    + " suggested name (a string of 1 to 120 code points, not blank) and record type (one of the input's"
+                    + " recordTypes keys, or null); a proposal that is not an object, a name that is not such a string"
+                    + " or a recordType that is neither a string nor null is 400 job.result_invalid, and a recordType"
+                    + " that is no longer a key of the campaign's system is stored as null. A missing result or"
+                    + " proposal is accepted with none")
             Map<String, Object> result,
             @ArraySchema(maxItems = JobClaims.MAX_USAGE, arraySchema = @Schema(description = "The usage of the"
                     + " attempt's model calls not posted with events (contract 1.17.0), done or failed, recorded once"

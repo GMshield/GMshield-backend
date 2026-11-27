@@ -1808,6 +1808,30 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     (internal contract 1.25.0), then frontend (minimum public contract 1.46.0); the previous frontend and worker keep
     working, since questions are unchanged and no draft is asked until the new frontend sends one.
 
+- **The draft's proposal (`conversations`, Story 5.3 part B, public contract 1.47.0, internal contract 1.26.0,
+  migration V48).** A finished draft says what it is: the worker proposes a name and a record type for it, which Story
+  5.4's save confirmation will suggest. Nothing is written to the library.
+  - **The claim.** A `content.draft` input adds `recordTypeNames`: each `recordTypes` key with the name of the campaign
+    system's record type (`Scopes.recordTypeNames`, through `RecordTypeKeys.named`: a core type by its stored English
+    name, an approved one decrypted), data for the model.
+  - **The result.** `DraftJobs.completed` reads `result.proposal {name, recordType}`. A missing result or proposal is
+    accepted with none, so part A's worker keeps working. A proposal that is not an object, a name that is not a string or
+    that, once trimmed, is blank or longer than 120 code points, or a `recordType` that is neither a string nor null is 400
+    `job.result_invalid`, and nothing changes. A `recordType` that is not a key of the campaign's system when the draft
+    ends (`Scopes.recordTypeKeys`) is stored as null.
+  - **Stored before `done`.** Only when the turn has not ended and was not stopped, `markProposed` (one bulk update)
+    stores the name trimmed and encrypted (binding `turn`/`proposal_name`) and the type plain, in the transaction that
+    appends `done` (`AnswerJobs.completed` runs it before the references and `done`), so no reader sees a done draft
+    without its proposal. An answer's result is never read.
+  - **Exposed.** `TurnDoneEvent.proposal {name, recordType|null}` on the stream's `done` and in the stored turns, only
+    when one is stored and the turn is neither stopped nor silent (worked out when `done` is read).
+  - **V48.** Nullable `turn.proposal_name` (bytea) and `turn.proposal_type` (varchar(32)), the type set only with a name
+    (`turn_proposal_type_check`). Additive: the previous release neither reads nor writes them; the migration's comment
+    gives the statement that drops them.
+  - Log lines (ids and counts only, a core type key or `approved`): `conversation.proposal_stored` (`recordType`,
+    `typeDropped`, `nameLength`), never the name. Deploy order: backend, then worker (internal contract 1.26.0; its
+    minimum stays 1.20.0); the 1.46.0 frontend ignores `proposal` until Story 5.4.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

@@ -46,8 +46,8 @@ public interface RecordTypeKeys {
     }
 
     /**
-     * A type a records step may extract: its key and its name, as the model reads it. {@code toString} names a core key
-     * only.
+     * A type a records step may extract (or, Story 5.3 part B, a type a draft's proposal may name): its key and its
+     * name, as the model reads it. {@code toString} names a core key only.
      */
     @NamedInterface("service")
     record Named(String key, String name) {
@@ -75,4 +75,12 @@ public interface RecordTypeKeys {
      * system that is unknown, another owner's or being deleted.
      */
     Set<String> keysOf(UUID systemId);
+
+    /**
+     * Every record type of the owner's system {@code systemId} with its name (Story 5.3 part B), the keys of
+     * {@link #keysOf}: the core types first in their fixed order, by their stored English names, then the approved ones
+     * oldest first, their names decrypted for a model's input only (data). Empty for a system that is unknown, another
+     * owner's or being deleted.
+     */
+    List<Named> named(UUID systemId);
 }

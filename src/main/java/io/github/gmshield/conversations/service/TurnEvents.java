@@ -85,14 +85,21 @@ final class TurnEvents {
      * {@code page} and {@code passageIds}. {@code stopped} (Story 2.6) is whether the GM stopped the
      * answer; {@code silent} is true exactly when it was not stopped, there is no reference and (Story 3.8) no
      * {@code model} tier event was stored: a stopped answer is never the silent one. {@code modelKnowledge} is the
-     * turn's frozen switch.
+     * turn's frozen switch. {@code proposal: {name, recordType}} (Story 5.3 part B, {@code recordType} a key or null)
+     * is present only when the turn has a stored proposal and is neither stopped nor silent: whether a draft is silent
+     * is worked out here, so a silent draft's proposal is hidden here too, never when it is stored.
      */
     static ObjectNode doneData(Conversations.Ending ending, boolean stopped) {
         List<TurnReference> references = ending.references();
         ObjectNode data = JsonNodeFactory.instance.objectNode();
+        boolean silent = !stopped && references.isEmpty() && !ending.modelTier();
         data.put("stopped", stopped);
-        data.put("silent", !stopped && references.isEmpty() && !ending.modelTier());
+        data.put("silent", silent);
         data.put("modelKnowledge", ending.modelKnowledge());
+        Conversations.Proposal proposal = ending.proposal();
+        if (proposal != null && !stopped && !silent) {
+            data.putObject("proposal").put("name", proposal.name()).put("recordType", proposal.recordType());
+        }
         ArrayNode list = data.putArray("references");
         for (TurnReference reference : references) {
             ObjectNode entry = list.addObject();

@@ -37,6 +37,9 @@ import org.springframework.stereotype.Repository;
  * {@link #clearBookmarked}). The saved list ({@link #savedTurns}, {@link #savedCount}, {@link #savedCampaigns}) joins
  * each saved, shown turn to its {@code ready} conversation on the owner and the conversation's id; deleting a turn (by
  * any route) removes its bookmark with the row.
+ *
+ * <p>Story 5.3 part B: {@code turn.proposal_name} and {@code turn.proposal_type} are written by one bulk update only
+ * ({@link #markProposed}).
  */
 @Repository
 class JpaConversationStore implements ConversationStore {
@@ -270,6 +273,16 @@ class JpaConversationStore implements ConversationStore {
         }
         return em().createQuery("update Turn t set t.bookmarkedAt = null where t.id = :id"
                 + " and t.bookmarkedAt is not null").setParameter("id", turnId).executeUpdate() > 0;
+    }
+
+    @Override
+    public boolean markProposed(UUID turnId, byte[] name, String type) {
+        if (findTurn(turnId).isEmpty()) {
+            return false;
+        }
+        // As markBookmarked: one bulk update after the owner's row was read (Story 5.3 part B).
+        return em().createQuery("update Turn t set t.proposalName = :name, t.proposalType = :type where t.id = :id")
+                .setParameter("name", name).setParameter("type", type).setParameter("id", turnId).executeUpdate() > 0;
     }
 
     @Override

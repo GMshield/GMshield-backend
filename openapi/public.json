@@ -2938,6 +2938,10 @@
             "description" : "Whether the model could answer from its own knowledge on this turn: the switch as frozen when the question was asked (Story 3.8)",
             "type" : "boolean"
           },
+          "proposal" : {
+            "$ref" : "#/components/schemas/TurnDraftProposal",
+            "description" : "What a finished draft is (contract 1.47.0): the name and record type the worker proposed for it, to suggest when it is saved. Only on a draft's done that is neither stopped nor silent, and only when the worker proposed one; never on an answer"
+          },
           "references" : {
             "description" : "The source references, by number (1..n, each once)",
             "items" : {
@@ -2955,6 +2959,24 @@
           }
         },
         "required" : [ "modelKnowledge", "references", "silent", "stopped" ],
+        "type" : "object"
+      },
+      "TurnDraftProposal" : {
+        "description" : "A finished draft's proposal (contract 1.47.0): a suggestion only; nothing is saved",
+        "properties" : {
+          "name" : {
+            "description" : "The suggested name, in the request's language: 1 to 120 code points, not blank",
+            "maxLength" : 120,
+            "minLength" : 1,
+            "type" : "string"
+          },
+          "recordType" : {
+            "description" : "The suggested record type key, one of the campaign system's record types when the draft finished; null for none. A client shows its own translation of a core key, and the name of the system's record type with that key otherwise",
+            "pattern" : "^[a-z][a-z0-9_]{0,31}$",
+            "type" : [ "string", "null" ]
+          }
+        },
+        "required" : [ "name", "recordType" ],
         "type" : "object"
       },
       "TurnErrorEvent" : {
@@ -3131,7 +3153,7 @@
   },
   "info" : {
     "title" : "GMshield public API",
-    "version" : "1.46.0"
+    "version" : "1.47.0"
   },
   "openapi" : "3.1.0",
   "paths" : {

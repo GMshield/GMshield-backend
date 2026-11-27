@@ -30,8 +30,11 @@ import io.github.gmshield.jobs.data.JobRow;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.jobs.service.JobSweep;
 import io.github.gmshield.jobs.service.Jobs;
+import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
+import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.limits.data.InMemoryUsageStore;
 import io.github.gmshield.limits.data.UsageRow;
 import io.github.gmshield.materials.data.IndexChangeRow;
@@ -142,6 +145,12 @@ import tools.jackson.databind.json.JsonMapper;
  * area (by area or by the conversation's) or an unknown kind refused with the field {@code kind}, nothing recorded; a
  * stopped draft, a silent one and a failed one; and a finished draft bookmarked, in the next turn's history, never a
  * source, and dismissed until its undo.
+ *
+ * <p>Story 5.3 part B: the draft's claim with its {@code recordTypeNames}; its proposal stored (the name encrypted) with
+ * its done, streamed and in the stored turns; none when stopped, silent, done with no result, or for an answer; a type
+ * that is not a key of the system stored as null; the malformed proposals refused with {@code job.result_invalid},
+ * nothing changed; a name measured once trimmed; an approved type named in the claim, stored and exposed as its key and
+ * logged as {@code approved}; and no proposed name, request, draft or approved key in a line.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"GMSHIELD_MODE=test",
     "gmshield.conversations.keep-alive=400ms", "gmshield.conversations.poll=100ms"})
@@ -220,6 +229,8 @@ class ConversationFlowTest {
     private InMemoryIndexStore index;
     @Autowired
     private InMemoryLibraryStore library;
+    @Autowired
+    private InMemoryKnowledgeStore knowledge;
     @Autowired
     private InMemoryScopeStore scopes;
     @Autowired
@@ -3383,6 +3394,223 @@ class ConversationFlowTest {
         stopTurn(gm, later);
         assertThat(dismissal(gm, "DELETE", draft.toString()).statusCode()).isEqualTo(204);
         assertThat(turnIds(gm, conversation)).startsWith(draft.toString());
+    }
+
+    // --- Story 5.3 part B: the draft's proposal
+
+    private static final String PROPOSED = "{\"outcome\":\"done\",\"result\":{\"proposal\":"
+            + "{\"name\":\"Emboscada na Cripta\",\"recordType\":\"encounter\"}}}";
+
+    @Test
+    void aDraftsProposalIsStoredWithItsDoneAndExposedOnTheStreamAndTheStoredTurnsWithTheNamesInItsClaim()
+            throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(turnId));
+        // recordTypeNames: each recordTypes key with the name of the system's type.
+        JsonNode names = claim.input().path("recordTypeNames");
+        assertThat(strings(claim.input().path("recordTypes"))).contains("encounter", "character_sheet");
+        assertThat(names.propertyNames()).containsExactlyInAnyOrderElementsOf(
+                strings(claim.input().path("recordTypes")));
+        assertThat(names.path("encounter").asString()).isEqualTo("encounter");
+        assertThat(names.path("character_sheet").asString()).isEqualTo("character sheet");
+        postEvents(claim, 1, List.of(delta("## Encontro na cripta\n\n"), citation(passages.getFirst(), 0)),
+                List.of());
+
+        assertThat(report(claim, PROPOSED).statusCode()).isEqualTo(204);
+
+        JsonNode proposal = done(gm, turnId, null).path("proposal");
+        assertThat(proposal.path("name").asString()).isEqualTo("Emboscada na Cripta");
+        assertThat(proposal.path("recordType").asString()).isEqualTo("encounter");
+        // Stored: the type plain, the name encrypted under the turn's own binding.
+        TurnRow row = conversations.turns.get(turnId);
+        assertThat(row.proposalType()).isEqualTo("encounter");
+        assertThat(new String(row.proposalName(), StandardCharsets.ISO_8859_1)).doesNotContain("Emboscada");
+        assertThat(as(gm.id(), () -> vault.decryptText(new io.github.gmshield.vault.service.Binding("turn",
+                "proposal_name", turnId, gm.id()), row.proposalName()))).isEqualTo("Emboscada na Cripta");
+        assertThat(row.toString()).doesNotContain("Emboscada");
+        // Reopened: the stored turn's done has it too.
+        JsonNode items = json(get(gm, "/api/v1/conversations/" + row.conversationId() + "/turns")).path("items");
+        JsonNode storedDone = items.get(0).path("events").get(2);
+        assertThat(storedDone.path("type").asString()).isEqualTo("done");
+        assertThat(storedDone.path("data").path("proposal")).isEqualTo(proposal);
+        // A line says a proposal was stored, never its name, the request or the draft.
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getMessage()).isEqualTo("conversation.proposal_stored");
+            assertThat(event.getKeyValuePairs()).anySatisfy(pair -> {
+                assertThat(pair.key).isEqualTo("recordType");
+                assertThat(pair.value).isEqualTo("encounter");
+            });
+        });
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("Emboscada").doesNotContain("cripta")
+                .doesNotContain("Cripta").doesNotContain("character sheet"));
+    }
+
+    @Test
+    void aStoppedOrSilentDraftOrOneDoneWithNoResultOrAnAnswerHasNoProposalInItsDone() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        // Stopped: the later done's proposal is not stored, and done has none.
+        UUID stopped = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(stopped));
+        postEvents(claim, 1, List.of(delta("## Encontro"), citation(passages.getFirst(), 0)), List.of());
+        assertThat(stopTurn(gm, stopped).statusCode()).isEqualTo(204);
+        assertThat(report(claim, PROPOSED).statusCode()).isEqualTo(204);
+        assertThat(done(gm, stopped, null).has("proposal")).isFalse();
+        assertThat(conversations.turns.get(stopped).proposed()).isFalse();
+
+        // Silent: stored, but done is silent and shows none, also when reopened.
+        UUID silent = turnId(askKind(gm, "Um dragão de gelo", null, null, "draft"));
+        Claim empty = claim(jobOf(silent));
+        postEvents(empty, 1, List.of(delta("Nada nas fontes serve para este rascunho.")), List.of());
+        assertThat(report(empty, PROPOSED).statusCode()).isEqualTo(204);
+        JsonNode silentDone = done(gm, silent, null);
+        assertThat(silentDone.path("silent").asBoolean()).isTrue();
+        assertThat(silentDone.has("proposal")).isFalse();
+        UUID conversation = conversations.turns.get(silent).conversationId();
+        assertThat(json(get(gm, "/api/v1/conversations/" + conversation + "/turns")).path("items").toString())
+                .doesNotContain("proposal");
+
+        // Part A's worker: done with no result, or a result with no proposal.
+        for (String outcome : List.of("{\"outcome\":\"done\"}", "{\"outcome\":\"done\",\"result\":{}}")) {
+            UUID old = turnId(askKind(gm, DRAFT, null, null, "draft"));
+            Claim oldClaim = claim(jobOf(old));
+            postEvents(oldClaim, 1, List.of(delta("## Cripta"), citation(passages.getFirst(), 0)), List.of());
+            assertThat(report(oldClaim, outcome).statusCode()).isEqualTo(204);
+            JsonNode oldDone = done(gm, old, null);
+            assertThat(oldDone.path("silent").asBoolean()).isFalse();
+            assertThat(oldDone.has("proposal")).isFalse();
+            assertThat(conversations.turns.get(old).proposed()).isFalse();
+        }
+
+        // An answer reports none, and a proposal in its result is never stored.
+        UUID answer = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim answered = claim(jobOf(answer));
+        postEvents(answered, 1, List.of(delta("Fire Bolt causa 1d10."), citation(passages.getFirst(), 0)), List.of());
+        assertThat(report(answered, PROPOSED).statusCode()).isEqualTo(204);
+        assertThat(done(gm, answer, null).has("proposal")).isFalse();
+        assertThat(conversations.turns.get(answer).proposed()).isFalse();
+    }
+
+    @Test
+    void aProposedTypeThatIsNotAKeyOfTheSystemIsStoredAsNullAndANullTypeIsKept() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        for (String type : List.of("\"dragon_lair\"", "\"Encounter\"", "null")) {
+            UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+            Claim claim = claim(jobOf(turnId));
+            postEvents(claim, 1, List.of(delta("## Covil"), citation(passages.getFirst(), 0)), List.of());
+
+            HttpResponse<String> reported = report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":"
+                    + "{\"name\":\"  Covil do Dragão  \",\"recordType\":" + type + "}}}");
+
+            assertThat(reported.statusCode()).as(type).isEqualTo(204);
+            JsonNode proposal = done(gm, turnId, null).path("proposal");
+            assertThat(proposal.path("name").asString()).isEqualTo("Covil do Dragão");
+            assertThat(proposal.has("recordType")).isTrue();
+            assertThat(proposal.path("recordType").isNull()).as(type).isTrue();
+            assertThat(conversations.turns.get(turnId).proposalType()).isNull();
+            assertThat(conversations.turns.get(turnId).proposed()).isTrue();
+        }
+        // A proposal with no recordType reads as null too.
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(turnId));
+        postEvents(claim, 1, List.of(delta("## Covil"), citation(passages.getFirst(), 0)), List.of());
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":{\"name\":\"Covil\"}}}")
+                .statusCode()).isEqualTo(204);
+        assertThat(done(gm, turnId, null).path("proposal").path("recordType").isNull()).isTrue();
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getMessage()).isEqualTo("conversation.proposal_stored");
+            assertThat(event.getKeyValuePairs()).anySatisfy(pair -> {
+                assertThat(pair.key).isEqualTo("typeDropped");
+                assertThat(pair.value).isEqualTo(true);
+            });
+        });
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("dragon_lair").doesNotContain("Covil"));
+    }
+
+    @Test
+    void aMalformedProposalIsRefusedAsAnInvalidResultAndChangesNothing() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(turnId));
+        postEvents(claim, 1, List.of(delta("## Encontro"), citation(passages.getFirst(), 0)), List.of());
+        String longName = "a".repeat(121);
+        String longestName = "\uD83D\uDC09".repeat(120);
+
+        for (String proposal : List.of("{\"name\":\"" + "x".repeat(500) + "\",\"recordType\":null}",
+                "{\"name\":\"" + longName + "\"}", "{\"name\":\"Cripta\",\"recordType\":7}",
+                "{\"name\":\"Cripta\",\"recordType\":[\"encounter\"]}", "{\"name\":\"   \"}",
+                "{\"name\":\"\"}", "{\"recordType\":\"encounter\"}", "{\"name\":7}", "\"Cripta\"", "null",
+                "[]")) {
+            HttpResponse<String> refused = report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":"
+                    + proposal + "}}");
+            assertProblem(refused, 400, "job.result_invalid");
+        }
+        // Nothing changed: the turn is still running, with no proposal and no done.
+        assertThat(conversations.turns.get(turnId).proposed()).isFalse();
+        assertThat(jobs.row(jobOf(turnId)).state()).isEqualTo("running");
+        assertThat(logged.list).anySatisfy(event -> assertThat(event.getMessage()).isEqualTo("job.result_invalid"));
+
+        // 120 code points (each a surrogate pair) is the longest name accepted.
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":{\"name\":\""
+                + longestName + "\",\"recordType\":\"encounter\"}}}").statusCode()).isEqualTo(204);
+        assertThat(done(gm, turnId, null).path("proposal").path("name").asString())
+                .isEqualTo("\uD83D\uDC09".repeat(120));
+    }
+
+    @Test
+    void aNameIsMeasuredOnceTrimmed() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+        Claim claim = claim(jobOf(turnId));
+        postEvents(claim, 1, List.of(delta("## Encontro"), citation(passages.getFirst(), 0)), List.of());
+        String name = "a".repeat(119);
+
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":{\"name\":\"  " + name
+                + "    \",\"recordType\":null}}}").statusCode()).isEqualTo(204);
+
+        assertThat(done(gm, turnId, null).path("proposal").path("name").asString()).isEqualTo(name);
+    }
+
+    @Test
+    void anApprovedTypeIsNamedInTheClaimStoredAndExposedAsItsKeyAndLoggedAsApproved() throws Exception {
+        Gm gm = signUp();
+        List<UUID> passages = accepted(gm, 1);
+        UUID system = UUID.fromString(json(get(gm, "/api/v1/campaigns/current")).path("system").path("id").asString());
+        UUID typeId = Ids.newId();
+        OwnerContext.runAs(gm.id(), () -> knowledge.insertRecordTypes(List.of(new RecordTypeRow(typeId, gm.id(),
+                system, null, "talento", Ids.newId(), vault.encryptText(new io.github.gmshield.vault.service.Binding(
+                        "record_type", "name", typeId, gm.id()), "Talento Arcano"),
+                vault.fingerprint("record_type", "name", Library.uniqueForm("Talento Arcano")), 0, Instant.now()))));
+        UUID turnId = turnId(askKind(gm, DRAFT, null, null, "draft"));
+
+        Claim claim = claim(jobOf(turnId));
+
+        assertThat(strings(claim.input().path("recordTypes"))).contains("talento");
+        assertThat(claim.input().path("recordTypeNames").path("talento").asString()).isEqualTo("Talento Arcano");
+        postEvents(claim, 1, List.of(delta("## Talento"), citation(passages.getFirst(), 0)), List.of());
+        assertThat(report(claim, "{\"outcome\":\"done\",\"result\":{\"proposal\":{\"name\":\"Lâmina Rúnica\","
+                + "\"recordType\":\"talento\"}}}").statusCode()).isEqualTo(204);
+        assertThat(conversations.turns.get(turnId).proposalType()).isEqualTo("talento");
+        JsonNode proposal = done(gm, turnId, null).path("proposal");
+        assertThat(proposal.path("recordType").asString()).isEqualTo("talento");
+        assertThat(proposal.path("name").asString()).isEqualTo("Lâmina Rúnica");
+        assertThat(logged.list).anySatisfy(event -> {
+            assertThat(event.getMessage()).isEqualTo("conversation.proposal_stored");
+            assertThat(event.getKeyValuePairs()).anySatisfy(pair -> {
+                assertThat(pair.key).isEqualTo("recordType");
+                assertThat(pair.value).isEqualTo("approved");
+            });
+        });
+        assertThat(logged.list).allSatisfy(event -> assertThat(event.getFormattedMessage() + " "
+                + event.getKeyValuePairs()).doesNotContain("talento").doesNotContain("Talento")
+                .doesNotContain("Lâmina"));
     }
 
     private HttpResponse<String> askKind(Gm gm, String question, UUID conversation, String area, String kind)
