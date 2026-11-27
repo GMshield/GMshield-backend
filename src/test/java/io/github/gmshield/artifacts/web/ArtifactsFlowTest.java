@@ -35,6 +35,8 @@ import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.net.http.HttpClient;
@@ -48,6 +50,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import javax.imageio.ImageIO;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -100,6 +108,17 @@ import tools.jackson.databind.json.JsonMapper;
  * relation, sharing or conversation) and every other route is not found there; unshared or deleting it is not found
  * there, and its deletion's pass takes its shares; another owner finds none of it. The scope rows are
  * {@code RecordsFlowTest}'s, the cross-owner ones {@code CrossOwnerAuditFlowTest}'s.
+ *
+ * <p>Story 5.7 part A, every API row of its matrix: one PDF prints the name, type, fields, content and numbered sources
+ * with its accents and a removed source marked (in pt-BR and en, read back with {@code PDFTextStripper}); several
+ * artifacts make one Markdown, TXT or PDF file in the order given; one JPG is one image and several a zip of one image
+ * each in order, and a 20,000-character artifact is one tall image of all its pages; an artifact shared into the
+ * campaign is exported there; any unreadable id (another owner's, unknown, another campaign's, deleting, malformed)
+ * makes the whole export {@code request.not_found}; 51 ids, a duplicate, an empty one, a bad format or language is
+ * {@code request.invalid}; a PDF or JPG of more than 200 pages in all is {@code artifact.export_too_large} while TXT
+ * and Markdown still work (the busy gate is {@code ArtifactExportsTest}'s). Besides the matrix: a name is made safe
+ * for the file (a name beyond ASCII sent in both forms), an approved type prints its name, and Markdown prints the text
+ * as text. That nothing is written to disk is {@code ArtifactExportsTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -1407,7 +1426,301 @@ class ArtifactsFlowTest {
         assertThat(listed.path("types")).isEmpty();
     }
 
+    // --- export (Story 5.7 part A)
+
+    @Test
+    void onePdfPrintsTheNameTypeFieldsContentAndNumberedSourcesWithItsAccentsAndARemovedOneMarked() throws Exception {
+        Gm gm = signUp();
+        String kael = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        String skeleton = create(gm, gm.campaign(), "creature", "Esqueleto");
+        UUID artifact = UUID.fromString(kael);
+        // A material's place whose version is gone (removed) and a live artifact.
+        OwnerContext.runAs(gm.id(), () -> references.insert(List.of(
+                reference(gm, artifact, 1, Ids.newId(), Ids.newId(), null, null, null),
+                reference(gm, artifact, 2, null, null, UUID.fromString(skeleton), "creature", 1))));
+
+        HttpResponse<byte[]> exported = export(gm, gm.campaign(), "ids=" + kael + "&format=pdf");
+
+        assertThat(exported.statusCode()).as(new String(exported.body(), StandardCharsets.UTF_8)).isEqualTo(200);
+        assertThat(exported.headers().firstValue("Content-Type")).hasValue("application/pdf");
+        assertThat(exported.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"Espada de Kael.pdf\"; filename*=UTF-8''Espada%20de%20Kael.pdf");
+        assertThat(exported.headers().firstValue("Cache-Control")).hasValue("no-store");
+        assertThat(exported.headers().firstValue("X-Content-Type-Options")).hasValue("nosniff");
+        assertThat(exported.headers().firstValue("Content-Length")).hasValue(String.valueOf(exported.body().length));
+        String text = pdfText(exported.body());
+        assertThat(text).containsSubsequence("Espada de Kael", "Item", "Dano: 1d8 cortante", "Peso: 1,5 kg",
+                "Forjada nas montanhas do norte.", "Brilha perto de orcs.", "Fontes",
+                "[1] SRD Livro, Magias > Fire Bolt, p. 3 (fonte removida)", "[2] Criatura: Nome 2 (versão 1)");
+        assertThat(pages(exported.body())).isEqualTo(1);
+
+        // In English, the labels follow: the record type's, the title and the marks.
+        String english = pdfText(export(gm, gm.campaign(), "ids=" + kael + "&format=pdf&language=en").body());
+        assertThat(english).containsSubsequence("Espada de Kael", "Item", "Sources",
+                "[1] SRD Livro, Magias > Fire Bolt, p. 3 (source removed)", "[2] Creature: Nome 2 (version 1)");
+        assertThat(english).doesNotContain("Fontes");
+    }
+
+    @Test
+    void severalArtifactsMakeOneFileInTheOrderGivenEachFromANewSectionOrPage() throws Exception {
+        Gm gm = signUp();
+        String a = create(gm, gm.campaign(), "note", "Alfa");
+        String b = create(gm, gm.campaign(), "character_sheet", "Beta");
+
+        HttpResponse<byte[]> markdown = export(gm, gm.campaign(), "ids=" + b + "," + a + "&format=markdown");
+
+        assertThat(markdown.statusCode()).isEqualTo(200);
+        assertThat(markdown.headers().firstValue("Content-Type")).hasValue("text/markdown;charset=UTF-8");
+        assertThat(markdown.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"artefatos.md\"; filename*=UTF-8''artefatos.md");
+        String md = new String(markdown.body(), StandardCharsets.UTF_8);
+        assertThat(md).isEqualTo("# Beta\n\n*Ficha de personagem*\n\n---\n\n# Alfa\n\n*Nota*\n");
+
+        HttpResponse<byte[]> txt = export(gm, gm.campaign(), "ids=" + a + "," + b + "&format=txt&language=en");
+        assertThat(txt.headers().firstValue("Content-Type")).hasValue("text/plain;charset=UTF-8");
+        assertThat(txt.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"artifacts.txt\"; filename*=UTF-8''artifacts.txt");
+        assertThat(new String(txt.body(), StandardCharsets.UTF_8)).isEqualTo("Alfa\nNote"
+                + "\n\n========================================\n\nBeta\nCharacter sheet\n");
+
+        HttpResponse<byte[]> pdf = export(gm, gm.campaign(), "ids=" + b + "," + a + "&format=pdf");
+        assertThat(pages(pdf.body())).isEqualTo(2);
+        assertThat(pdfText(pdf.body())).containsSubsequence("Beta", "Ficha de personagem", "Alfa", "Nota");
+    }
+
+    @Test
+    void oneJpgIsOneImageAndSeveralAreAZipOfOneImageEachInTheOrderGiven() throws Exception {
+        Gm gm = signUp();
+        String kael = json(send(gm, "POST", artifacts(gm.campaign()), KAEL)).path("id").asString();
+        String a = create(gm, gm.campaign(), "note", "Alfa");
+        String b = create(gm, gm.campaign(), "item", "Bê/ta");
+
+        HttpResponse<byte[]> one = export(gm, gm.campaign(), "ids=" + kael + "&format=jpg");
+        assertThat(one.statusCode()).isEqualTo(200);
+        assertThat(one.headers().firstValue("Content-Type")).hasValue("image/jpeg");
+        assertThat(one.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"Espada de Kael.jpg\"; filename*=UTF-8''Espada%20de%20Kael.jpg");
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(one.body()));
+        assertThat(image.getWidth()).isEqualTo(909);
+        assertThat(image.getHeight()).isEqualTo(1286);
+
+        HttpResponse<byte[]> several = export(gm, gm.campaign(), "ids=" + b + "," + kael + "," + a + "&format=jpg");
+        assertThat(several.statusCode()).isEqualTo(200);
+        assertThat(several.headers().firstValue("Content-Type")).hasValue("application/zip");
+        assertThat(several.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"artefatos.zip\"; filename*=UTF-8''artefatos.zip");
+        Map<String, BufferedImage> entries = new LinkedHashMap<>();
+        try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(several.body()))) {
+            for (ZipEntry entry = zip.getNextEntry(); entry != null; entry = zip.getNextEntry()) {
+                entries.put(entry.getName(), ImageIO.read(new ByteArrayInputStream(zip.readAllBytes())));
+            }
+        }
+        assertThat(entries.keySet()).containsExactly("01-Bê ta.jpg", "02-Espada de Kael.jpg", "03-Alfa.jpg");
+        assertThat(entries.values()).allSatisfy(each -> assertThat(each.getWidth()).isEqualTo(909));
+    }
+
+    @Test
+    void aLongArtifactIsOneTallJpgOfAllItsPages() throws Exception {
+        Gm gm = signUp();
+        StringBuilder content = new StringBuilder();
+        while (content.length() < 20_000) {
+            content.append("Linha da história de Kael, com acentos: ação, coração. ");
+        }
+        String body = JSON.writeValueAsString(Map.of("recordType", "note", "name", "Crônica", "fields", List.of(),
+                "content", content.substring(0, 20_000).strip()));
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), body)).path("id").asString();
+
+        int pages = pages(export(gm, gm.campaign(), "ids=" + id + "&format=pdf").body());
+        HttpResponse<byte[]> jpg = export(gm, gm.campaign(), "ids=" + id + "&format=jpg");
+
+        assertThat(pages).isGreaterThan(2);
+        assertThat(jpg.statusCode()).isEqualTo(200);
+        // A name beyond ASCII: its ASCII form, and the UTF-8 name percent-encoded.
+        assertThat(jpg.headers().firstValue("Content-Disposition"))
+                .hasValue("attachment; filename=\"Cronica.jpg\"; filename*=UTF-8''Cr%C3%B4nica.jpg");
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(jpg.body()));
+        assertThat(image.getWidth()).isEqualTo(909);
+        assertThat(image.getHeight()).isEqualTo(pages * 1286);
+    }
+
+    @Test
+    void anArtifactOfAnApprovedTypeIsExportedWithTheTypesNameNotItsKey() throws Exception {
+        Gm gm = signUp();
+        String key = approvedType(gm);
+        String id = create(gm, gm.campaign(), key, "Arco élfico");
+
+        HttpResponse<byte[]> txt = export(gm, gm.campaign(), "ids=" + id + "&format=txt");
+
+        assertThat(txt.statusCode()).isEqualTo(200);
+        assertThat(new String(txt.body(), StandardCharsets.UTF_8)).isEqualTo("Arco élfico\nTipo " + key + "\n");
+    }
+
+    @Test
+    void aTypePastTheFirstPageOfFiftyRecordTypesIsExportedByItsName() throws Exception {
+        Gm gm = signUp();
+        // The 8 core types, then 50 approved ones: the last is the 58th, past the first page of 50.
+        String last = null;
+        for (int i = 0; i < 50; i++) {
+            last = approvedIn(gm, gm.system(), "tipo_" + i);
+        }
+        String id = create(gm, gm.campaign(), last, "Talento raro");
+
+        HttpResponse<byte[]> txt = export(gm, gm.campaign(), "ids=" + id + "&format=txt");
+
+        assertThat(txt.statusCode()).isEqualTo(200);
+        assertThat(new String(txt.body(), StandardCharsets.UTF_8)).isEqualTo("Talento raro\nTipo tipo_49\n");
+    }
+
+    @Test
+    void aPdfOrJpgExportOfMoreThanTwoHundredPagesIsTooLargeWhileTxtAndMarkdownStillWork() throws Exception {
+        Gm gm = signUp();
+        // 64 fields of 8,000 characters: about 130 pages each, so two pass 200 pages in all.
+        String value = "Uma linha longa de ficha com acentos: ação, coração. ".repeat(160).substring(0, 8_000).strip();
+        List<Map<String, String>> fields = new ArrayList<>();
+        for (int i = 0; i < 64; i++) {
+            fields.add(Map.of("name", "Campo " + i, "value", value));
+        }
+        List<String> ids = new ArrayList<>();
+        for (String name : List.of("Tomo I", "Tomo II")) {
+            HttpResponse<String> created = send(gm, "POST", artifacts(gm.campaign()), JSON.writeValueAsString(
+                    Map.of("recordType", "note", "name", name, "fields", fields)));
+            assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+            ids.add(json(created).path("id").asString());
+        }
+        String both = "ids=" + String.join(",", ids);
+
+        for (String format : List.of("pdf", "jpg")) {
+            HttpResponse<byte[]> refused = export(gm, gm.campaign(), both + "&format=" + format);
+            String problem = new String(refused.body(), StandardCharsets.UTF_8);
+            assertThat(refused.statusCode()).as(format + " " + problem).isEqualTo(400);
+            assertThat(JSON.readTree(problem).path("code").asString()).isEqualTo("artifact.export_too_large");
+            assertThat(refused.headers().firstValue("Content-Disposition")).isEmpty();
+            assertThat(problem).doesNotContain("Tomo");
+        }
+        // TXT and Markdown are not counted; one of them alone is within the limit.
+        assertThat(export(gm, gm.campaign(), both + "&format=txt").statusCode()).isEqualTo(200);
+        assertThat(export(gm, gm.campaign(), both + "&format=markdown").statusCode()).isEqualTo(200);
+        HttpResponse<byte[]> one = export(gm, gm.campaign(), "ids=" + ids.getFirst() + "&format=pdf");
+        assertThat(one.statusCode()).isEqualTo(200);
+        assertThat(pages(one.body())).isBetween(101, 200);
+    }
+
+    @Test
+    void anArtifactSharedIntoTheCampaignIsExportedThereAndANameIsMadeSafe() throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        String kael = create(gm, gm.campaign(), "item", "Espada: \\\"Rubra\\\" / <Kael>?");
+        assertThat(share(gm, artifacts(gm.campaign()) + "/" + kael, quinta).statusCode()).isEqualTo(200);
+
+        HttpResponse<byte[]> exported = export(gm, quinta, "ids=" + kael + "&format=txt");
+
+        assertThat(exported.statusCode()).isEqualTo(200);
+        assertThat(exported.headers().firstValue("Content-Disposition")).hasValue("attachment;"
+                + " filename=\"Espada Rubra Kael.txt\"; filename*=UTF-8''Espada%20Rubra%20Kael.txt");
+        assertThat(new String(exported.body(), StandardCharsets.UTF_8))
+                .isEqualTo("Espada: \"Rubra\" / <Kael>?\nItem\n");
+        // Unshared, it is not readable there any more.
+        assertThat(share(gm, artifacts(gm.campaign()) + "/" + kael).statusCode()).isEqualTo(200);
+        assertExportNotFound(export(gm, quinta, "ids=" + kael + "&format=txt"));
+    }
+
+    @Test
+    void anUnreadableIdMakesTheWholeExportNotFoundNamingNone() throws Exception {
+        Gm gm = signUp();
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        UUID other = campaign(gm, "Mesa de quinta");
+        String elsewhere = create(gm, other, "item", "Outra Kael");
+        Gm them = signUp();
+        String theirs = create(them, them.campaign(), "item", "Kael deles");
+
+        for (String ids : List.of(theirs, kael + "," + theirs, kael + "," + Ids.newId(), elsewhere,
+                kael + ",not-an-id")) {
+            assertExportNotFound(export(gm, gm.campaign(), "ids=" + ids + "&format=pdf"));
+        }
+        // Another owner finds nothing of the GM's, from either campaign.
+        assertExportNotFound(export(them, gm.campaign(), "ids=" + kael + "&format=pdf"));
+        assertExportNotFound(export(them, them.campaign(), "ids=" + kael + "&format=pdf"));
+        // A deleting one is not readable either.
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + kael, null).statusCode()).isEqualTo(202);
+        assertExportNotFound(export(gm, gm.campaign(), "ids=" + kael + "&format=txt"));
+    }
+
+    @Test
+    void aBadListFormatOrLanguageIsInvalid() throws Exception {
+        Gm gm = signUp();
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        List<String> many = new ArrayList<>();
+        for (int i = 0; i < 51; i++) {
+            many.add(Ids.newId().toString());
+        }
+
+        for (String query : List.of("ids=" + String.join(",", many) + "&format=pdf",
+                "ids=" + kael + "," + kael + "&format=pdf", "ids=" + kael + "," + kael.toUpperCase() + "&format=pdf",
+                "ids=" + kael + "&format=docx", "ids=" + kael, "format=pdf", "ids=&format=pdf",
+                "ids=" + kael + ",&format=pdf", "ids=" + kael + "&format=PDF",
+                "ids=" + kael + "&format=pdf&language=fr")) {
+            HttpResponse<byte[]> refused = export(gm, gm.campaign(), query);
+            assertThat(refused.statusCode()).as(query).isEqualTo(400);
+            assertThat(JSON.readTree(refused.body()).path("code").asString()).isEqualTo("request.invalid");
+        }
+        // 50 ids are allowed: unknown ones are then not found.
+        assertExportNotFound(export(gm, gm.campaign(), "ids=" + String.join(",", many.subList(0, 50))
+                + "&format=pdf"));
+        // A malformed campaign is not found.
+        assertExportNotFound(client.send(HttpRequest.newBuilder(uri("/api/v1/campaigns/x/artifacts/export?ids=" + kael
+                        + "&format=pdf")).header("Authorization", "Bearer " + CREDENTIAL)
+                .header("X-Session-Token", gm.session()).GET().build(), HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    @Test
+    void markdownPrintsTheArtifactsTextAsTextNeverAsMarkup() throws Exception {
+        Gm gm = signUp();
+        String body = JSON.writeValueAsString(Map.of("recordType", "note", "name", "# Título *forte* [x](y)",
+                "fields", List.of(Map.of("name", "_Campo_", "value", "1. um\n- dois")),
+                "content", "## Cabeçalho\n<img src=x>\n    código\n\n> citação | a & b ~ `c`"));
+        String id = json(send(gm, "POST", artifacts(gm.campaign()), body)).path("id").asString();
+
+        String md = new String(export(gm, gm.campaign(), "ids=" + id + "&format=markdown").body(),
+                StandardCharsets.UTF_8);
+
+        assertThat(md).isEqualTo("# \\# Título \\*forte\\* \\[x\\](y)\n\n*Nota*\n\n"
+                + "- **\\_Campo\\_:** 1\\. um\\\n  \\- dois\n\n"
+                + "\\#\\# Cabeçalho\\\n\\<img src=x\\>\\\n\u00A0\u00A0\u00A0\u00A0código\n\n"
+                + "\\> citação \\| a \\& b \\~ \\`c\\`\n");
+        // The PDF prints the same text as it is.
+        assertThat(pdfText(export(gm, gm.campaign(), "ids=" + id + "&format=pdf").body()))
+                .containsSubsequence("# Título *forte* [x](y)", "_Campo_: 1. um", "- dois", "## Cabeçalho",
+                        "<img src=x>", "código", "> citação | a & b ~ `c`");
+    }
+
     // --- helpers
+
+    private HttpResponse<byte[]> export(Gm gm, UUID campaign, String query) throws Exception {
+        return client.send(HttpRequest.newBuilder(uri(artifacts(campaign) + "/export?" + query))
+                .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session()).GET().build(),
+                HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    private static void assertExportNotFound(HttpResponse<byte[]> response) {
+        String body = new String(response.body(), StandardCharsets.UTF_8);
+        assertThat(response.statusCode()).as(body).isEqualTo(404);
+        assertThat(response.headers().firstValue("Content-Type").orElseThrow()).contains("json");
+        assertThat(JSON.readTree(body).path("code").asString()).isEqualTo("request.not_found");
+        assertThat(response.headers().firstValue("Content-Disposition")).isEmpty();
+        assertThat(body).doesNotContain("Kael");
+    }
+
+    private static String pdfText(byte[] pdf) throws Exception {
+        try (PDDocument document = Loader.loadPDF(pdf)) {
+            return new PDFTextStripper().getText(document);
+        }
+    }
+
+    private static int pages(byte[] pdf) throws Exception {
+        try (PDDocument document = Loader.loadPDF(pdf)) {
+            return document.getNumberOfPages();
+        }
+    }
 
     private void edit(Gm gm, String id, int version, String type, String name) throws Exception {
         HttpResponse<String> edited = send(gm, "PATCH", artifacts(gm.campaign()) + "/" + id, "{\"version\":" + version

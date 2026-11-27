@@ -1,24 +1,37 @@
 package io.github.gmshield.artifacts.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import io.github.gmshield.artifacts.service.ArtifactExports;
 import io.github.gmshield.artifacts.service.Artifacts;
 import io.github.gmshield.conversations.service.TurnReference;
 import io.github.gmshield.knowledge.service.RecordRelations;
+import io.github.gmshield.library.service.Language;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.ApiProblem;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.text.Normalizer;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -83,6 +96,16 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 5.6 part B (contract 1.53.0): {@code listArtifacts} also lists the live artifacts shared into the campaign,
  * whatever its tiers, in the same order and counts, each with {@code sharedFrom} naming its own campaign (null for the
  * campaign's own).
+ *
+ * <p>Story 5.7 part A (contract 1.54.0): {@code GET .../artifacts/export?ids=a,b&format=pdf|txt|markdown|jpg&language=
+ * pt-BR|en} answers one file of 1 to 50 distinct artifacts of the campaign, in the order given, each read as
+ * {@code getArtifact} reads it (the campaign's own and those shared into it, at their newest version), built in memory
+ * ({@link ArtifactExports}): PDF, TXT or Markdown as one file, JPG as one image for one artifact or a zip of one image
+ * each. Any unreadable id is {@code request.not_found} (404) naming none; a duplicate id, a count outside 1 to 50, or an
+ * unknown format or language is {@code request.invalid} (400); a PDF or JPG export of more than 200 pages is
+ * {@code artifact.export_too_large} (400), and one while 2 others render {@code artifact.export_busy} (503). The
+ * answer is an attachment (RFC 6266 {@code filename*}), {@code no-store} and {@code nosniff}; a refusal stays problem
+ * JSON (no {@code produces}).
  */
 @RestController
 @Tag(name = "artifacts")
@@ -90,6 +113,8 @@ class ArtifactController {
 
     static final String ARTIFACTS = "/api/v1/campaigns/{campaignId}/artifacts";
     static final String ARTIFACT = "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}";
+    /** Story 5.7: an export of the campaign's artifacts; a literal segment, so it is never read as an artifact's id. */
+    static final String EXPORT = ARTIFACTS + "/export";
     static final String VERSIONS = ARTIFACT + "/versions";
     static final String VERSION = VERSIONS + "/{number}";
     static final String RESTORE = VERSION + "/restore";
@@ -122,10 +147,15 @@ class ArtifactController {
             + " an artifact that is not this campaign's (unknown, another account's, another campaign's or malformed);"
             + " none is told apart;";
 
-    private final Artifacts artifacts;
+    /** RFC 5987's attr-char beside letters and digits: kept as they are in {@code filename*}. */
+    private static final String ATTR_CHAR = "!#$&+-.^_`|~";
 
-    ArtifactController(Artifacts artifacts) {
+    private final Artifacts artifacts;
+    private final ArtifactExports exports;
+
+    ArtifactController(Artifacts artifacts, ArtifactExports exports) {
         this.artifacts = artifacts;
+        this.exports = exports;
     }
 
     @Schema(name = "ArtifactField", requiredProperties = {"name", "value"})
@@ -587,6 +617,115 @@ class ArtifactController {
         UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
         return artifacts.get(campaign, artifact).map(found -> ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(ArtifactView.of(found))).orElseThrow(ArtifactController::notFound);
+    }
+
+    // No `produces`: a refusal is problem JSON, which a file's Accept would otherwise turn into a 406.
+    @GetMapping(path = EXPORT)
+    @Operation(operationId = "exportArtifacts", summary = "One file of 1 to 50 of the account's artifacts readable in"
+            + " one of its campaigns (contract 1.54.0), in the order given: each read as getArtifact reads it (the"
+            + " campaign's own and the live ones shared into it, at their newest version) and printed with its name,"
+            + " record type, fields in the order written, content, then its sources as numbered references (a"
+            + " material's place, a record's type and name, an artifact's type, name and version; a removed one"
+            + " marked), labelled in the language given. pdf, txt and markdown give one file, each artifact a new"
+            + " section (a new page in the PDF); jpg gives one image (all the pages of the PDF stacked) for one artifact,"
+            + " a zip of 01-<name>.jpg, 02-... for several. The file is named after the artifact, or artefatos /"
+            + " artifacts for several, as an attachment (filename*), no-store and nosniff. Built in memory: nothing is"
+            + " kept. request.not_found (404) for a campaign that is not the account's, and when any id is not readable"
+            + " there (unknown, another account's, another campaign's, deleting or malformed), naming none;"
+            + " request.invalid (400) for no ids, more than 50, a duplicate or an empty one, or a format or language"
+            + " that is not one of these; artifact.export_too_large (400) for a pdf or jpg export of more than 200 PDF"
+            + " pages in all (txt and markdown are not counted); artifact.export_busy (503) while 2 pdf or jpg exports"
+            + " render, to try again in a moment;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "ids", in = ParameterIn.QUERY, required = true, description = "The artifacts' ids,"
+                        + " comma-separated, 1 to 50, distinct, in the order the file holds them",
+                        schema = @Schema(type = "string", example = ID_EXAMPLE)),
+                @Parameter(name = "format", in = ParameterIn.QUERY, required = true, description = "The file's format",
+                        schema = @Schema(type = "string", allowableValues = {"pdf", "txt", "markdown", "jpg"})),
+                @Parameter(name = "language", in = ParameterIn.QUERY, description = "The language of the labels the"
+                        + " export adds (record type names of the core types, Fontes or Sources, a removed source's"
+                        + " mark)", schema = @Schema(type = "string", allowableValues = {"pt-BR", "en"},
+                                defaultValue = "pt-BR"))},
+            responses = @ApiResponse(responseCode = "200", description = "The file, as an attachment", content = {
+                @Content(mediaType = "application/pdf", schema = @Schema(type = "string", format = "binary")),
+                @Content(mediaType = "text/plain", schema = @Schema(type = "string", format = "binary")),
+                @Content(mediaType = "text/markdown", schema = @Schema(type = "string", format = "binary")),
+                @Content(mediaType = "image/jpeg", schema = @Schema(type = "string", format = "binary")),
+                @Content(mediaType = "application/zip", schema = @Schema(type = "string", format = "binary"))}))
+    void exportArtifacts(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(hidden = true) @RequestParam(value = "ids", required = false) String ids,
+            @Parameter(hidden = true) @RequestParam(value = "format", required = false) String format,
+            @Parameter(hidden = true) @RequestParam(value = "language", required = false) String language,
+            @Parameter(hidden = true) HttpServletResponse response) throws IOException {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        ArtifactExports.Format chosen = ArtifactExports.Format.of(format).orElseThrow(ArtifactController::invalid);
+        Language labels = language == null ? Language.DEFAULT
+                : Language.fromTag(language).orElseThrow(ArtifactController::invalid);
+        List<UUID> chosenIds = exportIds(ids);
+        ArtifactExports.Rendered file = exports.export(campaign, chosenIds, chosen, labels);
+        response.setStatus(HttpStatus.OK.value());
+        response.setContentType(file.mediaType());
+        response.setContentLengthLong(file.bytes().length);
+        response.setHeader(HttpHeaders.CONTENT_DISPOSITION, attachment(file.fileName()));
+        response.setHeader(HttpHeaders.CACHE_CONTROL, CacheControl.noStore().getHeaderValue());
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        try (OutputStream out = response.getOutputStream()) {
+            out.write(file.bytes());
+        }
+    }
+
+    /**
+     * An export's ids (Story 5.7): 1 to {@value ArtifactExports#MAX_IDS}, comma-separated, none empty and none twice,
+     * else {@code request.invalid}; a malformed one is an id that exists nowhere, so {@code request.not_found}, once
+     * the list itself is valid.
+     */
+    private static List<UUID> exportIds(String ids) {
+        if (ids == null || ids.isEmpty()) {
+            throw invalid();
+        }
+        String[] parts = ids.split(",", -1);
+        if (parts.length > ArtifactExports.MAX_IDS) {
+            throw invalid();
+        }
+        Set<String> seen = new HashSet<>();
+        for (String part : parts) {
+            if (part.isBlank() || !seen.add(part.toLowerCase(Locale.ROOT))) {
+                throw invalid();
+            }
+        }
+        List<UUID> parsed = new ArrayList<>(parts.length);
+        for (String part : parts) {
+            parsed.add(parse(part).orElseThrow(ArtifactController::notFound));
+        }
+        return parsed;
+    }
+
+    /**
+     * {@code Content-Disposition} for an attachment named {@code name} (RFC 6266): {@code filename} its ASCII form (accents
+     * dropped, anything else outside printable ASCII, a quote, a backslash or a percent sign as {@code _}) for old
+     * clients, and {@code filename*} the UTF-8 name, percent-encoded (RFC 5987).
+     */
+    static String attachment(String name) {
+        String ascii = Normalizer.normalize(name, Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+        StringBuilder fallback = new StringBuilder(ascii.length());
+        ascii.codePoints().forEach(c -> fallback.append(c >= 0x20 && c < 0x7F && c != '"' && c != '\\' && c != '%'
+                ? (char) c : '_'));
+        StringBuilder encoded = new StringBuilder();
+        for (byte b : name.getBytes(StandardCharsets.UTF_8)) {
+            int c = b & 0xFF;
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                    || ATTR_CHAR.indexOf(c) >= 0) {
+                encoded.append((char) c);
+            } else {
+                encoded.append('%').append(Character.toUpperCase(Character.forDigit(c >> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(c & 0xF, 16)));
+            }
+        }
+        return "attachment; filename=\"" + fallback + "\"; filename*=UTF-8''" + encoded;
     }
 
     @GetMapping(path = VERSION, produces = MediaType.APPLICATION_JSON_VALUE)

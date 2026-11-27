@@ -16,6 +16,7 @@ image are the newest release at least two weeks old that day, and images are als
 | Spring Modulith | 2.2.0-RC1 | `build.gradle.kts` |
 | springdoc-openapi | 3.2.0 | `build.gradle.kts` |
 | JaCoCo | 0.8.16 | `build.gradle.kts` |
+| Apache PDFBox | 3.0.8 (Apache-2.0; Story 5.7, checked 2026-11-27), with Noto Sans Regular and Bold (SIL OFL 1.1, `src/main/resources/fonts/OFL.txt`) | `build.gradle.kts`, `src/main/resources/fonts/` |
 | Gradle | 9.8.2 (released 2026-10-19), wrapper committed with the distribution checksum | `gradle/wrapper/gradle-wrapper.properties` |
 | Build image | `eclipse-temurin:27.0.1.0-jdk-alpine` (JDK released 2026-10-24) | `Dockerfile` |
 | Runtime image | `eclipse-temurin:27.0.1.0-jre-alpine` | `Dockerfile` |
@@ -1980,6 +1981,50 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - No migration, no index change. Log lines: `artifacts.listed` gains `sharedShown`. Deploy order: backend, then
     frontend (the 1.52.0 frontend shows shared rows as plain rows that open the read-only page). Internal contract and
     worker unchanged.
+
+- **Export artifacts (`artifacts`, Story 5.7 part A, FR-39, public contract 1.54.0).** A GM takes artifacts out of
+  GMshield to print them or hand them to players.
+  - **API.** `GET /api/v1/campaigns/{campaignId}/artifacts/export?ids=a,b&format=pdf|txt|markdown|jpg&language=pt-BR|en`
+    (`ArtifactController.exportArtifacts`, written to the `HttpServletResponse` with no `produces`, as
+    `MaterialController.picture` is, so a refusal stays problem JSON). 1 to 50 distinct ids, in the order given; each is
+    read exactly as `Artifacts.get(campaignId, id)` reads it (the campaign's own and the live ones shared into it, at
+    their newest version). Any unreadable id is 404 `request.not_found` naming none, and nothing is rendered; no ids,
+    51, a duplicate (case ignored) or an empty one, an unknown format or language is 400 `request.invalid`; a malformed
+    id is an unknown one. The answer is `Content-Disposition: attachment` with an ASCII `filename` and the UTF-8
+    `filename*` (RFC 6266), `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+  - **Content** (`artifacts.service.ArtifactExports`): the name, the record type's name (a core type's in the export's
+    language, as the frontend writes it, `CoreRecordTypes.shownName`; an approved type's as the system names it), the
+    fields in the order written, the content, then "Fontes" / "Sources" as numbered lines: a material's place (material,
+    section path, page), a record's type and name, an artifact's type, name and version, each removed one marked
+    "(fonte removida)" / "(source removed)". Nothing is quoted beyond the artifact's own text (Dalton, 2026-11-27).
+    Text is data: it is printed as text, never as Markdown (the Markdown export escapes every character that could make
+    it markup, `ExportText.escaped`).
+  - **Files.** PDF, TXT and Markdown are one file, each artifact a new section (a new A4 page in the PDF); JPG is one
+    image for one artifact, and a zip of `01-<name>.jpg`, `02-…` for several. The file is named after the artifact (made
+    safe: no `\ / : * ? " < > |`, control or format character, at most 200 UTF-8 bytes cut after a whole character, no reserved device name) or
+    `artefatos` / `artifacts` for several.
+  - **Rendering decision (recorded at the story's start).** Apache PDFBox 3.0.8 in the `artifacts` module
+    (`ExportPdf`), with Noto Sans Regular and Bold bundled as resources and embedded as subsets, so accents print the
+    same everywhere; a character neither font has prints as `?`. Lines wrap by the font's widths. JPG (`ExportJpg`)
+    renders the artifact's own PDF pages at 110 DPI with `PDFRenderer`, stacks them into one image and writes it with
+    `ImageIO`; an image stays within 65,000 pixels tall and 24 million pixels in all, so a long artifact is drawn at a
+    lower resolution rather than exhausting the heap (every page is kept). Several JPGs are packed with
+    `java.util.zip`. No outside service, no browser rendering, no worker change.
+  - **Limits (Dalton, 2026-11-27).** A PDF or JPG export holds at most 200 PDF pages in all (`ExportPdf.Pages`, across
+    every artifact's PDF): the 201st page is refused before it is drawn, so the rest is never built, with 400
+    `artifact.export_too_large`. At most 2 PDF or JPG exports render at once (`ExportGate`); a third is refused at once,
+    never queued, with 503 `artifact.export_busy`. TXT and Markdown are neither counted nor gated. With the 200-page cap,
+    a JPG keeps every page, each a whole number of pixels tall, under 65,000 pixels in all (the JDK's JPEG writer takes
+    at most 65,500).
+  - **Memory only.** The PDF is built and read back with PDFBox's memory-only stream cache
+    (`IOUtils.createMemoryOnlyStreamCache`), the JPEG is written through a `MemoryCacheImageOutputStream` (ImageIO's
+    default for a stream is a temporary file), and the zip into a byte array: no temporary file is made
+    (`ArtifactExportsTest`), so nothing is left once the answer is written. Checked in the production image (read-only
+    root, `/tmp` tmpfs): headless AWT renders with the JRE as it is.
+  - No migration, no internal-contract or worker change. Log lines (ids and counts only, never a name or text):
+    `artifacts.exported` (`count`, `format`, `language`, `bytes`), `artifacts.export_not_found`,
+    `artifacts.export_refused` (`reason`). Deploy order: backend,
+    then frontend (the 1.53.0 frontend behaves as before).
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

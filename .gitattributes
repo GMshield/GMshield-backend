@@ -4,3 +4,4 @@ openapi/*.json text eol=lf
 dev/start text eol=lf
 dev/stop text eol=lf
 gradle/wrapper/gradle-wrapper.jar binary
+*.ttf binary
