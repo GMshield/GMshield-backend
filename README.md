@@ -43,8 +43,8 @@ build when a class uses another module's `web` or `data`, or a module that is no
 Twelve modules exist so far: `shared` (the error model, trace ids, log lines, start-up checks, the
 contract versions, the owner context and `Ids`, which mints every id as a UUID v7), `vault` (encryption at rest,
 below), `audit` (the append-only audit log, below; it may use `shared`), `jobs` (background work that
-survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems and
-campaigns, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
+survives a restart, below; it may use `shared` and `vault`, and no feature module), `library` (systems,
+campaigns and, from Story 6.1, their Shields, below; it may use `shared` and `vault`), `materials` (materials and the resumable upload of their
 files, below; it may use `shared`, `vault`, `jobs` and `library`), `scope` (what a campaign may use, below; it may
 use `shared`, `library`, `materials` and `vault`), `limits` (the model setting and the usage of model calls, below; it may use `shared` and
 `jobs`), `conversations` (a campaign's conversation and its answers, Story 2.4, below; it may use `shared`, `jobs`,
@@ -2025,6 +2025,33 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.exported` (`count`, `format`, `language`, `bytes`), `artifacts.export_not_found`,
     `artifacts.export_refused` (`reason`). Deploy order: backend,
     then frontend (the 1.53.0 frontend behaves as before).
+
+- **Shields in a campaign (`library`, Story 6.1 part A, public contract 1.55.0, migration V53).** A Shield (Escudo do
+  Mestre) is the GM's private space in a campaign, for notes (6.2) and dice (6.3, 6.4).
+  - **V53** `shield` (id, owner, campaign, `name` and `name_fingerprint` both null or both set, `version`, created).
+    Keys: (owner, id); (owner, campaign) to `campaign` with no cascade; unique (campaign, name fingerprint); and the
+    partial unique index `shield_campaign_unnamed_key` (one unnamed Shield per campaign). It backfills one unnamed
+    Shield (`uuidv7()`) per existing campaign. The migration's header has the way back (drop the table before running
+    the previous release, whose campaign deletion would fail on the key). Warning: that drop deletes every Shield of
+    every account for good, the typed names with them; back the table up first if they must come back.
+  - **Every campaign has one.** `Library.createStarter` and `createCampaign` insert the campaign's first Shield, unnamed,
+    in the campaign's transaction. A campaign the previous release created after V53 gets it when its Shields are
+    listed (`Shields.shields`): the insert runs in its own transaction, and when another list won the race the partial
+    index refuses it (`LibraryConflict.UNNAMED_SHIELD_TAKEN`) and the list reads again. The frontend shows an unnamed
+    Shield as "Escudo do Mestre" / "GM's Shield".
+  - **Rules** (`library.service.Shields`). A typed name is 1 to 120 code points after trimming
+    (`request.shield_name_invalid`, 400), encrypted only through the vault (`Binding("shield", "name", id, owner)`) and
+    unique within the campaign by the keyed fingerprint of its `uniqueForm` (`request.shield_name_taken`, 409). A
+    rename names its version (`request.stale_version`, 409). Another owner's campaign or Shield, an unknown or malformed
+    id, a Shield of another campaign and a campaign being deleted are all `request.not_found`.
+  - **API** (`ShieldController`, all `no-store`): `GET /api/v1/campaigns/{id}/shields` (oldest first, `limit`, `cursor`
+    or `offset`, `total`), `POST` (201), `GET` and `PATCH .../shields/{shieldId}` (`{version, name}`). Each `Shield` is
+    `{id, name or null, version}`. Each route is a row of the cross-owner audit.
+  - **Deletion.** A campaign's or a system's deletion removes the campaigns' Shields (`LibraryStore.deleteShieldsOf`) in
+    the transaction that removes the campaign rows, before them. Deleting a single Shield is part B.
+  - Log lines (ids and versions only): `library.shield_created`, `library.shield_renamed`,
+    `library.first_shield_created`, `library.first_shield_raced`. Deploy order: backend, then frontend (the 1.54.0
+    frontend shows no Shields). Internal contract and worker unchanged.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

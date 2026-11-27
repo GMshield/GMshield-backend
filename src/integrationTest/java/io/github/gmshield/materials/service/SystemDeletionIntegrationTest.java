@@ -171,10 +171,14 @@ class SystemDeletionIntegrationTest {
         assertThat(count("turn", "id in (?, ?, ?)", turn, again, secondTurn)).isZero();
         assertThat(count("campaign", "id = ?", first)).isOne();
 
+        assertThat(count("shield", "campaign_id in (?, ?)", first, second)).isEqualTo(2);
+
         assertThat(deletion.run(a.id(), deletionId)).isTrue();
 
         assertThat(count("system", "id = ?", system)).isZero();
         assertThat(count("campaign", "id in (?, ?)", first, second)).isZero();
+        // Story 6.1: their Shields went before their rows, which shield_campaign_fkey names.
+        assertThat(count("shield", "campaign_id in (?, ?)", first, second)).isZero();
         assertThat(count("conversation", "campaign_id in (?, ?)", first, second)).isZero();
         assertThat(count("turn_event_batch", "turn_id = ?", turn)).isZero();
         assertThat(count("turn_reference", "turn_id = ?", turn)).isZero();

@@ -79,6 +79,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * same transaction; its handler, given {@code Going.ofArtifact}, cancels the artifact's index jobs and waits for their
  * claims, then removes its rows. Every other handler ignores it. A campaign's or a system's deletion meanwhile takes
  * the artifact too: its own deletion then finds nothing left and is marked done.
+ *
+ * <p>Story 6.1: a campaign's Shields go with it. {@code library} removes them itself, in the transaction that removes
+ * the campaign rows (a campaign's or a system's deletion) and just before them, because their key names the campaign.
  */
 @Service
 public class SystemDeletion {
@@ -390,6 +393,8 @@ public class SystemDeletion {
             return true;
         }
         writing(() -> {
+            // Story 6.1: the campaigns' Shields first, which the campaign rows' key would otherwise refuse.
+            store.deleteShieldsOf(store.campaignIdsOfDeleting(row.targetId()));
             if (!store.deleteDeleting(row.targetId())) {
                 throw new IllegalStateException("library.deleting_system_missing");
             }
@@ -431,12 +436,16 @@ public class SystemDeletion {
     }
 
     /**
-     * The end of a campaign's deletion, once its handlers removed their parts: the campaign row goes and the record is
-     * done, in one transaction. A system's deletion that took the campaign meanwhile removed the row already; the record
+     * The end of a campaign's deletion, once its handlers removed their parts: its Shields (Story 6.1) and the campaign
+     * row go and the record is done, in one transaction. A system's deletion that took the campaign meanwhile removed the row already; the record
      * ends all the same, logged {@code removed=false}.
      */
     private void endCampaign(UUID owner, DeletionRow row) {
         boolean removed = Boolean.TRUE.equals(writing(() -> {
+            // Story 6.1: its Shields first, which the campaign row's key would otherwise refuse.
+            if (store.campaignDeleting(row.targetId())) {
+                store.deleteShieldsOf(List.of(row.targetId()));
+            }
             boolean deleted = store.deleteDeletingCampaign(row.targetId());
             deletions.done(owner, row.id(), now());
             return deleted;

@@ -23,6 +23,7 @@ import io.github.gmshield.library.data.DeletionRow;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
 import io.github.gmshield.library.data.LibraryTestStores;
+import io.github.gmshield.library.data.ShieldRow;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.materials.data.InMemoryIndexStore;
 import io.github.gmshield.materials.data.IndexRemovalRow;
@@ -237,6 +238,9 @@ class SystemDeletionFlowTest {
 
         assertThat(library.systems).doesNotContainKey(system).containsKeys(other, gm.system());
         assertThat(library.campaigns).doesNotContainKeys(first, second).containsKeys(kept, gm.campaign());
+        // Story 6.1: the system's campaigns' Shields went before their rows; the other campaigns' stay.
+        assertThat(library.shields.values()).noneMatch(shield -> List.of(first, second).contains(shield.campaignId()))
+                .anyMatch(shield -> shield.campaignId().equals(kept));
         assertThat(conversations.conversations.values()).noneMatch(conversation ->
                 List.of(first, second).contains(conversation.campaignId()));
         assertThat(conversations.turns).doesNotContainKeys(firstTurn, secondTurn).hasSize(1);
@@ -336,6 +340,8 @@ class SystemDeletionFlowTest {
         as(gm.id(), () -> {
             library.insertCampaign(new CampaignRow(id, gm.id(), system,
                     vault.encryptText(new Binding("campaign", "name", id, gm.id()), name), clock.instant()));
+            // Story 6.1: with its first Shield, as a campaign is created.
+            library.insertShield(ShieldRow.unnamed(Ids.newId(), gm.id(), id, clock.instant()));
             return null;
         });
         return id;

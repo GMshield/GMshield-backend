@@ -27,6 +27,9 @@ import org.springframework.stereotype.Repository;
  * the campaigns of ready systems, only; the deletion's methods alone reach a deleting one. Story 3.2 part B: likewise
  * every read takes ready campaigns only; a deleting campaign is reached by its deletion's methods, and by a system's
  * deletion, which takes all the system's campaigns.
+ *
+ * <p>Story 6.1: a campaign's Shields ({@code shield}, V53), read by campaign and id, oldest first; a write that the key on
+ * {@code (campaign_id, name_fingerprint)} or the one unnamed Shield's partial index refuses is a {@link LibraryConflict}.
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
@@ -79,6 +82,18 @@ class JpaLibraryStore implements LibraryStore {
             + " and" + READY_CAMPAIGN + " order by c.id";
     private static final String WITHOUT_FINGERPRINT_OF = "select c from LibraryCampaign c where c.systemId = :system"
             + " and c.nameFingerprint is null and" + READY_CAMPAIGN + " order by c.id";
+
+    /** Story 6.1: the unique key on a Shield's name fingerprint within its campaign, and the one unnamed Shield (V53). */
+    static final String SHIELD_NAME_KEY = "shield_campaign_name_fingerprint_key";
+    static final String UNNAMED_SHIELD_KEY = "shield_campaign_unnamed_key";
+    private static final String SHIELD_BY_ID = "select s from LibraryShield s where s.id = :id and s.campaignId = :campaign";
+    private static final String SHIELDS = "select s from LibraryShield s where s.campaignId = :campaign order by s.id";
+    private static final String SHIELDS_AFTER = "select s from LibraryShield s where s.campaignId = :campaign"
+            + " and s.id > :after order by s.id";
+    private static final String SHIELD_COUNT = "select count(s) from LibraryShield s where s.campaignId = :campaign";
+    private static final String SHIELD_NAME_TAKEN = "select s.id from LibraryShield s where s.campaignId = :campaign"
+            + " and s.nameFingerprint = :fingerprint and s.id <> :except";
+    private static final String SHIELDS_OF = "select s from LibraryShield s where s.campaignId in :campaigns";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -366,6 +381,85 @@ class JpaLibraryStore implements LibraryStore {
         return campaign.isPresent();
     }
 
+    @Override
+    public void insertShield(ShieldRow row) {
+        EntityManager em = em();
+        em.persist(new ShieldEntity(row));
+        flushChecked(em);
+    }
+
+    @Override
+    public Optional<ShieldRow> findShield(UUID campaignId, UUID id) {
+        return shield(campaignId, id).map(ShieldEntity::row);
+    }
+
+    @Override
+    public List<ShieldRow> shields(UUID campaignId, UUID after, int limit) {
+        if (limit < 1) {
+            return List.of();
+        }
+        TypedQuery<ShieldEntity> query = em().createQuery(after == null ? SHIELDS : SHIELDS_AFTER, ShieldEntity.class)
+                .setParameter("campaign", campaignId).setMaxResults(limit);
+        if (after != null) {
+            query.setParameter("after", after);
+        }
+        return query.getResultList().stream().map(ShieldEntity::row).toList();
+    }
+
+    @Override
+    public List<ShieldRow> shieldsFrom(UUID campaignId, int offset, int limit) {
+        if (limit < 1 || offset < 0) {
+            return List.of();
+        }
+        return em().createQuery(SHIELDS, ShieldEntity.class).setParameter("campaign", campaignId).setFirstResult(offset)
+                .setMaxResults(limit).getResultList().stream().map(ShieldEntity::row).toList();
+    }
+
+    @Override
+    public long shieldCount(UUID campaignId) {
+        return em().createQuery(SHIELD_COUNT, Long.class).setParameter("campaign", campaignId).getSingleResult();
+    }
+
+    @Override
+    public boolean shieldNameTaken(UUID campaignId, byte[] nameFingerprint, UUID except) {
+        return !em().createQuery(SHIELD_NAME_TAKEN, UUID.class).setParameter("campaign", campaignId)
+                .setParameter("fingerprint", nameFingerprint).setParameter("except", except)
+                .setMaxResults(1).getResultList().isEmpty();
+    }
+
+    @Override
+    public Optional<ShieldRow> renameShield(UUID campaignId, UUID id, long version, byte[] name, byte[] nameFingerprint) {
+        Optional<ShieldEntity> found = shield(campaignId, id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        ShieldEntity entity = found.get();
+        if (entity.version() != version) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        entity.rename(name, nameFingerprint);
+        flushChecked(em());
+        return Optional.of(entity.row());
+    }
+
+    @Override
+    public int deleteShieldsOf(Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return 0;
+        }
+        EntityManager em = em();
+        List<ShieldEntity> going = em.createQuery(SHIELDS_OF, ShieldEntity.class).setParameter("campaigns", campaignIds)
+                .getResultList();
+        going.forEach(em::remove);
+        em.flush();
+        return going.size();
+    }
+
+    private Optional<ShieldEntity> shield(UUID campaignId, UUID id) {
+        return em().createQuery(SHIELD_BY_ID, ShieldEntity.class).setParameter("id", id)
+                .setParameter("campaign", campaignId).getResultList().stream().findFirst();
+    }
+
     private Optional<CampaignEntity> deletingCampaign(UUID id) {
         return em().createQuery("select c from LibraryCampaign c where c.id = :id and c.state = :state",
                         CampaignEntity.class)
@@ -390,7 +484,7 @@ class JpaLibraryStore implements LibraryStore {
                 .getResultList().stream().findFirst();
     }
 
-    /** Writes a system or a campaign now, so that its key or its version refuses it here, as a {@link LibraryConflict}. */
+    /** Writes a system, a campaign or a Shield now, so that its key or its version refuses it here, as a {@link LibraryConflict}. */
     private static void flushChecked(EntityManager em) {
         try {
             em.flush();
@@ -415,6 +509,14 @@ class JpaLibraryStore implements LibraryStore {
             if (cause instanceof ConstraintViolationException violation
                     && CAMPAIGN_NAME_KEY.equalsIgnoreCase(violation.getConstraintName())) {
                 return Optional.of(new LibraryConflict(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN));
+            }
+            if (cause instanceof ConstraintViolationException violation
+                    && SHIELD_NAME_KEY.equalsIgnoreCase(violation.getConstraintName())) {
+                return Optional.of(new LibraryConflict(LibraryConflict.Reason.SHIELD_NAME_TAKEN));
+            }
+            if (cause instanceof ConstraintViolationException violation
+                    && UNNAMED_SHIELD_KEY.equalsIgnoreCase(violation.getConstraintName())) {
+                return Optional.of(new LibraryConflict(LibraryConflict.Reason.UNNAMED_SHIELD_TAKEN));
             }
         }
         return Optional.empty();

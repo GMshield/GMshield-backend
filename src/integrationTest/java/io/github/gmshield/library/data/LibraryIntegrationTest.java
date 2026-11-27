@@ -55,6 +55,8 @@ import tools.jackson.databind.json.JsonMapper;
  * another owner's system on every new route and on {@code ?system=}. Story 3.2: campaigns created, renamed by version,
  * archived, restored and chosen, stored only encrypted with their name fingerprint (the key and the version as the
  * store's conflicts), the fill of a fingerprint from before V23, and another owner's campaign on every new route.
+ * Story 6.1: Shields stored unnamed with each campaign, a named one only as ciphertext bound to its row, the store's
+ * conflicts on PostgreSQL's keys and version, and one first Shield for a campaign without one, whatever the lists at once.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application itself never reads a library
  * table with native SQL.
@@ -232,6 +234,47 @@ class LibraryIntegrationTest {
         @Override
         public boolean deleteDeletingCampaign(UUID id) {
             return real.deleteDeletingCampaign(id);
+        }
+
+        @Override
+        public void insertShield(ShieldRow row) {
+            real.insertShield(row);
+        }
+
+        @Override
+        public Optional<ShieldRow> findShield(UUID campaignId, UUID id) {
+            return real.findShield(campaignId, id);
+        }
+
+        @Override
+        public List<ShieldRow> shields(UUID campaignId, UUID after, int limit) {
+            return real.shields(campaignId, after, limit);
+        }
+
+        @Override
+        public List<ShieldRow> shieldsFrom(UUID campaignId, int offset, int limit) {
+            return real.shieldsFrom(campaignId, offset, limit);
+        }
+
+        @Override
+        public long shieldCount(UUID campaignId) {
+            return real.shieldCount(campaignId);
+        }
+
+        @Override
+        public boolean shieldNameTaken(UUID campaignId, byte[] nameFingerprint, UUID except) {
+            return real.shieldNameTaken(campaignId, nameFingerprint, except);
+        }
+
+        @Override
+        public Optional<ShieldRow> renameShield(UUID campaignId, UUID id, long version, byte[] name,
+                                                byte[] nameFingerprint) {
+            return real.renameShield(campaignId, id, version, name, nameFingerprint);
+        }
+
+        @Override
+        public int deleteShieldsOf(java.util.Collection<UUID> campaignIds) {
+            return real.deleteShieldsOf(campaignIds);
         }
     }
 
@@ -850,6 +893,111 @@ class LibraryIntegrationTest {
             }
         }));
         return material;
+    }
+
+    // --- Story 6.1: Shields ---
+
+    @Test
+    void aFirstSignInAndANewCampaignEachStoreOneUnnamedShieldAndANamedOneIsOnlyCiphertextOnPostgresql()
+            throws Exception {
+        Gm gm = signUp("en");
+        Map<String, Object> first = jdbc.sql("select id, owner_id, name, name_fingerprint, version from shield"
+                + " where campaign_id = ?").param(gm.campaignId()).query().singleRow();
+        assertThat(first).containsEntry("owner_id", gm.id()).containsEntry("name", null)
+                .containsEntry("name_fingerprint", null).containsEntry("version", 0L);
+        JsonNode list = ok(get("/api/v1/campaigns/" + gm.campaignId() + "/shields", gm.session()));
+        assertThat(list.path("items")).singleElement().satisfies(item -> {
+            assertThat(item.path("id").asString()).isEqualTo(first.get("id").toString());
+            assertThat(item.path("name").isNull()).isTrue();
+        });
+        UUID campaign = UUID.fromString(created(send("POST", "/api/v1/campaigns", gm.session(),
+                Map.of("name", "Mesa de sexta", "systemId", gm.systemId().toString()))).path("id").asString());
+        assertThat(count("select count(*) from shield where campaign_id = ? and name is null", campaign)).isEqualTo(1);
+
+        // Acceptance: a stored name is ciphertext that decrypts only under its own binding.
+        JsonNode combat = created(send("POST", "/api/v1/campaigns/" + gm.campaignId() + "/shields", gm.session(),
+                Map.of("name", "Combate")));
+        UUID id = UUID.fromString(combat.path("id").asString());
+        byte[] stored = jdbc.sql("select name from shield where id = ?").param(id).query(byte[].class).single();
+        assertThat(new String(stored, StandardCharsets.ISO_8859_1)).doesNotContain("Combate").doesNotContain("ombat");
+        assertThat(vault.decryptText(new Binding("shield", "name", id, gm.id()), stored)).isEqualTo("Combate");
+        for (Binding other : List.of(new Binding("shield", "name", (UUID) first.get("id"), gm.id()),
+                new Binding("shield", "edition", id, gm.id()), new Binding("campaign", "name", id, gm.id()),
+                new Binding("shield", "name", id, Ids.newId()))) {
+            assertThatThrownBy(() -> vault.decryptText(other, stored))
+                    .isInstanceOf(io.github.gmshield.vault.service.IntegrityException.class);
+        }
+        assertThat(jdbc.sql("select name_fingerprint from shield where id = ?").param(id).query(byte[].class).single())
+                .isEqualTo(vault.fingerprint("shield", "name", "combate"));
+        JsonNode renamed = ok(send("PATCH", "/api/v1/campaigns/" + gm.campaignId() + "/shields/" + id, gm.session(),
+                Map.of("version", 0, "name", "Combate final")));
+        assertThat(renamed.path("version").asLong()).isEqualTo(1);
+        assertThat(jdbc.sql("select version from shield where id = ?").param(id).query(Long.class).single())
+                .isEqualTo(1);
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaignId() + "/shields", gm.session())).path("items"))
+                .extracting(item -> item.path("name").isNull() ? null : item.path("name").asString())
+                .containsExactly(null, "Combate final");
+    }
+
+    @Test
+    void theStoreRefusesASecondUnnamedShieldATakenShieldNameAndAStaleRenameAsConflicts() throws Exception {
+        Gm gm = signUp("pt-BR");
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID combat = UUID.fromString(created(send("POST", "/api/v1/campaigns/" + gm.campaignId() + "/shields",
+                gm.session(), Map.of("name", "Combate"))).path("id").asString());
+        byte[] taken = vault.fingerprint("shield", "name", "combate");
+        UUID twin = Ids.newId();
+
+        assertThatThrownBy(() -> OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> store.insertShield(ShieldRow.unnamed(twin, gm.id(), gm.campaignId(), now)))))
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.UNNAMED_SHIELD_TAKEN));
+        assertThatThrownBy(() -> OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions)
+                .executeWithoutResult(status -> store.insertShield(new ShieldRow(twin, gm.id(), gm.campaignId(),
+                        new byte[] {1}, taken, 0, now)))))
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.SHIELD_NAME_TAKEN));
+        assertThat(count("select count(*) from shield where id = ?", twin)).isZero();
+        assertThatThrownBy(() -> OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                store.renameShield(gm.campaignId(), combat, 3, new byte[] {1}, new byte[] {2}))))
+                .isInstanceOfSatisfying(LibraryConflict.class,
+                        conflict -> assertThat(conflict.reason()).isEqualTo(LibraryConflict.Reason.STALE_VERSION));
+        assertThat(jdbc.sql("select version from shield where id = ?").param(combat).query(Long.class).single()).isZero();
+        // Another owner's Shield, or one named under another campaign, is not there to rename.
+        Optional<ShieldRow> foreign = OwnerContext.callAs(Ids.newId(), () -> new TransactionTemplate(transactions)
+                .execute(status -> store.renameShield(gm.campaignId(), combat, 0, new byte[] {1}, new byte[] {2})));
+        assertThat(foreign).isEmpty();
+        Optional<ShieldRow> elsewhere = OwnerContext.callAs(gm.id(), () -> new TransactionTemplate(transactions)
+                .execute(status -> store.renameShield(Ids.newId(), combat, 0, new byte[] {1}, new byte[] {2})));
+        assertThat(elsewhere).isEmpty();
+        assertThat(jdbc.sql("select version from shield where id = ?").param(combat).query(Long.class).single()).isZero();
+    }
+
+    @Test
+    void aCampaignWithoutAShieldGetsExactlyOneWhenSeveralListsRunAtOnceOnPostgresql() throws Exception {
+        Gm gm = signUp("en");
+        // As the previous release creates a campaign after V53: no Shield.
+        jdbc.sql("delete from shield where campaign_id = ?").param(gm.campaignId()).update();
+        String path = "/api/v1/campaigns/" + gm.campaignId() + "/shields";
+
+        List<java.util.concurrent.CompletableFuture<HttpResponse<String>>> lists = new java.util.ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            lists.add(client.sendAsync(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                    .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session()).GET()
+                    .build(), HttpResponse.BodyHandlers.ofString()));
+        }
+
+        List<JsonNode> pages = new java.util.ArrayList<>();
+        for (java.util.concurrent.CompletableFuture<HttpResponse<String>> list : lists) {
+            pages.add(ok(list.get(30, java.util.concurrent.TimeUnit.SECONDS)));
+        }
+        UUID only = jdbc.sql("select id from shield where campaign_id = ?").param(gm.campaignId()).query(UUID.class)
+                .single();
+        for (JsonNode page : pages) {
+            assertThat(page.path("items")).singleElement()
+                    .satisfies(item -> assertThat(item.path("id").asString()).isEqualTo(only.toString()));
+        }
+        assertThat(count("select count(*) from shield where campaign_id = ?", gm.campaignId())).isEqualTo(1);
     }
 
     // --- helpers ---

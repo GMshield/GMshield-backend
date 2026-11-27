@@ -88,7 +88,8 @@ import tools.jackson.databind.node.ObjectNode;
  * conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it also cites the
  * record, which becomes a reference of its own), a done, dismissed turn, a search, and a turn still waiting in a second
  * conversation; from Story 5.1 an artifact of the campaign (from part B indexed, and cited by the bookmarked turn too);
- * from Story 5.3 part A a finished draft (a turn of kind draft). From Story 5.4 part B, A's artifact named in the deletion
+ * from Story 5.3 part A a finished draft (a turn of kind draft); from Story 6.1 a renamed Shield of the campaign beside its
+ * unnamed first one. From Story 5.4 part B, A's artifact named in the deletion
  * of B's own conversation is ignored as a random id is, and stays. Account B then walks {@link #ROUTES}, every public
  * route that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same
  * body as a random id on that route (the trace id aside), and a route with a container and an item ({@code own})
@@ -292,6 +293,12 @@ class CrossOwnerAuditFlowTest {
             // an export of a campaign's artifacts (Story 5.7 part A): the artifact is named in the query
             route("GET", "/api/v1/campaigns/{campaignId}/artifacts/export", "campaignId", "campaign")
                     .query("ids={artifact}&format=txt").own("campaignId"),
+            // a campaign's Shields and one of them (Story 6.1 part A)
+            route("GET", "/api/v1/campaigns/{id}/shields", "id", "campaign"),
+            route("POST", "/api/v1/campaigns/{id}/shields", "id", "campaign").json("{\"name\":\"Tomado\"}"),
+            route("GET", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield").own("id"),
+            route("PATCH", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield")
+                    .json("{\"version\":{shieldVersion},\"name\":\"Tomado\"}").own("id"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -900,6 +907,18 @@ class CrossOwnerAuditFlowTest {
                 "{\"outcome\":\"done\",\"result\":{\"indexRecipe\":\"2\",\"points\":1}}");
         assertThat(indexed.statusCode()).as(indexed.body()).isEqualTo(204);
 
+        // Story 6.1: a Shield of the campaign, renamed so that it has a name and a version above 0, beside the unnamed
+        // first one.
+        HttpResponse<String> shield = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/shields",
+                "{\"name\":\"Combate\"}");
+        assertThat(shield.statusCode()).as(shield.body()).isEqualTo(201);
+        items.put("shield", json(shield).path("id").asString());
+        HttpResponse<String> shieldRenamed = send(gm, "PATCH", "/api/v1/campaigns/" + gm.campaign() + "/shields/"
+                + items.get("shield"), "{\"version\":0,\"name\":\"Combate final\"}");
+        assertThat(shieldRenamed.statusCode()).as(shieldRenamed.body()).isEqualTo(200);
+        items.put("firstShield", json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/shields")).path("items").get(0)
+                .path("id").asString());
+
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
                 + "\"materialsOff\":[]}");
@@ -943,6 +962,7 @@ class CrossOwnerAuditFlowTest {
         items.put("scopeVersion", version(gm, "/api/v1/campaigns/" + gm.campaign() + "/scope"));
         items.put("materialVersion", version(gm, "/api/v1/materials/" + first.materialId()));
         items.put("conversationVersion", version(gm, "/api/v1/conversations/" + items.get("conversation")));
+        items.put("shieldVersion", version(gm, "/api/v1/campaigns/" + gm.campaign() + "/shields/" + items.get("shield")));
         Set<String> hidden = new LinkedHashSet<>();
         hidden.add(gm.id().toString());
         stores.jobIds(gm.id()).forEach(job -> hidden.add(job.toString()));
@@ -1033,6 +1053,7 @@ class CrossOwnerAuditFlowTest {
                 "/api/v1/campaigns/" + world.gm().campaign() + "/scope",
                 "/api/v1/campaigns/" + world.gm().campaign() + "/conversations?area=questions",
                 "/api/v1/campaigns/" + world.gm().campaign() + "/conversations?area=rules",
+                "/api/v1/campaigns/" + world.gm().campaign() + "/shields",
                 "/api/v1/materials/" + world.get("material"), "/api/v1/systems/" + world.get("system")));
         if (world.get("rulesConversation") != null) {
             paths.add("/api/v1/conversations/" + world.get("rulesConversation") + "/turns");
@@ -1069,6 +1090,7 @@ class CrossOwnerAuditFlowTest {
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=questions",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/conversations?area=rules",
                 "/api/v1/campaigns/" + b.gm().campaign() + "/artifacts",
+                "/api/v1/campaigns/" + b.gm().campaign() + "/shields",
                 "/api/v1/systems/" + b.get("system") + "/record-types",
                 "/api/v1/systems/" + b.get("system") + "/proposals", "/api/v1/systems/" + b.get("system") + "/terms",
                 "/api/v1/materials/" + b.get("material") + "/proposals")) {

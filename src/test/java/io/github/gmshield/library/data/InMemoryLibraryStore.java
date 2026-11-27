@@ -20,7 +20,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * {@code @TenantId}, it sees the rows of the {@link OwnerContext}'s owner only and refuses to work without one;
  * like the tables, it keeps the unique keys and the campaign's (owner, system) reference, and (Story 3.1) a system's
  * version, refusing a stale edit or a taken name as {@link LibraryConflict}; from Story 3.2 a campaign's version, archive,
- * choice and name key (owner, system, fingerprint) as well; from Story 3.2 part B a campaign's state. A write undoes
+ * choice and name key (owner, system, fingerprint) as well; from Story 3.2 part B a campaign's state; from Story 6.1 a
+ * campaign's Shields, with their name key (campaign, fingerprint), the one unnamed Shield per campaign, their version
+ * and the (owner, campaign) reference, which refuses to delete a campaign that still has Shields. A write undoes
  * itself when its transaction rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
@@ -34,6 +36,8 @@ public class InMemoryLibraryStore implements LibraryStore {
      * deletions' skips them.
      */
     public final Set<UUID> deletingCampaigns = ConcurrentHashMap.newKeySet();
+    /** The Shields (Story 6.1, V53). */
+    public final Map<UUID, ShieldRow> shields = new ConcurrentHashMap<>();
     /** Set it to make the next campaign insert fail, as a database failure would. */
     public final AtomicBoolean failNextCampaign = new AtomicBoolean();
 
@@ -297,6 +301,11 @@ public class InMemoryLibraryStore implements LibraryStore {
         ownerFor(system.ownerId());
         for (CampaignRow campaign : List.copyOf(campaigns.values())) {
             if (campaign.systemId().equals(id)) {
+                refuseWithShields(campaign.id());
+            }
+        }
+        for (CampaignRow campaign : List.copyOf(campaigns.values())) {
+            if (campaign.systemId().equals(id)) {
                 campaigns.remove(campaign.id());
                 boolean wasDeleting = deletingCampaigns.remove(campaign.id());
                 RollbackUndo.onRollback(() -> {
@@ -348,6 +357,7 @@ public class InMemoryLibraryStore implements LibraryStore {
         }
         CampaignRow campaign = campaigns.get(id);
         ownerFor(campaign.ownerId());
+        refuseWithShields(id);
         campaigns.remove(id);
         deletingCampaigns.remove(id);
         RollbackUndo.onRollback(() -> {
@@ -355,6 +365,107 @@ public class InMemoryLibraryStore implements LibraryStore {
             deletingCampaigns.add(id);
         });
         return true;
+    }
+
+    @Override
+    public synchronized void insertShield(ShieldRow row) {
+        UUID owner = ownerFor(row.ownerId());
+        CampaignRow campaign = campaigns.get(row.campaignId());
+        if (shields.containsKey(row.id()) || campaign == null || !campaign.ownerId().equals(owner)) {
+            throw new IllegalStateException("key or reference refused");
+        }
+        if (row.unnamed() && shields.values().stream()
+                .anyMatch(other -> other.campaignId().equals(row.campaignId()) && other.unnamed())) {
+            throw new LibraryConflict(LibraryConflict.Reason.UNNAMED_SHIELD_TAKEN);
+        }
+        if (shieldTaken(row.campaignId(), row.nameFingerprint(), row.id())) {
+            throw new LibraryConflict(LibraryConflict.Reason.SHIELD_NAME_TAKEN);
+        }
+        shields.put(row.id(), row);
+        RollbackUndo.onRollback(() -> shields.remove(row.id()));
+    }
+
+    @Override
+    public Optional<ShieldRow> findShield(UUID campaignId, UUID id) {
+        UUID owner = OwnerContext.require();
+        return Optional.ofNullable(shields.get(id))
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId));
+    }
+
+    @Override
+    public List<ShieldRow> shields(UUID campaignId, UUID after, int limit) {
+        UUID owner = OwnerContext.require();
+        return shields.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.campaignId().equals(campaignId)
+                        && (after == null || row.id().compareTo(after) > 0))
+                .sorted(Comparator.comparing(ShieldRow::id)).limit(Math.max(limit, 0)).toList();
+    }
+
+    @Override
+    public List<ShieldRow> shieldsFrom(UUID campaignId, int offset, int limit) {
+        return shields(campaignId, null, Integer.MAX_VALUE).stream().skip(Math.max(offset, 0)).limit(Math.max(limit, 0))
+                .toList();
+    }
+
+    @Override
+    public long shieldCount(UUID campaignId) {
+        return shields(campaignId, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public boolean shieldNameTaken(UUID campaignId, byte[] nameFingerprint, UUID except) {
+        OwnerContext.require();
+        return shieldTaken(campaignId, nameFingerprint, except);
+    }
+
+    @Override
+    public synchronized Optional<ShieldRow> renameShield(UUID campaignId, UUID id, long version, byte[] name,
+                                                         byte[] nameFingerprint) {
+        Optional<ShieldRow> found = findShield(campaignId, id);
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        ShieldRow before = found.get();
+        UUID owner = ownerFor(before.ownerId());
+        if (before.version() != version) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        if (shieldTaken(campaignId, nameFingerprint, id)) {
+            throw new LibraryConflict(LibraryConflict.Reason.SHIELD_NAME_TAKEN);
+        }
+        ShieldRow after = new ShieldRow(id, owner, campaignId, name.clone(), nameFingerprint.clone(), before.version() + 1,
+                before.createdAt());
+        shields.put(id, after);
+        RollbackUndo.onRollback(() -> shields.put(id, before));
+        return Optional.of(after);
+    }
+
+    @Override
+    public synchronized int deleteShieldsOf(java.util.Collection<UUID> campaignIds) {
+        UUID owner = OwnerContext.require();
+        int deleted = 0;
+        for (ShieldRow row : List.copyOf(shields.values())) {
+            if (row.ownerId().equals(owner) && campaignIds.contains(row.campaignId())) {
+                ownerFor(row.ownerId());
+                shields.remove(row.id());
+                RollbackUndo.onRollback(() -> shields.put(row.id(), row));
+                deleted++;
+            }
+        }
+        return deleted;
+    }
+
+    /** Like the key on (campaign, name fingerprint), which ignores a null fingerprint. */
+    private boolean shieldTaken(UUID campaignId, byte[] fingerprint, UUID except) {
+        return fingerprint != null && shields.values().stream().anyMatch(other -> other.campaignId().equals(campaignId)
+                && !other.id().equals(except) && Arrays.equals(other.nameFingerprint(), fingerprint));
+    }
+
+    /** Like {@code shield_campaign_fkey}: a campaign that still has Shields cannot be deleted. */
+    private void refuseWithShields(UUID campaignId) {
+        if (shields.values().stream().anyMatch(row -> row.campaignId().equals(campaignId))) {
+            throw new IllegalStateException("shield_campaign_fkey");
+        }
     }
 
     /** Like the reads' filter: a ready campaign of a ready system. */

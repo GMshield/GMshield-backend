@@ -18,6 +18,10 @@ import java.util.UUID;
  * ready systems only; a deleting campaign is reached through its deletion's methods ({@link #markCampaignDeleting},
  * {@link #campaignDeleting}, {@link #deleteDeletingCampaign}), and through a system's deletion, which takes every
  * campaign of the system, deleting ones included.
+ *
+ * <p>From Story 6.1 a campaign has Shields ({@code shield}, V53): the methods below take a campaign id that the caller has
+ * found ready in the same transaction; they never check the campaign's state themselves. {@link #deleteShieldsOf} alone
+ * reaches the Shields of any campaign of the owner, for the deletions.
  */
 public interface LibraryStore {
 
@@ -177,4 +181,46 @@ public interface LibraryStore {
      * such campaign (a system's deletion may have taken it). Joins the caller's transaction, which must exist.
      */
     boolean deleteDeletingCampaign(UUID id);
+
+    // --- Shields (Story 6.1)
+
+    /**
+     * Stores a new Shield of the current owner's campaign; joins the caller's transaction, which must exist. Throws
+     * {@link LibraryConflict}: {@code SHIELD_NAME_TAKEN} when another Shield of the campaign has its name fingerprint,
+     * {@code UNNAMED_SHIELD_TAKEN} when it is unnamed and the campaign has an unnamed Shield already.
+     */
+    void insertShield(ShieldRow row);
+
+    /** The current owner's Shield {@code id} of the campaign {@code campaignId}; empty for any other id. */
+    Optional<ShieldRow> findShield(UUID campaignId, UUID id);
+
+    /**
+     * The current owner's Shields of the campaign {@code campaignId}, oldest first (ascending id, a UUID v7), only those
+     * whose id is above {@code after} when it is given, at most {@code limit}.
+     */
+    List<ShieldRow> shields(UUID campaignId, UUID after, int limit);
+
+    /** As {@link #shields}, by position instead of by cursor: the Shields after the {@code offset} oldest, at most {@code limit}. */
+    List<ShieldRow> shieldsFrom(UUID campaignId, int offset, int limit);
+
+    /** How many Shields the current owner's campaign {@code campaignId} has. */
+    long shieldCount(UUID campaignId);
+
+    /** Whether a Shield of the campaign {@code campaignId} other than {@code except} has this name fingerprint. */
+    boolean shieldNameTaken(UUID campaignId, byte[] nameFingerprint, UUID except);
+
+    /**
+     * Renames the current owner's Shield {@code id} of the campaign {@code campaignId} and answers the row as stored, its
+     * version raised by one; empty for any other id. Throws {@link LibraryConflict}: {@code STALE_VERSION} when the row
+     * is not at {@code version} (nothing is written), {@code SHIELD_NAME_TAKEN} when another Shield of the campaign has
+     * the new name fingerprint. Joins the caller's transaction, which must exist.
+     */
+    Optional<ShieldRow> renameShield(UUID campaignId, UUID id, long version, byte[] name, byte[] nameFingerprint);
+
+    /**
+     * Deletes every Shield of the current owner's campaigns {@code campaignIds}, whatever their state (a campaign's or a
+     * system's deletion, before the campaign rows go); answers how many went. Joins the caller's transaction, which must
+     * exist.
+     */
+    int deleteShieldsOf(Collection<UUID> campaignIds);
 }
