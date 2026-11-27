@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -234,10 +235,21 @@ public class AnswerJobs implements JobHandler {
 
     @Override
     public void completed(JobRef job, JsonNode result) {
+        completed(job, turn -> {
+        });
+    }
+
+    /**
+     * {@link #completed(JobRef, JsonNode)} with {@code beforeDone} (Story 5.3 part B: a draft's proposal), run in the
+     * same transaction only when the turn has not ended (a stopped turn has: its stop appended {@code done}), before its
+     * references and {@code done} are stored, so no reader sees the turn done without what it stored.
+     */
+    void completed(JobRef job, Consumer<TurnRow> beforeDone) {
         TurnRow turn = turnOf(job);
         if (ended(turn, "completed")) {
             return;
         }
+        beforeDone.accept(turn);
         storeReferences(turn);
         append(turn, null, null, List.of(new TurnEvent(0, TurnEvent.DONE, null, null, null, null, null, false, null)));
     }

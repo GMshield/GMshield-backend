@@ -65,7 +65,8 @@ import tools.jackson.databind.node.ObjectNode;
  *       {@code questions} one; made on its first question), the turn with the question
  *       encrypted, its language ({@link Languages}) and the campaign's stored scope settings frozen on it (Story 3.5,
  *       {@link CampaignScopes#settings}: the switches and the materials off), and its
- *       {@code question.answer} job on the interactive lane.</li>
+ *       {@code question.answer} job, or {@code content.draft} for a draft (Story 5.3 part A), on the interactive
+ *       lane.</li>
  *   <li>{@link #turn} and {@link #eventsAfter}: a turn of the owner, and its stored events after a sequence, decrypted,
  *       in order.</li>
  *   <li>{@link #references} (Story 2.5): a turn's stored source references, decrypted, by number, each marked
@@ -127,6 +128,15 @@ import tools.jackson.databind.node.ObjectNode;
  *       (their bookmark is kept, so an undo lists them again), turns of deleting conversations, and campaigns that are
  *       archived or being deleted. A bookmark gives an answer no standing as a source: {@link #history}, the scope
  *       and retrieval never read it. {@link #turns} says whether each turn is saved.</li>
+ *   <li>Story 5.3 part A, drafts. A turn has a {@link TurnKind kind}: a question, or a draft the GM asked for in the
+ *       {@code questions} area ({@link #ask(UUID, String, UUID, Area, TurnKind)}), written by a {@link DraftJobs} job
+ *       from the same sources. A draft is an answer like any other: it is stopped, dismissed, bookmarked, read in
+ *       {@link #turns} (with its kind) and sent in the {@link #history} of later turns, and it is never a source.</li>
+ *   <li>Story 5.3 part B, the draft's proposal. A finished draft may have a {@link Proposal} (a suggested name and
+ *       record type), which {@link DraftJobs} stores with the turn (the name encrypted, binding
+ *       {@code turn}/{@code proposal_name}) before its {@code done}. The {@link Ending} read for the stream
+ *       ({@link #ending}) and for {@link #turns} carries it, and {@code done} shows it only when the turn is neither
+ *       stopped nor silent ({@link TurnEvents#doneData}). Nothing is written to the library.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -136,6 +146,7 @@ public class Conversations {
 
     static final String TURN = "turn";
     static final String FIELD_QUESTION = "question";
+    static final String FIELD_PROPOSAL_NAME = "proposal_name";
     static final String BATCH = "turn_event_batch";
     static final String FIELD_PAYLOAD = "payload";
     private static final Logger log = LoggerFactory.getLogger(Conversations.class);
@@ -207,12 +218,25 @@ public class Conversations {
 
     /**
      * What a turn's {@code done} event says beside {@code stopped} (Story 3.8): its source references, its frozen
-     * model-knowledge switch, and whether a {@code model} tier event was stored with it.
+     * model-knowledge switch, and whether a {@code model} tier event was stored with it. From Story 5.3 part B, a
+     * draft's stored proposal, decrypted (null when it has none).
      */
-    public record Ending(List<TurnReference> references, boolean modelKnowledge, boolean modelTier) {
+    public record Ending(List<TurnReference> references, boolean modelKnowledge, boolean modelTier,
+                         Proposal proposal) {
 
         public Ending {
             references = List.copyOf(references);
+        }
+    }
+
+    /**
+     * A finished draft's proposal (Story 5.3 part B): its suggested name and record type key (null for none).
+     * {@code toString} names the type only when it is core, never the name.
+     */
+    public record Proposal(String name, String recordType) {
+        @Override
+        public String toString() {
+            return "Proposal[recordType=" + Scopes.loggedType(recordType) + "]";
         }
     }
 
@@ -249,10 +273,11 @@ public class Conversations {
 
     /**
      * A stored turn (Story 3.10): its question and language, when it was asked, and its stored events in order, each
-     * with its data as the stream sends it ({@code done}'s built now from its references).
+     * with its data as the stream sends it ({@code done}'s built now from its references); from Story 5.3 part A, its
+     * kind.
      */
     public record StoredTurn(UUID id, String question, String language, Instant createdAt, List<StoredEvent> events,
-                             boolean bookmarked) {
+                             boolean bookmarked, TurnKind kind) {
         public StoredTurn {
             events = List.copyOf(events);
         }
@@ -331,27 +356,42 @@ public class Conversations {
      * has none). The conversation's last question moves to now.
      */
     public Asked ask(UUID campaignId, String question, UUID conversationId, Area area) {
+        return ask(campaignId, question, conversationId, area, TurnKind.QUESTION);
+    }
+
+    /**
+     * Records a turn of {@code kind} on the owner's campaign, as {@link #ask(UUID, String, UUID, Area)} says (Story 5.3
+     * part A): a {@link TurnKind#DRAFT draft} gets a {@value DraftJobs#KIND} job instead of a {@value AnswerJobs#KIND}
+     * one, and only in the {@code questions} area: a draft whose {@code area}, or whose conversation's area, is another
+     * is {@code request.invalid} with the field {@code kind}, and nothing is recorded.
+     */
+    public Asked ask(UUID campaignId, String question, UUID conversationId, Area area, TurnKind kind) {
         if (question == null || question.isBlank()
                 || question.codePointCount(0, question.length()) > Scopes.MAX_QUESTION) {
             throw ConversationProblems.invalid();
         }
+        TurnKind asked = kind == null ? TurnKind.QUESTION : kind;
+        if (asked == TurnKind.DRAFT && area != null && area != Area.QUESTIONS) {
+            throw ConversationProblems.kindInvalid();
+        }
         UUID owner = OwnerContext.require();
         String language = Languages.detect(question);
-        Asked asked = writing(() -> {
+        return writing(() -> {
             if (campaignId == null || library.campaign(campaignId).isEmpty()) {
                 throw ConversationProblems.notFound();
             }
             Instant now = now();
-            ConversationRow conversation = conversationFor(owner, campaignId, conversationId, area, now);
+            ConversationRow conversation = conversationFor(owner, campaignId, conversationId, area, asked, now);
             UUID turnId = Ids.newId();
             ScopeSettings settings = campaignScopes.settings(campaignId);
-            JobRef job = jobs.create(AnswerJobs.KIND, Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
+            JobRef job = jobs.create(asked.jobKind(), Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
-                    settings.modelKnowledge(), settings.materialsOff(), now, null, null, null)));
+                    settings.modelKnowledge(), settings.materialsOff(), now, null, null, null, asked.word(), null,
+                    null)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
-                    .addKeyValue("turnId", turnId)
+                    .addKeyValue("turnId", turnId).addKeyValue("kind", asked.word())
                     .addKeyValue("jobId", job.id()).addKeyValue("language", language == null ? "unsure" : language)
                     .addKeyValue("otherTier", settings.otherTier())
                     .addKeyValue("materialsOff", settings.materialsOff().size())
@@ -359,16 +399,22 @@ public class Conversations {
                     .log("conversation.turn_recorded");
             return new Asked(turnId, conversation.id(), language);
         });
-        return asked;
     }
 
-    /** The conversation a question goes to, as {@link #ask} says: continued (its last question now) or made now. */
-    private ConversationRow conversationFor(UUID owner, UUID campaignId, UUID conversationId, Area area, Instant now) {
+    /**
+     * The conversation a question goes to, as {@link #ask} says: continued (its last question now) or made now. A
+     * draft continues only a {@code questions} conversation (Story 5.3 part A); this is checked before anything changes.
+     */
+    private ConversationRow conversationFor(UUID owner, UUID campaignId, UUID conversationId, Area area, TurnKind kind,
+                                            Instant now) {
         if (conversationId != null) {
             ConversationRow found = store.findConversation(conversationId)
                     .filter(row -> row.campaignId().equals(campaignId)).orElseThrow(ConversationProblems::notFound);
             if (area != null && !area.word().equals(found.area())) {
                 throw ConversationProblems.invalid();
+            }
+            if (kind == TurnKind.DRAFT && !ConversationRow.QUESTIONS.equals(found.area())) {
+                throw ConversationProblems.kindInvalid();
             }
             store.markAsked(found.id(), now);
             return found;
@@ -544,12 +590,19 @@ public class Conversations {
         for (TurnEvent event : events) {
             ObjectNode data = TurnEvent.DONE.equals(event.type())
                     ? TurnEvents.doneData(new Ending(references(row.id()), row.modelKnowledge(), row.modelKnowledge()
-                            && events.stream().anyMatch(Conversations::modelTier)), event.stopped())
+                            && events.stream().anyMatch(Conversations::modelTier), proposal(row)), event.stopped())
                     : TurnEvents.data(event);
             stored.add(new StoredEvent(event.sequence(), event.type(), data));
         }
         return new StoredTurn(row.id(), vault.decryptText(question(row.id(), row.ownerId()), row.question()),
-                row.language(), row.createdAt(), stored, row.bookmarkedAt() != null);
+                row.language(), row.createdAt(), stored, row.bookmarkedAt() != null,
+                TurnKind.of(row.kind()).orElse(TurnKind.QUESTION));
+    }
+
+    /** The turn's stored proposal, its name decrypted (Story 5.3 part B); null when it has none. */
+    private Proposal proposal(TurnRow row) {
+        return row.proposed() ? new Proposal(vault.decryptText(proposalName(row.id(), row.ownerId()),
+                row.proposalName()), row.proposalType()) : null;
     }
 
     private static boolean modelTier(TurnEvent event) {
@@ -822,15 +875,15 @@ public class Conversations {
 
     /**
      * The owner's turn's {@link Ending}: its references ({@link #references}), the model-knowledge switch frozen with
-     * it (false for an unknown turn or another owner's), and whether one of its stored events is a {@code model} tier
-     * marker.
+     * it (false for an unknown turn or another owner's), whether one of its stored events is a {@code model} tier
+     * marker, and (Story 5.3 part B) its stored proposal.
      */
     public Ending ending(UUID turnId) {
         return reading(() -> {
-            boolean modelKnowledge = turnId != null && store.findTurn(turnId).map(TurnRow::modelKnowledge)
-                    .orElse(false);
+            Optional<TurnRow> row = turnId == null ? Optional.empty() : store.findTurn(turnId);
+            boolean modelKnowledge = row.map(TurnRow::modelKnowledge).orElse(false);
             boolean modelTier = modelKnowledge && storedEvents(turnId, 0).stream().anyMatch(Conversations::modelTier);
-            return new Ending(references(turnId), modelKnowledge, modelTier);
+            return new Ending(references(turnId), modelKnowledge, modelTier, row.map(this::proposal).orElse(null));
         });
     }
 
@@ -881,6 +934,11 @@ public class Conversations {
 
     static Binding question(UUID turnId, UUID owner) {
         return new Binding(TURN, FIELD_QUESTION, turnId, owner);
+    }
+
+    /** The binding of a draft's proposed name (Story 5.3 part B, {@code turn.proposal_name}). */
+    static Binding proposalName(UUID turnId, UUID owner) {
+        return new Binding(TURN, FIELD_PROPOSAL_NAME, turnId, owner);
     }
 
     static Binding name(UUID conversationId, UUID owner) {

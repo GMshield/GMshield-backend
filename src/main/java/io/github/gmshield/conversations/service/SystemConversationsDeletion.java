@@ -30,9 +30,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <ul>
  *   <li>{@link #count}: how many conversations the campaigns have.</li>
- *   <li>{@link #prepare}: the {@code question.answer} job of every turn is locked ({@link Jobs#claimLapse}) and, unless
- *       it has ended, cancelled; it answers the latest claim lapse of those jobs. The turns are already "not found":
- *       their campaign is.</li>
+ *   <li>{@link #prepare}: the job of every turn (its {@code question.answer} job, or {@code content.draft} for a draft
+ *       (Story 5.3 part A)) is locked ({@link Jobs#claimLapse}) and, unless it has ended, cancelled; it answers the
+ *       latest claim lapse of those jobs. The turns are already "not found": their campaign is.</li>
  *   <li>{@link #remove}: one transaction per conversation deletes the references, event batches and turn of each of
  *       its turns, then the conversation. Safe to repeat.</li>
  * </ul>

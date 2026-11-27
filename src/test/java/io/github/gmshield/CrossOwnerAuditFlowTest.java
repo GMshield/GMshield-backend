@@ -79,19 +79,19 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * Story 3.13 part C: the cross-owner audit. Account A owns one item of every library kind of Epic 3 and before: a
- * system (from Story 4.1 with its core record types, and from Story 4.3 the spell record of its accepted version) and
- * a campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second version that
- * is accepted too (the first superseded), with its pages, pictures and passages; an image set with its
- * open uploads; a conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it
- * also cites the record, which becomes a reference of its own), a done, dismissed turn, a
- * search, and a turn still waiting in a second conversation; from Story 5.1 an artifact of the campaign (from part B
- * indexed, and cited by the bookmarked turn too). Account B then walks {@link #ROUTES}, every public route
- * that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same body as
- * a random id on that route (the trace id aside), and a route with a container and an item ({@code own}) answers the
- * same with B's own container. B's body and header fields that name an item ({@link #probes}) answer exactly what a
- * random id gets. Afterwards the compared tables ({@link CrossOwnerAuditStores#tables}) are as they were (no job, no
- * event, no row, no version, bookmark, dismissal or last question changed), A reads back each item unchanged, and B's
- * own lists hold none of A's ids.
+ * system (from Story 4.1 with its core record types, and from Story 4.3 the spell record of its accepted version) and a
+ * campaign with a changed scope; a material uploaded, ingested and accepted, then replaced by a second version that is
+ * accepted too (the first superseded), with its pages, pictures and passages; an image set with its open uploads; a
+ * conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it also cites the
+ * record, which becomes a reference of its own), a done, dismissed turn, a search, and a turn still waiting in a second
+ * conversation; from Story 5.1 an artifact of the campaign (from part B indexed, and cited by the bookmarked turn too);
+ * from Story 5.3 part A a finished draft (a turn of kind draft). Account B then walks {@link #ROUTES}, every public
+ * route that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same
+ * body as a random id on that route (the trace id aside), and a route with a container and an item ({@code own})
+ * answers the same with B's own container. B's body and header fields that name an item ({@link #probes}) answer
+ * exactly what a random id gets. Afterwards the compared tables ({@link CrossOwnerAuditStores#tables}) are as they were
+ * (no job, no event, no row, no version, bookmark, dismissal or last question changed), A reads back each item
+ * unchanged, and B's own lists hold none of A's ids.
  *
  * <p>Here the audit runs on the in-memory twins of the stores ({@link InMemoryCrossOwnerAuditStores}).
  * {@code CrossOwnerAuditIntegrationTest} runs the same audit, its routes, probes and worlds, on PostgreSQL and Redis
@@ -235,6 +235,10 @@ class CrossOwnerAuditFlowTest {
                     .query("area=questions"),
             route("POST", "/api/v1/campaigns/{campaignId}/turns", "campaignId", "campaign")
                     .json("{\"question\":\"Quem leva a coroa?\",\"conversationId\":\"{conversation}\"}"),
+            // a draft asked in a questions conversation (Story 5.3 part A)
+            route("POST", "/api/v1/campaigns/{campaignId}/turns", "campaignId", "campaign")
+                    .json("{\"question\":\"Um encontro\",\"conversationId\":\"{conversation}\","
+                            + "\"kind\":\"draft\"}"),
             route("POST", "/api/v1/campaigns/{campaignId}/searches", "campaignId", "campaign")
                     .json("{\"query\":\"Fire Bolt\"}"),
             // a record as a campaign shows it, for a search's record result (Story 4.3 part B)
@@ -303,6 +307,8 @@ class CrossOwnerAuditFlowTest {
             route("PUT", "/api/v1/turns/{turnId}/dismissal", "turnId", "turn"),
             route("DELETE", "/api/v1/turns/{turnId}/dismissal", "turnId", "dismissedTurn"),
             route("GET", "/api/v1/turns/{turnId}/events", "turnId", "turn").headers("Accept", "text/event-stream"),
+            route("GET", "/api/v1/turns/{turnId}/events", "turnId", "draftTurn").headers("Accept",
+                    "text/event-stream"),
             route("POST", "/api/v1/turns/{turnId}/stop", "turnId", "waitingTurn"),
             route("GET", "/api/v1/turns/{turnId}/references/{number}/pages/{page}", "turnId", "turn", "number", "1",
                     "page", "1"),
@@ -790,6 +796,10 @@ class CrossOwnerAuditFlowTest {
         UUID dismissed = answered(ask(gm, "{\"question\":\"E Ray of Frost?\"}"), passage, null);
         items.put("dismissedTurn", dismissed.toString());
         assertThat(send(gm, "PUT", "/api/v1/turns/" + dismissed + "/dismissal", "").statusCode()).isEqualTo(204);
+        // Story 5.3 part A: a finished draft, a turn of kind draft in the same conversation.
+        UUID draft = answered(ask(gm, "{\"question\":\"Um encontro para a cripta\",\"kind\":\"draft\"}"),
+                passage, null);
+        items.put("draftTurn", draft.toString());
 
         HttpResponse<String> searched = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/searches",
                 "{\"query\":\"Fire Bolt\"}");

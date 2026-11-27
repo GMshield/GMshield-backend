@@ -834,6 +834,37 @@ public class Scopes {
         return RecordTypeKeys.valid(key);
     }
 
+    /**
+     * The names of the record types of the owner's campaign's system among {@code keys} (Story 5.3 part B, internal
+     * contract 1.26.0): each such key with its name ({@link RecordTypeKeys#named}), in the order of {@code keys}; a key
+     * the system has no type for is left out. Empty for a campaign that is unknown, another owner's or being deleted.
+     * The names are data for a model's input; nothing logs them.
+     */
+    public Map<String, String> recordTypeNames(UUID campaignId, Collection<String> keys) {
+        Objects.requireNonNull(keys, "keys");
+        return reading(() -> {
+            Optional<Library.Campaign> campaign = campaignId == null ? Optional.empty() : library.campaign(campaignId);
+            if (campaign.isEmpty() || keys.isEmpty()) {
+                return Map.of();
+            }
+            Map<String, String> byKey = new HashMap<>();
+            recordTypeKeys.named(campaign.get().system().id()).forEach(type -> byKey.put(type.key(), type.name()));
+            Map<String, String> named = new LinkedHashMap<>();
+            keys.stream().filter(byKey::containsKey).forEach(key -> named.put(key, byKey.get(key)));
+            return java.util.Collections.unmodifiableMap(named);
+        });
+    }
+
+    /**
+     * The record type keys of the owner's campaign's system now (Story 5.3 part B: what a draft's proposed type is
+     * checked against when it is stored), as a scope resolved now has them ({@link ResolvedScope#recordTypes}); empty
+     * for a campaign that is unknown, another owner's or being deleted.
+     */
+    public Set<String> recordTypeKeys(UUID campaignId) {
+        return reading(() -> (campaignId == null ? Optional.<Library.Campaign>empty() : library.campaign(campaignId))
+                .map(campaign -> recordTypeKeys.keysOf(campaign.system().id())).orElse(Set.of()));
+    }
+
     /** A record type key as a log line may carry it: a core key as it is, any other as {@code approved}. */
     public static String loggedType(String key) {
         return RecordTypeKeys.logged(key);
