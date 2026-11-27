@@ -150,6 +150,11 @@ import tools.jackson.databind.node.ObjectNode;
  *       and {@link #reopenSave} ("Salvar como artefato") are safe to repeat, and refuse a turn that is not offered or
  *       is saved. None changes the turn's events: the conversation keeps the agent's text. Every refusal and
  *       {@code request.not_found} is as {@link #bookmark}'s.</li>
+ *   <li>Story 5.4 part B, a conversation's saved artifacts. {@link #deletion} also lists the live artifacts saved from
+ *       the conversation, read through the {@link ConversationArtifacts} port the {@code artifacts} module implements
+ *       (this module never depends on that one), and {@link #delete(UUID, Set)} takes the ticked ones with the
+ *       conversation in one transaction: a conversation not found deletes none of them. {@link #ready} tells which
+ *       conversations are {@code ready}, so an artifact never links to a deleting one.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a question or an answer's text.
@@ -195,12 +200,14 @@ public class Conversations {
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final ObjectProvider<AnswerJobs> answers;
     private final ObjectProvider<SystemDeletion> deletions;
+    private final ObjectProvider<ConversationArtifacts> savedArtifacts;
     private final Clock clock;
 
     Conversations(ConversationStore store, TurnReferenceStore referenceStore, Library library, Scopes scopes,
                   CampaignScopes campaignScopes, Jobs jobs, Vault vault,
                   ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<AnswerJobs> answers,
-                  ObjectProvider<SystemDeletion> deletions, ObjectProvider<Clock> clock) {
+                  ObjectProvider<SystemDeletion> deletions, ObjectProvider<ConversationArtifacts> savedArtifacts,
+                  ObjectProvider<Clock> clock) {
         this.store = store;
         this.referenceStore = referenceStore;
         this.library = library;
@@ -211,6 +218,7 @@ public class Conversations {
         this.transactions = transactions;
         this.answers = answers;
         this.deletions = deletions;
+        this.savedArtifacts = savedArtifacts;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
 
@@ -223,6 +231,16 @@ public class Conversations {
 
     /** A campaign's conversation and how many questions it holds (Story 3.2). */
     public record OfCampaign(UUID id, long questions) {
+    }
+
+    /**
+     * What goes with a conversation if it is deleted (Story 3.10 part B): how many questions it shows, and (Story 5.4
+     * part B) its live saved artifacts, oldest first, which its delete may take.
+     */
+    public record Deletion(long questions, List<ConversationArtifacts.SavedArtifact> artifacts) {
+        public Deletion {
+            artifacts = List.copyOf(artifacts);
+        }
     }
 
     /** A recorded turn: its id, its conversation and its language (null when unsure). */
@@ -568,26 +586,67 @@ public class Conversations {
     }
 
     /**
-     * What goes with the owner's conversation if it is deleted (Story 3.10 part B): how many questions it holds; empty
-     * for a conversation that is not the owner's (a deleting one included).
+     * What goes with the owner's conversation if it is deleted (Story 3.10 part B): how many questions it holds, and
+     * (Story 5.4 part B) the live artifacts saved from it, oldest first ({@link ConversationArtifacts#saved}), which its
+     * delete may take; empty for a conversation that is not the owner's (a deleting one included).
      */
-    public Optional<Long> deletion(UUID id) {
-        return reading(() -> visible(id).map(row -> store.turnCount(row.id())));
+    public Optional<Deletion> deletion(UUID id) {
+        return reading(() -> visible(id).map(row -> new Deletion(store.turnCount(row.id()),
+                savedArtifacts.getObject().saved(row.id()))));
     }
 
     /**
-     * Deletes the owner's conversation (Story 3.10 part B), as the class says: true when its deletion was recorded now;
-     * false (nothing changes) for a conversation that is not the owner's, a deleting one included.
+     * Deletes the owner's conversation (Story 3.10 part B), as the class says, keeping every artifact saved from it:
+     * {@link #delete(UUID, Set)} with none ticked.
      */
     public boolean delete(UUID id) {
+        return delete(id, Set.of());
+    }
+
+    /**
+     * Deletes the owner's conversation (Story 3.10 part B), as the class says, with (Story 5.4 part B) the artifacts
+     * saved from it among {@code artifactIds}: in one transaction, the conversation's deletion is recorded
+     * ({@link SystemDeletion#deleteConversation}), then each id that is one of its live saved artifacts starts its
+     * recorded deletion ({@link ConversationArtifacts#deleteSaved}; any other id is ignored). True when it was recorded now;
+     * false (nothing changes, those artifacts' deletions roll back too) for a conversation that is not the owner's, a
+     * deleting one included.
+     */
+    public boolean delete(UUID id, Set<UUID> artifactIds) {
         UUID owner = OwnerContext.require();
-        if (reading(() -> visible(id)).isEmpty()) {
-            return false;
+        Set<UUID> ticked = Set.copyOf(artifactIds);
+        Boolean recorded = new TransactionTemplate(transactions.getObject()).execute(status -> {
+            Optional<ConversationRow> found = visible(id);
+            if (found.isEmpty()) {
+                return false;
+            }
+            ConversationRow row = found.get();
+            if (!deletions.getObject().deleteConversation(row.id())) {
+                // Recorded already (another tab's delete won): not found, and no artifact is touched.
+                status.setRollbackOnly();
+                return false;
+            }
+            // In the same transaction: an artifact deletion that fails rolls the conversation's back too.
+            savedArtifacts.getObject().deleteSaved(row.campaignId(), row.id(), ticked);
+            return true;
+        });
+        boolean started = Boolean.TRUE.equals(recorded);
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("conversationId", id).addKeyValue("recorded", started)
+                .addKeyValue("artifactsTicked", ticked.size()).log("conversation.delete");
+        return started;
+    }
+
+    /**
+     * Which of these ids are the owner's {@code ready} conversations (Story 5.4 part B: an artifact links to the
+     * conversation it was saved from only then); one that is deleting, gone, of a campaign not readable, another
+     * owner's or unknown is left out.
+     */
+    public Set<UUID> ready(Set<UUID> ids) {
+        OwnerContext.require();
+        if (ids.isEmpty()) {
+            return Set.of();
         }
-        boolean recorded = deletions.getObject().deleteConversation(id);
-        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("conversationId", id).addKeyValue("recorded", recorded)
-                .log("conversation.delete");
-        return recorded;
+        return reading(() -> ids.stream().filter(Objects::nonNull).filter(id -> visible(id).isPresent())
+                .collect(Collectors.toUnmodifiableSet()));
     }
 
     /**

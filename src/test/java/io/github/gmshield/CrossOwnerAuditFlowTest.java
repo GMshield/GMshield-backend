@@ -86,7 +86,8 @@ import tools.jackson.databind.node.ObjectNode;
  * conversation with a done, bookmarked turn whose reference opens a page (from Story 4.3 part C it also cites the
  * record, which becomes a reference of its own), a done, dismissed turn, a search, and a turn still waiting in a second
  * conversation; from Story 5.1 an artifact of the campaign (from part B indexed, and cited by the bookmarked turn too);
- * from Story 5.3 part A a finished draft (a turn of kind draft). Account B then walks {@link #ROUTES}, every public
+ * from Story 5.3 part A a finished draft (a turn of kind draft). From Story 5.4 part B, A's artifact named in the deletion
+ * of B's own conversation is ignored as a random id is, and stays. Account B then walks {@link #ROUTES}, every public
  * route that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same
  * body as a random id on that route (the trace id aside), and a route with a container and an item ({@code own})
  * answers the same with B's own container. B's body and header fields that name an item ({@link #probes}) answer
@@ -279,6 +280,9 @@ class CrossOwnerAuditFlowTest {
                     .json("{\"version\":{conversationVersion},\"name\":\"Tomada\"}"),
             route("GET", "/api/v1/conversations/{conversationId}/deletion", "conversationId", "conversation"),
             route("DELETE", "/api/v1/conversations/{conversationId}", "conversationId", "conversation"),
+            // a conversation's deletion with the saved artifacts the GM ticked (Story 5.4 part B)
+            route("POST", "/api/v1/conversations/{conversationId}/deletion", "conversationId", "conversation")
+                    .json("{\"artifactIds\":[\"{artifact}\"]}"),
             route("GET", "/api/v1/conversations/{conversationId}/turns", "conversationId", "conversation"),
             // image sets
             route("POST", "/api/v1/image-sets/{id}/images/{position}", "id", "imageSet", "position", "2")
@@ -701,6 +705,40 @@ class CrossOwnerAuditFlowTest {
                 "X-Job-Grant", claim.path("grant").asString());
         assertThat(input.statusCode()).as(input.body()).isEqualTo(randomInput.statusCode()).isIn(403, 404);
         assertThat(input.body()).doesNotContain("Kael");
+    }
+
+    /**
+     * Story 5.4 part B: another account's artifact named in the deletion of B's own conversation is ignored exactly as a
+     * random id is (202, no body, nothing else deleted), and A's artifact stays undeleted, unchanged and listed.
+     */
+    @Test
+    void anotherAccountsArtifactInAConversationsDeletionIsIgnoredAsARandomIdIsAndStays() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = artifact(a, "Espada de Kael");
+        String own = artifact(b, "Arco de Lia");
+        String theirPath = "/api/v1/campaigns/" + a.campaign() + "/artifacts/" + theirs;
+        String before = json(get(a, theirPath)).toString();
+        String first = json(ask(b, "{\"question\":\"Quem leva a coroa?\",\"area\":\"rules\"}"))
+                .path("conversationId").asString();
+        String second = json(ask(b, "{\"question\":\"E a espada?\",\"area\":\"rules\"}"))
+                .path("conversationId").asString();
+        String random = UUID.randomUUID().toString();
+
+        HttpResponse<String> foreign = send(b, "POST", "/api/v1/conversations/" + first + "/deletion",
+                "{\"artifactIds\":[\"" + theirs + "\"]}");
+        HttpResponse<String> unknown = send(b, "POST", "/api/v1/conversations/" + second + "/deletion",
+                "{\"artifactIds\":[\"" + random + "\"]}");
+
+        assertThat(foreign.statusCode()).as(foreign.body()).isEqualTo(unknown.statusCode()).isEqualTo(202);
+        assertThat(foreign.body()).isEqualTo(unknown.body()).isEmpty();
+        HttpResponse<String> kept = get(a, theirPath);
+        assertThat(kept.statusCode()).as(kept.body()).isEqualTo(200);
+        assertThat(json(kept).toString()).isEqualTo(before);
+        assertThat(json(get(a, "/api/v1/campaigns/" + a.campaign() + "/artifacts")).path("items").toString())
+                .contains(theirs);
+        // B's own artifact, written by hand, is no conversation's either: it stays too.
+        assertThat(get(b, "/api/v1/campaigns/" + b.campaign() + "/artifacts/" + own).statusCode()).isEqualTo(200);
     }
 
     /** A worker call's response as the audit compares answers. */

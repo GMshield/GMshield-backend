@@ -187,7 +187,9 @@ class ModuleBoundaryTest {
      * artifacts of the campaigns going; from part B it also cancels their index jobs and removes their points, through
      * {@code jobs}, and {@code scope} reads the campaign's artifacts through its own port, which {@code artifacts}
      * implements, so {@code scope} still depends on no module that holds them. Story 5.4 part A: {@code artifacts} reads
-     * and marks a saved draft through {@code conversations}, which never depends on {@code artifacts}.
+     * and marks a saved draft through {@code conversations}, which never depends on {@code artifacts}. Story 5.4 part B:
+     * a conversation's deletion reads and takes its saved artifacts through its own port, {@code ConversationArtifacts},
+     * which {@code artifacts} implements, so that rule still holds.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
@@ -205,7 +207,8 @@ class ModuleBoundaryTest {
                 .because("scope reads artifacts through its CampaignArtifacts port only").check(application);
         noClasses().that().resideInAPackage(base + ".conversations..").should().dependOnClassesThat()
                 .resideInAnyPackage(base + ".artifacts..", base + ".knowledge..")
-                .because("artifacts saves a draft through conversations, never the other way (Story 5.4 part A)")
+                .because("artifacts saves a draft through conversations, never the other way (Story 5.4 part A), and"
+                        + " implements its ConversationArtifacts port (part B)")
                 .check(application);
         List<String> handlers = application.get(io.github.gmshield.library.service.SystemDeletionHandler.class)
                 .getAllSubclasses().stream().map(JavaClass::getPackageName).sorted().toList();

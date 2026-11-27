@@ -227,6 +227,16 @@ public class ArtifactRecords {
                 .toList();
     }
 
+    /**
+     * The owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its deletion's
+     * dialog lists them), oldest first; a deleting one is left out.
+     */
+    public List<Identity> ofConversation(UUID conversationId) {
+        OwnerContext.require();
+        return conversationId == null ? List.of() : store.artifactsOfConversation(conversationId).stream()
+                .map(ArtifactRecords::identity).toList();
+    }
+
     /** How many artifacts the owner's campaign has, of the type key {@code recordType} when it is not null. */
     public long count(UUID campaignId, String recordType) {
         OwnerContext.require();

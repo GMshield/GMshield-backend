@@ -3,6 +3,7 @@ package io.github.gmshield.conversations.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.gmshield.artifacts.service.Artifacts;
 import io.github.gmshield.jobs.service.JobClaims;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
@@ -17,6 +18,7 @@ import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import org.junit.jupiter.api.Test;
@@ -35,7 +37,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * their event batches, materials-off rows or references, and touches nothing else (the other conversation, its
  * campaign, the searches, the usage); it waits for a running answer's claim, it is finished by the sweep after a pass
  * stopped mid-way, and a campaign deleted meanwhile takes the conversation, after which both deletions end done.
- * Story 3.12: a saved turn's bookmark goes with its row, and another conversation's stays.
+ * Story 3.12: a saved turn's bookmark goes with its row, and another conversation's stays. Story 5.4 part B: the dialog's
+ * saved artifacts through V49's index, a ticked one deleted with the conversation in one transaction (rolled back with
+ * it when the conversation's deletion is refused), a kept one unlinked at once and kept by the pass.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL.
@@ -55,6 +59,8 @@ class ConversationDeletionIntegrationTest {
     private Conversations conversations;
     @Autowired
     private Searches searches;
+    @Autowired
+    private Artifacts artifacts;
     @Autowired
     private SystemDeletion deletion;
     @Autowired
@@ -88,7 +94,8 @@ class ConversationDeletionIntegrationTest {
         // Story 3.12: a saved turn of each conversation (the column is the store's to write; set here to prove removal).
         jdbc.sql("update turn set bookmarked_at = now() where id in (?, ?)").params(second, kept.turnId()).update();
         UUID search = as(a.id(), () -> searches.create(a.campaign(), "Quanto dano", null, null));
-        assertThat(as(a.id(), () -> conversations.deletion(target))).contains(3L);
+        assertThat(as(a.id(), () -> conversations.deletion(target))).map(Conversations.Deletion::questions)
+                .contains(3L);
         assertThat(as(Ids.newId(), () -> conversations.deletion(target))).isEmpty();
         assertThat(as(Ids.newId(), () -> conversations.delete(target))).isFalse();
         assertThat(as(a.id(), () -> conversations.ofCampaign(a.campaign())).orElseThrow().id()).isEqualTo(target);
@@ -239,7 +246,84 @@ class ConversationDeletionIntegrationTest {
         }
     }
 
+    @Test
+    void theTickedSavedArtifactGoesWithTheConversationAndTheKeptOneStaysWithNoLinkOnPostgres() throws Exception {
+        Owner e = owner();
+        UUID conversation = as(e.id(), () -> conversations.ask(e.campaign(), "Um encontro para a cripta", null,
+                Area.QUESTIONS)).conversationId();
+        UUID kept = savedFrom(e, conversation, "Troll", "creature");
+        Thread.sleep(2);
+        UUID ticked = savedFrom(e, conversation, "Cripta", "encounter");
+        UUID gone = savedFrom(e, conversation, "Velho", "note");
+        assertThat(as(e.id(), () -> artifacts.delete(e.campaign(), gone))).isTrue();
+        UUID handWritten = as(e.id(), () -> artifacts.create(e.campaign(), new Artifacts.Written("item", "Espada",
+                List.of(), null))).orElseThrow().id();
+
+        // The dialog: the live saved artifacts, oldest first, through V49's index; neither the deleting one nor the
+        // one written by hand.
+        Conversations.Deletion dialog = as(e.id(), () -> conversations.deletion(conversation)).orElseThrow();
+        assertThat(dialog.questions()).isOne();
+        assertThat(dialog.artifacts()).extracting(ConversationArtifacts.SavedArtifact::id)
+                .containsExactly(kept, ticked);
+        assertThat(dialog.artifacts()).extracting(ConversationArtifacts.SavedArtifact::name)
+                .containsExactly("Troll", "Cripta");
+        assertThat(dialog.artifacts()).extracting(ConversationArtifacts.SavedArtifact::recordType)
+                .containsExactly("creature", "encounter");
+        assertThat(as(Ids.newId(), () -> conversations.deletion(conversation))).isEmpty();
+
+        // Its deletion recorded by another tab while this one ran: one transaction, so the ticked artifact's deletion
+        // rolls back with it.
+        UUID earlier = Ids.newId();
+        jdbc.sql("insert into deletion (id, owner_id, kind, target_id, not_before, created_at) values (?, ?,"
+                + " 'conversation', ?, now(), now())").params(earlier, e.id(), conversation).update();
+        assertThat(as(e.id(), () -> conversations.delete(conversation, Set.of(ticked)))).isFalse();
+        assertThat(count("record", "id = ? and deleted_at is null", ticked)).isOne();
+        assertThat(count("deletion", "target_id = ?", ticked)).isZero();
+        assertThat(jdbc.sql("select state from conversation where id = ?").param(conversation).query(String.class)
+                .single()).isEqualTo("ready");
+        jdbc.sql("delete from deletion where id = ?").param(earlier).update();
+        // Another owner's delete deletes nothing.
+        assertThat(as(Ids.newId(), () -> conversations.delete(conversation, Set.of(ticked)))).isFalse();
+        assertThat(count("record", "id = ? and deleted_at is null", ticked)).isOne();
+
+        assertThat(as(e.id(), () -> conversations.delete(conversation, Set.of(ticked, handWritten, Ids.newId()))))
+                .isTrue();
+
+        // From the commit: the ticked one deleting, the others live; the kept one names no conversation, though its
+        // row still does until the conversation's pass.
+        assertThat(count("record", "id = ? and deleted_at is not null", ticked)).isOne();
+        assertThat(count("record", "id in (?, ?) and deleted_at is null", kept, handWritten)).isEqualTo(2);
+        assertThat(count("deletion", "kind = 'artifact' and target_id = ?", ticked)).isOne();
+        assertThat(count("deletion", "target_id in (?, ?)", kept, handWritten)).isZero();
+        assertThat(jdbc.sql("select conversation_id from record where id = ?").param(kept).query(UUID.class)
+                .single()).isEqualTo(conversation);
+        assertThat(as(e.id(), () -> artifacts.get(e.campaign(), kept)).orElseThrow().conversationId()).isNull();
+        assertThat(as(e.id(), () -> artifacts.get(e.campaign(), ticked))).isEmpty();
+
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(2);
+
+        assertThat(count("conversation", "id = ?", conversation)).isZero();
+        assertThat(count("record", "id in (?, ?)", ticked, gone)).isZero();
+        assertThat(count("record_version", "record_id in (?, ?)", ticked, gone)).isZero();
+        assertThat(count("record", "id = ? and conversation_id is null", kept)).isOne();
+        assertThat(count("record_version", "record_id = ?", kept)).isOne();
+        Artifacts.Artifact read = as(e.id(), () -> artifacts.get(e.campaign(), kept)).orElseThrow();
+        assertThat(read.conversationId()).isNull();
+        assertThat(read.name()).isEqualTo("Troll");
+    }
+
     // --- helpers
+
+    /**
+     * An artifact of the owner's campaign saved from the conversation (Story 5.4 part B): written as a draft's save
+     * writes it, then given its conversation, the column a save sets.
+     */
+    private UUID savedFrom(Owner owner, UUID conversation, String name, String recordType) throws Exception {
+        UUID id = as(owner.id(), () -> artifacts.create(owner.campaign(), new Artifacts.Written(recordType, name,
+                List.of(), "Três esqueletos."))).orElseThrow().id();
+        jdbc.sql("update record set conversation_id = ? where id = ?").params(conversation, id).update();
+        return id;
+    }
 
     private Owner owner() throws Exception {
         UUID id = Ids.newId();

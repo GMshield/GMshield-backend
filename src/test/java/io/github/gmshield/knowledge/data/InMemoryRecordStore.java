@@ -307,6 +307,15 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
+    public List<ArtifactRow> artifactsOfConversation(UUID conversationId) {
+        UUID owner = OwnerContext.require();
+        return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
+                && conversationId.equals(row.conversationId()) && live(row))
+                .sorted(Comparator.comparing(ArtifactRow::createdAt).thenComparing(ArtifactRow::id,
+                        InMemoryRecordStore::unsigned)).toList();
+    }
+
+    @Override
     public long artifactCount(UUID campaignId, String type) {
         return ofCampaign(campaignId, type).count();
     }

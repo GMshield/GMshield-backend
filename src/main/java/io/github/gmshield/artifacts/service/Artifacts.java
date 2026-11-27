@@ -83,10 +83,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       and the whole transaction rolls back, the artifact and its index job included).</li>
  * </ul>
  *
- * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand) and its
- * references, by number, each marked {@code removed} when read as an answer's are ({@link Scopes#removedVersions} for a
- * passage's or a record's, {@link Scopes#removedArtifacts} in its campaign for an artifact's). An edit or a restore
- * keeps them: they belong to the artifact, not to a version.
+ * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
+ * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
+ * and its references, by number, each marked {@code removed} when read as an answer's are
+ * ({@link Scopes#removedVersions} for a passage's or a record's, {@link Scopes#removedArtifacts} in its campaign for an
+ * artifact's). An edit or a restore keeps them: they belong to the artifact, not to a version.
  *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
  */
@@ -183,6 +184,12 @@ public class Artifacts {
         public Artifact {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
+        }
+
+        /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
+        Artifact unlinked() {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    null, references);
         }
 
         /** This artifact with its references (Story 5.4 part A). */
@@ -371,8 +378,8 @@ public class Artifacts {
                             .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
                     Optional<ArtifactVersionRow> shown = number == null || number == newest.number()
                             ? Optional.of(newest) : versions.find(identity.id(), number);
-                    return shown.map(version -> open(vault, identity, version, newest.number(), owner)
-                            .withReferences(referencesOf(identity.id(), identity.campaignId(), owner)));
+                    return shown.map(version -> linked(open(vault, identity, version, newest.number(), owner)
+                            .withReferences(referencesOf(identity.id(), identity.campaignId(), owner))));
                 }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("artifactId", artifactId).addKeyValue("version", number)
@@ -402,8 +409,8 @@ public class Artifacts {
                         Artifact current = open(vault, identity, newest, owner);
                         if (current.recordType().equals(recordType) && current.name().equals(checked.name())
                                 && current.fields().equals(fields) && Objects.equals(current.content(), content)) {
-                            return Optional.of(current.withReferences(referencesOf(identity.id(),
-                                    identity.campaignId(), owner)));
+                            return Optional.of(linked(current.withReferences(referencesOf(identity.id(),
+                                    identity.campaignId(), owner))));
                         }
                     }
                     return next(identity, owner, version, recordType, checked.name(), fields, content);
@@ -542,8 +549,22 @@ public class Artifacts {
         }
         records.retype(id, recordType).orElseThrow(() -> new IllegalStateException("artifacts.identity_missing"));
         indexing.start(id, number, now);
-        return Optional.of(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number, number,
-                identity.createdAt(), identity.conversationId(), referencesOf(id, identity.campaignId(), owner)));
+        return Optional.of(linked(new Artifact(id, identity.campaignId(), recordType, name, fields, content, number,
+                number, identity.createdAt(), identity.conversationId(), referencesOf(id, identity.campaignId(),
+                owner))));
+    }
+
+    /**
+     * The artifact as an answer shows it (Story 5.4 part B): its conversation only while that conversation is
+     * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise.
+     */
+    private Artifact linked(Artifact artifact) {
+        UUID conversationId = artifact.conversationId();
+        if (conversationId == null || conversations.getObject().ready(Set.of(conversationId))
+                .contains(conversationId)) {
+            return artifact;
+        }
+        return artifact.unlinked();
     }
 
     private int newestNumber(UUID id) {

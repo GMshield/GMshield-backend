@@ -10,6 +10,8 @@ import io.github.gmshield.conversations.service.TurnStreams;
 import io.github.gmshield.scope.service.SourcePage;
 import io.github.gmshield.scope.service.SourcePicture;
 import io.github.gmshield.scope.service.Tier;
+import io.github.gmshield.shared.service.ApiException;
+import io.github.gmshield.shared.service.ApiProblem;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -22,9 +24,11 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.CacheControl;
@@ -44,7 +48,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import tools.jackson.core.JacksonException;
 import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -68,6 +74,9 @@ import tools.jackson.databind.json.JsonMapper;
  * From Story 5.4 part A, an offered draft's save state on each stored turn, and the GM's "Agora não" (PUT) and
  * "Salvar como artefato" (DELETE) on {@code /turns/{turnId}/save-decline}; the save itself is the {@code artifacts}
  * module's ({@code POST /turns/{turnId}/artifact}).
+ * From Story 5.4 part B, what goes with a conversation also lists the artifacts saved from it, and
+ * {@code POST /conversations/{conversationId}/deletion} deletes it with the ones the GM ticked, in one transaction
+ * ({@code DELETE /conversations/{conversationId}} keeps them all).
  * The owner is the session's account, set by the request edge ({@code accounts.web}); another owner's id, an unknown id
  * and a malformed id are the same {@code request.not_found} (404). Every answer is {@code no-store}.
  */
@@ -106,6 +115,10 @@ class ConversationController {
     static final String LAST_EVENT_ID = "Last-Event-ID";
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern SEQUENCE = Pattern.compile("\\d{1,18}");
+    /** The most artifact ids a conversation's deletion takes (Story 5.4 part B). */
+    static final int MAX_DELETED_ARTIFACTS = 64;
+    /** The problem's {@code field} for a conversation deletion's artifact ids (Story 5.4 part B). */
+    static final String ARTIFACT_IDS = "artifactIds";
 
     private final Conversations conversations;
     private final Searches searches;
@@ -249,12 +262,51 @@ class ConversationController {
         }
     }
 
-    @Schema(name = "ConversationDeletion", requiredProperties = "questions",
-            description = "What goes with a conversation if it is deleted (contract 1.30.0)")
+    @Schema(name = "ConversationDeletion", requiredProperties = {"questions", "artifacts"},
+            description = "What goes with a conversation if it is deleted (contract 1.30.0; artifacts from 1.49.0)")
     record ConversationDeletionView(
             @Schema(description = "How many questions it shows (from contract 1.31.0 a dismissed one is not counted,"
                     + " though it goes too): each goes with its answer, events and source references", format = "int64",
-                    minimum = "0", example = "3") long questions) {
+                    minimum = "0", example = "3") long questions,
+            @ArraySchema(arraySchema = @Schema(description = "The artifacts saved from it that are not being deleted,"
+                    + " oldest first (contract 1.49.0); possibly none. Each stays unless its id is sent in the"
+                    + " deletion's artifactIds"),
+                    schema = @Schema(implementation = ConversationDeletionArtifactView.class))
+            List<ConversationDeletionArtifactView> artifacts) {
+
+        static ConversationDeletionView of(Conversations.Deletion deletion) {
+            return new ConversationDeletionView(deletion.questions(), deletion.artifacts().stream()
+                    .map(artifact -> new ConversationDeletionArtifactView(artifact.id(), artifact.name(),
+                            artifact.recordType())).toList());
+        }
+
+        @Override
+        public String toString() {
+            return "ConversationDeletionView[questions=" + questions + ", artifacts=" + artifacts.size() + "]";
+        }
+    }
+
+    @Schema(name = "ConversationDeletionArtifact", requiredProperties = {"id", "name", "recordType"},
+            description = "An artifact saved from a conversation, as its deletion's dialog lists it (contract 1.49.0)")
+    record ConversationDeletionArtifactView(
+            @Schema(description = "The artifact's id", format = "uuid") UUID id,
+            @Schema(description = "Its newest version's name", example = "Emboscada na Cripta") String name,
+            @Schema(description = "Its record type's key", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "encounter")
+            String recordType) {
+
+        @Override
+        public String toString() {
+            return "ConversationDeletionArtifactView[id=" + id + "]";
+        }
+    }
+
+    @Schema(name = "ConversationDeletionRequest", requiredProperties = "artifactIds",
+            description = "A conversation's deletion with the artifacts saved from it that go too (contract 1.49.0)")
+    record ConversationDeletionRequest(
+            @ArraySchema(arraySchema = @Schema(description = "The ids of the artifacts saved from the conversation that"
+                    + " are deleted with it, 0 to 64; empty keeps them all. An id that is not one of its artifacts"
+                    + " not being deleted is ignored"), maxItems = MAX_DELETED_ARTIFACTS,
+                    schema = @Schema(type = "string", format = "uuid")) List<String> artifactIds) {
     }
 
     @Schema(name = "ConversationChange", requiredProperties = {"version", "name"},
@@ -808,9 +860,65 @@ class ConversationController {
     ResponseEntity<ConversationDeletionView> conversationDeletion(
             @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
             @PathVariable("conversationId") String conversationId) {
-        long questions = parse(conversationId).flatMap(conversations::deletion)
+        Conversations.Deletion deletion = parse(conversationId).flatMap(conversations::deletion)
                 .orElseThrow(ConversationProblems::notFound);
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new ConversationDeletionView(questions));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ConversationDeletionView.of(deletion));
+    }
+
+    @PostMapping(path = CONVERSATION_DELETION, consumes = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "startConversationDeletion", summary = "Deletes one of the account's conversations with"
+            + " the artifacts saved from it that the GM ticked (contract 1.49.0; 202, no body). In one transaction each"
+            + " id of artifactIds that is an artifact saved from this conversation and not being deleted starts its"
+            + " deletion, as deleteArtifact does, and any other id (another conversation's, another account's, one"
+            + " being deleted or unknown) is ignored; then the conversation is deleted as deleteConversation does. The"
+            + " artifacts not ticked stay, with their versions, and from now on name no conversation. request.invalid"
+            + " (400) with params.field artifactIds for a malformed body, a malformed id or more than 64 ids;"
+            + " request.not_found (404) for any other conversation id, a conversation already being deleted included;"
+            + " nothing is deleted then. Cannot be undone",
+            parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
+                    description = "The session token", schema = @Schema(type = "string")),
+            requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(required = true,
+                    content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
+                            schema = @Schema(implementation = ConversationDeletionRequest.class))),
+            responses = @ApiResponse(responseCode = "202", description = "The deletion started"))
+    ResponseEntity<Void> startConversationDeletion(
+            @Parameter(description = "The conversation's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("conversationId") String conversationId,
+            @RequestBody(required = false) String body) {
+        UUID id = parse(conversationId).orElseThrow(ConversationProblems::notFound);
+        Set<UUID> artifactIds = artifactIds(body);
+        if (!conversations.delete(id, artifactIds)) {
+            throw ConversationProblems.notFound();
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).build();
+    }
+
+    /**
+     * A deletion body's artifact ids (Story 5.4 part B): an object whose {@code artifactIds} is an array of 0 to
+     * {@value #MAX_DELETED_ARTIFACTS} UUIDs as text; anything else is {@code request.invalid} naming that field.
+     */
+    private static Set<UUID> artifactIds(String body) {
+        JsonNode read;
+        try {
+            read = body == null || body.isBlank() ? null : JSON.readTree(body);
+        } catch (JacksonException malformed) {
+            throw artifactIdsInvalid();
+        }
+        JsonNode ids = read == null || !read.isObject() ? null : read.get(ARTIFACT_IDS);
+        if (ids == null || !ids.isArray() || ids.size() > MAX_DELETED_ARTIFACTS) {
+            throw artifactIdsInvalid();
+        }
+        Set<UUID> found = new LinkedHashSet<>();
+        for (JsonNode id : ids) {
+            Optional<UUID> parsed = id.isString() ? parse(id.asString()) : Optional.empty();
+            found.add(parsed.orElseThrow(ConversationController::artifactIdsInvalid));
+        }
+        return Set.copyOf(found);
+    }
+
+    private static ApiException artifactIdsInvalid() {
+        return new ApiException(ApiProblem.forStatus(400).withParams(Map.<String, Object>of("field", ARTIFACT_IDS,
+                "max", MAX_DELETED_ARTIFACTS)));
     }
 
     @DeleteMapping(path = CONVERSATION)
@@ -819,8 +927,9 @@ class ConversationController {
             + " conversation, its turns, a question naming it, the campaign's latest questions conversation, and its"
             + " turns' events, stop and reference pages), its answers still being written are cancelled, and its turns,"
             + " their events and source references are removed in the background. Nothing of its campaign, of the other"
-            + " conversations, of the searches or of the materials changes. Cannot be undone. request.not_found (404)"
-            + " for any other id, a conversation already being deleted included",
+            + " conversations, of the searches or of the materials changes; from contract 1.49.0 the artifacts saved"
+            + " from it stay too, as startConversationDeletion with no artifactIds. Cannot be undone."
+            + " request.not_found (404) for any other id, a conversation already being deleted included",
             parameters = @Parameter(name = "X-Session-Token", in = ParameterIn.HEADER,
                     description = "The session token", schema = @Schema(type = "string")),
             responses = @ApiResponse(responseCode = "202", description = "The deletion started"))

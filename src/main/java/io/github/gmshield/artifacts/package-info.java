@@ -13,7 +13,9 @@
  * version, restores one as the newest and opens a cited one by its number. Story 5.4 part A saves a finished draft as an
  * artifact ({@code web.DraftSaveController}, {@code service.Artifacts#saveDraft}): it reads the draft and marks the
  * turn saved through {@code conversations :: service}, in the transaction that creates the artifact; nothing in
- * {@code conversations} depends on this module.
+ * {@code conversations} depends on this module. Story 5.4 part B implements that module's {@code ConversationArtifacts}
+ * port ({@code service.SavedArtifacts}): a conversation's deletion lists the artifacts saved from it and takes the
+ * ticked ones through {@code service.Artifacts#delete}; an artifact names its conversation only while it is ready.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Artifacts",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "knowledge :: service",

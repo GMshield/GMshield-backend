@@ -75,6 +75,10 @@ class JpaRecordStore implements RecordStore {
             + " and r.id < :before" + LIVE + " order by r.id desc";
     private static final String ARTIFACTS_OF_TYPE_BEFORE = "select r from Record r where r.campaignId = :campaign"
             + " and r.recordType = :type and r.id < :before" + LIVE + " order by r.id desc";
+    /** Story 5.4 part B: a conversation's live saved artifacts, oldest first (V49's record_owner_conversation). */
+    private static final String ARTIFACTS_OF_CONVERSATION = "select r from Record r"
+            + " where r.conversationId = :conversation and r.campaignId is not null" + LIVE
+            + " order by r.createdAt, r.id";
     private static final String ARTIFACT_COUNT = "select count(r) from Record r where r.campaignId = :campaign" + LIVE;
     private static final String ARTIFACT_COUNT_OF_TYPE = "select count(r) from Record r where r.campaignId = :campaign"
             + " and r.recordType = :type" + LIVE;
@@ -403,6 +407,13 @@ class JpaRecordStore implements RecordStore {
             read.setParameter("before", before);
         }
         return read.setFirstResult(offset).setMaxResults(limit).getResultList().stream().map(RecordEntity::artifact)
+                .toList();
+    }
+
+    @Override
+    public List<ArtifactRow> artifactsOfConversation(UUID conversationId) {
+        return em().createQuery(ARTIFACTS_OF_CONVERSATION, RecordEntity.class)
+                .setParameter("conversation", conversationId).getResultList().stream().map(RecordEntity::artifact)
                 .toList();
     }
 

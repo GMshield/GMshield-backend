@@ -1860,6 +1860,26 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `conversation.save_reopened`. Deploy order: backend, then frontend (minimum public contract 1.48.0); internal
     contract and worker unchanged.
 
+- **Delete a conversation that has saved artifacts (`conversations`, `artifacts`, Story 5.4 part B, public contract
+  1.49.0, no migration).** A conversation's deletion names the artifacts saved from it, and the GM may take some.
+  - **The dialog read.** `GET /api/v1/conversations/{id}/deletion` gains `artifacts: [{id, name, recordType}]`
+    (`ConversationDeletionArtifact`): the conversation's live saved artifacts (`record.conversation_id`, not deleting),
+    oldest first, possibly none. `conversations` reads them through its own port `ConversationArtifacts`, which
+    `artifacts` implements (`SavedArtifacts`, over `ArtifactRecords.ofConversation` and V49's
+    `record_owner_conversation` index); `conversations` never depends on `artifacts` (`ModuleBoundaryTest`).
+  - **The delete.** `POST /api/v1/conversations/{id}/deletion` (body `ConversationDeletionRequest {artifactIds}`, 0 to
+    64 UUIDs; 202, no body). `Conversations.delete(id, artifactIds)` runs one transaction: the conversation found (else
+    404, nothing deleted), `SystemDeletion.deleteConversation` (a deletion recorded already is 404, and no artifact is
+    touched), then each ticked id that is one of its live saved artifacts deleted as `Artifacts.delete` does (5.2 B's
+    recorded deletion), any other id ignored. A malformed body, a malformed id or more than 64 ids is 400
+    `request.invalid` with `params.field: artifactIds`. `DELETE /api/v1/conversations/{id}` stays and keeps every
+    artifact.
+  - **The link.** `Artifact.conversationId` is null unless that conversation is `ready` (`Conversations.ready`), so a
+    deleting conversation's id never leaves, before its pass sets `record.conversation_id` to null.
+  - Log lines (ids and counts only): `conversation.delete` gains `artifactsTicked`; each artifact taken logs
+    `artifacts.delete`. Deploy order: backend, then frontend (minimum public contract 1.49.0); the 1.48.0 frontend's
+    `DELETE` keeps the artifacts as before. Internal contract and worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

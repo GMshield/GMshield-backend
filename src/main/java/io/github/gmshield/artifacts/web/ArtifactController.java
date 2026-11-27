@@ -51,7 +51,8 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 5.4 part A (contract 1.48.0): every artifact answer carries {@code conversationId} (the conversation a saved
  * draft came from; null for one written by hand) and {@code references} (a saved draft's sources, copied by value, in
  * the shape of a turn's references, each {@code removed} as of the answer; empty for one written by hand). The save
- * itself is {@link DraftSaveController}.
+ * itself is {@link DraftSaveController}. From Story 5.4 part B (contract 1.49.0) {@code conversationId} is null as
+ * soon as that conversation's deletion starts.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -127,7 +128,8 @@ class ArtifactController {
             @Schema(description = "When the artifact was written", format = "date-time") String createdAt,
             @Schema(description = "The conversation the artifact was saved from, a draft's (contract 1.48.0); its page"
                     + " is that conversation's. Null for an artifact written by hand, and once that conversation is"
-                    + " deleted", types = {"string", "null"}, format = "uuid") String conversationId,
+                    + " deleted (from contract 1.49.0, from the moment its deletion starts)",
+                    types = {"string", "null"}, format = "uuid") String conversationId,
             @ArraySchema(arraySchema = @Schema(description = "The sources of the draft the artifact was saved from"
                     + " (contract 1.48.0), copied by value when it was saved, by number, in the shape of a turn's"
                     + " references (a passage's, a record's or an artifact's) without their positions in the text."

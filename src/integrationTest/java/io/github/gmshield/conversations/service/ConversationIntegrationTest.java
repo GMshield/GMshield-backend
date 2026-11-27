@@ -1238,7 +1238,8 @@ class ConversationIntegrationTest {
         Conversations.OfCampaign ofCampaign = as(owner, () -> conversations.ofCampaign(campaign)).orElseThrow();
         assertThat(ofCampaign.id()).isEqualTo(conversation);
         assertThat(ofCampaign.questions()).isEqualTo(questions);
-        assertThat(as(owner, () -> conversations.deletion(conversation)).orElseThrow()).isEqualTo(questions);
+        assertThat(as(owner, () -> conversations.deletion(conversation)).orElseThrow().questions())
+                .isEqualTo(questions);
     }
 
     @Test
