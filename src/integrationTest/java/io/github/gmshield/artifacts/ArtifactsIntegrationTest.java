@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.gmshield.GmshieldApplication;
 import io.github.gmshield.artifacts.data.ArtifactIndexStore;
+import io.github.gmshield.artifacts.data.ArtifactShareStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.artifacts.data.StaleArtifacts;
@@ -118,6 +119,10 @@ import tools.jackson.databind.json.JsonMapper;
  * PostgreSQL, never to another owner; the target campaign's key has no cascade, so its deletion's pass removes the shares
  * into it; and the artifact's key cascades.
  *
+ * <p>Story 5.6 part B: a campaign's list holds the artifacts shared into it beside its own, by id in SQL, with the type
+ * filter, the cursor and the offset, counted in its total and types; the other owner's store reads answer none of
+ * them, and {@code ArtifactShareStore#ofAll} reads the shares of many artifacts on PostgreSQL.
+ *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
  */
@@ -182,6 +187,8 @@ class ArtifactsIntegrationTest {
     private MaterialStore materials;
     @Autowired
     private Scopes scopes;
+    @Autowired
+    private ArtifactShareStore shares;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID system, UUID campaign) {
@@ -870,19 +877,20 @@ class ArtifactsIntegrationTest {
             assertThat(records.artifactIdsOf(List.of(other), RecordStore.Reach.LIVE)).containsExactly(live);
             assertThat(records.artifactIdsOf(List.of(other), RecordStore.Reach.ALL))
                     .containsExactlyInAnyOrder(id, live, typed);
-            assertThat(records.artifacts(other, null, null, 0, 20)).extracting(ArtifactRow::id).containsExactly(live);
-            assertThat(records.artifacts(other, "item", null, 0, 20)).isEmpty();
-            // The cursor-paged reads, from an id newer than the deleting ones (the newest artifact, typed).
-            assertThat(records.artifacts(other, null, Ids.newId(), 0, 20)).extracting(ArtifactRow::id)
+            assertThat(records.artifacts(other, List.of(), null, null, 0, 20)).extracting(ArtifactRow::id)
                     .containsExactly(live);
-            assertThat(records.artifacts(other, "item", Ids.newId(), 0, 20)).isEmpty();
-            assertThat(records.artifacts(other, null, typed, 0, 20)).extracting(ArtifactRow::id)
+            assertThat(records.artifacts(other, List.of(), "item", null, 0, 20)).isEmpty();
+            // The cursor-paged reads, from an id newer than the deleting ones (the newest artifact, typed).
+            assertThat(records.artifacts(other, List.of(), null, Ids.newId(), 0, 20)).extracting(ArtifactRow::id)
+                    .containsExactly(live);
+            assertThat(records.artifacts(other, List.of(), "item", Ids.newId(), 0, 20)).isEmpty();
+            assertThat(records.artifacts(other, List.of(), null, typed, 0, 20)).extracting(ArtifactRow::id)
                     .containsExactly(live).doesNotContain(id);
-            assertThat(records.artifactCount(other, null)).isOne();
-            assertThat(records.artifactCount(other, "item")).isZero();
+            assertThat(records.artifactCount(other, List.of(), null)).isOne();
+            assertThat(records.artifactCount(other, List.of(), "item")).isZero();
             assertThat(records.artifactsIn(List.of(other))).isOne();
             assertThat(records.artifactsOfTypeIn(List.of(other), "arma_magica")).isZero();
-            assertThat(records.artifactTypes(other)).containsOnlyKeys("note");
+            assertThat(records.artifactTypes(other, List.of())).containsOnlyKeys("note");
             assertThat(records.retypeArtifact(id, "note")).isEmpty();
             assertThat(records.markArtifactDeleting(id, Instant.now())).isFalse();
             return null;
@@ -1196,6 +1204,74 @@ class ArtifactsIntegrationTest {
         jdbc.sql("delete from record where id = ?").param(kael).update();
         assertThat(count("artifact_share", "artifact_id = ?", kael)).isZero();
         assertThat(as(a.id(), () -> campaignArtifacts.shared(domingo))).isEmpty();
+        freeTheIngestionLane();
+    }
+
+    // --- Story 5.6 part B
+
+    @Test
+    void theListOfACampaignHoldsTheArtifactsSharedIntoItInIdOrderWithItsPagingAndCountsOnPostgres() throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        Owner b = owner();
+        UUID quinta = as(a.id(), () -> library.createCampaign(a.system(), "Mesa de quinta")).orElseThrow().id();
+        UUID older = as(a.id(), () -> artifacts.create(quinta, new Artifacts.Written("note", "Lembrete", List.of(),
+                null))).orElseThrow().id();
+        UUID espada = as(a.id(), () -> artifacts.create(a.campaign(), kael())).orElseThrow().id();
+        UUID kept = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("note", "Diário", List.of(),
+                null))).orElseThrow().id();
+        UUID newer = as(a.id(), () -> artifacts.create(quinta, new Artifacts.Written("item", "Escudo", List.of(),
+                null))).orElseThrow().id();
+        as(a.id(), () -> artifacts.share(a.campaign(), espada, List.of(quinta))).orElseThrow();
+
+        // One list, newest first by id: the own artifacts and the shared one, counted in total and types.
+        Artifacts.Page page = as(a.id(), () -> artifacts.list(quinta, null, null, 0, 20)).orElseThrow();
+        assertThat(page.items()).extracting(Artifacts.Summary::id).containsExactly(newer, espada, older);
+        assertThat(page.items()).extracting(summary -> summary.sharedFrom() == null ? null
+                : summary.sharedFrom().name()).containsExactly(null, "Primeira campanha", null);
+        assertThat(page.total()).isEqualTo(3);
+        assertThat(page.types()).containsExactly(new Artifacts.TypeCount("item", 2), new Artifacts.TypeCount("note",
+                1));
+        // The type filter, the cursor and the offset page the same list in SQL.
+        assertThat(as(a.id(), () -> artifacts.list(quinta, "item", null, 0, 20)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(newer, espada);
+        assertThat(as(a.id(), () -> artifacts.list(quinta, "item", null, 0, 20)).orElseThrow().total()).isEqualTo(2);
+        Artifacts.Page first = as(a.id(), () -> artifacts.list(quinta, null, null, 0, 1)).orElseThrow();
+        assertThat(first.nextCursor()).isEqualTo(newer);
+        assertThat(as(a.id(), () -> artifacts.list(quinta, null, newer, 0, 1)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(espada);
+        assertThat(as(a.id(), () -> artifacts.list(quinta, "item", newer, 0, 20)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(espada);
+        assertThat(as(a.id(), () -> artifacts.list(quinta, null, null, 2, 20)).orElseThrow().items())
+                .extracting(Artifacts.Summary::id).containsExactly(older);
+        // The own list is unchanged, and the other owner's sees nothing of A's.
+        Artifacts.Page own = as(a.id(), () -> artifacts.list(a.campaign(), null, null, 0, 20)).orElseThrow();
+        assertThat(own.items()).extracting(Artifacts.Summary::id).containsExactly(kept, espada);
+        assertThat(own.items()).allMatch(summary -> summary.sharedFrom() == null);
+        assertThat(as(b.id(), () -> artifacts.list(b.campaign(), null, null, 0, 20)).orElseThrow().total()).isZero();
+        as(b.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(records.artifacts(b.campaign(), List.of(espada), null, null, 0, 20)).isEmpty();
+            assertThat(records.artifactCount(b.campaign(), List.of(espada), null)).isZero();
+            assertThat(records.artifactTypes(b.campaign(), List.of(espada))).isEmpty();
+            assertThat(shares.ofAll(List.of(espada))).isEmpty();
+            return null;
+        }));
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            assertThat(shares.ofAll(List.of(espada, kept))).singleElement().satisfies(row -> {
+                assertThat(row.artifactId()).isEqualTo(espada);
+                assertThat(row.campaignId()).isEqualTo(quinta);
+            });
+            assertThat(shares.ofAll(List.of())).isEmpty();
+            return null;
+        }));
+
+        // Deleting the shared artifact takes it out of the list and its counts.
+        assertThat(as(a.id(), () -> artifacts.delete(a.campaign(), espada))).isTrue();
+        Artifacts.Page after = as(a.id(), () -> artifacts.list(quinta, null, null, 0, 20)).orElseThrow();
+        assertThat(after.items()).extracting(Artifacts.Summary::id).containsExactly(newer, older);
+        assertThat(after.total()).isEqualTo(2);
+        assertThat(after.types()).containsExactly(new Artifacts.TypeCount("item", 1), new Artifacts.TypeCount("note",
+                1));
         freeTheIngestionLane();
     }
 

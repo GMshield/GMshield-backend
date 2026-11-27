@@ -22,6 +22,12 @@ public interface ArtifactShareStore {
     /** The current owner's shares into the campaign {@code campaignId}, oldest first (by when written, then artifact). */
     List<ArtifactShareRow> into(UUID campaignId);
 
+    /**
+     * The current owner's shares of the artifacts with these ids (Story 5.6 part B: a conversation's deletion dialog
+     * says which are shared), in no set order; none for no id.
+     */
+    List<ArtifactShareRow> ofAll(Collection<UUID> artifactIds);
+
     /** Deletes the current owner's share of {@code artifactId} with {@code campaignId}; answers whether one went. */
     boolean delete(UUID artifactId, UUID campaignId);
 

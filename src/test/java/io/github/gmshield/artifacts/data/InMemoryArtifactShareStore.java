@@ -51,6 +51,13 @@ public class InMemoryArtifactShareStore implements ArtifactShareStore {
     }
 
     @Override
+    public List<ArtifactShareRow> ofAll(Collection<UUID> artifactIds) {
+        UUID owner = OwnerContext.require();
+        return rows.values().stream().filter(row -> row.ownerId().equals(owner)
+                && artifactIds.contains(row.artifactId())).toList();
+    }
+
+    @Override
     public boolean delete(UUID artifactId, UUID campaignId) {
         return removed(row -> row.artifactId().equals(artifactId) && row.campaignId().equals(campaignId)) > 0;
     }

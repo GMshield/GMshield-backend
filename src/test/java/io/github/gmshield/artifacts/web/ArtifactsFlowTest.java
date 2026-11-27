@@ -1232,7 +1232,8 @@ class ArtifactsFlowTest {
         assertNotFound(send(gm, "POST", there + "/relations", "{\"recordId\":\"" + guard + "\"}"));
         assertNotFound(send(gm, "DELETE", there + "/relations/" + guard, null));
         assertNotFound(get(gm, there + "/relation-targets?recordType=creature"));
-        assertThat(ids(json(get(gm, artifacts(quinta))))).isEmpty();
+        // Story 5.6 part B: the list there holds it.
+        assertThat(ids(json(get(gm, artifacts(quinta))))).containsExactly(kael);
         assertThat(versionsOf(kael)).isEqualTo(2);
         assertThat(json(get(gm, own)).path("sharedWith")).hasSize(1);
         // A campaign it is not shared with does not read it.
@@ -1297,6 +1298,113 @@ class ArtifactsFlowTest {
         assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + kael)).path("sharedWith"))
                 .extracting(one -> one.path("campaignId").asString()).containsExactly(quinta.toString());
         assertThat(shares.rows.values()).noneMatch(row -> row.ownerId().equals(them.id()));
+    }
+
+    // --- the list in the other campaigns (Story 5.6 part B)
+
+    @Test
+    void theListOfTheCampaignItIsSharedIntoHoldsItAmongItsOwnByIdMarkedWithItsOwnCampaignWhateverTheTiers()
+            throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        String older = create(gm, quinta, "note", "Lembrete");
+        String espada = create(gm, gm.campaign(), "item", "Espada");
+        String sheet = create(gm, gm.campaign(), "character_sheet", "Kael");
+        String newer = create(gm, quinta, "item", "Escudo");
+        String own = artifacts(gm.campaign());
+        String ownName = json(get(gm, "/api/v1/campaigns/" + gm.campaign())).path("name").asString();
+        JsonNode before = json(get(gm, artifacts(quinta)));
+        assertThat(ids(before)).containsExactly(newer, older);
+        assertThat(before.path("items").get(0).has("sharedFrom")).isTrue();
+        assertThat(before.path("items").get(0).path("sharedFrom").isNull()).isTrue();
+        assertThat(share(gm, own + "/" + espada, quinta).statusCode()).isEqualTo(200);
+        assertThat(share(gm, own + "/" + sheet, quinta).statusCode()).isEqualTo(200);
+
+        // Matrix row "Listed in B": among its own, by id, marked with its own campaign; total +1 for each.
+        JsonNode listed = json(get(gm, artifacts(quinta)));
+        assertThat(ids(listed)).containsExactly(newer, sheet, espada, older);
+        assertThat(listed.path("total").asLong()).isEqualTo(4);
+        JsonNode shared = listed.path("items").get(2);
+        assertThat(shared.path("name").asString()).isEqualTo("Espada");
+        assertThat(shared.path("recordType").asString()).isEqualTo("item");
+        assertThat(shared.path("sharedFrom").propertyNames()).containsExactlyInAnyOrder("campaignId", "name");
+        assertThat(shared.path("sharedFrom").path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(shared.path("sharedFrom").path("name").asString()).isEqualTo(ownName);
+        assertThat(listed.path("items").get(0).path("sharedFrom").isNull()).isTrue();
+        // The row opens part A's read-only read there.
+        assertThat(json(get(gm, artifacts(quinta) + "/" + espada)).path("sharedFrom").path("campaignId").asString())
+                .isEqualTo(gm.campaign().toString());
+        // Matrix row "Type filter": own and shared of the type only; types count both, whatever the filter.
+        JsonNode items = json(get(gm, artifacts(quinta) + "?recordType=item"));
+        assertThat(ids(items)).containsExactly(newer, espada);
+        assertThat(items.path("total").asLong()).isEqualTo(2);
+        assertThat(items.path("types").toString()).isEqualTo("[{\"key\":\"character_sheet\",\"count\":1},"
+                + "{\"key\":\"item\",\"count\":2},{\"key\":\"note\",\"count\":1}]");
+        // Matrix row "Personagens": a character sheet shared into it lists by its type there.
+        JsonNode sheets = json(get(gm, artifacts(quinta) + "?recordType=character_sheet"));
+        assertThat(ids(sheets)).containsExactly(sheet);
+        assertThat(sheets.path("items").get(0).path("sharedFrom").path("name").asString()).isEqualTo(ownName);
+        // The cursor and the offset page the one list.
+        JsonNode first = json(get(gm, artifacts(quinta) + "?limit=2"));
+        assertThat(ids(first)).containsExactly(newer, sheet);
+        assertThat(ids(json(get(gm, artifacts(quinta) + "?limit=2&cursor=" + first.path("nextCursor").asString()))))
+                .containsExactly(espada, older);
+        assertThat(ids(json(get(gm, artifacts(quinta) + "?limit=2&offset=1")))).containsExactly(sheet, espada);
+        // Matrix row "Own list": unchanged, sharedFrom null.
+        JsonNode ownList = json(get(gm, own));
+        assertThat(ids(ownList)).containsExactly(sheet, espada);
+        assertThat(ownList.path("items")).allMatch(item -> item.path("sharedFrom").isNull());
+        assertThat(ownList.path("total").asLong()).isEqualTo(2);
+
+        // Its own campaign archived, it is still listed there, naming that campaign; the total is unchanged.
+        long ownVersion = json(get(gm, "/api/v1/campaigns/" + gm.campaign())).path("version").asLong();
+        assertThat(send(gm, "PATCH", "/api/v1/campaigns/" + gm.campaign(), "{\"version\":" + ownVersion
+                + ",\"archived\":true}").statusCode()).isEqualTo(200);
+        JsonNode archivedOwn = json(get(gm, artifacts(quinta)));
+        assertThat(ids(archivedOwn)).containsExactly(newer, sheet, espada, older);
+        assertThat(archivedOwn.path("total").asLong()).isEqualTo(4);
+        assertThat(archivedOwn.path("items").get(2).path("sharedFrom").path("campaignId").asString())
+                .isEqualTo(gm.campaign().toString());
+        assertThat(archivedOwn.path("items").get(2).path("sharedFrom").path("name").asString()).isEqualTo(ownName);
+
+        // Whatever B's tier switches: listed with every tier off.
+        assertThat(send(gm, "PUT", "/api/v1/campaigns/" + quinta + "/scope", "{\"version\":0,"
+                + "\"campaignTier\":false,\"systemTier\":false,\"otherTier\":false,\"modelKnowledge\":false,"
+                + "\"materialsOff\":[]}").statusCode()).isEqualTo(200);
+        assertThat(ids(json(get(gm, artifacts(quinta))))).containsExactly(newer, sheet, espada, older);
+
+        // Matrix row "Unshared or deleting": gone from the list and its total.
+        assertThat(share(gm, own + "/" + sheet).statusCode()).isEqualTo(200);
+        assertThat(send(gm, "DELETE", own + "/" + espada, null).statusCode()).isEqualTo(202);
+        JsonNode after = json(get(gm, artifacts(quinta)));
+        assertThat(ids(after)).containsExactly(newer, older);
+        assertThat(after.path("total").asLong()).isEqualTo(2);
+        assertThat(after.path("types").toString()).isEqualTo("[{\"key\":\"item\",\"count\":1},"
+                + "{\"key\":\"note\",\"count\":1}]");
+    }
+
+    @Test
+    void anArtifactSharedFromACampaignBeingDeletedLeavesTheListAndAnotherOwnersListHoldsNothingOfIt()
+            throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        UUID domingo = campaign(gm, "Mesa de domingo");
+        String espada = create(gm, domingo, "item", "Espada");
+        assertThat(share(gm, artifacts(domingo) + "/" + espada, quinta).statusCode()).isEqualTo(200);
+        assertThat(ids(json(get(gm, artifacts(quinta))))).containsExactly(espada);
+        Gm them = signUp();
+
+        // Matrix row "Other owner": their campaign's list holds no artifact of A's.
+        JsonNode theirs = json(get(them, artifacts(them.campaign())));
+        assertThat(theirs.path("total").asLong()).isZero();
+        assertNotFound(get(them, artifacts(quinta)));
+
+        // Its own campaign being deleted, it is no longer listed in the other one.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + domingo, null).statusCode()).isEqualTo(202);
+        JsonNode listed = json(get(gm, artifacts(quinta)));
+        assertThat(ids(listed)).isEmpty();
+        assertThat(listed.path("total").asLong()).isZero();
+        assertThat(listed.path("types")).isEmpty();
     }
 
     // --- helpers

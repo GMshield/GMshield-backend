@@ -79,6 +79,10 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code sharedWith} (by name; empty in a read from another campaign) and {@code sharedFrom} (null in its own campaign).
  * {@code getArtifact} and {@code getArtifactVersion} also answer, read-only, a live artifact shared into the path
  * campaign; every other route answers it as not found there.
+ *
+ * <p>Story 5.6 part B (contract 1.53.0): {@code listArtifacts} also lists the live artifacts shared into the campaign,
+ * whatever its tiers, in the same order and counts, each with {@code sharedFrom} naming its own campaign (null for the
+ * campaign's own).
  */
 @RestController
 @Tag(name = "artifacts")
@@ -366,8 +370,8 @@ class ArtifactController {
                     minimum = "1", example = "3") long total) {
     }
 
-    @Schema(name = "ArtifactSummary", requiredProperties = {"id", "recordType", "name", "version", "createdAt"},
-            description = "An artifact in a list (contract 1.42.0)")
+    @Schema(name = "ArtifactSummary", requiredProperties = {"id", "recordType", "name", "version", "createdAt",
+        "sharedFrom"}, description = "An artifact in a list (contract 1.42.0; sharedFrom from 1.53.0)")
     record SummaryView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "The key of its record type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item")
@@ -375,16 +379,20 @@ class ArtifactController {
             @Schema(description = "Its name, in its newest version", example = "Espada de Kael") String name,
             @Schema(description = "The number of its newest version, from 1", format = "int32", minimum = "1",
                     example = "1") int version,
-            @Schema(description = "When it was written", format = "date-time") String createdAt) {
+            @Schema(description = "When it was written", format = "date-time") String createdAt,
+            @Schema(description = "Set for an artifact of another of the account's campaigns shared into the listed"
+                    + " one (contract 1.53.0): its own campaign, where alone it is changed. getArtifact answers it"
+                    + " read-only from the listed campaign. Null for the listed campaign's own artifacts",
+                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom) {
 
         static SummaryView of(Artifacts.Summary summary) {
             return new SummaryView(summary.id().toString(), summary.recordType(), summary.name(), summary.version(),
-                    summary.createdAt().toString());
+                    summary.createdAt().toString(), SharedFromView.of(summary.sharedFrom()));
         }
 
         @Override
         public String toString() {
-            return "SummaryView[id=" + id + ", recordType=" + recordType + "]";
+            return "SummaryView[id=" + id + ", recordType=" + recordType + ", shared=" + (sharedFrom != null) + "]";
         }
     }
 
@@ -404,9 +412,11 @@ class ArtifactController {
             @Schema(description = "The cursor of the next page; absent on the last", format = "uuid",
                     example = ID_EXAMPLE) String nextCursor,
             @Schema(description = "How many artifacts the list has in all (of its record type when filtered),"
-                    + " whatever the page", format = "int64", minimum = "0", example = "3") long total,
+                    + " whatever the page; from contract 1.53.0 the shared ones included", format = "int64",
+                    minimum = "0", example = "3") long total,
             @ArraySchema(arraySchema = @Schema(description = "The record types in use in the campaign's artifacts,"
-                    + " whatever the filter, by key, each with its count; empty for a campaign without artifacts"),
+                    + " whatever the filter, by key, each with its count (from contract 1.53.0 the shared ones"
+                    + " included); empty for a campaign without artifacts"),
                     schema = @Schema(implementation = TypeCountView.class)) List<TypeCountView> types) {
     }
 
@@ -516,7 +526,9 @@ class ArtifactController {
     @Operation(operationId = "listArtifacts", summary = "One of the account's campaigns' artifacts (contract 1.42.0),"
             + " newest first, of one record type when recordType is given. A page starts after a cursor or at an"
             + " offset (a numbered page), and names the total of the list and the record types in use in the whole"
-            + " campaign with their counts. request.not_found (404) for a campaign that is not the account's (unknown,"
+            + " campaign with their counts. From contract 1.53.0 the list also holds, whatever the campaign's tiers, the"
+            + " live artifacts of the account's other campaigns shared into this one (sharedFrom set), in the same"
+            + " order, counted in total and types. request.not_found (404) for a campaign that is not the account's (unknown,"
             + " another account's, malformed or being deleted); request.invalid (400) for a recordType that is not a"
             + " key's text, a limit outside 1 to 50, a malformed cursor, an offset outside 0 to 100000 or a cursor"
             + " together with an offset above 0;" + SESSION_SUMMARY,

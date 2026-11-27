@@ -2971,6 +2971,35 @@ class RecordsFlowTest {
         JsonNode row = ok(get(deletion, gm.session())).path("artifacts").get(0);
         assertThat(row.path("id").asString()).isEqualTo(saved);
         assertThat(row.path("overrides").asBoolean()).isTrue();
+        assertThat(row.path("shared").asBoolean()).isFalse();
+
+        // Story 5.6 part B, matrix row "Dialog": shared and overriding, the row says both.
+        UUID quinta = campaignOf(gm, "Mesa de quinta");
+        UUID domingo = campaignOf(gm, "Mesa de domingo");
+        ok(share(gm, saved, quinta, domingo));
+        JsonNode both = ok(get(deletion, gm.session())).path("artifacts").get(0);
+        assertThat(both.propertyNames()).containsExactlyInAnyOrder("id", "name", "recordType", "overrides", "shared");
+        assertThat(both.path("overrides").asBoolean()).isTrue();
+        assertThat(both.path("shared").asBoolean()).isTrue();
+        // Shared only into a campaign being deleted, it is no longer shared, as sharedWith counts them.
+        ok(share(gm, saved, quinta));
+        assertThat(send("DELETE", "/api/v1/campaigns/" + quinta, gm.session(), null).statusCode()).isEqualTo(202);
+        assertThat(ok(get(artifactPath(gm, saved), gm.session())).path("sharedWith")).isEmpty();
+        assertThat(ok(get(deletion, gm.session())).path("artifacts").get(0).path("shared").asBoolean()).isFalse();
+        // Shared again, with one campaign only, which is then archived: still shared, as sharedWith counts it.
+        ok(share(gm, saved, domingo));
+        assertThat(ok(get(deletion, gm.session())).path("artifacts").get(0).path("shared").asBoolean()).isTrue();
+        long domingoVersion = ok(get("/api/v1/campaigns/" + domingo, gm.session())).path("version").asLong();
+        ok(send("PATCH", "/api/v1/campaigns/" + domingo, gm.session(), Map.of("version", domingoVersion,
+                "archived", true)));
+        assertThat(ok(get(deletion, gm.session())).path("artifacts").get(0).path("shared").asBoolean()).isTrue();
+        JsonNode archived = ok(get(artifactPath(gm, saved), gm.session())).path("sharedWith");
+        assertThat(archived).hasSize(1);
+        assertThat(archived.get(0).path("campaignId").asString()).isEqualTo(domingo.toString());
+        assertThat(archived.get(0).path("archived").asBoolean()).isTrue();
+        // Then unshared.
+        ok(share(gm, saved));
+        assertThat(ok(get(deletion, gm.session())).path("artifacts").get(0).path("shared").asBoolean()).isFalse();
     }
 
     // --- Story 5.5 part B: relate records

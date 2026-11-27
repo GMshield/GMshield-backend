@@ -114,6 +114,14 @@ class ArtifactSources implements CampaignArtifacts {
      * each of another campaign that is still readable. Runs in the caller's transaction.
      */
     List<ArtifactRecords.Identity> sharedInto(UUID campaignId, Set<UUID> among) {
+        return origins(campaignId, among).stream().map(Origin::identity).toList();
+    }
+
+    /**
+     * {@link #sharedInto}, each with its own readable campaign (Story 5.6 part B: a list in the campaign it is shared
+     * into names it), in the order of the shares. Runs in the caller's transaction.
+     */
+    List<Origin> origins(UUID campaignId, Set<UUID> among) {
         List<UUID> ids = shares.into(campaignId).stream().map(ArtifactShareRow::artifactId)
                 .filter(id -> among == null || among.contains(id)).distinct().toList();
         if (ids.isEmpty()) {
@@ -124,9 +132,14 @@ class ArtifactSources implements CampaignArtifacts {
         if (found.isEmpty()) {
             return List.of();
         }
-        Set<UUID> readable = library.places(found.stream().map(ArtifactRecords.Identity::campaignId)
-                .collect(Collectors.toSet()), List.of()).campaigns().keySet();
-        return found.stream().filter(identity -> readable.contains(identity.campaignId())).toList();
+        Map<UUID, Library.Campaign> readable = library.places(found.stream().map(ArtifactRecords.Identity::campaignId)
+                .collect(Collectors.toSet()), List.of()).campaigns();
+        return found.stream().filter(identity -> readable.containsKey(identity.campaignId()))
+                .map(identity -> new Origin(identity, readable.get(identity.campaignId()))).toList();
+    }
+
+    /** A live artifact shared into a campaign and its own campaign, readable (Story 5.6 part B). */
+    record Origin(ArtifactRecords.Identity identity, Library.Campaign from) {
     }
 
     /** These artifacts, each with its newest version, decrypted; one with no version is left out. */

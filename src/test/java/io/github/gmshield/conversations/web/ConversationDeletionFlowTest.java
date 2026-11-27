@@ -543,6 +543,8 @@ class ConversationDeletionFlowTest {
         assertThat(dialog.path("artifacts").get(0).path("recordType").asString()).isEqualTo("encounter");
         assertThat(dialog.path("artifacts").get(1).path("name").asString()).isEqualTo("Troll das Pedras");
         assertThat(dialog.path("artifacts").get(1).path("recordType").asString()).isEqualTo("creature");
+        // Story 5.6 part B: neither is shared.
+        assertThat(dialog.path("artifacts")).allMatch(row -> row.has("shared") && !row.path("shared").asBoolean());
         assertThat(ids(json(get(gm, "/api/v1/conversations/" + conversations.turns.get(otherTurn).conversationId()
                 + "/deletion")).path("artifacts"))).containsExactly(elsewhere.toString());
 

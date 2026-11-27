@@ -54,6 +54,15 @@ class JpaArtifactShareStore implements ArtifactShareStore {
     }
 
     @Override
+    public List<ArtifactShareRow> ofAll(Collection<UUID> artifactIds) {
+        if (artifactIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(ALL_OF, ArtifactShareEntity.class).setParameter("artifacts", List.copyOf(artifactIds))
+                .getResultList().stream().map(ArtifactShareEntity::row).toList();
+    }
+
+    @Override
     public boolean delete(UUID artifactId, UUID campaignId) {
         EntityManager em = em();
         List<ArtifactShareEntity> found = em.createQuery(ONE, ArtifactShareEntity.class)

@@ -1967,6 +1967,20 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.deletion_removed` gains `shares`, `scope.resolved` and the question input's line gain `shared`. Deploy
     order: backend, then frontend (the 1.51.0 frontend behaves as before). Internal contract and worker unchanged.
 
+- **Shared artifacts in the other campaigns (`artifacts`, `conversations`, Story 5.6 part B, public contract
+  1.53.0).** What part A shared into campaign B is listed there and named where it is deleted.
+  - **List.** `listArtifacts` in B holds B's own artifacts and the live artifacts shared into B (their own campaign
+    readable, as part A's rule), whatever B's tiers: one list, newest first by id, with the same cursor and offset
+    paging, and `total` and `types` count both. The record store's `artifacts`, `artifactCount` and `artifactTypes`
+    take the shared ids (`campaign_id = :campaign or id in :shared`, ordered in SQL). Each `ArtifactSummary` gains
+    `sharedFrom: {campaignId, name}` (its own campaign) or null for B's own; the row opens part A's read-only read.
+  - **Dialog.** `ConversationDeletionArtifact` gains `shared`: true while the artifact is shared with at least one
+    readable campaign, as `sharedWith` counts them (one batch of shares, `ArtifactShareStore#ofAll`, and one of
+    campaigns).
+  - No migration, no index change. Log lines: `artifacts.listed` gains `sharedShown`. Deploy order: backend, then
+    frontend (the 1.52.0 frontend shows shared rows as plain rows that open the read-only page). Internal contract and
+    worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

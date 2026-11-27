@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -114,6 +115,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * campaign, whose own campaign is readable: read-only, with {@link Artifact#sharedFrom} naming its own campaign, and
  * with no mark, no relation and no conversation, since those belong to its own campaign; every other call here answers
  * it as not found in that campaign.
+ *
+ * <p>Story 5.6 part B: {@link #list} also lists, whatever the campaign's tiers, the live artifacts shared into it whose
+ * own campaign is readable, in the same list newest first, counted in its total and its types, each with
+ * {@link Summary#sharedFrom} naming its own campaign. The read stays {@link #get}'s read-only one.
  *
  * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
  * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
@@ -331,11 +336,15 @@ public class Artifacts {
         }
     }
 
-    /** An artifact as a list shows it: its id, type key, name, version and when it was written. */
-    public record Summary(UUID id, String recordType, String name, int version, Instant createdAt) {
+    /**
+     * An artifact as a list shows it: its id, type key, name, version and when it was written; from Story 5.6 part B,
+     * for an artifact shared into the listed campaign, its own campaign (null for one of the listed campaign's own).
+     */
+    public record Summary(UUID id, String recordType, String name, int version, Instant createdAt,
+                          SharedFrom sharedFrom) {
         @Override
         public String toString() {
-            return "Summary[id=" + id + ", recordType=" + recordType + "]";
+            return "Summary[id=" + id + ", recordType=" + recordType + ", shared=" + (sharedFrom != null) + "]";
         }
     }
 
@@ -445,7 +454,8 @@ public class Artifacts {
      * A page of the owner's campaign {@code campaignId}'s artifacts, as the class says: of the type key
      * {@code recordType} only when it is not null, after {@code cursor} (an artifact id of the previous page) or the
      * {@code offset} first skipped (0 to {@value #MAX_OFFSET}), at most {@code limit} (1 to {@value #MAX_LIMIT}).
-     * Empty when the campaign is not the owner's or not readable.
+     * From Story 5.6 part B the artifacts shared into the campaign are in the list too, as the class says. Empty when
+     * the campaign is not the owner's or not readable.
      */
     public Optional<Page> list(UUID campaignId, String recordType, UUID cursor, int offset, int limit) {
         if (limit < 1 || limit > MAX_LIMIT) {
@@ -456,8 +466,16 @@ public class Artifacts {
         }
         UUID owner = OwnerContext.require();
         Optional<Page> found = reading(() -> library.campaign(campaignId).map(campaign -> {
+            // Story 5.6 part B: the live artifacts shared into the campaign, from their own readable campaigns, are in
+            // the same list, whatever the campaign's tiers.
+            Map<UUID, SharedFrom> sharedFrom = new HashMap<>();
+            for (ArtifactSources.Origin origin : sources.origins(campaign.id(), null)) {
+                sharedFrom.put(origin.identity().id(), new SharedFrom(origin.from().id(), origin.from().name()));
+            }
+            Set<UUID> shared = sharedFrom.keySet();
             // One row past the page tells whether a next page exists.
-            List<ArtifactRecords.Identity> rows = records.list(campaign.id(), recordType, cursor, offset, limit + 1);
+            List<ArtifactRecords.Identity> rows = records.list(campaign.id(), shared, recordType, cursor, offset,
+                    limit + 1);
             List<ArtifactRecords.Identity> shown = rows.subList(0, Math.min(limit, rows.size()));
             Map<UUID, ArtifactVersionRow> latest = versions.latest(shown.stream().map(ArtifactRecords.Identity::id)
                     .toList());
@@ -469,16 +487,20 @@ public class Artifacts {
                 }
                 items.add(new Summary(identity.id(), identity.recordType(),
                         vault.decryptText(binding(FIELD_NAME, identity.id(), owner), version.name()), version.number(),
-                        identity.createdAt()));
+                        identity.createdAt(), campaign.id().equals(identity.campaignId()) ? null
+                        : sharedFrom.get(identity.id())));
             }
             UUID next = rows.size() > limit ? shown.getLast().id() : null;
-            return new Page(items, next, records.count(campaign.id(), recordType), records.types(campaign.id())
-                    .stream().map(type -> new TypeCount(type.key(), type.count())).toList());
+            return new Page(items, next, records.count(campaign.id(), shared, recordType),
+                    records.types(campaign.id(), shared).stream().map(type -> new TypeCount(type.key(), type.count()))
+                            .toList());
         }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("filtered", recordType != null).addKeyValue("offset", offset).addKeyValue("limit", limit)
                 .addKeyValue("found", found.isPresent())
                 .addKeyValue("shown", found.map(page -> page.items().size()).orElse(0))
+                .addKeyValue("sharedShown", found.map(page -> page.items().stream()
+                        .filter(item -> item.sharedFrom() != null).count()).orElse(0L))
                 .addKeyValue("total", found.map(Page::total).orElse(0L)).log("artifacts.listed");
         return found;
     }

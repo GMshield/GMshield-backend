@@ -784,6 +784,35 @@ class CrossOwnerAuditFlowTest {
         assertThat(get(b, "/api/v1/campaigns/" + b.campaign() + "/artifacts/" + own).statusCode()).isEqualTo(200);
     }
 
+    /**
+     * Story 5.6 part B: an artifact of A shared into A's other campaign is listed there, never in B's list, and B's
+     * read of A's campaign's list is not found as a random campaign's is.
+     */
+    @Test
+    void anotherAccountsSharedArtifactIsInNoListOfTheirs() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = artifact(a, "Espada de Kael");
+        String own = artifact(b, "Arco de Lia");
+        UUID quinta = UUID.fromString(json(send(a, "POST", "/api/v1/campaigns", "{\"name\":\"Mesa de quinta\","
+                + "\"systemId\":\"" + json(get(a, "/api/v1/campaigns/current")).path("system").path("id").asString()
+                + "\"}")).path("id").asString());
+        HttpResponse<String> shared = send(a, "PUT", "/api/v1/campaigns/" + a.campaign() + "/artifacts/" + theirs
+                + "/sharing", "{\"campaignIds\":[\"" + quinta + "\"]}");
+        assertThat(shared.statusCode()).as(shared.body()).isEqualTo(200);
+        assertThat(json(get(a, "/api/v1/campaigns/" + quinta + "/artifacts")).path("items").toString())
+                .contains(theirs);
+
+        JsonNode list = json(get(b, "/api/v1/campaigns/" + b.campaign() + "/artifacts"));
+        assertThat(list.path("total").asLong()).isOne();
+        assertThat(list.path("items").get(0).path("id").asString()).isEqualTo(own);
+        assertThat(list.toString()).doesNotContain(theirs).doesNotContain("Kael");
+        HttpResponse<String> foreign = get(b, "/api/v1/campaigns/" + quinta + "/artifacts");
+        HttpResponse<String> random = get(b, "/api/v1/campaigns/" + UUID.randomUUID() + "/artifacts");
+        assertThat(foreign.statusCode()).isEqualTo(random.statusCode()).isEqualTo(404);
+        assertThat(foreign.body()).doesNotContain("Kael");
+    }
+
     /** A worker call's response as the audit compares answers. */
     private static Answer answerOf(HttpResponse<String> response) {
         return new Answer(response.statusCode(), response.headers().firstValue("Content-Type").orElse(""),
