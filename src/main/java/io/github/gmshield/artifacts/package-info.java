@@ -17,7 +17,9 @@
  * port ({@code service.SavedArtifacts}): a conversation's deletion lists the artifacts saved from it and takes the
  * ticked ones through {@code service.Artifacts#delete}; an artifact names its conversation only while it is ready.
  * Story 5.5 part A marks an artifact as overriding one system record of its campaign through
- * {@code knowledge.service.RecordRelations}, which owns that relation; every artifact answer carries its mark.
+ * {@code knowledge.service.RecordRelations}, which owns that relation; every artifact answer carries its mark. Part B
+ * relates an artifact to records of its campaign's scope and to the campaign's other artifacts the same way; every
+ * artifact answer carries its relations.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Artifacts",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "knowledge :: service",

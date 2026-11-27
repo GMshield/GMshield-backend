@@ -63,7 +63,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       a version that is an allowed source of the campaign's current scope ({@link Scopes#resolveSources}, its stored
  *       settings, no filter, any tier switched on, so a record of another system's material opens too while the other
  *       tier is on); anything else is not found. Its references open the source view on the ground of the campaign's
- *       current scope, so this class serves no page for it.</li>
+ *       current scope, so this class serves no page for it. From Story 5.5 part B it also carries the live artifacts
+ *       of the campaign related to the record ({@link RecordRelations#relatedArtifacts}).</li>
  * </ul>
  *
  * <p>Story 4.5, {@link #correct} and {@link #correctInCampaign}: the GM corrects a record's name, type and fields on the
@@ -97,12 +98,14 @@ public class Records {
     private final Scopes scopes;
     private final CampaignScopes campaignScopes;
     private final RecordIndexing indexing;
+    private final RecordRelations relations;
     private final ObjectProvider<PlatformTransactionManager> transactions;
     private final Clock clock;
 
     Records(KnowledgeStore types, RecordStore store, Vault vault, Library library, ReadyVersions ready,
             RecordSources sources, Scopes scopes, CampaignScopes campaignScopes, RecordIndexing indexing,
-            ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
+            RecordRelations relations, ObjectProvider<PlatformTransactionManager> transactions,
+            ObjectProvider<Clock> clock) {
         this.types = types;
         this.store = store;
         this.vault = vault;
@@ -112,6 +115,7 @@ public class Records {
         this.scopes = scopes;
         this.campaignScopes = campaignScopes;
         this.indexing = indexing;
+        this.relations = relations;
         this.transactions = transactions;
         this.clock = clock.getIfAvailable(Clock::systemUTC);
     }
@@ -166,20 +170,34 @@ public class Records {
     }
 
     /**
-     * One record as its page shows it, with its row version (Story 4.5: a correction names it). {@code toString} names
-     * ids and counts only.
+     * One record as its page shows it, with its row version (Story 4.5: a correction names it), and (Story 5.5 part B)
+     * on the campaign's read only the live artifacts of the campaign related to it ({@code related}; null on every
+     * other read). {@code toString} names ids and counts only.
      */
     public record Detail(UUID id, String name, TypeOf recordType, List<Field> fields, List<Reference> references,
-                         long version) {
+                         long version, List<RecordRelations.RelatedArtifact> related) {
         public Detail {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
+            related = related == null ? null : List.copyOf(related);
+        }
+
+        /** A record as a read other than the campaign's shows it: no related artifacts. */
+        public Detail(UUID id, String name, TypeOf recordType, List<Field> fields, List<Reference> references,
+                      long version) {
+            this(id, name, recordType, fields, references, version, null);
+        }
+
+        /** This record with the artifacts related to it (Story 5.5 part B). */
+        Detail withRelated(List<RecordRelations.RelatedArtifact> found) {
+            return new Detail(id, name, recordType, fields, references, version, found);
         }
 
         @Override
         public String toString() {
             return "Detail[id=" + id + ", recordType=" + recordType.id() + ", fields=" + fields.size()
-                    + ", references=" + references.size() + ", version=" + version + "]";
+                    + ", references=" + references.size() + ", version=" + version + ", related="
+                    + (related == null ? "none" : related.size()) + "]";
         }
     }
 
@@ -254,11 +272,13 @@ public class Records {
             Set<UUID> allowed = scopes.resolveSources(campaign.id(), campaignScopes.settings(campaign.id()))
                     .allowedSources();
             return store.find(recordId).filter(row -> allowed.contains(row.versionId()))
-                    .flatMap(row -> typeOf(campaign.system().id(), row.type()).map(type -> detail(row, type, owner)));
+                    .flatMap(row -> typeOf(campaign.system().id(), row.type()).map(type -> detail(row, type, owner)
+                            .withRelated(relations.relatedArtifacts(campaign.id(), row.id()))));
         }));
         log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("recordId", recordId)
                 .addKeyValue("found", found.isPresent())
                 .addKeyValue("references", found.map(detail -> detail.references().size()).orElse(0))
+                .addKeyValue("related", found.map(detail -> detail.related().size()).orElse(0))
                 .log("knowledge.campaign_record_read");
         return found;
     }

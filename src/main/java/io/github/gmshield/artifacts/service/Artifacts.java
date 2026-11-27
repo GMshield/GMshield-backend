@@ -92,6 +92,13 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * carries its mark ({@link Artifact#overrides}, null for none), {@code removed} when it has no effect. The mark is not
  * versioned: an edit or a restore keeps it.
  *
+ * <p>Story 5.5 part B: {@link #relate} relates the artifact to a record of any tier of its campaign's scope or to
+ * another artifact of the campaign, and {@link #unrelate} removes a relation from either side (safe to repeat), each in
+ * one transaction through {@link RecordRelations}, which refuses a record that is no target
+ * ({@code artifact.relation_target}, 400) and a 51st relation ({@code artifact.relations_full}, 409).
+ * {@link #relationTargets} lists the records it can be related to. Every artifact read carries its relations
+ * ({@link Artifact#related}), from both sides; like the mark, they are not versioned.
+ *
  * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
  * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
  * and its references, by number, each marked {@code removed} when read as an answer's are
@@ -188,47 +195,55 @@ public class Artifacts {
      * version's type key, name, fields and content (null for none), the version's number, the number of the artifact's
      * newest version (Story 5.2; the same as {@code version} unless an earlier one is read), when the artifact was
      * written, (Story 5.4 part A) the conversation it was saved from (null for none) and its references by number
-     * (empty for an artifact written by hand), and (Story 5.5 part A) the record it overrides (null for none).
-     * {@code toString} names ids and counts only.
+     * (empty for an artifact written by hand), (Story 5.5 part A) the record it overrides (null for none) and (part B)
+     * the records it is related to, oldest first (empty for none). {@code toString} names ids and counts only.
      */
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
                            String content, int version, int currentVersion, Instant createdAt, UUID conversationId,
-                           List<TurnReference> references, Overridden overrides) {
+                           List<TurnReference> references, Overridden overrides, List<RecordRelations.Related> related) {
         public Artifact {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
+            related = List.copyOf(related);
         }
 
-        /** An artifact that overrides nothing. */
+        /** An artifact that overrides nothing and is related to nothing. */
         public Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields, String content,
                         int version, int currentVersion, Instant createdAt, UUID conversationId,
                         List<TurnReference> references) {
             this(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt, conversationId,
-                    references, null);
+                    references, null, List.of());
         }
 
         /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
         Artifact unlinked() {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    null, references, overrides);
+                    null, references, overrides, related);
         }
 
         /** This artifact with its references (Story 5.4 part A). */
         Artifact withReferences(List<TurnReference> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, found, overrides);
+                    conversationId, found, overrides, related);
         }
 
         /** This artifact with the record it overrides (Story 5.5 part A; null for none). */
         Artifact withOverride(Overridden mark) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, mark);
+                    conversationId, references, mark, related);
+        }
+
+        /** This artifact with the records it is related to (Story 5.5 part B). */
+        Artifact withRelated(List<RecordRelations.Related> found) {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    conversationId, references, overrides, found);
         }
 
         @Override
         public String toString() {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
-                    + version + ", currentVersion=" + currentVersion + ", references=" + references.size() + "]";
+                    + version + ", currentVersion=" + currentVersion + ", references=" + references.size()
+                    + ", related=" + related.size() + "]";
         }
     }
 
@@ -611,6 +626,60 @@ public class Artifacts {
         return relations.targets(campaignId, recordType, query, offset, limit);
     }
 
+    /**
+     * The GM relates the owner's artifact {@code artifactId} of the campaign {@code campaignId} to the record
+     * {@code recordId} (Story 5.5 part B), as the class says; a relation that exists already, in either direction, is
+     * kept as it is. Answers the artifact with its newest version and its relations, or empty when the campaign is not
+     * the owner's or not readable, or the artifact is not the campaign's (nothing changes then).
+     */
+    public Optional<Artifact> relate(UUID campaignId, UUID artifactId, UUID recordId) {
+        UUID owner = OwnerContext.require();
+        Optional<Artifact> related = writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .filter(identity -> relations.relate(identity.campaignId(), identity.id(), recordId))
+                .map(identity -> newest(identity, owner)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("recordId", recordId)
+                .addKeyValue("found", related.isPresent()).log("artifacts.relation_set");
+        return related;
+    }
+
+    /**
+     * The GM removes the relation between the owner's artifact {@code artifactId} and the record {@code recordId}
+     * (Story 5.5 part B), whichever side made it, whether there was one or not; true when the artifact is the
+     * campaign's, false when the campaign is not the owner's or not readable, or the artifact is not the campaign's
+     * (nothing changes then).
+     */
+    public boolean unrelate(UUID campaignId, UUID artifactId, UUID recordId) {
+        UUID owner = OwnerContext.require();
+        boolean found = Boolean.TRUE.equals(writing(() -> library.campaign(campaignId)
+                .flatMap(campaign -> records.find(campaign.id(), artifactId))
+                .map(identity -> relations.unrelate(identity.campaignId(), identity.id(), recordId)).orElse(false)));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("recordId", recordId).addKeyValue("found", found)
+                .log("artifacts.relation_removed");
+        return found;
+    }
+
+    /**
+     * The records the owner's artifact {@code artifactId} of the campaign {@code campaignId} can be related to (Story
+     * 5.5 part B, {@link RecordRelations#relationTargets}): of the type key {@code recordType}, whose name contains
+     * {@code query} (case and accents ignored; null or blank for all), the {@code offset} first skipped (0 to
+     * {@value #MAX_OFFSET}), at most {@code limit} (1 to {@value #MAX_LIMIT}). Empty when the campaign is not the
+     * owner's or not readable, or the artifact is not a live one of it.
+     */
+    public Optional<RecordRelations.RelationTargetPage> relationTargets(UUID campaignId, UUID artifactId,
+                                                                        String recordType, String query, int offset,
+                                                                        int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new IllegalArgumentException("artifacts.limit_invalid");
+        }
+        if (offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("artifacts.offset_invalid");
+        }
+        return relations.relationTargets(campaignId, artifactId, recordType, query, offset, limit);
+    }
+
     /** The artifact {@code identity} with its newest version, as {@link #get} answers it, in the caller's transaction. */
     private Artifact newest(ArtifactRecords.Identity identity, UUID owner) {
         ArtifactVersionRow newest = versions.latest(identity.id())
@@ -659,11 +728,12 @@ public class Artifacts {
     /**
      * The artifact as an answer shows it (Story 5.4 part B): its conversation only while that conversation is
      * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise. From Story 5.5
-     * part A with its mark ({@link RecordRelations#mark}), null for none.
+     * part A with its mark ({@link RecordRelations#mark}), null for none, and from part B with its relations
+     * ({@link RecordRelations#related}).
      */
     private Artifact linked(Artifact artifact) {
         Artifact marked = artifact.withOverride(relations.mark(artifact.campaignId(), artifact.id())
-                .map(Overridden::of).orElse(null));
+                .map(Overridden::of).orElse(null)).withRelated(relations.related(artifact.campaignId(), artifact.id()));
         UUID conversationId = marked.conversationId();
         if (conversationId == null || conversations.getObject().ready(Set.of(conversationId))
                 .contains(conversationId)) {

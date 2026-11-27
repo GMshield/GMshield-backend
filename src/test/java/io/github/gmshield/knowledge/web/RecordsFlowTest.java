@@ -26,8 +26,10 @@ import io.github.gmshield.jobs.data.InMemoryJobStorage;
 import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.knowledge.data.InMemoryOntologyStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordRelationStore;
 import io.github.gmshield.knowledge.data.ProposalRow;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
+import io.github.gmshield.knowledge.data.RecordRelationRow;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.knowledge.data.TermAliasRow;
@@ -205,6 +207,8 @@ class RecordsFlowTest {
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryRecordStore records;
+    @Autowired
+    private InMemoryRecordRelationStore relationStore;
     @Autowired
     private InMemoryKnowledgeStore knowledge;
     @Autowired
@@ -842,9 +846,13 @@ class RecordsFlowTest {
         String pending = recordOf(review.versionId(), "Pendente");
         String campaign = "/api/v1/campaigns/" + gm.campaign() + "/records/";
 
-        // The same answer as the system's, with the campaign's system's type.
+        // The same answer as the system's, with the campaign's system's type, plus (Story 5.5 part B) the campaign's
+        // related artifacts, none here.
         JsonNode read = ok(get(campaign + light, gm.session()));
-        assertThat(read).isEqualTo(ok(get("/api/v1/systems/" + gm.system() + "/records/" + light, gm.session())));
+        assertThat(read.path("related").isArray()).isTrue();
+        assertThat(read.path("related")).isEmpty();
+        assertThat(withoutRelated(read)).isEqualTo(ok(get("/api/v1/systems/" + gm.system() + "/records/" + light,
+                gm.session())));
         // Another system's material is in the other tier: not found while it is off, found once it is on, with the
         // campaign's system's record type.
         assertProblem(get(campaign + shadow, gm.session()), 404, "request.not_found");
@@ -1300,7 +1308,9 @@ class RecordsFlowTest {
         assertThat(kept.path("version").asLong()).isEqualTo(2);
         assertThat(kept.path("name").asString()).isEqualTo("Raio de Fogo");
         assertThat(kept.path("fields")).isEmpty();
-        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + id, gm.session()))).isEqualTo(kept);
+        // (Story 5.5 part B: the campaign's read also lists its related artifacts, none here.)
+        assertThat(withoutRelated(ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + id, gm.session()))))
+                .isEqualTo(kept);
         // The extracted match key is the first correction's still.
         assertThat(records.records.get(UUID.fromString(id)).extractedNameFingerprint())
                 .isEqualTo(fingerprint("Fire Boll"));
@@ -2950,6 +2960,352 @@ class RecordsFlowTest {
         JsonNode row = ok(get(deletion, gm.session())).path("artifacts").get(0);
         assertThat(row.path("id").asString()).isEqualTo(saved);
         assertThat(row.path("overrides").asBoolean()).isTrue();
+    }
+
+    // --- Story 5.5 part B: relate records
+
+    private static final Map<String, Object> CRYPT = Map.of("recordType", "encounter", "name", "Cripta", "fields",
+            List.of());
+
+    @Test
+    void anArtifactIsRelatedToARecordAndAnotherArtifactAndEachRelationShowsOnBothPagesUntilRemovedFromEither()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Monstros.pdf", "system", gm.system().toString()),
+                List.of(record("creature", "Troll", 1, List.of()), record("creature", "Ogro", 1, List.of())));
+        Ingested adventure = accepted(gm, metadata("Aventura.pdf", "campaign", gm.campaign().toString()),
+                List.of(record("creature", "Ánima", 1, List.of())));
+        String troll = recordOf(book.versionId(), "Troll");
+        String ogre = recordOf(book.versionId(), "Ogro");
+        String anima = recordOf(adventure.versionId(), "Ánima");
+        String crypt = artifact(gm, gm.campaign(), CRYPT);
+        String guard = artifact(gm, gm.campaign(), Map.of("recordType", "creature", "name", "Guarda da Cripta",
+                "fields", List.of()));
+        String map = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Mapa", "fields", List.of()));
+        String targets = artifactPath(gm, crypt) + "/relation-targets?recordType=creature";
+        String recordPage = "/api/v1/campaigns/" + gm.campaign() + "/records/";
+
+        // The picker lists every tier's creatures and the campaign's other artifacts, alphabetical, each with its tier.
+        JsonNode listed = ok(get(targets, gm.session()));
+        assertThat(listed.path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Ánima", "Guarda da Cripta", "Ogro", "Troll");
+        assertThat(listed.path("items")).extracting(item -> item.path("tier").asString())
+                .containsExactly("campaign", "campaign", "system", "system");
+        assertThat(listed.path("items")).extracting(item -> item.path("artifact").asBoolean())
+                .containsExactly(false, true, false, false);
+        assertThat(listed.path("total").asLong()).isEqualTo(4);
+        assertThat(listed.path("items").get(0).propertyNames()).containsExactlyInAnyOrder("id", "name", "recordType",
+                "tier", "artifact", "materialName");
+        assertThat(listed.path("items").get(0).path("id").asString()).isEqualTo(anima);
+        assertThat(listed.path("items").get(0).path("materialName").asString()).isEqualTo("Aventura.pdf");
+        assertThat(listed.path("items").get(1).path("id").asString()).isEqualTo(guard);
+        assertThat(listed.path("items").get(1).path("materialName").isNull()).isTrue();
+        assertThat(ok(get(targets + "&q=ANIMA", gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(anima);
+        assertThat(ok(get(targets + "&limit=1&offset=3", gm.session())).path("items"))
+                .extracting(item -> item.path("id").asString()).containsExactly(troll);
+        // The artifact itself is never listed, whatever its type.
+        assertThat(ok(get(targets.replace("creature", "encounter"), gm.session())).path("total").asLong()).isZero();
+        // Before any relation, the record page has none, and the artifact neither.
+        assertThat(ok(get(recordPage + troll, gm.session())).path("related")).isEmpty();
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related")).isEmpty();
+
+        // Matrix row "Relate a record".
+        JsonNode related = ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(),
+                Map.of("recordId", troll))).path("related");
+        assertThat(related).hasSize(1);
+        assertThat(related.get(0).path("recordId").asString()).isEqualTo(troll);
+        assertThat(related.get(0).path("name").asString()).isEqualTo("Troll");
+        assertThat(related.get(0).path("recordType").asString()).isEqualTo("creature");
+        assertThat(related.get(0).path("tier").asString()).isEqualTo("system");
+        assertThat(related.get(0).path("artifact").asBoolean()).isFalse();
+        assertThat(related.get(0).path("removed").asBoolean()).isFalse();
+        JsonNode trollPage = ok(get(recordPage + troll, gm.session())).path("related");
+        assertThat(trollPage).hasSize(1);
+        assertThat(trollPage.get(0).path("artifactId").asString()).isEqualTo(crypt);
+        assertThat(trollPage.get(0).path("name").asString()).isEqualTo("Cripta");
+        assertThat(trollPage.get(0).path("recordType").asString()).isEqualTo("encounter");
+        // The system's record page is unchanged.
+        assertThat(ok(get("/api/v1/systems/" + gm.system() + "/records/" + troll, gm.session())).has("related"))
+                .isFalse();
+        // A campaign tier record, and the related ones leave the picker.
+        ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", anima)));
+        assertThat(ok(get(targets, gm.session())).path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Guarda da Cripta", "Ogro");
+
+        // Matrix row "Relate an artifact": both artifact pages list the other.
+        ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", map)));
+        JsonNode mapRelated = ok(get(artifactPath(gm, map), gm.session())).path("related");
+        assertThat(mapRelated).hasSize(1);
+        assertThat(mapRelated.get(0).path("recordId").asString()).isEqualTo(crypt);
+        assertThat(mapRelated.get(0).path("name").asString()).isEqualTo("Cripta");
+        assertThat(mapRelated.get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(mapRelated.get(0).path("artifact").asBoolean()).isTrue();
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related"))
+                .extracting(item -> item.path("recordId").asString()).containsExactly(troll, anima, map);
+        // Neither lists the other in its picker any more.
+        assertThat(ok(get(artifactPath(gm, map) + "/relation-targets?recordType=encounter", gm.session()))
+                .path("total").asLong()).isZero();
+
+        // Matrix row "Reverse exists": a success that stores nothing.
+        JsonNode reverse = ok(send("POST", artifactPath(gm, map) + "/relations", gm.session(),
+                Map.of("recordId", crypt))).path("related");
+        assertThat(reverse).extracting(item -> item.path("recordId").asString()).containsExactly(crypt);
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).hasSize(3);
+        // Relating the same record again stores nothing either; an edit keeps the relations.
+        ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", troll)));
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).hasSize(3);
+        HttpResponse<String> edited = send("PATCH", artifactPath(gm, crypt), gm.session(), Map.of("version", 1,
+                "recordType", "encounter", "name", "Cripta Antiga", "fields", List.of()));
+        assertThat(ok(edited).path("related")).hasSize(3);
+        assertThat(ok(get(recordPage + troll, gm.session())).path("related").get(0).path("name").asString())
+                .isEqualTo("Cripta Antiga");
+
+        // Matrix row "Remove": from the other artifact's page, gone from both; again 204.
+        for (int i = 0; i < 2; i++) {
+            HttpResponse<String> removed = send("DELETE", artifactPath(gm, map) + "/relations/" + crypt,
+                    gm.session(), null);
+            assertThat(removed.statusCode()).as(removed.body()).isEqualTo(204);
+        }
+        assertThat(ok(get(artifactPath(gm, map), gm.session())).path("related")).isEmpty();
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related"))
+                .extracting(item -> item.path("recordId").asString()).containsExactly(troll, anima);
+        // From the artifact's page, a record's relation: gone from the record page too.
+        assertThat(send("DELETE", artifactPath(gm, crypt) + "/relations/" + troll, gm.session(), null).statusCode())
+                .isEqualTo(204);
+        assertThat(ok(get(recordPage + troll, gm.session())).path("related")).isEmpty();
+        // An unknown or malformed record is no relation: 204, nothing changes.
+        for (String none : List.of(Ids.newId().toString(), "x", ogre)) {
+            assertThat(send("DELETE", artifactPath(gm, crypt) + "/relations/" + none, gm.session(), null)
+                    .statusCode()).isEqualTo(204);
+        }
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related")).hasSize(1);
+
+        // A relation changes no answer: the records read carries no relation.
+        endIngestion();
+        Answer answer = asked(gm, "Quem vive na cripta?");
+        JsonNode read = ok(readRecords(answer, List.of(crypt, anima))).path("records");
+        assertThat(read.get(0).has("related")).isFalse();
+        assertThat(read.get(1).has("related")).isFalse();
+        assertNoLineNames("Cripta", "Troll", "Ánima", "Mapa");
+    }
+
+    @Test
+    void aRecordOutOfScopeIsNoRelationTargetAFiftyFirstRelationIsRefusedAndAnotherOwnerFindsNothing()
+            throws Exception {
+        Gm gm = signUp();
+        List<Extracted> creatures = new ArrayList<>();
+        for (int i = 1; i <= 51; i++) {
+            creatures.add(record("creature", "Criatura %02d".formatted(i), 1, List.of()));
+        }
+        Ingested book = accepted(gm, metadata("Monstros.pdf", "system", gm.system().toString()), creatures);
+        UUID otherSystem = createSystem(gm, "Outro sistema");
+        Ingested foreign = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()),
+                List.of(record("creature", "Lobo", 1, List.of())));
+        Ingested switched = accepted(gm, metadata("Bestiário.pdf", "system", gm.system().toString()),
+                List.of(record("creature", "Grifo", 1, List.of())));
+        Ingested deletedBook = accepted(gm, metadata("Antigo.pdf", "system", gm.system().toString()),
+                List.of(record("creature", "Hidra", 1, List.of())));
+        String hydra = recordOf(deletedBook.versionId(), "Hidra");
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + hydra, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+        endIngestion();
+        scope(gm, false, List.of(UUID.fromString(switched.materialId())));
+        Gm them = signUp();
+        Ingested theirs = accepted(them, metadata("Deles.pdf", "system", them.system().toString()),
+                List.of(record("creature", "Lobo Deles", 1, List.of())));
+        String crypt = artifact(gm, gm.campaign(), CRYPT);
+        UUID other = campaignOf(gm, "Outra mesa");
+        String elsewhere = artifact(gm, other, Map.of("recordType", "creature", "name", "Lobo da outra mesa",
+                "fields", List.of()));
+        String relations = artifactPath(gm, crypt) + "/relations";
+
+        // Matrix row "Out of scope": none is listed, and each is refused.
+        JsonNode listed = ok(get(artifactPath(gm, crypt) + "/relation-targets?recordType=creature&limit=50",
+                gm.session()));
+        assertThat(listed.path("total").asLong()).isEqualTo(51);
+        assertThat(listed.path("items")).extracting(item -> item.path("name").asString())
+                .allMatch(name -> name.startsWith("Criatura"));
+        for (String refused : List.of(recordOf(foreign.versionId(), "Lobo"), recordOf(switched.versionId(), "Grifo"),
+                hydra, elsewhere, crypt, recordOf(theirs.versionId(), "Lobo Deles"), Ids.newId().toString(), "x")) {
+            assertProblem(send("POST", relations, gm.session(), Map.of("recordId", refused)), 400,
+                    "artifact.relation_target");
+        }
+        assertProblem(send("POST", relations, gm.session(), Map.of()), 400, "artifact.relation_target");
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related")).isEmpty();
+        // Another system's record is a target while the other tier is on.
+        scope(gm, true, List.of(UUID.fromString(switched.materialId())));
+        JsonNode wolf = ok(send("POST", relations, gm.session(), Map.of("recordId",
+                recordOf(foreign.versionId(), "Lobo")))).path("related").get(0);
+        assertThat(wolf.path("tier").asString()).isEqualTo("other");
+        assertThat(send("DELETE", relations + "/" + wolf.path("recordId").asString(), gm.session(), null)
+                .statusCode()).isEqualTo(204);
+
+        // Matrix row "Full": 50 relations, then the 51st is refused, from either side.
+        for (int i = 1; i <= 50; i++) {
+            ok(send("POST", relations, gm.session(), Map.of("recordId",
+                    recordOf(book.versionId(), "Criatura %02d".formatted(i)))));
+        }
+        assertProblem(send("POST", relations, gm.session(), Map.of("recordId", recordOf(book.versionId(),
+                "Criatura 51"))), 409, "artifact.relations_full");
+        String map = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Mapa", "fields", List.of()));
+        assertProblem(send("POST", artifactPath(gm, map) + "/relations", gm.session(), Map.of("recordId", crypt)), 409,
+                "artifact.relations_full");
+        // One that exists already is still a success.
+        ok(send("POST", relations, gm.session(), Map.of("recordId", recordOf(book.versionId(), "Criatura 01"))));
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related")).hasSize(50);
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).hasSize(50);
+
+        // Matrix row "Other owner": 404 on every route, and nothing changes.
+        String creature = recordOf(book.versionId(), "Criatura 51");
+        assertProblem(get(artifactPath(gm, crypt) + "/relation-targets?recordType=creature", them.session()), 404,
+                "request.not_found");
+        assertProblem(send("POST", relations, them.session(), Map.of("recordId", creature)), 404,
+                "request.not_found");
+        assertProblem(send("DELETE", relations + "/" + recordOf(book.versionId(), "Criatura 01"), them.session(),
+                null), 404, "request.not_found");
+        assertProblem(get("/api/v1/campaigns/" + them.campaign() + "/artifacts/" + crypt
+                + "/relation-targets?recordType=creature", them.session()), 404, "request.not_found");
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related")).hasSize(50);
+        // Another campaign's route finds no artifact of this one.
+        assertProblem(get("/api/v1/campaigns/" + other + "/artifacts/" + crypt + "/relation-targets?recordType=note",
+                gm.session()), 404, "request.not_found");
+        // Malformed reads of the picker.
+        for (String bad : List.of("", "?recordType=Creature", "?recordType=creature&limit=0",
+                "?recordType=creature&offset=-1", "?recordType=creature&q=" + "a".repeat(201))) {
+            assertProblem(get(artifactPath(gm, crypt) + "/relation-targets" + bad, gm.session()), 400,
+                    "request.invalid");
+        }
+    }
+
+    @Test
+    void aRelatedRecordTombstonedOrSwitchedOffShowsRemovedAndADeletingArtifactsRelationIsNotShown()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Monstros.pdf", "system", gm.system().toString()),
+                List.of(record("creature", "Troll", 1, List.of()), record("creature", "Ogro", 1, List.of())));
+        String troll = recordOf(book.versionId(), "Troll");
+        String ogre = recordOf(book.versionId(), "Ogro");
+        String crypt = artifact(gm, gm.campaign(), CRYPT);
+        String map = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Mapa", "fields", List.of()));
+        for (String target : List.of(troll, ogre, map)) {
+            ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", target)));
+        }
+        ok(send("POST", artifactPath(gm, map) + "/relations", gm.session(), Map.of("recordId", ogre)));
+
+        // Matrix row "Target gone": a tombstone shows removed, with its name.
+        assertThat(send("DELETE", "/api/v1/systems/" + gm.system() + "/records/" + troll, gm.session(), null)
+                .statusCode()).isEqualTo(204);
+        JsonNode gone = ok(get(artifactPath(gm, crypt), gm.session())).path("related").get(0);
+        assertThat(gone.path("recordId").asString()).isEqualTo(troll);
+        assertThat(gone.path("name").asString()).isEqualTo("Troll");
+        assertThat(gone.path("removed").asBoolean()).isTrue();
+        // Relating it again is still a success that stores nothing, though it is no target any more.
+        assertThat(ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", troll)))
+                .path("related")).hasSize(3);
+        // A material switched off: out of the scope, removed with no tier, until it is back.
+        scope(gm, false, List.of(UUID.fromString(book.materialId())));
+        JsonNode off = ok(get(artifactPath(gm, crypt), gm.session())).path("related").get(1);
+        assertThat(off.path("recordId").asString()).isEqualTo(ogre);
+        assertThat(off.path("removed").asBoolean()).isTrue();
+        assertThat(off.path("tier").isNull()).isTrue();
+        ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", ogre)));
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).hasSize(4);
+        scope(gm, false, List.of());
+        JsonNode back = ok(get(artifactPath(gm, crypt), gm.session())).path("related").get(1);
+        assertThat(back.path("removed").asBoolean()).isFalse();
+        assertThat(back.path("tier").asString()).isEqualTo("system");
+
+        // A deleting artifact's relations are not shown, on either page.
+        assertThat(send("DELETE", artifactPath(gm, map), gm.session(), null).statusCode()).isEqualTo(202);
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related"))
+                .extracting(item -> item.path("recordId").asString()).containsExactly(troll, ogre);
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + ogre, gm.session())).path("related"))
+                .extracting(item -> item.path("artifactId").asString()).containsExactly(crypt);
+        // Another campaign's record page does not list this campaign's artifacts.
+        UUID other = campaignOf(gm, "Outra mesa");
+        assertThat(ok(get("/api/v1/campaigns/" + other + "/records/" + ogre, gm.session())).path("related")).isEmpty();
+    }
+
+    @Test
+    void aReprocessCarriesARelationToTheMatchingNewRecordAndOneWithNoMatchShowsRemoved() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        store(gm, first, List.of(
+                new Extracted("spell", "Bola de Fogo", List.of(), List.of(p.get(0)), 1),
+                new Extracted("spell", "Relâmpago", List.of(), List.of(p.get(3)), 2)));
+        accept(gm, first);
+        String crypt = artifact(gm, gm.campaign(), CRYPT);
+        for (String name : List.of("Bola de Fogo", "Relâmpago")) {
+            ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(),
+                    Map.of("recordId", recordOf(first.versionId(), name))));
+        }
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        store(gm, second, List.of(new Extracted("spell", "Bola de Fogo", List.of(), List.of(q.get(0)), 1)));
+        accept(gm, second);
+
+        String newFireball = recordOf(second.versionId(), "Bola de Fogo");
+        JsonNode related = ok(get(artifactPath(gm, crypt), gm.session())).path("related");
+        assertThat(related.get(0).path("recordId").asString()).isEqualTo(newFireball);
+        assertThat(related.get(0).path("removed").asBoolean()).isFalse();
+        assertThat(related.get(1).path("name").asString()).isEqualTo("Relâmpago");
+        assertThat(related.get(1).path("removed").asBoolean()).isTrue();
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + newFireball, gm.session()))
+                .path("related").get(0).path("artifactId").asString()).isEqualTo(crypt);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "related", 1) && hasPair(event, "overrides", 0));
+    }
+
+    @Test
+    void aReprocessThatMatchesTwoRelatedRecordsToOneKeepsOneRelation() throws Exception {
+        Gm gm = signUp();
+        Ingested first = ingested(gm, metadata("Livro.pdf", "system", gm.system().toString()));
+        List<UUID> p = first.passages();
+        // Two records of one type and one name, on different pages: the artifact is related to both.
+        store(gm, first, List.of(
+                new Extracted("creature", "Troll", List.of(), List.of(p.get(0)), 1),
+                new Extracted("creature", "Troll", List.of(), List.of(p.get(3)), 2)));
+        accept(gm, first);
+        List<String> trolls = idsOf(first.versionId());
+        assertThat(trolls).hasSize(2);
+        String crypt = artifact(gm, gm.campaign(), CRYPT);
+        for (String troll : trolls) {
+            ok(send("POST", artifactPath(gm, crypt) + "/relations", gm.session(), Map.of("recordId", troll)));
+        }
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).hasSize(2);
+        endIngestion();
+
+        Ingested second = reprocessed(gm, first, STANDARD_PASSAGES);
+        List<UUID> q = second.passages();
+        store(gm, second, List.of(new Extracted("creature", "Troll", List.of(), List.of(q.get(0)), 1)));
+        accept(gm, second);
+
+        // Both old records match the one new "Troll": one relation moves, the other is deleted, never doubled.
+        String newTroll = recordOf(second.versionId(), "Troll");
+        assertThat(ok(get(artifactPath(gm, crypt), gm.session())).path("related"))
+                .extracting(item -> item.path("recordId").asString()).containsExactly(newTroll);
+        assertThat(relationRows(gm, RecordRelationRow.RELATED)).singleElement()
+                .satisfies(row -> assertThat(row.toRecordId().toString()).isEqualTo(newTroll));
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("material.corrections_carried")
+                && hasPair(event, "related", 1));
+    }
+
+    /** A campaign's record read without its related artifacts (Story 5.5 part B), which only that read answers. */
+    private static JsonNode withoutRelated(JsonNode read) {
+        assertThat(read.path("related").isArray()).as("related").isTrue();
+        tools.jackson.databind.node.ObjectNode copy = (tools.jackson.databind.node.ObjectNode) read.deepCopy();
+        copy.remove("related");
+        return copy;
+    }
+
+    /** The GM's relation rows of this kind. */
+    private List<RecordRelationRow> relationRows(Gm gm, String kind) {
+        return relationStore.rows.values().stream().filter(row -> row.ownerId().equals(gm.id())
+                && row.kind().equals(kind)).toList();
     }
 
     private static String artifactPath(Gm gm, String artifact) {

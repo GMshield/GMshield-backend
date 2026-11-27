@@ -2,6 +2,7 @@ package io.github.gmshield.knowledge.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.materials.service.RecordSources;
 import io.github.gmshield.shared.service.ApiException;
@@ -50,7 +51,8 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <p>Story 4.3 part B: one record as a campaign shows it (a search's record result), the same answer, for a record of a
  * version in the campaign's current scope; its references open the source view on the ground of that scope, whose
- * pages the conversations module serves.
+ * pages the conversations module serves. From Story 5.5 part B (contract 1.51.0) that read alone also answers
+ * {@code related}, the campaign's live artifacts related to the record.
  *
  * <p>Story 4.5: a record is corrected on either route ({@code PATCH}), under the same visibility as its read: its name,
  * type and fields, on the version it names ({@code request.stale_version}, 409, when it moved); anything the read would
@@ -331,6 +333,24 @@ class OntologyController {
         }
     }
 
+    @Schema(name = "RecordRelatedArtifact", requiredProperties = {"artifactId", "name", "recordType"},
+            description = "An artifact of the campaign related to the record (contract 1.51.0)")
+    record RelatedArtifactView(
+            @Schema(description = "The artifact's id; its page is in the campaign", format = "uuid") String artifactId,
+            @Schema(description = "The artifact's name, as its newest version has it", example = "Cripta") String name,
+            @Schema(description = "The key of the artifact's record type", pattern = "^[a-z][a-z0-9_]{0,31}$",
+                    example = "encounter") String recordType) {
+
+        static RelatedArtifactView of(RecordRelations.RelatedArtifact artifact) {
+            return new RelatedArtifactView(artifact.artifactId().toString(), artifact.name(), artifact.recordType());
+        }
+
+        @Override
+        public String toString() {
+            return "RelatedArtifactView[artifactId=" + artifactId + ", recordType=" + recordType + "]";
+        }
+    }
+
     @Schema(name = "Record", requiredProperties = {"id", "name", "recordType", "fields", "references", "version"})
     record RecordView(
             @Schema(description = "The record's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000010")
@@ -346,12 +366,19 @@ class OntologyController {
                     schema = @Schema(implementation = RecordReferenceView.class))
             List<RecordReferenceView> references,
             @Schema(description = "The record's version (contract 1.40.0): a correction names it and raises it by one",
-                    format = "int64", minimum = "0", example = "0") long version) {
+                    format = "int64", minimum = "0", example = "0") long version,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            @ArraySchema(arraySchema = @Schema(description = "Only on getCampaignRecord (contract 1.51.0): the live"
+                    + " artifacts of the campaign related to the record, oldest relation first; empty for none. Absent"
+                    + " from every other answer"), schema = @Schema(implementation = RelatedArtifactView.class))
+            List<RelatedArtifactView> related) {
 
         static RecordView of(Records.Detail detail) {
             return new RecordView(detail.id().toString(), detail.name(), RecordTypeOfView.of(detail.recordType()),
                     detail.fields().stream().map(field -> new RecordFieldView(field.name(), field.value())).toList(),
-                    detail.references().stream().map(RecordReferenceView::of).toList(), detail.version());
+                    detail.references().stream().map(RecordReferenceView::of).toList(), detail.version(),
+                    detail.related() == null ? null : detail.related().stream().map(RelatedArtifactView::of)
+                            .toList());
         }
 
         @Override
@@ -503,8 +530,9 @@ class OntologyController {
             + " the ground of that scope (getScopeSourcePage). request.not_found (404) for a campaign that is not the"
             + " account's (another account's, unknown, malformed or being deleted), and for a record that is not one of"
             + " those (another account's, unknown, malformed, of a version that needs review or is superseded, or of a"
-            + " material switched off or outside the scope): none is told apart, and no name or field is answered then;"
-            + SESSION_SUMMARY,
+            + " material switched off or outside the scope): none is told apart, and no name or field is answered then."
+            + " From contract 1.51.0 it alone also answers related, the campaign's live artifacts related to the"
+            + " record;" + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")))
     ResponseEntity<RecordView> campaignRecord(

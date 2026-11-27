@@ -23,7 +23,9 @@
  * type for the {@code artifacts} module, which owns the content; no read of a system's records reaches it. From Story
  * 5.5 part A it owns the relations between records ({@code record_relation}, {@code service.RecordRelations}): an
  * artifact overrides one system record in its campaign; it implements the {@code scope} module's port
- * {@code CampaignOverrides}, so {@code scope} depends on nothing here.
+ * {@code CampaignOverrides}, so {@code scope} depends on nothing here. Part B adds "related to" between an artifact
+ * and a record of its campaign's scope or another artifact of the campaign, reading artifacts' names through the
+ * {@code scope} port {@code CampaignArtifacts}.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service",

@@ -1,6 +1,7 @@
 package io.github.gmshield.knowledge.service;
 
 import io.github.gmshield.knowledge.data.RecordCorrection;
+import io.github.gmshield.knowledge.data.RecordRelationRow;
 import io.github.gmshield.knowledge.data.RecordRelationStore;
 import io.github.gmshield.knowledge.data.RecordRow;
 import io.github.gmshield.knowledge.data.RecordStore;
@@ -50,7 +51,8 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * {@link #read(Collection, Reach)} with {@link Reach#ALL}, and by {@link #deleted}; {@link #pointsRemoved}
  * marks its point gone, and {@link #carryCorrections} carries tombstones over too, never reading their name or fields.
  * From Story 5.5 part A {@link #carryCorrections} also moves the overrides of the old version's records to the records
- * of the new version they match ({@link RecordRelations#carry}). Nothing here logs a name or a field.
+ * of the new version they match ({@link RecordRelations#carry}), and from part B the relations too. Nothing here logs a
+ * name or a field.
  */
 @Service
 public class ExtractedRecordStore implements ExtractedRecords {
@@ -197,7 +199,8 @@ public class ExtractedRecordStore implements ExtractedRecords {
         List<RecordRow> corrections = store.ofVersion(fromVersionId).stream().filter(RecordRow::corrected).toList();
         List<RecordRow> tombstones = store.tombstones(fromVersionId);
         if (corrections.isEmpty() && tombstones.isEmpty()) {
-            return new Carried(0, 0, 0, 0, 0, carryOverrides(fromVersionId, toVersionId));
+            return new Carried(0, 0, 0, 0, 0, carryLinks(fromVersionId, toVersionId, RecordRelationRow.OVERRIDES),
+                    carryLinks(fromVersionId, toVersionId, RecordRelationRow.RELATED));
         }
         List<RecordRow> newRecords = store.ofVersion(toVersionId);
         List<RecordRow> fresh = new ArrayList<>(newRecords.stream().filter(row -> !row.corrected()).toList());
@@ -244,17 +247,19 @@ public class ExtractedRecordStore implements ExtractedRecords {
         }
         store.insert(copies);
         return new Carried(matched, copied, dropped, deleted, copies.size() - copied,
-                carryOverrides(fromVersionId, toVersionId));
+                carryLinks(fromVersionId, toVersionId, RecordRelationRow.OVERRIDES),
+                carryLinks(fromVersionId, toVersionId, RecordRelationRow.RELATED));
     }
 
     /**
-     * The overrides of the old version's live records moved to the new version's records (Story 5.5 part A, Q2), once
-     * the corrections are carried, as {@link RecordRelations#carry} says: by the old record's (type key, name
-     * fingerprint), the nearest first page winning, then the lowest ordinal.
+     * The links of the kind {@code kind} (the overrides, Story 5.5 part A, Q2; the relations, part B) to the old
+     * version's live records moved to the new version's records, once the corrections are carried, as
+     * {@link RecordRelations#carry} says: by the old record's (type key, name fingerprint), the nearest first page
+     * winning, then the lowest ordinal.
      */
-    private int carryOverrides(UUID fromVersionId, UUID toVersionId) {
+    private int carryLinks(UUID fromVersionId, UUID toVersionId, String kind) {
         List<RecordRow> newRecords = new ArrayList<>();
-        return RecordRelations.carry(store, relations, fromVersionId, toVersionId, old -> {
+        return RecordRelations.carry(store, relations, fromVersionId, toVersionId, kind, old -> {
             if (newRecords.isEmpty()) {
                 newRecords.addAll(store.ofVersion(toVersionId));
             }

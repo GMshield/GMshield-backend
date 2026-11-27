@@ -13,8 +13,9 @@ import org.springframework.stereotype.Repository;
 
 /**
  * {@code record_relation} through JPA (Story 5.5 part A), as the library's stores: every read is JPQL, which Hibernate
- * filters by the owner of the work ({@code @TenantId}), and every write goes through an entity. The entity manager is
- * looked up on first use, so the unit tests, which start without a database, can still create the application.
+ * filters by the owner of the work ({@code @TenantId}), and every write goes through an entity. Story 5.5 part B adds
+ * the reads of both sides of a relation and the removal of one link. The entity manager is looked up on first use, so
+ * the unit tests, which start without a database, can still create the application.
  */
 @Repository
 class JpaRecordRelationStore implements RecordRelationStore {
@@ -24,6 +25,10 @@ class JpaRecordRelationStore implements RecordRelationStore {
             + " and l.kind = :kind";
     private static final String TO = "select l from RecordRelation l where l.toRecordId in :to and l.kind = :kind";
     private static final String BY_ID = "select l from RecordRelation l where l.id = :id";
+    private static final String BETWEEN = "select l from RecordRelation l where l.kind = :kind"
+            + " and ((l.fromRecordId = :a and l.toRecordId = :b) or (l.fromRecordId = :b and l.toRecordId = :a))";
+    private static final String EITHER = "select l from RecordRelation l where l.kind = :kind"
+            + " and (l.fromRecordId in :ids or l.toRecordId in :ids) order by l.createdAt, l.id";
     private static final String RECORDS = "select r from Record r where r.id in :ids order by r.id";
 
     private final ObjectProvider<EntityManagerFactory> factory;
@@ -81,6 +86,31 @@ class JpaRecordRelationStore implements RecordRelationStore {
         EntityManager em = em();
         List<RecordRelationEntity> found = em.createQuery(FROM, RecordRelationEntity.class)
                 .setParameter("from", fromRecordId).setParameter("kind", kind).getResultList();
+        found.forEach(em::remove);
+        em.flush();
+        return !found.isEmpty();
+    }
+
+    @Override
+    public List<RecordRelationRow> between(UUID a, UUID b, String kind) {
+        return em().createQuery(BETWEEN, RecordRelationEntity.class).setParameter("a", a).setParameter("b", b)
+                .setParameter("kind", kind).getResultList().stream().map(RecordRelationEntity::row).toList();
+    }
+
+    @Override
+    public List<RecordRelationRow> ofEither(Collection<UUID> recordIds, String kind) {
+        if (recordIds.isEmpty()) {
+            return List.of();
+        }
+        return em().createQuery(EITHER, RecordRelationEntity.class).setParameter("ids", List.copyOf(recordIds))
+                .setParameter("kind", kind).getResultList().stream().map(RecordRelationEntity::row).toList();
+    }
+
+    @Override
+    public boolean delete(UUID id) {
+        EntityManager em = em();
+        List<RecordRelationEntity> found = em.createQuery(BY_ID, RecordRelationEntity.class).setParameter("id", id)
+                .getResultList();
         found.forEach(em::remove);
         em.flush();
         return !found.isEmpty();

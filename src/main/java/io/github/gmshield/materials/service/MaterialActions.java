@@ -162,6 +162,7 @@ public class MaterialActions {
                 .addKeyValue("matched", carried.matched()).addKeyValue("copied", carried.copied())
                 .addKeyValue("dropped", carried.dropped()).addKeyValue("deleted", carried.deleted())
                 .addKeyValue("tombstoned", carried.tombstoned()).addKeyValue("overrides", carried.overrides())
+                .addKeyValue("related", carried.related())
                 .log("material.corrections_carried");
     }
 

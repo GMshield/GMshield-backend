@@ -278,6 +278,13 @@ class CrossOwnerAuditFlowTest {
                     "campaign", "artifactId", "artifact").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/override-targets", "campaignId", "campaign")
                     .query("recordType=spell"),
+            // an artifact's relations, their removal and the records it can be related to (Story 5.5 part B)
+            route("POST", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations", "campaignId", "campaign",
+                    "artifactId", "artifact").json("{\"recordId\":\"{record}\"}").own("campaignId"),
+            route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations/{recordId}", "campaignId",
+                    "campaign", "artifactId", "artifact", "recordId", "record").own("campaignId"),
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relation-targets", "campaignId",
+                    "campaign", "artifactId", "artifact").query("recordType=spell").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -602,7 +609,17 @@ class CrossOwnerAuditFlowTest {
                 new Probe("recordId in PUT /campaigns/{campaignId}/artifacts/{artifactId}/override", "record", 400,
                         "artifact.override_target", "systemRecord", 200, false,
                         id -> json("PUT", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
-                                + "/override", "{\"recordId\":\"" + id + "\"}")));
+                                + "/override", "{\"recordId\":\"" + id + "\"}")),
+                // Story 5.5 part B: relating another account's record, or its artifact, is refused as an unknown
+                // record is.
+                new Probe("recordId in POST /campaigns/{campaignId}/artifacts/{artifactId}/relations", "record", 400,
+                        "artifact.relation_target", "systemRecord", 200, false,
+                        id -> json("POST", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/relations", "{\"recordId\":\"" + id + "\"}")),
+                new Probe("an artifact's recordId in POST /campaigns/{campaignId}/artifacts/{artifactId}/relations",
+                        "artifact", 400, "artifact.relation_target", "otherArtifact", 200, false,
+                        id -> json("POST", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/relations", "{\"recordId\":\"" + id + "\"}")));
     }
 
     @Test
@@ -898,9 +915,9 @@ class CrossOwnerAuditFlowTest {
 
     /**
      * Account B, with its own items for the probes' controls: two systems, a campaign, two materials of the campaign
-     * (ingested and accepted), from Story 5.5 part A a material of its system and an artifact, a conversation, and the
-     * versions its changes name. Its items stay writable: a control
-     * that changes a version writes the new one ({@link #refresh}).
+     * (ingested and accepted), from Story 5.5 part A a material of its system and an artifact (from part B two), a
+     * conversation, and the versions its changes name. Its items stay writable: a control that changes a version
+     * writes the new one ({@link #refresh}).
      */
     private World mine() throws Exception {
         Gm gm = signUp();
@@ -919,6 +936,8 @@ class CrossOwnerAuditFlowTest {
         assertThat(targets.path("total").asLong()).as(targets.toString()).isEqualTo(1);
         items.put("systemRecord", targets.path("items").get(0).path("id").asString());
         items.put("artifact", artifact(gm, "Arco de Lia"));
+        // Story 5.5 part B: a second artifact of B's campaign, for the relation's control.
+        items.put("otherArtifact", artifact(gm, "Flecha de Lia"));
         // Its index job would hold the ingestion lane.
         stores.endIngestion();
         items.put("conversation", json(ask(gm, "{\"question\":\"Quem leva a coroa?\"}")).path("conversationId")

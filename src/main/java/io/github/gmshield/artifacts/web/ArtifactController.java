@@ -64,6 +64,14 @@ import org.springframework.web.bind.annotation.RestController;
  * (409, {@code params.artifactId} naming it). {@code .../override-targets} lists the records an artifact of the
  * campaign can override, alphabetical, filtered by type and name. Every artifact answer carries {@code overrides}, null
  * for none.
+ *
+ * <p>Story 5.5 part B (contract 1.51.0): a {@code POST} on {@code .../relations} relates the artifact to a record of any
+ * tier of its campaign's scope or to another artifact of the campaign, and a {@code DELETE} on
+ * {@code .../relations/{recordId}} removes the relation from either side (204, safe to repeat). A relation has no
+ * direction and changes no answer. A record that is no target is {@code artifact.relation_target} (400), a 51st relation
+ * {@code artifact.relations_full} (409). {@code .../relation-targets} lists the records the artifact can be related to,
+ * alphabetical, filtered by type and name, each with its tier. Every artifact answer carries {@code related}, from both
+ * sides, oldest first.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -76,6 +84,9 @@ class ArtifactController {
     static final String RESTORE = VERSION + "/restore";
     static final String OVERRIDE = ARTIFACT + "/override";
     static final String OVERRIDE_TARGETS = "/api/v1/campaigns/{campaignId}/override-targets";
+    static final String RELATIONS = ARTIFACT + "/relations";
+    static final String RELATION = RELATIONS + "/{recordId}";
+    static final String RELATION_TARGETS = ARTIFACT + "/relation-targets";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -141,11 +152,41 @@ class ArtifactController {
         }
     }
 
+    @Schema(name = "ArtifactRelated", requiredProperties = {"recordId", "name", "recordType", "tier", "artifact",
+        "removed"}, description = "A record an artifact is related to (contract 1.51.0)")
+    record RelatedView(
+            @Schema(description = "The other record's id: an artifact's page is in the campaign; an extracted record's is"
+                    + " /search/records/{recordId} in the campaign", format = "uuid") String recordId,
+            @Schema(description = "Its name: an artifact's newest version's, or a record's as extracted or corrected",
+                    example = "Troll") String name,
+            @Schema(description = "The key of its record type", pattern = "^[a-z][a-z0-9_]{0,31}$",
+                    example = "creature") String recordType,
+            @Schema(description = "Its tier in the campaign's scope: campaign for an artifact; null for a record out of"
+                    + " the scope", types = {"string", "null"}, allowableValues = {"campaign", "system", "other"})
+            String tier,
+            @Schema(description = "True for another artifact of the campaign, false for an extracted record")
+            boolean artifact,
+            @Schema(description = "True when the record no longer shows in the campaign: it was deleted, its version"
+                    + " superseded or its material left the campaign's scope. Show its name with no link, or remove the"
+                    + " relation") boolean removed) {
+
+        static RelatedView of(RecordRelations.Related related) {
+            return new RelatedView(related.recordId().toString(), related.name(), related.recordType(),
+                    related.tier() == null ? null : related.tier().word(), related.artifact(), related.removed());
+        }
+
+        @Override
+        public String toString() {
+            return "RelatedView[recordId=" + recordId + ", tier=" + tier + ", artifact=" + artifact + ", removed="
+                    + removed + "]";
+        }
+    }
+
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
-        "version", "currentVersion", "createdAt", "conversationId", "references", "overrides"}, description = "An"
-            + " artifact with its newest version, or one of its versions when asked by number (contract 1.42.0;"
-            + " currentVersion and versions from 1.44.0; conversationId and references from 1.48.0; overrides from"
-            + " 1.50.0)")
+        "version", "currentVersion", "createdAt", "conversationId", "references", "overrides", "related"},
+            description = "An artifact with its newest version, or one of its versions when asked by number (contract"
+            + " 1.42.0; currentVersion and versions from 1.44.0; conversationId and references from 1.48.0; overrides"
+            + " from 1.50.0; related from 1.51.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
@@ -178,7 +219,12 @@ class ArtifactController {
             @Schema(description = "The record of its campaign's system the artifact overrides (contract 1.50.0): in"
                     + " this campaign, an answer that reaches that record reads the artifact first, as replacing it. Not"
                     + " versioned: every version shows the artifact's current mark. Null for none",
-                    types = {"object", "null"}, implementation = OverrideView.class) OverrideView overrides) {
+                    types = {"object", "null"}, implementation = OverrideView.class) OverrideView overrides,
+            @ArraySchema(arraySchema = @Schema(description = "The records the artifact is related to (contract 1.51.0),"
+                    + " from either side, oldest first: extracted records of the campaign's scope and the campaign's"
+                    + " other artifacts. A relation changes no answer. Not versioned: every version shows the"
+                    + " artifact's current relations. Empty for none"),
+                    schema = @Schema(implementation = RelatedView.class)) List<RelatedView> related) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
@@ -187,7 +233,8 @@ class ArtifactController {
                     artifact.createdAt().toString(),
                     artifact.conversationId() == null ? null : artifact.conversationId().toString(),
                     artifact.references().stream().map(ReferenceView::of).toList(),
-                    OverrideView.of(artifact.overrides()));
+                    OverrideView.of(artifact.overrides()),
+                    artifact.related().stream().map(RelatedView::of).toList());
         }
 
         @Override
@@ -744,6 +791,147 @@ class ArtifactController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new TargetPageView(page.items().stream()
                 .map(target -> new TargetView(target.id().toString(), target.name(), target.recordType(),
                         target.materialName())).toList(), page.total()));
+    }
+
+    @Schema(name = "ArtifactRelationChange", requiredProperties = "recordId",
+            description = "A record the artifact is related to from now on (contract 1.51.0)")
+    record RelationBody(
+            @Schema(description = "The record's id: an extracted record of the campaign's scope or another artifact of"
+                    + " the campaign, as listRelationTargets lists them", format = "uuid") String recordId) {
+    }
+
+    @Schema(name = "RelationTarget", requiredProperties = {"id", "name", "recordType", "tier", "artifact",
+        "materialName"}, description = "A record an artifact can be related to (contract 1.51.0)")
+    record RelationTargetView(
+            @Schema(description = "The record's id", format = "uuid") String id,
+            @Schema(description = "The record's name", example = "Troll") String name,
+            @Schema(description = "The key of the record's type", pattern = "^[a-z][a-z0-9_]{0,31}$",
+                    example = "creature") String recordType,
+            @Schema(description = "Its tier in the campaign's scope: campaign for an artifact",
+                    allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(description = "True for another artifact of the campaign") boolean artifact,
+            @Schema(description = "The name of the material it was extracted from; null for an artifact",
+                    types = {"string", "null"}, example = "Livro dos Monstros") String materialName) {
+
+        static RelationTargetView of(RecordRelations.RelationTarget target) {
+            return new RelationTargetView(target.id().toString(), target.name(), target.recordType(),
+                    target.tier().word(), target.artifact(), target.materialName());
+        }
+
+        @Override
+        public String toString() {
+            return "RelationTargetView[id=" + id + ", tier=" + tier + ", artifact=" + artifact + "]";
+        }
+    }
+
+    @Schema(name = "RelationTargetPage", requiredProperties = {"items", "total"},
+            description = "A page of the records an artifact can be related to (contract 1.51.0)")
+    record RelationTargetPageView(
+            @ArraySchema(schema = @Schema(implementation = RelationTargetView.class)) List<RelationTargetView> items,
+            @Schema(description = "How many records match in all, whatever the page", format = "int64", minimum = "0",
+                    example = "12") long total) {
+    }
+
+    @PostMapping(path = RELATIONS, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "relateArtifact", summary = "The GM relates one of the account's campaigns' artifacts to a"
+            + " record (contract 1.51.0), answering the artifact as getArtifact does. The record is a live extracted"
+            + " record of any tier of the campaign's scope, or another live artifact of the campaign. A relation has no"
+            + " direction: it shows on both records, and relating a record that is related to the artifact already,"
+            + " from either side, stores nothing and answers 200. A relation changes no answer."
+            + " artifact.relation_target (400) for a record that is no target (out of the scope, a deleted one,"
+            + " another campaign's artifact, another account's, unknown or malformed, the artifact itself, or none);"
+            + " artifact.relations_full (409) when the artifact, or the artifact it is related to, has 50 relations"
+            + " already; request.invalid (400) for a malformed body;" + NOT_FOUND + " nothing changes then;"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> relateArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody RelationBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null) {
+            throw invalid();
+        }
+        // A missing or malformed id is a record that is no target: the same refusal, after the artifact is found.
+        UUID record = parse(body.recordId()).orElse(null);
+        Artifacts.Artifact related = artifacts.relate(campaign, artifact, record)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(related));
+    }
+
+    @DeleteMapping(path = RELATION)
+    @Operation(operationId = "unrelateArtifact", summary = "The GM removes the relation between one of the account's"
+            + " campaigns' artifacts and a record (contract 1.51.0; 204, no body), whichever side made it: it shows on"
+            + " neither record any more. A record the artifact is not related to (unknown or malformed included)"
+            + " answers 204 too, so repeating it is safe." + NOT_FOUND + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The artifact is not related to the record"))
+    ResponseEntity<Void> unrelateArtifact(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @Parameter(description = "The related record's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("recordId") String recordId) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (!artifacts.unrelate(campaign, artifact, parse(recordId).orElse(null))) {
+            throw notFound();
+        }
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    @GetMapping(path = RELATION_TARGETS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listRelationTargets", summary = "The records one of the account's campaigns' artifacts"
+            + " can be related to (contract 1.51.0): of one record type, the live extracted records of every tier of"
+            + " the campaign's scope (its stored settings) and the campaign's other live artifacts, each with its tier"
+            + " (campaign for an artifact), alphabetical by name, a page at a time with the total; the artifact itself"
+            + " and the records it is related to already are left out; q keeps those whose name contains it, case and"
+            + " accents ignored." + NOT_FOUND + " request.invalid (400) for a missing or malformed recordType, a q over"
+            + " 200 characters, a limit outside 1 to 50 or an offset outside 0 to 100000;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "recordType", in = ParameterIn.QUERY, required = true, description = "The record"
+                        + " type key of the records listed", schema = @Schema(type = "string",
+                        pattern = "^[a-z][a-z0-9_]{0,31}$")),
+                @Parameter(name = "q", in = ParameterIn.QUERY, description = "Only the records whose name contains"
+                        + " this, case and accents ignored; at most 200 characters, blank for all",
+                        schema = @Schema(type = "string", maxLength = 200)),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the first to skip, 0 to"
+                        + " 100000, for a numbered page", schema = @Schema(type = "integer", format = "int32",
+                        minimum = "0", maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<RelationTargetPageView> listRelationTargets(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @Parameter(hidden = true) @RequestParam(value = "recordType", required = false) String recordType,
+            @Parameter(hidden = true) @RequestParam(value = "q", required = false) String query,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (recordType == null || !KEY.matcher(recordType).matches()
+                || (query != null && query.strip().codePointCount(0, query.strip().length())
+                > RecordRelations.MAX_QUERY)) {
+            throw invalid();
+        }
+        int size = limit(limit);
+        int from = offset(offset, null);
+        RecordRelations.RelationTargetPage page = artifacts.relationTargets(campaign, artifact, recordType, query,
+                from, size).orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new RelationTargetPageView(page.items()
+                .stream().map(RelationTargetView::of).toList(), page.total()));
     }
 
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */

@@ -1012,6 +1012,70 @@ class ArtifactsFlowTest {
         assertNotFound(send(gm, "PUT", path + "/override", "{\"recordId\":\"" + Ids.newId() + "\"}"));
     }
 
+    // --- relations (Story 5.5 part B; the matrix with a system's records is in RecordsFlowTest)
+
+    @Test
+    void twoArtifactsOfTheCampaignAreRelatedWithNoSystemMaterialAndTheRelationRoutesAnswerOnlyTheirOwnCampaign()
+            throws Exception {
+        Gm gm = signUp();
+        String crypt = create(gm, gm.campaign(), "encounter", "Cripta");
+        String guard = create(gm, gm.campaign(), "creature", "Guarda");
+        String path = artifacts(gm.campaign()) + "/" + crypt;
+        JsonNode read = json(get(gm, path));
+        assertThat(read.path("related").isArray()).isTrue();
+        assertThat(read.path("related")).isEmpty();
+
+        // Removing a relation it does not have is no error, and repeating it neither.
+        for (int i = 0; i < 2; i++) {
+            HttpResponse<String> removed = send(gm, "DELETE", path + "/relations/" + guard, null);
+            assertThat(removed.statusCode()).as(removed.body()).isEqualTo(204);
+            assertThat(removed.headers().firstValue("Cache-Control")).hasValue("no-store");
+        }
+        // An unknown id, a malformed one, none, or the artifact itself is no target.
+        for (String body : List.of("{\"recordId\":\"" + Ids.newId() + "\"}", "{\"recordId\":\"x\"}", "{}",
+                "{\"recordId\":\"" + crypt + "\"}")) {
+            HttpResponse<String> refused = send(gm, "POST", path + "/relations", body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("artifact.relation_target");
+        }
+        // With no material, the campaign's other artifacts are the targets.
+        JsonNode targets = json(get(gm, path + "/relation-targets?recordType=creature"));
+        assertThat(targets.path("items")).extracting(item -> item.path("id").asString()).containsExactly(guard);
+        assertThat(targets.path("items").get(0).path("tier").asString()).isEqualTo("campaign");
+        assertThat(targets.path("items").get(0).path("artifact").asBoolean()).isTrue();
+        assertThat(targets.path("total").asLong()).isOne();
+
+        HttpResponse<String> related = send(gm, "POST", path + "/relations", "{\"recordId\":\"" + guard + "\"}");
+        assertThat(related.statusCode()).as(related.body()).isEqualTo(200);
+        assertThat(related.headers().firstValue("Cache-Control")).hasValue("no-store");
+        assertThat(json(related).path("related").get(0).propertyNames()).containsExactlyInAnyOrder("recordId",
+                "name", "recordType", "tier", "artifact", "removed");
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + guard)).path("related").get(0).path("recordId")
+                .asString()).isEqualTo(crypt);
+        assertThat(json(get(gm, path + "/relation-targets?recordType=creature")).path("total").asLong()).isZero();
+
+        // Another campaign's artifact and another owner's are not found on every route; nor is a deleting artifact.
+        Gm them = signUp();
+        String theirs = create(them, them.campaign(), "creature", "Deles");
+        for (String other : List.of(artifacts(gm.campaign()) + "/" + theirs, artifacts(them.campaign()) + "/" + crypt)) {
+            assertNotFound(send(gm, "POST", other + "/relations", "{\"recordId\":\"" + guard + "\"}"));
+            assertNotFound(send(gm, "DELETE", other + "/relations/" + guard, null));
+            assertNotFound(get(gm, other + "/relation-targets?recordType=creature"));
+        }
+        // Their artifact is no target of this campaign's.
+        HttpResponse<String> foreign = send(gm, "POST", path + "/relations", "{\"recordId\":\"" + theirs + "\"}");
+        assertThat(foreign.statusCode()).isEqualTo(400);
+        assertThat(send(gm, "DELETE", artifacts(gm.campaign()) + "/" + guard, null).statusCode()).isEqualTo(202);
+        assertThat(json(get(gm, path)).path("related")).isEmpty();
+        String guardPath = artifacts(gm.campaign()) + "/" + guard;
+        assertNotFound(send(gm, "DELETE", guardPath + "/relations/" + crypt, null));
+        assertNotFound(send(gm, "POST", guardPath + "/relations", "{\"recordId\":\"" + crypt + "\"}"));
+        assertNotFound(get(gm, guardPath + "/relation-targets?recordType=encounter"));
+        // A deleting artifact is no target either.
+        HttpResponse<String> deleting = send(gm, "POST", path + "/relations", "{\"recordId\":\"" + guard + "\"}");
+        assertThat(deleting.statusCode()).isEqualTo(400);
+    }
+
     // --- helpers
 
     private void edit(Gm gm, String id, int version, String type, String name) throws Exception {

@@ -1909,6 +1909,35 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.override_removed`; `material.corrections_carried` gains `overrides`. Deploy order: backend, then worker,
     then frontend (the 1.49.0 frontend and the 1.26.0-reading worker behave as before).
 
+- **Relate records (`knowledge`, `artifacts`, Story 5.5 part B, FR-20, public contract 1.51.0).** An artifact is
+  related to other records with "related to"; the relation shows on both records and changes no answer.
+  - **V51** on `record_relation`: the kind check gains `related`; part A's unique `(from_record_id, kind)` becomes the
+    partial unique index `record_relation_overrides_from_key` on `from_record_id` where `kind = 'overrides'` (one
+    override per artifact still), and `record_relation_from_to_kind_key` makes `(from_record_id, to_record_id, kind)`
+    unique. Additive; the migration's header has the steps back to V50's keys.
+  - **The rule.** `knowledge.service.RecordRelations`: a target is a live extracted record of any tier of the
+    campaign's resolved scope (stored settings), or another live artifact of the same campaign (through the `scope`
+    port `CampaignArtifacts`). A relation has no direction: one row, read from both sides; relating the other way, or
+    again, stores nothing. At most 50 relations per artifact, either side (409 `artifact.relations_full`); anything
+    that is no target (out of scope, a tombstone, another campaign's artifact, the artifact itself, another owner's,
+    unknown, malformed) is 400 `artifact.relation_target`. Both rows are locked first. Not versioned.
+  - **API.** `POST /api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations` `{recordId}` answers the artifact;
+    `DELETE …/relations/{recordId}` is 204, idempotent, and removes the relation from either side;
+    `GET …/artifacts/{artifactId}/relation-targets?recordType=&q=&offset=&limit=` lists
+    `{items: [{id, name, recordType, tier, artifact, materialName}], total}`, alphabetical, `q` folded as part A's,
+    leaving out the artifact and the records it is related to. Every `Artifact` carries `related`
+    (`[{recordId, name, recordType, tier, artifact, removed}]`, oldest first; `removed` for an extracted record that is
+    tombstoned, superseded or out of scope, whose `tier` is then null when out of scope; a deleting artifact is left
+    out). `getCampaignRecord` alone gains `related: [{artifactId, name, recordType}]`, the campaign's live artifacts
+    related to the record; the system's record read is unchanged.
+  - **Reprocess.** A relation to an old version's record moves to the matching new record as an override does; one
+    whose artifact is related to the match already is deleted.
+  - Log lines (ids and counts only): `knowledge.relation_set`, `knowledge.relation_removed`,
+    `knowledge.relation_refused`, `knowledge.relation_targets_listed`, `artifacts.relation_set`,
+    `artifacts.relation_removed`; `material.corrections_carried` gains `related`; `knowledge.campaign_record_read`
+    gains `related`. Deploy order: backend, then frontend (the 1.50.0 frontend behaves as before). Internal contract
+    and worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are
