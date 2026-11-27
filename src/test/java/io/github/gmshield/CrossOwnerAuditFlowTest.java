@@ -299,6 +299,11 @@ class CrossOwnerAuditFlowTest {
             route("GET", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield").own("id"),
             route("PATCH", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield")
                     .json("{\"version\":{shieldVersion},\"name\":\"Tomado\"}").own("id"),
+            // a Shield's deletion preview and its deletion (Story 6.1 part B)
+            route("GET", "/api/v1/campaigns/{id}/shields/{shieldId}/deletion", "id", "campaign", "shieldId", "shield")
+                    .own("id"),
+            route("DELETE", "/api/v1/campaigns/{id}/shields/{shieldId}", "id", "campaign", "shieldId", "shield")
+                    .own("id"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",

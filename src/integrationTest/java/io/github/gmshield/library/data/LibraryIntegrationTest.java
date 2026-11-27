@@ -26,11 +26,15 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +61,8 @@ import tools.jackson.databind.json.JsonMapper;
  * store's conflicts), the fill of a fingerprint from before V23, and another owner's campaign on every new route.
  * Story 6.1: Shields stored unnamed with each campaign, a named one only as ciphertext bound to its row, the store's
  * conflicts on PostgreSQL's keys and version, and one first Shield for a campaign without one, whatever the lists at once.
+ * Part B: a Shield's deletion and the refusal of the last one, and two deletions at once, which the campaign's row lock
+ * makes leave one Shield.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application itself never reads a library
  * table with native SQL.
@@ -275,6 +281,16 @@ class LibraryIntegrationTest {
         @Override
         public int deleteShieldsOf(java.util.Collection<UUID> campaignIds) {
             return real.deleteShieldsOf(campaignIds);
+        }
+
+        @Override
+        public Optional<CampaignRow> lockCampaign(UUID id) {
+            return real.lockCampaign(id);
+        }
+
+        @Override
+        public boolean deleteShield(UUID campaignId, UUID id) {
+            return real.deleteShield(campaignId, id);
         }
     }
 
@@ -998,6 +1014,79 @@ class LibraryIntegrationTest {
                     .satisfies(item -> assertThat(item.path("id").asString()).isEqualTo(only.toString()));
         }
         assertThat(count("select count(*) from shield where campaign_id = ?", gm.campaignId())).isEqualTo(1);
+    }
+
+    @Test
+    void aShieldIsDeletedTheLastOneIsRefusedAndTwoDeletionsAtOnceLeaveOneOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        String path = "/api/v1/campaigns/" + gm.campaignId() + "/shields";
+        UUID first = UUID.fromString(ok(get(path, gm.session())).path("items").get(0).path("id").asString());
+        UUID combat = UUID.fromString(created(send("POST", path, gm.session(), Map.of("name", "Combate")))
+                .path("id").asString());
+        JsonNode preview = ok(get(path + "/" + combat + "/deletion", gm.session()));
+        assertThat(preview.path("last").asBoolean()).isFalse();
+        assertThat(preview.path("notes").asLong()).isZero();
+        assertThat(preview.path("rolls").asLong()).isZero();
+
+        HttpResponse<String> deleted = send("DELETE", path + "/" + combat, gm.session(), Map.of());
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        assertThat(count("select count(*) from shield where id = ?", combat)).isZero();
+        assertThat(ok(get(path + "/" + first + "/deletion", gm.session())).path("last").asBoolean()).isTrue();
+        HttpResponse<String> refused = send("DELETE", path + "/" + first, gm.session(), Map.of());
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
+        assertThat(json(refused).path("code").asString()).isEqualTo("request.last_shield");
+        assertThat(count("select count(*) from shield where id = ?", first)).isEqualTo(1);
+        notFound(send("DELETE", path + "/" + combat, gm.session(), Map.of()));
+
+        // Two Shields, two deletions at once. A transaction holds the campaign's row lock until both wait for it, so that
+        // without the lock both would count two Shields and leave none.
+        UUID second = UUID.fromString(created(send("POST", path, gm.session(), Map.of("name", "Exploração")))
+                .path("id").asString());
+        CountDownLatch locked = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<Void> holder = CompletableFuture.runAsync(() ->
+                OwnerContext.runAs(gm.id(), () -> new TransactionTemplate(transactions).executeWithoutResult(status -> {
+                    assertThat(store.lockCampaign(gm.campaignId())).isPresent();
+                    locked.countDown();
+                    try {
+                        assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                })));
+        assertThat(locked.await(30, TimeUnit.SECONDS)).isTrue();
+        long waitingBefore = waitingOnLocks();
+        List<CompletableFuture<HttpResponse<String>>> deletions = new ArrayList<>();
+        for (UUID shield : List.of(first, second)) {
+            deletions.add(client.sendAsync(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path + "/"
+                    + shield)).header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
+                    .DELETE().build(), HttpResponse.BodyHandlers.ofString()));
+        }
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (waitingOnLocks() < waitingBefore + 2 && System.nanoTime() < until) {
+            Thread.sleep(20);
+        }
+        assertThat(waitingOnLocks()).isGreaterThanOrEqualTo(waitingBefore + 2);
+        release.countDown();
+        holder.get(30, TimeUnit.SECONDS);
+
+        List<Integer> statuses = new ArrayList<>();
+        for (CompletableFuture<HttpResponse<String>> deletion : deletions) {
+            HttpResponse<String> response = deletion.get(30, TimeUnit.SECONDS);
+            statuses.add(response.statusCode());
+            if (response.statusCode() == 409) {
+                assertThat(json(response).path("code").asString()).isEqualTo("request.last_shield");
+            }
+        }
+        assertThat(statuses).containsExactlyInAnyOrder(204, 409);
+        assertThat(count("select count(*) from shield where campaign_id = ?", gm.campaignId())).isEqualTo(1);
+        assertThat(ok(get(path, gm.session())).path("total").asLong()).isEqualTo(1);
+    }
+
+    /** How many sessions of this database wait for a lock now. */
+    private long waitingOnLocks() {
+        return jdbc.sql("select count(*) from pg_stat_activity where datname = current_database()"
+                + " and wait_event_type = 'Lock'").query(Long.class).single();
     }
 
     // --- helpers ---

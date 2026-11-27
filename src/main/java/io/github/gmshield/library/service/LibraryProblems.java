@@ -35,6 +35,9 @@ final class LibraryProblems {
     /** Another Shield of the campaign has the same name (its unique form, Story 6.1). */
     static final ApiProblem SHIELD_NAME_TAKEN =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "shield_name_taken", "Shield name taken");
+    /** The Shield is its campaign's only one, which cannot be deleted (Story 6.1 part B). */
+    static final ApiProblem LAST_SHIELD =
+            ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "last_shield", "Last shield");
     /** The edit names a version the item has left: someone changed it elsewhere. */
     static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");

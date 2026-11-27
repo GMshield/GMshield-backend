@@ -13,6 +13,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -22,8 +24,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * version, refusing a stale edit or a taken name as {@link LibraryConflict}; from Story 3.2 a campaign's version, archive,
  * choice and name key (owner, system, fingerprint) as well; from Story 3.2 part B a campaign's state; from Story 6.1 a
  * campaign's Shields, with their name key (campaign, fingerprint), the one unnamed Shield per campaign, their version
- * and the (owner, campaign) reference, which refuses to delete a campaign that still has Shields. A write undoes
- * itself when its transaction rolls back.
+ * and the (owner, campaign) reference, which refuses to delete a campaign that still has Shields; from Story 6.1 part B
+ * a per-campaign lock that {@link #lockCampaign} holds until its transaction ends, so that Shield deletions of one
+ * campaign run one after the other (the campaign's own deletion does not take it). A write undoes itself when its
+ * transaction rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
 
@@ -38,6 +42,8 @@ public class InMemoryLibraryStore implements LibraryStore {
     public final Set<UUID> deletingCampaigns = ConcurrentHashMap.newKeySet();
     /** The Shields (Story 6.1, V53). */
     public final Map<UUID, ShieldRow> shields = new ConcurrentHashMap<>();
+    /** Per-campaign locks for Shield deletions (Story 6.1 part B), each held from {@link #lockCampaign} until its transaction ends. */
+    private final Map<UUID, ReentrantLock> campaignLocks = new ConcurrentHashMap<>();
     /** Set it to make the next campaign insert fail, as a database failure would. */
     public final AtomicBoolean failNextCampaign = new AtomicBoolean();
 
@@ -453,6 +459,40 @@ public class InMemoryLibraryStore implements LibraryStore {
             }
         }
         return deleted;
+    }
+
+    @Override
+    public Optional<CampaignRow> lockCampaign(UUID id) {
+        OwnerContext.require();
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("no transaction");
+        }
+        if (findCampaign(id).isEmpty()) {
+            return Optional.empty();
+        }
+        ReentrantLock lock = campaignLocks.computeIfAbsent(id, key -> new ReentrantLock());
+        lock.lock();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                lock.unlock();
+            }
+        });
+        // As PostgreSQL reads the row again once the lock is granted: it may have become deleting meanwhile.
+        return findCampaign(id);
+    }
+
+    @Override
+    public synchronized boolean deleteShield(UUID campaignId, UUID id) {
+        Optional<ShieldRow> found = findShield(campaignId, id);
+        if (found.isEmpty()) {
+            return false;
+        }
+        ShieldRow row = found.get();
+        ownerFor(row.ownerId());
+        shields.remove(id);
+        RollbackUndo.onRollback(() -> shields.put(id, row));
+        return true;
     }
 
     /** Like the key on (campaign, name fingerprint), which ignores a null fingerprint. */

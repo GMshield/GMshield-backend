@@ -7,7 +7,7 @@ package io.github.gmshield.shared.service;
  */
 public final class ContractVersions {
 
-    public static final String PUBLIC_API = "1.55.0";
+    public static final String PUBLIC_API = "1.56.0";
     public static final String INTERNAL_API = "1.27.0";
 
     private ContractVersions() {

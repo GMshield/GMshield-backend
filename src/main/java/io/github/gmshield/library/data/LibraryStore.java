@@ -223,4 +223,19 @@ public interface LibraryStore {
      * exist.
      */
     int deleteShieldsOf(Collection<UUID> campaignIds);
+
+    // --- Shield deletion (Story 6.1 part B)
+
+    /**
+     * The current owner's ready campaign {@code id} of a ready system, its row locked until the caller's transaction ends
+     * (which must exist), so that two deletions of its Shields run one after the other; empty for any other id. A
+     * campaign that became deleting while this waited for the lock is empty too.
+     */
+    Optional<CampaignRow> lockCampaign(UUID id);
+
+    /**
+     * Deletes the current owner's Shield {@code id} of the campaign {@code campaignId}; false when there is no such
+     * Shield. Joins the caller's transaction, which must exist.
+     */
+    boolean deleteShield(UUID campaignId, UUID id);
 }

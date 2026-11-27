@@ -2026,7 +2026,7 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.export_refused` (`reason`). Deploy order: backend,
     then frontend (the 1.53.0 frontend behaves as before).
 
-- **Shields in a campaign (`library`, Story 6.1 part A, public contract 1.55.0, migration V53).** A Shield (Escudo do
+- **Shields in a campaign (`library`, Story 6.1 parts A and B, public contracts 1.55.0 and 1.56.0, migration V53).** A Shield (Escudo do
   Mestre) is the GM's private space in a campaign, for notes (6.2) and dice (6.3, 6.4).
   - **V53** `shield` (id, owner, campaign, `name` and `name_fingerprint` both null or both set, `version`, created).
     Keys: (owner, id); (owner, campaign) to `campaign` with no cascade; unique (campaign, name fingerprint); and the
@@ -2048,10 +2048,18 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     or `offset`, `total`), `POST` (201), `GET` and `PATCH .../shields/{shieldId}` (`{version, name}`). Each `Shield` is
     `{id, name or null, version}`. Each route is a row of the cross-owner audit.
   - **Deletion.** A campaign's or a system's deletion removes the campaigns' Shields (`LibraryStore.deleteShieldsOf`) in
-    the transaction that removes the campaign rows, before them. Deleting a single Shield is part B.
-  - Log lines (ids and versions only): `library.shield_created`, `library.shield_renamed`,
+    the transaction that removes the campaign rows, before them.
+  - **Deleting one Shield (part B, contract 1.56.0).** `GET .../shields/{shieldId}/deletion` answers
+    `ShieldDeletion{notes, rolls, last}`: the counts are 0 until Stories 6.2 and 6.4 store notes and rolls, and `last`
+    is true when the campaign has exactly one Shield. `DELETE .../shields/{shieldId}` deletes it at once (204, no
+    recorded deletion process: a Shield holds nothing yet) and refuses the campaign's only Shield with
+    `request.last_shield` (409), changing nothing. `Shields.deleteShield` locks the campaign's row first
+    (`LibraryStore.lockCampaign`, JPQL `PESSIMISTIC_WRITE`; the in-memory store holds a lock until the transaction
+    ends), then counts, so two deletions at once leave one Shield (one 204, one 409). Not found is as above on both
+    routes, an already deleted Shield included; both are rows of the cross-owner audit.
+  - Log lines (ids and versions only): `library.shield_created`, `library.shield_renamed`, `library.shield_deleted`,
     `library.first_shield_created`, `library.first_shield_raced`. Deploy order: backend, then frontend (the 1.54.0
-    frontend shows no Shields). Internal contract and worker unchanged.
+    frontend shows no Shields; the 1.55.0 frontend cannot delete one). Internal contract and worker unchanged.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

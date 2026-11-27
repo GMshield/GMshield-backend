@@ -56,6 +56,10 @@ import tools.jackson.databind.json.JsonMapper;
  * malformed id, a Shield of another campaign and a campaign being deleted. The same rows against PostgreSQL are in
  * {@code LibraryIntegrationTest}; the deletions of Shields with their campaign are in {@link CampaignDeletionFlowTest}
  * and {@link SystemDeletionFlowTest}.
+ *
+ * <p>Part B: the deletion preview ({@code notes} and {@code rolls} 0, {@code last} for the campaign's only Shield), the
+ * deletion (204, the list one shorter), the refusal of the last Shield ({@code request.last_shield}, 409, the row kept),
+ * an already deleted Shield (404), and the same not found on both routes.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -314,11 +318,15 @@ class ShieldFlowTest {
             refused.add(get(b, "/api/v1/campaigns/" + campaign + "/shields/" + aShield));
             refused.add(send(b, "PATCH", "/api/v1/campaigns/" + campaign + "/shields/" + aShield,
                     "{\"version\":0,\"name\":\"Tomado\"}"));
+            refused.add(get(b, "/api/v1/campaigns/" + campaign + "/shields/" + aShield + "/deletion"));
+            refused.add(send(b, "DELETE", "/api/v1/campaigns/" + campaign + "/shields/" + aShield, ""));
         }
         // B's own campaign with A's Shield, B's Shield of its other campaign, an unknown and a malformed Shield id.
         for (String shield : List.of(aShield.toString(), bOtherShield.toString(), UUID.randomUUID().toString(), "123")) {
             refused.add(get(b, shields(b.campaign()) + "/" + shield));
             refused.add(send(b, "PATCH", shields(b.campaign()) + "/" + shield, "{\"version\":0,\"name\":\"Tomado\"}"));
+            refused.add(get(b, shields(b.campaign()) + "/" + shield + "/deletion"));
+            refused.add(send(b, "DELETE", shields(b.campaign()) + "/" + shield, ""));
         }
         for (HttpResponse<String> response : refused) {
             assertThat(withoutTraceId(notFound(response))).isEqualTo(withoutTraceId(expected));
@@ -338,10 +346,61 @@ class ShieldFlowTest {
         notFound(send(b, "POST", shields(bOther), "{\"name\":\"Tarde\"}"));
         notFound(get(b, shields(bOther) + "/" + bOtherShield));
         notFound(send(b, "PATCH", shields(bOther) + "/" + bOtherShield, "{\"version\":0,\"name\":\"Tarde\"}"));
+        notFound(get(b, shields(bOther) + "/" + bOtherShield + "/deletion"));
+        notFound(send(b, "DELETE", shields(bOther) + "/" + bOtherShield, ""));
         // Its removal takes its Shields before its row.
         deletion.sweep();
         assertThat(library.campaigns).doesNotContainKey(bOther);
         assertThat(library.shields).doesNotContainKey(bOtherShield).containsKeys(aShield, bShield);
+    }
+
+    @Test
+    void theDeletionPreviewNamesWhatGoesAndWhetherItIsTheLastShieldAndADeletionRefusesTheLastOne() throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID combat = UUID.fromString(json(send(gm, "POST", shields(gm.campaign()), "{\"name\":\"Combate\"}"))
+                .path("id").asString());
+
+        JsonNode preview = ok(get(gm, shields(gm.campaign()) + "/" + combat + "/deletion"));
+        assertThat(preview.path("notes").asLong()).isZero();
+        assertThat(preview.path("rolls").asLong()).isZero();
+        assertThat(preview.path("last").asBoolean()).isFalse();
+        assertThat(preview.properties()).extracting(Map.Entry::getKey).containsExactlyInAnyOrder("notes", "rolls", "last");
+        assertThat(ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion")).path("last").asBoolean()).isFalse();
+
+        HttpResponse<String> deleted = send(gm, "DELETE", shields(gm.campaign()) + "/" + combat, "");
+        assertThat(deleted.statusCode()).as(deleted.body()).isEqualTo(204);
+        assertThat(deleted.headers().firstValue("Cache-Control")).hasValue("no-store");
+        assertThat(deleted.body()).isEmpty();
+        assertThat(library.shields).doesNotContainKey(combat).containsKey(first);
+        JsonNode list = ok(get(gm, shields(gm.campaign())));
+        assertThat(list.path("total").asLong()).isEqualTo(1);
+        assertThat(list.path("items")).extracting(item -> item.path("id").asString()).containsExactly(first.toString());
+        // Gone: not found on every route, a second deletion included.
+        notFound(get(gm, shields(gm.campaign()) + "/" + combat));
+        notFound(get(gm, shields(gm.campaign()) + "/" + combat + "/deletion"));
+        notFound(send(gm, "DELETE", shields(gm.campaign()) + "/" + combat, ""));
+
+        // The campaign's only Shield: the preview says so, and its deletion is refused with nothing changed.
+        JsonNode last = ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion"));
+        assertThat(last.path("last").asBoolean()).isTrue();
+        assertThat(last.path("notes").asLong()).isZero();
+        assertThat(last.path("rolls").asLong()).isZero();
+        ShieldRow kept = library.shields.get(first);
+        HttpResponse<String> refused = send(gm, "DELETE", shields(gm.campaign()) + "/" + first, "");
+        assertThat(refused.statusCode()).as(refused.body()).isEqualTo(409);
+        assertThat(refused.headers().firstValue("Cache-Control").orElseThrow()).contains("no-store");
+        assertThat(json(refused).path("code").asString()).isEqualTo("request.last_shield");
+        assertThat(library.shields.get(first)).isEqualTo(kept);
+        assertThat(ok(get(gm, shields(gm.campaign()))).path("total").asLong()).isEqualTo(1);
+
+        // A new Shield makes the first one deletable again; the new one, named, keeps the campaign's one Shield.
+        UUID next = UUID.fromString(json(send(gm, "POST", shields(gm.campaign()), "{\"name\":\"Exploração\"}"))
+                .path("id").asString());
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + first, "").statusCode()).isEqualTo(204);
+        assertThat(ok(get(gm, shields(gm.campaign()))).path("items")).extracting(item -> item.path("id").asString())
+                .containsExactly(next.toString());
+        assertThat(ok(get(gm, shields(gm.campaign()) + "/" + next + "/deletion")).path("last").asBoolean()).isTrue();
     }
 
     // --- helpers

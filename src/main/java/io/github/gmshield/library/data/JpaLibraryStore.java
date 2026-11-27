@@ -30,6 +30,8 @@ import org.springframework.stereotype.Repository;
  *
  * <p>Story 6.1: a campaign's Shields ({@code shield}, V53), read by campaign and id, oldest first; a write that the key on
  * {@code (campaign_id, name_fingerprint)} or the one unnamed Shield's partial index refuses is a {@link LibraryConflict}.
+ * Part B: a Shield's deletion first locks its campaign's row ({@code PESSIMISTIC_WRITE}), so two deletions cannot both
+ * count two Shields and leave none.
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
@@ -453,6 +455,24 @@ class JpaLibraryStore implements LibraryStore {
         going.forEach(em::remove);
         em.flush();
         return going.size();
+    }
+
+    @Override
+    public Optional<CampaignRow> lockCampaign(UUID id) {
+        return em().createQuery(CAMPAIGN_BY_ID, CampaignEntity.class).setParameter("id", id)
+                .setLockMode(LockModeType.PESSIMISTIC_WRITE).getResultList().stream().findFirst()
+                .map(CampaignEntity::row);
+    }
+
+    @Override
+    public boolean deleteShield(UUID campaignId, UUID id) {
+        Optional<ShieldEntity> found = shield(campaignId, id);
+        found.ifPresent(entity -> {
+            EntityManager em = em();
+            em.remove(entity);
+            em.flush();
+        });
+        return found.isPresent();
     }
 
     private Optional<ShieldEntity> shield(UUID campaignId, UUID id) {

@@ -7,6 +7,7 @@ import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.media.ArraySchema;
 import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.util.List;
 import java.util.UUID;
@@ -14,6 +15,7 @@ import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -31,6 +33,9 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code request.shield_name_taken} (409); a malformed body, limit, cursor or offset is {@code request.invalid} (400).
  * Another owner's campaign or Shield, an unknown or malformed id, a Shield of another campaign and a campaign being
  * deleted are the same {@code request.not_found} (404). Every answer is {@code no-store}.
+ *
+ * <p>Part B: what goes with a Shield if it is deleted (its notes and rolls, none yet, and whether it is the campaign's
+ * last), and its deletion (204), which refuses the campaign's only Shield with {@code request.last_shield} (409).
  */
 @RestController
 @Tag(name = "library")
@@ -38,6 +43,7 @@ class ShieldController {
 
     static final String SHIELDS = "/api/v1/campaigns/{id}/shields";
     static final String SHIELD = "/api/v1/campaigns/{id}/shields/{shieldId}";
+    static final String SHIELD_DELETION = "/api/v1/campaigns/{id}/shields/{shieldId}/deletion";
     private static final String SESSION = "X-Session-Token";
     private static final String SESSION_SUMMARY = " session.required (401) without a session.";
     private static final String SHIELD_EXAMPLE = "0190a0b0-0000-7000-8000-000000000003";
@@ -99,6 +105,20 @@ class ShieldController {
         @Override
         public String toString() {
             return "ShieldRenameBody[version=" + version + "]";
+        }
+    }
+
+    @Schema(name = "ShieldDeletion", requiredProperties = {"notes", "rolls", "last"})
+    record ShieldDeletionView(
+            @Schema(description = "How many notes of the Shield go with it (0 until notes exist)", format = "int64",
+                    minimum = "0", example = "0") long notes,
+            @Schema(description = "How many stored rolls of the Shield go with it (0 until rolls are stored)",
+                    format = "int64", minimum = "0", example = "0") long rolls,
+            @Schema(description = "Whether it is the campaign's only Shield, which cannot be deleted", example = "false")
+            boolean last) {
+
+        static ShieldDeletionView of(Shields.ShieldDeletion deletion) {
+            return new ShieldDeletionView(deletion.notes(), deletion.rolls(), deletion.last());
         }
     }
 
@@ -199,5 +219,44 @@ class ShieldController {
         }
         return LibraryController.found(shields.renameShield(campaignId, shield, body.version(), body.name())
                 .map(ShieldView::of));
+    }
+
+    @GetMapping(path = SHIELD_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "getShieldDeletion", summary = "What goes with one Shield of one of the account's campaigns"
+            + " if it is deleted: how many notes and stored rolls (0 until they exist), and whether it is the campaign's"
+            + " only Shield (last), which cannot be deleted. request.not_found (404) for any other id (unknown, another"
+            + " account's, malformed, already deleted, a Shield of another campaign or of a campaign being deleted);"
+            + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ShieldDeletionView> shieldDeletion(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(description = "The Shield's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("shieldId") String shieldId) {
+        return LibraryController.found(LibraryController.parse(id).flatMap(campaignId -> LibraryController.parse(shieldId)
+                .flatMap(shield -> shields.shieldDeletion(campaignId, shield))).map(ShieldDeletionView::of));
+    }
+
+    @DeleteMapping(path = SHIELD)
+    @Operation(operationId = "deleteShield", summary = "Deletes one Shield of one of the account's campaigns (204, no"
+            + " body): from now on it is not found, and nothing else of the campaign changes. Cannot be undone."
+            + " request.last_shield (409) when it is the campaign's only Shield, request.not_found (404) for any other id"
+            + " (unknown, another account's, malformed, already deleted, a Shield of another campaign or of a campaign"
+            + " being deleted); nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")),
+            responses = @ApiResponse(responseCode = "204", description = "The Shield was deleted"))
+    ResponseEntity<Void> deleteShield(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @Parameter(description = "The Shield's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("shieldId") String shieldId) {
+        UUID campaignId = LibraryController.parse(id).orElseThrow(LibraryController::notFound);
+        UUID shield = LibraryController.parse(shieldId).orElseThrow(LibraryController::notFound);
+        if (!shields.deleteShield(campaignId, shield)) {
+            throw LibraryController.notFound();
+        }
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
 }
