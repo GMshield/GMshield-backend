@@ -1880,6 +1880,64 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     `artifacts.delete`. Deploy order: backend, then frontend (minimum public contract 1.49.0); the 1.48.0 frontend's
     `DELETE` keeps the artifacts as before. Internal contract and worker unchanged.
 
+- **Override a system record (`knowledge`, `artifacts`, `scope`, Story 5.5 part A, FR-20, public contract 1.50.0,
+  internal contract 1.27.0).** An artifact can replace one system record in its own campaign.
+  - **V50 `record_relation`** (owned by `knowledge`): `id`, `owner_id`, `from_record_id` (the artifact),
+    `to_record_id` (the record), `kind` (check `overrides`, part B extends it), `created_at`; unique
+    `(from_record_id, kind)`, both keys `on delete cascade` (the artifact's pass, a version's removal, a campaign's or
+    a system's deletion take the marks). Additive; drop the table to roll back.
+  - **The rule.** `knowledge.service.RecordRelations`: a mark applies in campaign C only from a live artifact of C to a
+    live record of the system tier of C's resolved scope (stored settings). A second artifact of C on the same record
+    is 409 `artifact.override_taken` (`params.artifactId`); anything that is no target (another system's, a campaign
+    material's, a tombstone, another owner's, unknown, malformed) is 400 `artifact.override_target`. Both rows are
+    locked first. The mark is not versioned (an edit or restore keeps it).
+  - **API.** `PUT /api/v1/campaigns/{campaignId}/artifacts/{artifactId}/override` `{recordId}` answers the artifact
+    (replacing a mark is allowed); `DELETE …/override` is 204 and idempotent; `GET /api/v1/campaigns/{campaignId}/
+    override-targets?recordType=&q=&offset=&limit=` lists `{items: [{id, name, recordType, materialName}], total}`,
+    alphabetical, `q` folded for case and accents after the names are decrypted. Every `Artifact` carries `overrides`
+    (`{recordId, name, recordType, systemId, removed}` or null; `removed` when the record is tombstoned, superseded or
+    out of scope). `ConversationDeletionArtifact` gains `overrides: boolean` (5.4 B's dialog row).
+  - **Answers.** `scope` reads the marks through its own port `CampaignOverrides` (`knowledge` implements it; `scope`
+    depends on no module that holds them, `ModuleBoundaryTest`). The records read (`JobRecord`, internal 1.27.0) gains
+    optional `overrides` (on the artifact) and `overriddenBy` (on the record), each set only when both sides are in the
+    job's frozen scope; the worker then reads a missing artifact first and tells the model it replaces the record.
+  - **Reprocess (Q2).** At a reprocess's acceptance, where Story 4.5 carries corrections, a mark moves to the new
+    record that matches the old one's (type, name fingerprint); with no match it stays, shown removed, and goes with the
+    old record. A replacement upload carries nothing.
+  - Log lines (ids and counts only): `knowledge.override_set`, `knowledge.override_removed`,
+    `knowledge.override_refused`, `knowledge.override_targets_listed`, `artifacts.override_set`,
+    `artifacts.override_removed`; `material.corrections_carried` gains `overrides`. Deploy order: backend, then worker,
+    then frontend (the 1.49.0 frontend and the 1.26.0-reading worker behave as before).
+
+- **Relate records (`knowledge`, `artifacts`, Story 5.5 part B, FR-20, public contract 1.51.0).** An artifact is
+  related to other records with "related to"; the relation shows on both records and changes no answer.
+  - **V51** on `record_relation`: the kind check gains `related`; part A's unique `(from_record_id, kind)` becomes the
+    partial unique index `record_relation_overrides_from_key` on `from_record_id` where `kind = 'overrides'` (one
+    override per artifact still), and `record_relation_from_to_kind_key` makes `(from_record_id, to_record_id, kind)`
+    unique. Additive; the migration's header has the steps back to V50's keys.
+  - **The rule.** `knowledge.service.RecordRelations`: a target is a live extracted record of any tier of the
+    campaign's resolved scope (stored settings), or another live artifact of the same campaign (through the `scope`
+    port `CampaignArtifacts`). A relation has no direction: one row, read from both sides; relating the other way, or
+    again, stores nothing. At most 50 relations per artifact, either side (409 `artifact.relations_full`); anything
+    that is no target (out of scope, a tombstone, another campaign's artifact, the artifact itself, another owner's,
+    unknown, malformed) is 400 `artifact.relation_target`. Both rows are locked first. Not versioned.
+  - **API.** `POST /api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations` `{recordId}` answers the artifact;
+    `DELETE …/relations/{recordId}` is 204, idempotent, and removes the relation from either side;
+    `GET …/artifacts/{artifactId}/relation-targets?recordType=&q=&offset=&limit=` lists
+    `{items: [{id, name, recordType, tier, artifact, materialName}], total}`, alphabetical, `q` folded as part A's,
+    leaving out the artifact and the records it is related to. Every `Artifact` carries `related`
+    (`[{recordId, name, recordType, tier, artifact, removed}]`, oldest first; `removed` for an extracted record that is
+    tombstoned, superseded or out of scope, whose `tier` is then null when out of scope; a deleting artifact is left
+    out). `getCampaignRecord` alone gains `related: [{artifactId, name, recordType}]`, the campaign's live artifacts
+    related to the record; the system's record read is unchanged.
+  - **Reprocess.** A relation to an old version's record moves to the matching new record as an override does; one
+    whose artifact is related to the match already is deleted.
+  - Log lines (ids and counts only): `knowledge.relation_set`, `knowledge.relation_removed`,
+    `knowledge.relation_refused`, `knowledge.relation_targets_listed`, `artifacts.relation_set`,
+    `artifacts.relation_removed`; `material.corrections_carried` gains `related`; `knowledge.campaign_record_read`
+    gains `related`. Deploy order: backend, then frontend (the 1.50.0 frontend behaves as before). Internal contract
+    and worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

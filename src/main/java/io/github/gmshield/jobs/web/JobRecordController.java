@@ -1,5 +1,6 @@
 package io.github.gmshield.jobs.web;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.gmshield.jobs.service.JobRecord;
 import io.github.gmshield.jobs.service.JobRecordReads;
 import io.swagger.v3.oas.annotations.Operation;
@@ -62,7 +63,7 @@ class JobRecordController {
     }
 
     @Schema(name = "JobRecord", requiredProperties = {"id", "tier", "type", "name", "fields", "page", "sectionPath"},
-            description = "A record within the job's scope (contract 1.19.0)")
+            description = "A record within the job's scope (contract 1.19.0; overrides and overriddenBy from 1.27.0)")
     record JobRecordView(
             @Schema(format = "uuid") UUID id,
             @Schema(description = "The tier of the record's source", allowableValues = {"campaign", "system", "other"})
@@ -74,17 +75,28 @@ class JobRecordController {
                     schema = @Schema(implementation = JobRecordFieldView.class)) List<JobRecordFieldView> fields,
             @Schema(description = "The record's first page, from 1", format = "int32") int page,
             @ArraySchema(arraySchema = @Schema(description = "The section path of its first passage on that page,"
-                    + " outermost first"), schema = @Schema(type = "string")) List<String> sectionPath) {
+                    + " outermost first"), schema = @Schema(type = "string")) List<String> sectionPath,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            @Schema(description = "Contract 1.27.0: on an artifact of the job's campaign, the id of the record of the"
+                    + " job's scope it overrides (that record is in the system tier). The artifact replaces that record"
+                    + " in this campaign. Absent for none, and unless both are in the job's scope", format = "uuid")
+            UUID overrides,
+            @JsonInclude(JsonInclude.Include.NON_NULL)
+            @Schema(description = "Contract 1.27.0: on a system-tier record, the id of the artifact of the job's"
+                    + " campaign that overrides it; the artifact is read before the record, which follows as an"
+                    + " alternative. Absent for none, and unless both are in the job's scope", format = "uuid")
+            UUID overriddenBy) {
 
         static JobRecordView of(JobRecord record) {
             return new JobRecordView(record.id(), record.tier(), record.type(), record.name(), record.fields().stream()
                     .map(field -> new JobRecordFieldView(field.name(), field.value())).toList(), record.page(),
-                    record.sectionPath());
+                    record.sectionPath(), record.overrides(), record.overriddenBy());
         }
 
         @Override
         public String toString() {
-            return "JobRecordView[id=" + id + ", tier=" + tier + ", type=" + type + ", page=" + page + "]";
+            return "JobRecordView[id=" + id + ", tier=" + tier + ", type=" + type + ", page=" + page + ", overrides="
+                    + overrides + ", overriddenBy=" + overriddenBy + "]";
         }
     }
 

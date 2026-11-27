@@ -25,11 +25,17 @@ import io.github.gmshield.knowledge.data.KnowledgeStore;
 import io.github.gmshield.knowledge.data.RecordStore;
 import io.github.gmshield.knowledge.data.RecordTypeRow;
 import io.github.gmshield.knowledge.service.Ontology;
+import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.knowledge.service.Records;
 import io.github.gmshield.library.service.Language;
 import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.CampaignArtifacts;
+import io.github.gmshield.materials.data.MaterialRow;
+import io.github.gmshield.materials.data.MaterialStore;
+import io.github.gmshield.materials.data.MaterialSystemRow;
+import io.github.gmshield.materials.data.PassageRow;
+import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.materials.service.ExtractedRecords;
 import io.github.gmshield.shared.service.ApiException;
 import io.github.gmshield.shared.service.Ids;
@@ -95,6 +101,16 @@ import tools.jackson.databind.json.JsonMapper;
  * and identity with one {@code index.artifact_removal}; every live read leaves a deleting artifact out while the all
  * reads still answer it, and a campaign's deletion takes it.
  *
+ * <p>Story 5.5 part A (V50): an override is one {@code record_relation} row; the table refuses a second mark of the
+ * same artifact and another kind; a second artifact of the campaign is refused naming the first; an answer's records
+ * read carries the marks on both sides on PostgreSQL; and the row goes with the artifact's row (its deletion's pass) and
+ * with the record's row (its version's removal).
+ *
+ * <p>Story 5.5 part B (V51): a relation is one {@code record_relation} row of kind {@code related}, read from both
+ * sides; relating the other way stores nothing; the table keeps one override per artifact beside many relations and
+ * refuses a second link of a kind between the same records in the same direction; and the row goes with either
+ * artifact's row and with the record's row.
+ *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
  */
@@ -155,6 +171,8 @@ class ArtifactsIntegrationTest {
     private ArtifactIndexReconcile reconcile;
     @Autowired
     private CampaignArtifacts campaignArtifacts;
+    @Autowired
+    private MaterialStore materials;
 
     /** An owner with the starter system and campaign, as a first sign-in makes them. */
     private record Owner(UUID id, UUID system, UUID campaign) {
@@ -954,6 +972,173 @@ class ArtifactsIntegrationTest {
             assertThat(in).as(name).isNotNull();
             return new String(in.readAllBytes(), StandardCharsets.UTF_8);
         }
+    }
+
+    // --- Story 5.5 part A
+
+    @Test
+    void anOverrideIsOneRowAnAnswerReadsItAndItGoesWithTheArtifactsRowAndWithTheRecordsRowOnPostgres()
+            throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        SystemRecord fireball = systemRecord(a, "Bola de Fogo");
+        UUID house = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("spell",
+                "Bola de Fogo (casa)", List.of(), null))).orElseThrow().id();
+        UUID second = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("note", "Outra",
+                List.of(), null))).orElseThrow().id();
+
+        Artifacts.Artifact marked = as(a.id(), () -> artifacts.override(a.campaign(), house, fireball.id()))
+                .orElseThrow();
+
+        assertThat(marked.overrides().recordId()).isEqualTo(fireball.id());
+        assertThat(marked.overrides().name()).isEqualTo("Bola de Fogo");
+        assertThat(marked.overrides().removed()).isFalse();
+        Map<String, Object> row = jdbc.sql("select owner_id, to_record_id, kind from record_relation"
+                + " where from_record_id = ?").param(house).query().singleRow();
+        assertThat(row).containsEntry("owner_id", a.id()).containsEntry("to_record_id", fireball.id())
+                .containsEntry("kind", "overrides");
+        // The table: one mark per artifact (V51's partial index keeps it), and no kind but 'overrides' and 'related'.
+        assertThatThrownBy(() -> jdbc.sql("insert into record_relation (id, owner_id, from_record_id, to_record_id,"
+                + " kind, created_at) values (?, ?, ?, ?, 'overrides', now())").params(Ids.newId(), a.id(), house,
+                fireball.id()).update()).isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record_relation (id, owner_id, from_record_id, to_record_id,"
+                + " kind, created_at) values (?, ?, ?, ?, 'shares', now())").params(Ids.newId(), a.id(), second,
+                fireball.id()).update()).isInstanceOf(DataIntegrityViolationException.class);
+        // A second artifact of the campaign is refused, naming the first; nothing is written.
+        assertThatThrownBy(() -> as(a.id(), () -> artifacts.override(a.campaign(), second, fireball.id())))
+                .isInstanceOfSatisfying(ApiException.class, refused -> {
+                    assertThat(refused.problem().code()).isEqualTo("artifact.override_taken");
+                    assertThat(refused.problem().params()).containsEntry("artifactId", house.toString());
+                });
+        assertThat(count("record_relation", "from_record_id = ?", second)).isZero();
+
+        // An answer of the campaign reads the marks on both sides.
+        UUID turn = as(a.id(), () -> conversations.ask(a.campaign(), "Como funciona a Bola de Fogo?")).turnId();
+        UUID answerJob = jdbc.sql("select job_id from turn where id = ?").param(turn).query(UUID.class).single();
+        JobClaims.Claim answer = claims.claim(answerJob, null, List.of("azure-openai"));
+        List<JobRecord> read = recordReads.read(answerJob, answer.claimId(), answer.grant(),
+                List.of(house, fireball.id()));
+        assertThat(read).extracting(JobRecord::id, JobRecord::overrides, JobRecord::overriddenBy).containsExactly(
+                org.assertj.core.groups.Tuple.tuple(house, fireball.id(), null),
+                org.assertj.core.groups.Tuple.tuple(fireball.id(), null, house));
+
+        // Pointed to another record, the mark is the same row with its new record (the store's retarget).
+        UUID relation = jdbc.sql("select id from record_relation where from_record_id = ?").param(house)
+                .query(UUID.class).single();
+        SystemRecord lightning = systemRecord(a, "Relâmpago");
+        as(a.id(), () -> artifacts.override(a.campaign(), house, lightning.id())).orElseThrow();
+        assertThat(count("record_relation", "from_record_id = ?", house)).isOne();
+        assertThat(jdbc.sql("select id, to_record_id from record_relation where from_record_id = ?").param(house)
+                .query().singleRow()).containsEntry("id", relation).containsEntry("to_record_id", lightning.id());
+
+        // The artifact's deletion pass removes its row, and the mark with it.
+        assertThat(as(a.id(), () -> artifacts.delete(a.campaign(), house))).isTrue();
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+        assertThat(count("record", "id = ?", house)).isZero();
+        assertThat(count("record_relation", "from_record_id = ?", house)).isZero();
+        // The record's row removed with its version: the second artifact's mark goes with it.
+        as(a.id(), () -> artifacts.override(a.campaign(), second, fireball.id())).orElseThrow();
+        assertThat(count("record_relation", "from_record_id = ?", second)).isOne();
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.removeVersion(fireball.versionId())));
+        assertThat(count("record_relation", "from_record_id = ?", second)).isZero();
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), second)).orElseThrow().overrides()).isNull();
+        freeTheIngestionLane();
+    }
+
+    // --- Story 5.5 part B
+
+    @Test
+    void aRelationIsOneRowReadFromBothSidesAndItGoesWithEitherArtifactsRowAndWithTheRecordsRowOnPostgres()
+            throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        SystemRecord troll = systemRecord(a, "Troll");
+        UUID crypt = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("encounter", "Cripta",
+                List.of(), null))).orElseThrow().id();
+        UUID map = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("note", "Mapa",
+                List.of(), null))).orElseThrow().id();
+
+        Artifacts.Artifact related = as(a.id(), () -> artifacts.relate(a.campaign(), crypt, troll.id()))
+                .orElseThrow();
+        assertThat(related.related()).singleElement().satisfies(one -> {
+            assertThat(one.recordId()).isEqualTo(troll.id());
+            assertThat(one.name()).isEqualTo("Troll");
+            assertThat(one.tier()).isEqualTo(io.github.gmshield.scope.service.Tier.SYSTEM);
+            assertThat(one.artifact()).isFalse();
+            assertThat(one.removed()).isFalse();
+        });
+        as(a.id(), () -> artifacts.relate(a.campaign(), crypt, map)).orElseThrow();
+        // The other way round stores nothing, and both sides read the one row.
+        as(a.id(), () -> artifacts.relate(a.campaign(), map, crypt)).orElseThrow();
+        assertThat(count("record_relation", "kind = 'related' and owner_id = ?", a.id())).isEqualTo(2);
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), map)).orElseThrow().related())
+                .extracting(RecordRelations.Related::recordId, RecordRelations.Related::name,
+                        RecordRelations.Related::artifact)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple(crypt, "Cripta", true));
+        assertThat(as(a.id(), () -> systemRecords.inCampaign(a.campaign(), troll.id())).orElseThrow().related())
+                .extracting(RecordRelations.RelatedArtifact::artifactId).containsExactly(crypt);
+
+        // V51's keys: an override beside the relations, one override per artifact still, one link of a kind between
+        // two records in one direction.
+        as(a.id(), () -> artifacts.override(a.campaign(), crypt, troll.id())).orElseThrow();
+        assertThatThrownBy(() -> jdbc.sql("insert into record_relation (id, owner_id, from_record_id, to_record_id,"
+                + " kind, created_at) values (?, ?, ?, ?, 'overrides', now())").params(Ids.newId(), a.id(), crypt,
+                map).update()).isInstanceOf(DataIntegrityViolationException.class);
+        assertThatThrownBy(() -> jdbc.sql("insert into record_relation (id, owner_id, from_record_id, to_record_id,"
+                + " kind, created_at) values (?, ?, ?, ?, 'related', now())").params(Ids.newId(), a.id(), crypt,
+                troll.id()).update()).isInstanceOf(DataIntegrityViolationException.class);
+
+        // Oldest first, read from PostgreSQL.
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), crypt)).orElseThrow().related())
+                .extracting(RecordRelations.Related::recordId).containsExactly(troll.id(), map);
+
+        // Removed from the other side: the row made from the first goes.
+        assertThat(as(a.id(), () -> artifacts.unrelate(a.campaign(), map, crypt))).isTrue();
+        assertThat(count("record_relation", "kind = 'related' and from_record_id = ?", crypt)).isOne();
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), map)).orElseThrow().related()).isEmpty();
+
+        // The other artifact's deletion pass takes the relation made to it.
+        as(a.id(), () -> artifacts.relate(a.campaign(), crypt, map)).orElseThrow();
+        assertThat(as(a.id(), () -> artifacts.delete(a.campaign(), map))).isTrue();
+        // While it is deleting, its relation is not shown.
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), crypt)).orElseThrow().related())
+                .extracting(RecordRelations.Related::recordId).containsExactly(troll.id());
+        assertThat(deletion.sweep()).isGreaterThanOrEqualTo(1);
+        assertThat(count("record_relation", "to_record_id = ?", map)).isZero();
+        // The record's row removed with its version: the relation and the mark go with it.
+        as(a.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                extracted.removeVersion(troll.versionId())));
+        assertThat(count("record_relation", "from_record_id = ?", crypt)).isZero();
+        assertThat(as(a.id(), () -> artifacts.get(a.campaign(), crypt)).orElseThrow().related()).isEmpty();
+        freeTheIngestionLane();
+    }
+
+    /** A record of the owner's system, of its own ready version: its id and that version. */
+    private record SystemRecord(UUID id, UUID versionId) {
+    }
+
+    /** A ready material of the owner's system with one spell record named {@code name}, stored directly. */
+    private SystemRecord systemRecord(Owner owner, String name) throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        UUID material = Ids.newId();
+        UUID version = Ids.newId();
+        UUID passage = Ids.newId();
+        as(owner.id(), () -> new TransactionTemplate(transactions).execute(status -> {
+            materials.insertMaterial(new MaterialRow(material, owner.id(), vault.encryptText(new Binding("material",
+                    "name", material, owner.id()), "Livro"), now, "rulebook", null, null));
+            materials.insertMaterialSystem(new MaterialSystemRow(Ids.newId(), owner.id(), material, owner.system(),
+                    now));
+            materials.insertVersion(new VersionRow(version, owner.id(), material, "ready", "pdf", 1000L, now, now));
+            byte[] place = "{\"sectionPath\":[\"Magias\"],\"range\":[0,4]}".getBytes(StandardCharsets.UTF_8);
+            materials.insertPassages(List.of(new PassageRow(passage, owner.id(), version, 0, 1,
+                    vault.encryptText(new Binding("passage", "text", passage, owner.id()), name + "."),
+                    vault.encrypt(new Binding("passage", "place", passage, owner.id()), place), now)));
+            return extracted.replaceRange(version, 1, 1, List.of(new ExtractedRecords.Extracted("spell", name,
+                    List.of(), List.of(passage), 1)));
+        }));
+        return new SystemRecord(jdbc.sql("select id from record where version_id = ?").param(version)
+                .query(UUID.class).single(), version);
     }
 
     /** One ingestion job at a time: whatever another test left open would hold this test's jobs back. */

@@ -189,7 +189,9 @@ class ModuleBoundaryTest {
      * implements, so {@code scope} still depends on no module that holds them. Story 5.4 part A: {@code artifacts} reads
      * and marks a saved draft through {@code conversations}, which never depends on {@code artifacts}. Story 5.4 part B:
      * a conversation's deletion reads and takes its saved artifacts through its own port, {@code ConversationArtifacts},
-     * which {@code artifacts} implements, so that rule still holds.
+     * which {@code artifacts} implements, so that rule still holds. Story 5.5 part A: {@code scope} reads a campaign's
+     * overrides through its own port, {@code CampaignOverrides}, which {@code knowledge} implements, so {@code scope}
+     * depends on no module that holds them either.
      */
     @Test
     void theLibraryDeletesThroughHandlersAndUsesNoFeatureModule() {
@@ -205,6 +207,10 @@ class ModuleBoundaryTest {
         noClasses().that().resideInAPackage(base + ".scope..").should().dependOnClassesThat()
                 .resideInAnyPackage(base + ".artifacts..")
                 .because("scope reads artifacts through its CampaignArtifacts port only").check(application);
+        noClasses().that().resideInAPackage(base + ".scope..").should().dependOnClassesThat()
+                .resideInAnyPackage(base + ".knowledge..")
+                .because("scope reads overrides through its CampaignOverrides port only (Story 5.5 part A)")
+                .check(application);
         noClasses().that().resideInAPackage(base + ".conversations..").should().dependOnClassesThat()
                 .resideInAnyPackage(base + ".artifacts..", base + ".knowledge..")
                 .because("artifacts saves a draft through conversations, never the other way (Story 5.4 part A), and"

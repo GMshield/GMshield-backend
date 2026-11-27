@@ -20,7 +20,12 @@
  * ({@code service.Proposals}, {@code service.Terms}); an origin names its material through
  * {@code materials.service.MaterialNames}. From Story 5.1 an artifact (a record the GM wrote in a campaign) is a row of
  * {@code record} too, with its campaign instead of a version: {@code service.ArtifactRecords} owns that identity and
- * type for the {@code artifacts} module, which owns the content; no read of a system's records reaches it.
+ * type for the {@code artifacts} module, which owns the content; no read of a system's records reaches it. From Story
+ * 5.5 part A it owns the relations between records ({@code record_relation}, {@code service.RecordRelations}): an
+ * artifact overrides one system record in its campaign; it implements the {@code scope} module's port
+ * {@code CampaignOverrides}, so {@code scope} depends on nothing here. Part B adds "related to" between an artifact
+ * and a record of its campaign's scope or another artifact of the campaign, reading artifacts' names through the
+ * {@code scope} port {@code CampaignArtifacts}.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Knowledge",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "materials :: service",

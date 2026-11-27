@@ -24,6 +24,7 @@ import io.github.gmshield.jobs.data.JobMemoryStores;
 import io.github.gmshield.jobs.data.MutableClock;
 import io.github.gmshield.knowledge.data.InMemoryKnowledgeStore;
 import io.github.gmshield.knowledge.data.InMemoryOntologyStore;
+import io.github.gmshield.knowledge.data.InMemoryRecordRelationStore;
 import io.github.gmshield.knowledge.data.InMemoryRecordStore;
 import io.github.gmshield.library.data.InMemoryDeletionStore;
 import io.github.gmshield.library.data.InMemoryLibraryStore;
@@ -270,6 +271,20 @@ class CrossOwnerAuditFlowTest {
             // an artifact's deletion (Story 5.2 part B)
             route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}", "campaignId", "campaign",
                     "artifactId", "artifact").own("campaignId"),
+            // an artifact's override, its removal and the records it can override (Story 5.5 part A)
+            route("PUT", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/override", "campaignId", "campaign",
+                    "artifactId", "artifact").json("{\"recordId\":\"{record}\"}").own("campaignId"),
+            route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/override", "campaignId",
+                    "campaign", "artifactId", "artifact").own("campaignId"),
+            route("GET", "/api/v1/campaigns/{campaignId}/override-targets", "campaignId", "campaign")
+                    .query("recordType=spell"),
+            // an artifact's relations, their removal and the records it can be related to (Story 5.5 part B)
+            route("POST", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations", "campaignId", "campaign",
+                    "artifactId", "artifact").json("{\"recordId\":\"{record}\"}").own("campaignId"),
+            route("DELETE", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations/{recordId}", "campaignId",
+                    "campaign", "artifactId", "artifact", "recordId", "record").own("campaignId"),
+            route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relation-targets", "campaignId",
+                    "campaign", "artifactId", "artifact").query("recordType=spell").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -397,6 +412,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryArtifactReferenceStore artifactReferences;
     @Autowired
+    private InMemoryRecordRelationStore recordRelations;
+    @Autowired
     private InMemoryMaterialStore materials;
     @Autowired
     private InMemoryUploadStorage uploads;
@@ -467,7 +484,7 @@ class CrossOwnerAuditFlowTest {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
                     library, deletions, scopes, knowledge, records, ontology, artifactVersions, artifactIndex,
-                    artifactReferences, materials,
+                    artifactReferences, recordRelations, materials,
                     uploads, index, conversations, references, searches, clock, vault), START);
         }
         stores.start();
@@ -587,7 +604,22 @@ class CrossOwnerAuditFlowTest {
                 // Story 4.4: a merge into another account's record type is refused as an unknown target is.
                 probe("targetId in POST /proposals/{id}/merge", "recordType", 400, "ontology.merge_target_invalid", 200,
                         id -> json("POST", "/api/v1/proposals/" + b.get("proposal") + "/merge", "{\"version\":"
-                                + b.get("proposalVersion") + ",\"targetId\":\"" + id + "\"}")));
+                                + b.get("proposalVersion") + ",\"targetId\":\"" + id + "\"}")),
+                // Story 5.5 part A: overriding another account's record is refused as an unknown record is.
+                new Probe("recordId in PUT /campaigns/{campaignId}/artifacts/{artifactId}/override", "record", 400,
+                        "artifact.override_target", "systemRecord", 200, false,
+                        id -> json("PUT", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/override", "{\"recordId\":\"" + id + "\"}")),
+                // Story 5.5 part B: relating another account's record, or its artifact, is refused as an unknown
+                // record is.
+                new Probe("recordId in POST /campaigns/{campaignId}/artifacts/{artifactId}/relations", "record", 400,
+                        "artifact.relation_target", "systemRecord", 200, false,
+                        id -> json("POST", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/relations", "{\"recordId\":\"" + id + "\"}")),
+                new Probe("an artifact's recordId in POST /campaigns/{campaignId}/artifacts/{artifactId}/relations",
+                        "artifact", 400, "artifact.relation_target", "otherArtifact", 200, false,
+                        id -> json("POST", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/relations", "{\"recordId\":\"" + id + "\"}")));
     }
 
     @Test
@@ -883,8 +915,9 @@ class CrossOwnerAuditFlowTest {
 
     /**
      * Account B, with its own items for the probes' controls: two systems, a campaign, two materials of the campaign
-     * (ingested and accepted), a conversation, and the versions its changes name. Its items stay writable: a control
-     * that changes a version writes the new one ({@link #refresh}).
+     * (ingested and accepted), from Story 5.5 part A a material of its system and an artifact (from part B two), a
+     * conversation, and the versions its changes name. Its items stay writable: a control that changes a version
+     * writes the new one ({@link #refresh}).
      */
     private World mine() throws Exception {
         Gm gm = signUp();
@@ -897,6 +930,16 @@ class CrossOwnerAuditFlowTest {
         items.put("material", ingested(gm, metadata("Notas.pdf", "campaign", gm.campaign().toString())).materialId());
         items.put("otherMaterial", ingested(gm, metadata("Mapas.pdf", "campaign", gm.campaign().toString()))
                 .materialId());
+        // Story 5.5 part A: a record of B's system tier and an artifact of B's campaign, for the override's control.
+        ingested(gm, metadata("Regras.pdf", "system", items.get("system")));
+        JsonNode targets = json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/override-targets?recordType=spell"));
+        assertThat(targets.path("total").asLong()).as(targets.toString()).isEqualTo(1);
+        items.put("systemRecord", targets.path("items").get(0).path("id").asString());
+        items.put("artifact", artifact(gm, "Arco de Lia"));
+        // Story 5.5 part B: a second artifact of B's campaign, for the relation's control.
+        items.put("otherArtifact", artifact(gm, "Flecha de Lia"));
+        // Its index job would hold the ingestion lane.
+        stores.endIngestion();
         items.put("conversation", json(ask(gm, "{\"question\":\"Quem leva a coroa?\"}")).path("conversationId")
                 .asString());
         // Story 4.4: a pending record type proposal of B's system, and B's spell type, for the merge's control.

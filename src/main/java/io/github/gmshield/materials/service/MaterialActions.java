@@ -161,7 +161,9 @@ public class MaterialActions {
         log.atInfo().addKeyValue("versionId", version.id()).addKeyValue("fromVersionId", from)
                 .addKeyValue("matched", carried.matched()).addKeyValue("copied", carried.copied())
                 .addKeyValue("dropped", carried.dropped()).addKeyValue("deleted", carried.deleted())
-                .addKeyValue("tombstoned", carried.tombstoned()).log("material.corrections_carried");
+                .addKeyValue("tombstoned", carried.tombstoned()).addKeyValue("overrides", carried.overrides())
+                .addKeyValue("related", carried.related())
+                .log("material.corrections_carried");
     }
 
     /** In place while the version needs review; as a new version while it is ready (Story 3.4). */

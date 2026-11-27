@@ -4,6 +4,7 @@ import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.conversations.service.ConversationArtifacts;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
+import io.github.gmshield.knowledge.service.RecordRelations;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Vault;
 import java.util.ArrayList;
@@ -30,14 +31,16 @@ import org.springframework.transaction.support.TransactionTemplate;
 class SavedArtifacts implements ConversationArtifacts {
 
     private final ArtifactRecords records;
+    private final RecordRelations relations;
     private final ArtifactVersionStore versions;
     private final Vault vault;
     private final ObjectProvider<Artifacts> artifacts;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    SavedArtifacts(ArtifactRecords records, ArtifactVersionStore versions, Vault vault,
+    SavedArtifacts(ArtifactRecords records, RecordRelations relations, ArtifactVersionStore versions, Vault vault,
                    ObjectProvider<Artifacts> artifacts, ObjectProvider<PlatformTransactionManager> transactions) {
         this.records = records;
+        this.relations = relations;
         this.versions = versions;
         this.vault = vault;
         this.artifacts = artifacts;
@@ -54,6 +57,8 @@ class SavedArtifacts implements ConversationArtifacts {
             List<ArtifactRecords.Identity> found = records.ofConversation(conversationId);
             Map<UUID, ArtifactVersionRow> latest = versions.latest(found.stream().map(ArtifactRecords.Identity::id)
                     .toList());
+            // Story 5.5 part A: the dialog's row says when its artifact overrides a record.
+            Set<UUID> overriding = relations.overriding(found.stream().map(ArtifactRecords.Identity::id).toList());
             List<SavedArtifact> saved = new ArrayList<>(found.size());
             for (ArtifactRecords.Identity identity : found) {
                 ArtifactVersionRow version = latest.get(identity.id());
@@ -61,7 +66,8 @@ class SavedArtifacts implements ConversationArtifacts {
                     continue;
                 }
                 saved.add(new SavedArtifact(identity.id(), vault.decryptText(Artifacts.binding(Artifacts.FIELD_NAME,
-                        identity.id(), owner), version.name()), identity.recordType()));
+                        identity.id(), owner), version.name()), identity.recordType(),
+                        overriding.contains(identity.id())));
             }
             return List.copyOf(saved);
         });

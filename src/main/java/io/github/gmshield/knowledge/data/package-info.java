@@ -7,6 +7,8 @@
  * {@link io.github.gmshield.knowledge.data.MissingCoreTypes}), then works as each owner. Story 4.2: {@code record} and
  * {@code record_passage} (V35, {@link io.github.gmshield.knowledge.data.RecordStore}), the same way: a record's name
  * and fields are vault ciphertexts, its links name passages of its owner. Story 5.1 (V43): an artifact's identity is a
- * {@code record} row with a campaign and no version ({@link io.github.gmshield.knowledge.data.ArtifactRow}).
+ * {@code record} row with a campaign and no version ({@link io.github.gmshield.knowledge.data.ArtifactRow}). Story 5.5
+ * part A (V50): {@code record_relation} ({@link io.github.gmshield.knowledge.data.RecordRelationStore}), a link between
+ * two records of the owner, removed with either; part B (V51) adds the kind {@code related}.
  */
 package io.github.gmshield.knowledge.data;
