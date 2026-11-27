@@ -72,6 +72,13 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code artifact.relations_full} (409). {@code .../relation-targets} lists the records the artifact can be related to,
  * alphabetical, filtered by type and name, each with its tier. Every artifact answer carries {@code related}, from both
  * sides, oldest first.
+ *
+ * <p>Story 5.6 part A (contract 1.52.0): a {@code PUT} on {@code .../sharing} sets the whole set of the account's other
+ * campaigns of the artifact's system it is shared with (empty unshares it from all), from the next question. A campaign
+ * that is no target is {@code artifact.share_target} (400), and nothing is stored. Every artifact answer carries
+ * {@code sharedWith} (by name; empty in a read from another campaign) and {@code sharedFrom} (null in its own campaign).
+ * {@code getArtifact} and {@code getArtifactVersion} also answer, read-only, a live artifact shared into the path
+ * campaign; every other route answers it as not found there.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -87,6 +94,7 @@ class ArtifactController {
     static final String RELATIONS = ARTIFACT + "/relations";
     static final String RELATION = RELATIONS + "/{recordId}";
     static final String RELATION_TARGETS = ARTIFACT + "/relation-targets";
+    static final String SHARING = ARTIFACT + "/sharing";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -182,11 +190,47 @@ class ArtifactController {
         }
     }
 
+    @Schema(name = "ArtifactSharedWith", requiredProperties = {"campaignId", "name", "archived"},
+            description = "A campaign of the same system an artifact is shared with (contract 1.52.0)")
+    record SharedWithView(
+            @Schema(description = "The campaign's id", format = "uuid") String campaignId,
+            @Schema(description = "The campaign's name", example = "Mesa de quinta") String name,
+            @Schema(description = "True when the campaign is archived") boolean archived) {
+
+        static SharedWithView of(Artifacts.SharedWith shared) {
+            return new SharedWithView(shared.campaignId().toString(), shared.name(), shared.archived());
+        }
+
+        @Override
+        public String toString() {
+            return "SharedWithView[campaignId=" + campaignId + ", archived=" + archived + "]";
+        }
+    }
+
+    @Schema(name = "ArtifactSharedFrom", requiredProperties = {"campaignId", "name"},
+            description = "The campaign an artifact read from another campaign is shared from: its own (contract"
+            + " 1.52.0)")
+    record SharedFromView(
+            @Schema(description = "The artifact's own campaign's id; its page there is where it is changed",
+                    format = "uuid") String campaignId,
+            @Schema(description = "That campaign's name", example = "A Coroa Partida") String name) {
+
+        static SharedFromView of(Artifacts.SharedFrom from) {
+            return from == null ? null : new SharedFromView(from.campaignId().toString(), from.name());
+        }
+
+        @Override
+        public String toString() {
+            return "SharedFromView[campaignId=" + campaignId + "]";
+        }
+    }
+
     @Schema(name = "Artifact", requiredProperties = {"id", "campaignId", "recordType", "name", "fields", "content",
-        "version", "currentVersion", "createdAt", "conversationId", "references", "overrides", "related"},
+        "version", "currentVersion", "createdAt", "conversationId", "references", "overrides", "related", "sharedWith",
+        "sharedFrom"},
             description = "An artifact with its newest version, or one of its versions when asked by number (contract"
             + " 1.42.0; currentVersion and versions from 1.44.0; conversationId and references from 1.48.0; overrides"
-            + " from 1.50.0; related from 1.51.0)")
+            + " from 1.50.0; related from 1.51.0; sharedWith and sharedFrom from 1.52.0)")
     record ArtifactView(
             @Schema(description = "The artifact's id", format = "uuid", example = ID_EXAMPLE) String id,
             @Schema(description = "Its campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
@@ -224,7 +268,17 @@ class ArtifactController {
                     + " from either side, oldest first: extracted records of the campaign's scope and the campaign's"
                     + " other artifacts. A relation changes no answer. Not versioned: every version shows the"
                     + " artifact's current relations. Empty for none"),
-                    schema = @Schema(implementation = RelatedView.class)) List<RelatedView> related) {
+                    schema = @Schema(implementation = RelatedView.class)) List<RelatedView> related,
+            @ArraySchema(arraySchema = @Schema(description = "The account's other campaigns of the same system the"
+                    + " artifact is shared with (contract 1.52.0), by name: in each, from the next question, it is a"
+                    + " source of the system tier, cited under that tier. A campaign being deleted is left out. Not"
+                    + " versioned. Empty for none, and in a read from another campaign (sharedFrom set)"),
+                    schema = @Schema(implementation = SharedWithView.class)) List<SharedWithView> sharedWith,
+            @Schema(description = "Set when the artifact is read from a campaign it is shared into (contract 1.52.0):"
+                    + " its own campaign, where alone it is changed. Such a read is read-only: it has no overrides, no"
+                    + " related, no sharedWith and a null conversationId, and every other artifact route answers"
+                    + " request.not_found there. Null in its own campaign",
+                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom) {
 
         static ArtifactView of(Artifacts.Artifact artifact) {
             return new ArtifactView(artifact.id().toString(), artifact.campaignId().toString(), artifact.recordType(),
@@ -234,7 +288,9 @@ class ArtifactController {
                     artifact.conversationId() == null ? null : artifact.conversationId().toString(),
                     artifact.references().stream().map(ReferenceView::of).toList(),
                     OverrideView.of(artifact.overrides()),
-                    artifact.related().stream().map(RelatedView::of).toList());
+                    artifact.related().stream().map(RelatedView::of).toList(),
+                    artifact.sharedWith().stream().map(SharedWithView::of).toList(),
+                    SharedFromView.of(artifact.sharedFrom()));
         }
 
         @Override
@@ -503,8 +559,10 @@ class ArtifactController {
 
     @GetMapping(path = ARTIFACT, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getArtifact", summary = "One artifact of one of the account's campaigns with its newest"
-            + " version (contract 1.42.0). request.not_found (404) for a campaign that is not the account's, and for an"
-            + " artifact that is not this campaign's (unknown, another account's, another campaign's or malformed);"
+            + " version (contract 1.42.0). From contract 1.52.0 also, read-only, a live artifact of another of the"
+            + " account's campaigns shared into this one (sharedFrom set), whatever this campaign's tiers."
+            + " request.not_found (404) for a campaign that is not the account's, and for an artifact that is not this"
+            + " campaign's nor shared into it (unknown, another account's, another campaign's, deleting or malformed);"
             + " none is told apart;" + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
                     schema = @Schema(type = "string")))
@@ -522,6 +580,7 @@ class ArtifactController {
     @GetMapping(path = VERSION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getArtifactVersion", summary = "One version of one of the account's campaigns' artifacts,"
             + " by its number (contract 1.44.0), as a reference that cited it opens it; currentVersion names the newest."
+            + " From contract 1.52.0 also, read-only, a version of a live artifact shared into this campaign."
             + NOT_FOUND + " request.not_found (404) too for a number the artifact does not have, or a malformed one;"
             + SESSION_SUMMARY,
             parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
@@ -932,6 +991,47 @@ class ArtifactController {
                 from, size).orElseThrow(ArtifactController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new RelationTargetPageView(page.items()
                 .stream().map(RelationTargetView::of).toList(), page.total()));
+    }
+
+    @Schema(name = "ArtifactSharing", requiredProperties = "campaignIds",
+            description = "The whole set of campaigns an artifact is shared with from now on (contract 1.52.0)")
+    record SharingBody(
+            @ArraySchema(arraySchema = @Schema(description = "The ids of the account's other campaigns of the"
+                    + " artifact's system, archived or not; at most 200; empty unshares it from every campaign"),
+                    schema = @Schema(type = "string", format = "uuid"), maxItems = Artifacts.MAX_SHARES)
+            List<String> campaignIds) {
+    }
+
+    @PutMapping(path = SHARING, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "setArtifactSharing", summary = "The GM shares one of the account's campaigns' artifacts"
+            + " with exactly these other campaigns of its system (contract 1.52.0), answering the artifact as"
+            + " getArtifact does, with sharedWith. It stays one artifact: an edit shows everywhere. From the next"
+            + " question, in each campaign it is shared with, it is a source of the system tier while that tier is on,"
+            + " cited under that tier, and it opens read-only there; its override and relations apply in its own"
+            + " campaign only. A campaign it no longer names stops at once: a reference stored there reads as removed."
+            + " artifact.share_target (400) when any id is not another of the account's campaigns of the artifact's"
+            + " system (its own campaign, another system's, another account's, one being deleted, unknown or"
+            + " malformed); request.invalid (400) for a malformed body or more than 200 ids; nothing is stored then;"
+            + NOT_FOUND + " request.not_found (404) too from any campaign but the artifact's own;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<ArtifactView> setArtifactSharing(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(description = "The artifact's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("artifactId") String artifactId,
+            @RequestBody SharingBody body) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        UUID artifact = parse(artifactId).orElseThrow(ArtifactController::notFound);
+        if (body == null || body.campaignIds() == null || body.campaignIds().size() > Artifacts.MAX_SHARES) {
+            throw invalid();
+        }
+        // A null or malformed id is a campaign that is no target: the same refusal, after the artifact is found.
+        List<UUID> targets = body.campaignIds().stream().map(id -> parse(id).orElse(null)).toList();
+        Artifacts.Artifact shared = artifacts.share(campaign, artifact, targets)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(ArtifactView.of(shared));
     }
 
     /** A version's number in a path or a cursor: 1 to 999,999,999; anything else is none. */

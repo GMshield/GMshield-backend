@@ -9,6 +9,7 @@ import io.github.gmshield.accounts.data.InMemorySessionStore;
 import io.github.gmshield.accounts.data.InMemorySignInAttemptStore;
 import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactShareStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
 import io.github.gmshield.conversations.data.ConversationTestStores;
@@ -48,6 +49,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -78,6 +80,10 @@ import tools.jackson.databind.json.JsonMapper;
  * and its conversation); the removal waiting for a running answer's claim; an archived campaign and the last one
  * deleted; another owner's campaign on both routes. The same rows against PostgreSQL are in
  * {@code CampaignDeletionIntegrationTest}.
+ *
+ * <p>Story 5.6 part A: a campaign an artifact is shared into, once deleted, is no target and not listed, and its pass
+ * removes the shares into it before the campaign row; an artifact's own campaign deleted takes its shares, and the
+ * campaign it was shared into reads it no more.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -134,6 +140,8 @@ class CampaignDeletionFlowTest {
     private InMemoryAccountStore accounts;
     @Autowired
     private InMemoryLibraryStore library;
+    @Autowired
+    private InMemoryArtifactShareStore shares;
     @Autowired
     private InMemoryDeletionStore deletions;
     @Autowired
@@ -401,7 +409,61 @@ class CampaignDeletionFlowTest {
                 .isEqualTo(owner.campaign().toString());
     }
 
+    // --- Story 5.6 part A: shares into and out of a campaign going
+
+    @Test
+    void deletingACampaignAnArtifactIsSharedIntoRemovesThoseSharesAndDeletingItsOwnCampaignRemovesItsShares()
+            throws Exception {
+        Gm gm = signUp();
+        UUID quinta = createCampaign(gm, gm.system(), "Mesa de quinta");
+        UUID domingo = createCampaign(gm, gm.system(), "Mesa de domingo");
+        String kael = artifactIn(gm, gm.campaign(), "Espada de Kael");
+        String arco = artifactIn(gm, domingo, "Arco de Lia");
+        String kaelPath = "/api/v1/campaigns/" + gm.campaign() + "/artifacts/" + kael;
+        String arcoPath = "/api/v1/campaigns/" + domingo + "/artifacts/" + arco;
+        assertThat(share(gm, kaelPath, quinta, domingo).statusCode()).isEqualTo(200);
+        assertThat(share(gm, arcoPath, quinta).statusCode()).isEqualTo(200);
+
+        // Matrix row "Deleted" (B deleted): from the delete on, it is no target and not listed; then its pass removes
+        // the share into it, before the campaign row.
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + quinta).statusCode()).isEqualTo(202);
+        assertThat(json(get(gm, kaelPath)).path("sharedWith")).extracting(one -> one.path("campaignId").asString())
+                .containsExactly(domingo.toString());
+        HttpResponse<String> refused = send(gm, "PUT", kaelPath + "/sharing", "{\"campaignIds\":[\"" + quinta
+                + "\"]}");
+        assertThat(refused.statusCode()).isEqualTo(400);
+        assertThat(deletion.sweep()).isEqualTo(1);
+        assertThat(library.campaigns).doesNotContainKey(quinta);
+        assertThat(shares.rows.values()).noneMatch(row -> row.campaignId().equals(quinta));
+        assertThat(shares.rows.values()).extracting(row -> row.artifactId().toString() + ">" + row.campaignId())
+                .containsExactly(kael + ">" + domingo);
+
+        // The artifact's own campaign deleted: its shares go with it, and the campaign it was shared into reads it no
+        // more from the delete on.
+        String there = "/api/v1/campaigns/" + domingo + "/artifacts/" + kael;
+        assertThat(get(gm, there).statusCode()).isEqualTo(200);
+        assertThat(send(gm, "DELETE", "/api/v1/campaigns/" + gm.campaign()).statusCode()).isEqualTo(202);
+        assertNotFound(get(gm, there));
+        assertThat(deletion.sweep()).isEqualTo(1);
+        assertThat(shares.rows.values()).noneMatch(row -> row.artifactId().toString().equals(kael));
+        assertThat(get(gm, arcoPath).statusCode()).isEqualTo(200);
+    }
+
     // --- helpers
+
+    /** A new artifact of the GM's campaign (Story 5.6 part A); its id. */
+    private String artifactIn(Gm gm, UUID campaign, String name) throws Exception {
+        HttpResponse<String> created = post(gm, "/api/v1/campaigns/" + campaign + "/artifacts", Map.of("recordType",
+                "item", "name", name, "fields", List.of()));
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return json(created).path("id").asString();
+    }
+
+    /** The GM's sharing of the artifact at {@code path} with exactly these campaigns (Story 5.6 part A). */
+    private HttpResponse<String> share(Gm gm, String path, UUID... campaigns) throws Exception {
+        return send(gm, "PUT", path + "/sharing", JSON.writeValueAsString(Map.of("campaignIds",
+                Arrays.stream(campaigns).map(UUID::toString).toList())));
+    }
 
     /** The clock moves on, so what is chosen or made next comes later. */
     private void tick() {

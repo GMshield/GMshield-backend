@@ -2,6 +2,8 @@ package io.github.gmshield.artifacts.service;
 
 import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
 import io.github.gmshield.artifacts.data.ArtifactReferenceStore;
+import io.github.gmshield.artifacts.data.ArtifactShareRow;
+import io.github.gmshield.artifacts.data.ArtifactShareStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.artifacts.data.VersionTaken;
@@ -22,7 +24,11 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -99,6 +105,16 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * {@link #relationTargets} lists the records it can be related to. Every artifact read carries its relations
  * ({@link Artifact#related}), from both sides; like the mark, they are not versioned.
  *
+ * <p>Story 5.6 part A: {@link #share} sets the whole set of the owner's other campaigns of the artifact's system it is
+ * shared with ({@code artifact_share}, one row per campaign; an empty set unshares it from all), in one transaction,
+ * behind the lock an edit takes on its newest version; a campaign that is no target (its own, another system's, another
+ * owner's, one being deleted, unknown) is {@code artifact.share_target} (400), and nothing is stored. It stays one
+ * artifact: nothing is copied and no index job is created. Every own-campaign read carries {@link Artifact#sharedWith},
+ * the readable campaigns it is shared with, by name. {@link #get} also answers a live artifact shared into the path
+ * campaign, whose own campaign is readable: read-only, with {@link Artifact#sharedFrom} naming its own campaign, and
+ * with no mark, no relation and no conversation, since those belong to its own campaign; every other call here answers
+ * it as not found in that campaign.
+ *
  * <p>From Story 5.4 part A every artifact read carries its conversation (null for one written by hand; from part B
  * null too unless that conversation is {@code ready}, {@link Conversations#ready}, so a deleting one is never named)
  * and its references, by number, each marked {@code removed} when read as an answer's are
@@ -132,6 +148,14 @@ public class Artifacts {
     /** An edit or a restore names a version the artifact has left (Story 5.2): someone changed it elsewhere. */
     public static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");
+    /**
+     * A campaign that is no target of the artifact's sharing (Story 5.6 part A): not one of the owner's other readable
+     * campaigns of its system.
+     */
+    public static final ApiProblem SHARE_TARGET = ApiProblem.of(400, "artifact", "share_target",
+            "Not a campaign this artifact can be shared with");
+    /** The most campaigns one sharing names (Story 5.6 part A); more is {@code request.invalid}. */
+    public static final int MAX_SHARES = 200;
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final Logger log = LoggerFactory.getLogger(Artifacts.class);
 
@@ -139,6 +163,8 @@ public class Artifacts {
     private final RecordRelations relations;
     private final ArtifactVersionStore versions;
     private final ArtifactReferenceStore references;
+    private final ArtifactShareStore shares;
+    private final ArtifactSources sources;
     private final Library library;
     private final Vault vault;
     private final ArtifactIndexing indexing;
@@ -149,7 +175,7 @@ public class Artifacts {
     private final Clock clock;
 
     Artifacts(ArtifactRecords records, RecordRelations relations, ArtifactVersionStore versions,
-              ArtifactReferenceStore references,
+              ArtifactReferenceStore references, ArtifactShareStore shares, ArtifactSources sources,
               Library library, Vault vault, ArtifactIndexing indexing, Scopes scopes,
               ObjectProvider<Conversations> conversations, ObjectProvider<SystemDeletion> deletions,
               ObjectProvider<PlatformTransactionManager> transactions, ObjectProvider<Clock> clock) {
@@ -157,6 +183,8 @@ public class Artifacts {
         this.relations = relations;
         this.versions = versions;
         this.references = references;
+        this.shares = shares;
+        this.sources = sources;
         this.library = library;
         this.vault = vault;
         this.indexing = indexing;
@@ -196,54 +224,93 @@ public class Artifacts {
      * newest version (Story 5.2; the same as {@code version} unless an earlier one is read), when the artifact was
      * written, (Story 5.4 part A) the conversation it was saved from (null for none) and its references by number
      * (empty for an artifact written by hand), (Story 5.5 part A) the record it overrides (null for none) and (part B)
-     * the records it is related to, oldest first (empty for none). {@code toString} names ids and counts only.
+     * the records it is related to, oldest first (empty for none), and (Story 5.6 part A) the campaigns it is shared
+     * with, by name (empty for none, and in a read from a campaign it is shared into) and, in such a read, the campaign
+     * it is shared from (null otherwise). {@code toString} names ids and counts only.
      */
     public record Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields,
                            String content, int version, int currentVersion, Instant createdAt, UUID conversationId,
-                           List<TurnReference> references, Overridden overrides, List<RecordRelations.Related> related) {
+                           List<TurnReference> references, Overridden overrides, List<RecordRelations.Related> related,
+                           List<SharedWith> sharedWith, SharedFrom sharedFrom) {
         public Artifact {
             fields = List.copyOf(fields);
             references = List.copyOf(references);
             related = List.copyOf(related);
+            sharedWith = List.copyOf(sharedWith);
         }
 
-        /** An artifact that overrides nothing and is related to nothing. */
+        /** An artifact that overrides nothing, is related to nothing and is shared with no campaign. */
         public Artifact(UUID id, UUID campaignId, String recordType, String name, List<Field> fields, String content,
                         int version, int currentVersion, Instant createdAt, UUID conversationId,
                         List<TurnReference> references) {
             this(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt, conversationId,
-                    references, null, List.of());
+                    references, null, List.of(), List.of(), null);
         }
 
         /** This artifact with no conversation (Story 5.4 part B: the one it was saved from is not ready). */
         Artifact unlinked() {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    null, references, overrides, related);
+                    null, references, overrides, related, sharedWith, sharedFrom);
         }
 
         /** This artifact with its references (Story 5.4 part A). */
         Artifact withReferences(List<TurnReference> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, found, overrides, related);
+                    conversationId, found, overrides, related, sharedWith, sharedFrom);
         }
 
         /** This artifact with the record it overrides (Story 5.5 part A; null for none). */
         Artifact withOverride(Overridden mark) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, mark, related);
+                    conversationId, references, mark, related, sharedWith, sharedFrom);
         }
 
         /** This artifact with the records it is related to (Story 5.5 part B). */
         Artifact withRelated(List<RecordRelations.Related> found) {
             return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
-                    conversationId, references, overrides, found);
+                    conversationId, references, overrides, found, sharedWith, sharedFrom);
+        }
+
+        /** This artifact with the campaigns it is shared with (Story 5.6 part A). */
+        Artifact withSharedWith(List<SharedWith> found) {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    conversationId, references, overrides, related, found, sharedFrom);
+        }
+
+        /**
+         * This artifact as a campaign it is shared into reads it (Story 5.6 part A): shared from {@code from}, with no
+         * conversation, no mark, no relation and no sharing of its own campaign's.
+         */
+        Artifact sharedFrom(SharedFrom from) {
+            return new Artifact(id, campaignId, recordType, name, fields, content, version, currentVersion, createdAt,
+                    null, references, null, List.of(), List.of(), Objects.requireNonNull(from, "from"));
         }
 
         @Override
         public String toString() {
             return "Artifact[id=" + id + ", recordType=" + recordType + ", fields=" + fields.size() + ", version="
                     + version + ", currentVersion=" + currentVersion + ", references=" + references.size()
-                    + ", related=" + related.size() + "]";
+                    + ", related=" + related.size() + ", sharedWith=" + sharedWith.size() + ", shared="
+                    + (sharedFrom != null) + "]";
+        }
+    }
+
+    /**
+     * A campaign an artifact is shared with (Story 5.6 part A): its id, its name and whether it is archived.
+     * {@code toString} names the id only.
+     */
+    public record SharedWith(UUID campaignId, String name, boolean archived) {
+        @Override
+        public String toString() {
+            return "SharedWith[campaignId=" + campaignId + ", archived=" + archived + "]";
+        }
+    }
+
+    /** The campaign an artifact read elsewhere is shared from, its own (Story 5.6 part A). Names the id only. */
+    public record SharedFrom(UUID campaignId, String name) {
+        @Override
+        public String toString() {
+            return "SharedFrom[campaignId=" + campaignId + "]";
         }
     }
 
@@ -430,20 +497,38 @@ public class Artifacts {
      */
     public Optional<Artifact> get(UUID campaignId, UUID artifactId, Integer number) {
         UUID owner = OwnerContext.require();
-        Optional<Artifact> found = reading(() -> library.campaign(campaignId)
-                .flatMap(campaign -> records.find(campaign.id(), artifactId))
-                .flatMap(identity -> {
-                    ArtifactVersionRow newest = versions.latest(identity.id())
-                            .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
-                    Optional<ArtifactVersionRow> shown = number == null || number == newest.number()
-                            ? Optional.of(newest) : versions.find(identity.id(), number);
-                    return shown.map(version -> linked(open(vault, identity, version, newest.number(), owner)
-                            .withReferences(referencesOf(identity.id(), identity.campaignId(), owner))));
-                }));
+        boolean[] shared = {false};
+        Optional<Artifact> found = reading(() -> library.campaign(campaignId).flatMap(campaign -> {
+            Optional<ArtifactRecords.Identity> own = records.find(campaign.id(), artifactId);
+            if (own.isPresent()) {
+                return version(own.get(), number, campaign.id(), owner).map(this::linked);
+            }
+            // Story 5.6 part A: a live artifact shared into this campaign, read-only, from its own readable campaign.
+            return sources.sharedInto(campaign.id(), Set.of(artifactId)).stream().findFirst()
+                    .flatMap(identity -> library.campaign(identity.campaignId()).flatMap(from ->
+                            version(identity, number, campaign.id(), owner).map(artifact -> {
+                                shared[0] = true;
+                                return artifact.sharedFrom(new SharedFrom(from.id(), from.name()));
+                            })));
+        }));
         log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                 .addKeyValue("artifactId", artifactId).addKeyValue("version", number)
-                .addKeyValue("found", found.isPresent()).log("artifacts.read");
+                .addKeyValue("found", found.isPresent()).addKeyValue("shared", shared[0]).log("artifacts.read");
         return found;
+    }
+
+    /**
+     * The artifact {@code identity} with its version {@code number} (the newest when null) and its references, each
+     * {@code removed} as the campaign {@code readIn} reads it (its own, or from Story 5.6 part A one it is shared into);
+     * empty for a number it does not have. Runs in the caller's transaction.
+     */
+    private Optional<Artifact> version(ArtifactRecords.Identity identity, Integer number, UUID readIn, UUID owner) {
+        ArtifactVersionRow newest = versions.latest(identity.id())
+                .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+        Optional<ArtifactVersionRow> shown = number == null || number == newest.number()
+                ? Optional.of(newest) : versions.find(identity.id(), number);
+        return shown.map(version -> open(vault, identity, version, newest.number(), owner)
+                .withReferences(referencesOf(identity.id(), readIn, owner)));
     }
 
     /**
@@ -680,6 +765,87 @@ public class Artifacts {
         return relations.relationTargets(campaignId, artifactId, recordType, query, offset, limit);
     }
 
+    /**
+     * The GM shares the owner's artifact {@code artifactId} of the campaign {@code campaignId} with exactly the
+     * campaigns {@code campaignIds} (Story 5.6 part A), as the class says: each must be another readable campaign of the
+     * owner's of the artifact's system, else {@code artifact.share_target} (400); an empty set unshares it from every
+     * campaign. A null id is no target. Answers the artifact with its newest version and its sharing, or empty when the
+     * campaign is not the owner's or not readable, or the artifact is not the campaign's (nothing changes then).
+     */
+    public Optional<Artifact> share(UUID campaignId, UUID artifactId, Collection<UUID> campaignIds) {
+        Objects.requireNonNull(campaignIds, "campaignIds");
+        if (campaignIds.size() > MAX_SHARES) {
+            throw new IllegalArgumentException("artifacts.shares_invalid");
+        }
+        UUID owner = OwnerContext.require();
+        int[] changed = {0, 0};
+        Optional<Artifact> shared = writing(() -> library.campaign(campaignId).flatMap(campaign ->
+                records.find(campaign.id(), artifactId).flatMap(identity -> {
+                    UUID id = identity.id();
+                    // The lock an edit and a delete take: two sharings of one artifact take turns, and one that waited
+                    // on a delete finds the artifact gone.
+                    ArtifactVersionRow newest = versions.latest(id)
+                            .orElseThrow(() -> new IllegalStateException("artifacts.version_missing"));
+                    versions.lock(id, newest.number());
+                    if (records.find(campaign.id(), id).isEmpty()) {
+                        return Optional.<Artifact>empty();
+                    }
+                    Set<UUID> wanted = targets(campaign, campaignIds);
+                    Set<UUID> current = new HashSet<>();
+                    for (ArtifactShareRow row : shares.of(id)) {
+                        current.add(row.campaignId());
+                        if (!wanted.contains(row.campaignId()) && shares.delete(id, row.campaignId())) {
+                            changed[1]++;
+                        }
+                    }
+                    Instant now = clock.instant().truncatedTo(ChronoUnit.MICROS);
+                    for (UUID target : wanted.stream().sorted().toList()) {
+                        if (!current.contains(target)) {
+                            shares.insert(new ArtifactShareRow(id, target, owner, now));
+                            changed[0]++;
+                        }
+                    }
+                    return Optional.of(newest(identity, owner));
+                })));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("artifactId", artifactId).addKeyValue("requested", campaignIds.size())
+                .addKeyValue("found", shared.isPresent()).addKeyValue("added", changed[0])
+                .addKeyValue("removed", changed[1])
+                .addKeyValue("shared", shared.map(artifact -> artifact.sharedWith().size()).orElse(0))
+                .log("artifacts.shared");
+        return shared;
+    }
+
+    /**
+     * These campaign ids, each checked as a target of an artifact of {@code campaign} (Story 5.6 part A): another
+     * readable campaign of the owner's of the same system, archived or not; else {@code artifact.share_target}, naming
+     * no id. Runs in the caller's transaction.
+     */
+    private Set<UUID> targets(Library.Campaign campaign, Collection<UUID> campaignIds) {
+        if (campaignIds.isEmpty()) {
+            return Set.of();
+        }
+        if (campaignIds.stream().anyMatch(Objects::isNull) || campaignIds.contains(campaign.id())) {
+            throw shareTarget(campaign.id());
+        }
+        Set<UUID> wanted = Set.copyOf(campaignIds);
+        Map<UUID, Library.Campaign> found = library.places(wanted, List.of()).campaigns();
+        UUID system = campaign.system().id();
+        for (UUID id : wanted) {
+            Library.Campaign target = found.get(id);
+            if (target == null || !system.equals(target.system().id())) {
+                throw shareTarget(campaign.id());
+            }
+        }
+        return wanted;
+    }
+
+    private static ApiException shareTarget(UUID campaignId) {
+        log.atInfo().addKeyValue("campaignId", campaignId).addKeyValue("reason", "artifact.share_target")
+                .log("artifacts.share_refused");
+        return new ApiException(SHARE_TARGET);
+    }
+
     /** The artifact {@code identity} with its newest version, as {@link #get} answers it, in the caller's transaction. */
     private Artifact newest(ArtifactRecords.Identity identity, UUID owner) {
         ArtifactVersionRow newest = versions.latest(identity.id())
@@ -728,18 +894,35 @@ public class Artifacts {
     /**
      * The artifact as an answer shows it (Story 5.4 part B): its conversation only while that conversation is
      * {@code ready} ({@link Conversations#ready}), so a deleting one's id never leaves; null otherwise. From Story 5.5
-     * part A with its mark ({@link RecordRelations#mark}), null for none, and from part B with its relations
-     * ({@link RecordRelations#related}).
+     * part A with its mark ({@link RecordRelations#mark}), null for none, from part B with its relations
+     * ({@link RecordRelations#related}), and from Story 5.6 part A with the campaigns it is shared with.
      */
     private Artifact linked(Artifact artifact) {
         Artifact marked = artifact.withOverride(relations.mark(artifact.campaignId(), artifact.id())
-                .map(Overridden::of).orElse(null)).withRelated(relations.related(artifact.campaignId(), artifact.id()));
+                .map(Overridden::of).orElse(null)).withRelated(relations.related(artifact.campaignId(), artifact.id()))
+                .withSharedWith(sharedWith(artifact.id()));
         UUID conversationId = marked.conversationId();
         if (conversationId == null || conversations.getObject().ready(Set.of(conversationId))
                 .contains(conversationId)) {
             return marked;
         }
         return marked.unlinked();
+    }
+
+    /**
+     * The readable campaigns the owner's artifact {@code id} is shared with (Story 5.6 part A), by name (case ignored),
+     * then by id; a share into a campaign being deleted is left out. Runs in the caller's transaction.
+     */
+    private List<SharedWith> sharedWith(UUID id) {
+        List<UUID> campaignIds = shares.of(id).stream().map(ArtifactShareRow::campaignId).toList();
+        if (campaignIds.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, Library.Campaign> found = library.places(campaignIds, List.of()).campaigns();
+        return campaignIds.stream().map(found::get).filter(Objects::nonNull)
+                .map(campaign -> new SharedWith(campaign.id(), campaign.name(), campaign.archived()))
+                .sorted(Comparator.comparing((SharedWith one) -> one.name().toLowerCase(Locale.ROOT))
+                        .thenComparing(SharedWith::campaignId)).toList();
     }
 
     private int newestNumber(UUID id) {

@@ -10,7 +10,8 @@ import java.util.UUID;
  * first page), the ids of its passages on that page, its core type's key, its name and the tier of its source in that
  * scope. From Story 5.1 part B it may be one of the campaign's artifacts ({@link #artifact}): then
  * {@code artifactVersion} is its newest version's number, it has no version, material or passage, its section path is
- * empty, its page 1 and its tier the campaign's. {@code toString} names ids, the type, the page and the tier only, never
+ * empty, its page 1 and its tier the campaign's (from Story 5.6 part A the system's for an artifact shared into the
+ * campaign). {@code toString} names ids, the type, the page and the tier only, never
  * the name.
  */
 public record ScopedRecord(UUID recordId, UUID versionId, UUID materialId, String materialName,
@@ -31,10 +32,12 @@ public record ScopedRecord(UUID recordId, UUID versionId, UUID materialId, Strin
         this(recordId, versionId, materialId, materialName, sectionPath, page, passageIds, recordType, name, tier, null);
     }
 
-    /** A campaign's artifact as a campaign-tier record (Story 5.1 part B): page 1, no place and no passage. */
-    static ScopedRecord artifact(UUID artifactId, String recordType, String name, int version) {
-        return new ScopedRecord(artifactId, null, null, null, List.of(), 1, List.of(), recordType, name, Tier.CAMPAIGN,
-                version);
+    /**
+     * An artifact as a record of the scope (Story 5.1 part B): page 1, no place and no passage; of the tier
+     * {@code tier}, the campaign's for its own artifact and (Story 5.6 part A) the system's for one shared into it.
+     */
+    static ScopedRecord artifact(UUID artifactId, String recordType, String name, int version, Tier tier) {
+        return new ScopedRecord(artifactId, null, null, null, List.of(), 1, List.of(), recordType, name, tier, version);
     }
 
     /** Whether it is one of the campaign's artifacts (Story 5.1 part B). */

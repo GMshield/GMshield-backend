@@ -19,7 +19,9 @@
  * Story 5.5 part A marks an artifact as overriding one system record of its campaign through
  * {@code knowledge.service.RecordRelations}, which owns that relation; every artifact answer carries its mark. Part B
  * relates an artifact to records of its campaign's scope and to the campaign's other artifacts the same way; every
- * artifact answer carries its relations.
+ * artifact answer carries its relations. Story 5.6 part A shares an artifact with the owner's other campaigns of its
+ * system ({@code artifact_share}, this module's): it stays one artifact, a source of their system tier through the
+ * {@code CampaignArtifacts} port, readable there read-only.
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Artifacts",
         allowedDependencies = {"shared :: service", "vault :: service", "library :: service", "knowledge :: service",

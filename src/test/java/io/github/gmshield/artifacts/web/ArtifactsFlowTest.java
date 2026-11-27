@@ -12,6 +12,7 @@ import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.ArtifactReferenceRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactShareStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
@@ -42,6 +43,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -89,6 +91,15 @@ import tools.jackson.databind.json.JsonMapper;
  * references (stored here as a save stores them, sealed under the artifact) are read decrypted and in order, each
  * removed as of the read (an unknown version, a deleted cited artifact), kept by an edit and a restore and by a version
  * read, and removed with the artifact by its deletion's pass. The save itself is {@code ConversationFlowTest}'s.
+ *
+ * <p>Story 5.6 part A, the API rows of its matrix: an artifact is shared with the owner's other campaigns of its system
+ * (an archived one included) by the whole set, listed by name, and unshared by an empty set, with one row per pair and
+ * no copy, version or index job; its own campaign, another system's, another owner's, an unknown, malformed or null id
+ * is {@code artifact.share_target} and nothing changes; a malformed body or over 200 ids is {@code request.invalid}; in
+ * a campaign it is shared into it reads read-only (newest or a cited version, naming its own campaign, with no mark,
+ * relation, sharing or conversation) and every other route is not found there; unshared or deleting it is not found
+ * there, and its deletion's pass takes its shares; another owner finds none of it. The scope rows are
+ * {@code RecordsFlowTest}'s, the cross-owner ones {@code CrossOwnerAuditFlowTest}'s.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -148,6 +159,8 @@ class ArtifactsFlowTest {
     private InMemoryArtifactIndexStore index;
     @Autowired
     private InMemoryArtifactReferenceStore references;
+    @Autowired
+    private InMemoryArtifactShareStore shares;
     @Autowired
     private InMemoryLibraryStore library;
     @Autowired
@@ -1076,6 +1089,216 @@ class ArtifactsFlowTest {
         assertThat(deleting.statusCode()).isEqualTo(400);
     }
 
+    // --- sharing (Story 5.6 part A; the scope rows, with answers, are in RecordsFlowTest)
+
+    @Test
+    void anArtifactIsSharedWithTheOwnersOtherCampaignsOfItsSystemByNameAndUnsharedWithAnEmptySet() throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        UUID domingo = campaign(gm, "Mesa de domingo");
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String path = artifacts(gm.campaign()) + "/" + kael;
+        JsonNode read = json(get(gm, path));
+        assertThat(read.path("sharedWith").isArray()).isTrue();
+        assertThat(read.path("sharedWith")).isEmpty();
+        assertThat(read.has("sharedFrom")).isTrue();
+        assertThat(read.path("sharedFrom").isNull()).isTrue();
+
+        // Matrix row "Share": the whole set, by name; an archived campaign of the system is a target too.
+        HttpResponse<String> shared = share(gm, path, quinta, domingo);
+        assertThat(shared.statusCode()).as(shared.body()).isEqualTo(200);
+        assertThat(shared.headers().firstValue("Cache-Control")).hasValue("no-store");
+        JsonNode sharedWith = json(shared).path("sharedWith");
+        assertThat(sharedWith).extracting(one -> one.path("name").asString())
+                .containsExactly("Mesa de domingo", "Mesa de quinta");
+        assertThat(sharedWith.get(0).propertyNames()).containsExactlyInAnyOrder("campaignId", "name", "archived");
+        assertThat(sharedWith.get(0).path("campaignId").asString()).isEqualTo(domingo.toString());
+        assertThat(sharedWith.get(0).path("archived").asBoolean()).isFalse();
+        assertThat(json(shared).path("sharedFrom").isNull()).isTrue();
+        // One row per pair, and it stays one artifact: no copy, no new version and no index job.
+        assertThat(shares.rows.values()).filteredOn(row -> row.artifactId().toString().equals(kael))
+                .extracting(row -> row.campaignId()).containsExactlyInAnyOrder(quinta, domingo);
+        assertThat(artifactsOf(gm)).hasSize(1);
+        assertThat(versionsOf(kael)).isOne();
+        assertThat(index.rows.values()).filteredOn(row -> row.recordId().toString().equals(kael)).hasSize(1);
+        // Archiving a campaign it is shared with marks it; sending the same set again changes nothing.
+        long version = json(get(gm, "/api/v1/campaigns/" + domingo)).path("version").asLong();
+        assertThat(send(gm, "PATCH", "/api/v1/campaigns/" + domingo, "{\"version\":" + version
+                + ",\"archived\":true}").statusCode()).isEqualTo(200);
+        JsonNode again = json(share(gm, path, quinta, domingo));
+        assertThat(again.path("sharedWith").get(0).path("archived").asBoolean()).isTrue();
+        assertThat(again.path("sharedWith")).hasSize(2);
+
+        // The set replaces the last one: one campaign left, then none.
+        assertThat(json(share(gm, path, quinta)).path("sharedWith")).extracting(one -> one.path("campaignId")
+                .asString()).containsExactly(quinta.toString());
+        assertThat(json(get(gm, path)).path("sharedWith")).hasSize(1);
+        HttpResponse<String> unshared = share(gm, path);
+        assertThat(unshared.statusCode()).as(unshared.body()).isEqualTo(200);
+        assertThat(json(unshared).path("sharedWith")).isEmpty();
+        assertThat(shares.rows.values()).noneMatch(row -> row.artifactId().toString().equals(kael));
+    }
+
+    @Test
+    void aCampaignThatIsNoTargetIsRefusedAndNothingIsStored() throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        UUID farSystem = UUID.fromString(json(send(gm, "POST", "/api/v1/systems", "{\"name\":\"Outro sistema\"}"))
+                .path("id").asString());
+        UUID far = UUID.fromString(json(send(gm, "POST", "/api/v1/campaigns", "{\"name\":\"Mesa distante\","
+                + "\"systemId\":\"" + farSystem + "\"}")).path("id").asString());
+        Gm them = signUp();
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String path = artifacts(gm.campaign()) + "/" + kael;
+        assertThat(share(gm, path, quinta).statusCode()).isEqualTo(200);
+
+        // Matrix row "Wrong target": its own campaign, another system's, another owner's, an unknown or malformed id,
+        // each beside a good one; the share it had stays as it was.
+        for (String wrong : List.of(gm.campaign().toString(), far.toString(), them.campaign().toString(),
+                Ids.newId().toString(), "x")) {
+            HttpResponse<String> refused = send(gm, "PUT", path + "/sharing", "{\"campaignIds\":[\"" + quinta
+                    + "\",\"" + wrong + "\"]}");
+            assertThat(refused.statusCode()).as(wrong).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).isEqualTo("artifact.share_target");
+            assertThat(refused.body()).doesNotContain(wrong);
+        }
+        HttpResponse<String> nullId = send(gm, "PUT", path + "/sharing", "{\"campaignIds\":[null]}");
+        assertThat(json(nullId).path("code").asString()).isEqualTo("artifact.share_target");
+        assertThat(shares.rows.values()).filteredOn(row -> row.artifactId().toString().equals(kael))
+                .extracting(row -> row.campaignId()).containsExactly(quinta);
+        // A malformed body, or over 200 ids, is request.invalid.
+        StringBuilder many = new StringBuilder("{\"campaignIds\":[");
+        for (int i = 0; i < 201; i++) {
+            many.append(i == 0 ? "" : ",").append('"').append(quinta).append('"');
+        }
+        for (String body : List.of("{}", "{\"campaignIds\":null}", "{\"campaignIds\":\"x\"}",
+                many.append("]}").toString())) {
+            HttpResponse<String> invalid = send(gm, "PUT", path + "/sharing", body);
+            assertThat(invalid.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(invalid).path("code").asString()).isEqualTo("request.invalid");
+        }
+        assertThat(json(get(gm, path)).path("sharedWith")).hasSize(1);
+    }
+
+    @Test
+    void inTheCampaignItIsSharedIntoTheArtifactReadsReadOnlyAndEveryOtherRouteIsNotFound() throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        UUID domingo = campaign(gm, "Mesa de domingo");
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String guard = create(gm, gm.campaign(), "creature", "Guarda");
+        String own = artifacts(gm.campaign()) + "/" + kael;
+        assertThat(send(gm, "POST", own + "/relations", "{\"recordId\":\"" + guard + "\"}").statusCode())
+                .isEqualTo(200);
+        edit(gm, kael, 1, "item", "Espada Rubra de Kael");
+        assertThat(share(gm, own, quinta).statusCode()).isEqualTo(200);
+        String there = artifacts(quinta) + "/" + kael;
+
+        // Matrix row "Share": it opens in the other campaign, read-only, naming its own campaign.
+        HttpResponse<String> read = get(gm, there);
+        assertThat(read.statusCode()).as(read.body()).isEqualTo(200);
+        assertThat(read.headers().firstValue("Cache-Control")).hasValue("no-store");
+        JsonNode artifact = json(read);
+        assertThat(artifact.path("id").asString()).isEqualTo(kael);
+        assertThat(artifact.path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(artifact.path("name").asString()).isEqualTo("Espada Rubra de Kael");
+        assertThat(artifact.path("version").asInt()).isEqualTo(2);
+        assertThat(artifact.path("sharedFrom").propertyNames()).containsExactlyInAnyOrder("campaignId", "name");
+        assertThat(artifact.path("sharedFrom").path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertThat(artifact.path("sharedFrom").path("name").asString())
+                .isEqualTo(json(get(gm, "/api/v1/campaigns/" + gm.campaign())).path("name").asString());
+        assertThat(artifact.path("sharedWith")).isEmpty();
+        assertThat(artifact.path("related")).isEmpty();
+        assertThat(artifact.path("overrides").isNull()).isTrue();
+        assertThat(artifact.path("conversationId").isNull()).isTrue();
+        // A cited version opens there too.
+        JsonNode first = json(get(gm, there + "/versions/1"));
+        assertThat(first.path("name").asString()).isEqualTo("Espada de Kael");
+        assertThat(first.path("sharedFrom").path("campaignId").asString()).isEqualTo(gm.campaign().toString());
+        assertNotFound(get(gm, there + "/versions/3"));
+        // Its own page still has its relations, and no sharedFrom.
+        assertThat(json(get(gm, own)).path("related")).hasSize(1);
+        assertThat(json(get(gm, own)).path("sharedFrom").isNull()).isTrue();
+
+        // Matrix row "From B": every other route is not found there, and nothing changes.
+        assertNotFound(send(gm, "PUT", there + "/sharing", "{\"campaignIds\":[]}"));
+        assertNotFound(send(gm, "PATCH", there, "{\"version\":2,\"recordType\":\"item\",\"name\":\"Outra\","
+                + "\"fields\":[]}"));
+        assertNotFound(send(gm, "POST", there + "/versions/1/restore", "{\"version\":2}"));
+        assertNotFound(get(gm, there + "/versions"));
+        assertNotFound(send(gm, "DELETE", there, null));
+        assertNotFound(send(gm, "PUT", there + "/override", "{\"recordId\":\"" + Ids.newId() + "\"}"));
+        assertNotFound(send(gm, "DELETE", there + "/override", null));
+        assertNotFound(send(gm, "POST", there + "/relations", "{\"recordId\":\"" + guard + "\"}"));
+        assertNotFound(send(gm, "DELETE", there + "/relations/" + guard, null));
+        assertNotFound(get(gm, there + "/relation-targets?recordType=creature"));
+        assertThat(ids(json(get(gm, artifacts(quinta))))).isEmpty();
+        assertThat(versionsOf(kael)).isEqualTo(2);
+        assertThat(json(get(gm, own)).path("sharedWith")).hasSize(1);
+        // A campaign it is not shared with does not read it.
+        assertNotFound(get(gm, artifacts(domingo) + "/" + kael));
+
+        // Unshared, or deleting, it is not found there any more.
+        assertThat(share(gm, own).statusCode()).isEqualTo(200);
+        assertNotFound(get(gm, there));
+        assertThat(share(gm, own, quinta).statusCode()).isEqualTo(200);
+        assertThat(get(gm, there).statusCode()).isEqualTo(200);
+        assertThat(send(gm, "DELETE", own, null).statusCode()).isEqualTo(202);
+        assertNotFound(get(gm, there));
+        assertNotFound(get(gm, there + "/versions/1"));
+        // Its deletion's pass takes its shares.
+        deletion.sweep();
+        assertThat(shares.rows.values()).noneMatch(row -> row.artifactId().toString().equals(kael));
+    }
+
+    @Test
+    void readInTheCampaignItIsSharedIntoAReferenceToAnotherArtifactIsRemovedUntilThatOneIsSharedThereToo()
+            throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        String guard = create(gm, gm.campaign(), "creature", "Guarda");
+        UUID artifact = UUID.fromString(kael);
+        OwnerContext.runAs(gm.id(), () -> references.insert(List.of(
+                reference(gm, artifact, 1, null, null, UUID.fromString(guard), "creature", 1))));
+        assertThat(share(gm, artifacts(gm.campaign()) + "/" + kael, quinta).statusCode()).isEqualTo(200);
+        String there = artifacts(quinta) + "/" + kael;
+
+        // In its own campaign the cited artifact is live.
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + kael)).path("references").get(0).path("removed")
+                .asBoolean()).isFalse();
+        // In the campaign it is shared into, the cited artifact is worked out there: not shared, it is removed.
+        JsonNode reference = json(get(gm, there)).path("references").get(0);
+        assertThat(reference.path("artifactId").asString()).isEqualTo(guard);
+        assertThat(reference.path("removed").asBoolean()).isTrue();
+        assertThat(json(get(gm, there + "/versions/1")).path("references").get(0).path("removed").asBoolean())
+                .isTrue();
+        // Shared there too, it is live there.
+        assertThat(share(gm, artifacts(gm.campaign()) + "/" + guard, quinta).statusCode()).isEqualTo(200);
+        assertThat(json(get(gm, there)).path("references").get(0).path("removed").asBoolean()).isFalse();
+    }
+
+    @Test
+    void anotherOwnerFindsNoSharedArtifactAndCannotShareIntoOrFromTheirCampaigns() throws Exception {
+        Gm gm = signUp();
+        UUID quinta = campaign(gm, "Mesa de quinta");
+        String kael = create(gm, gm.campaign(), "item", "Espada de Kael");
+        assertThat(share(gm, artifacts(gm.campaign()) + "/" + kael, quinta).statusCode()).isEqualTo(200);
+        Gm them = signUp();
+        UUID theirOther = campaign(them, "Mesa deles");
+
+        // Matrix row "Other owner": not found on every route, from any of the ids.
+        for (String path : List.of(artifacts(gm.campaign()) + "/" + kael, artifacts(quinta) + "/" + kael,
+                artifacts(them.campaign()) + "/" + kael)) {
+            assertNotFound(get(them, path));
+            assertNotFound(get(them, path + "/versions/1"));
+            assertNotFound(send(them, "PUT", path + "/sharing", "{\"campaignIds\":[\"" + theirOther + "\"]}"));
+        }
+        assertThat(json(get(gm, artifacts(gm.campaign()) + "/" + kael)).path("sharedWith"))
+                .extracting(one -> one.path("campaignId").asString()).containsExactly(quinta.toString());
+        assertThat(shares.rows.values()).noneMatch(row -> row.ownerId().equals(them.id()));
+    }
+
     // --- helpers
 
     private void edit(Gm gm, String id, int version, String type, String name) throws Exception {
@@ -1136,6 +1359,20 @@ class ArtifactsFlowTest {
                 + "\",\"name\":\"" + name + "\",\"fields\":[]}");
         assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
         return json(created).path("id").asString();
+    }
+
+    /** A new campaign of the GM's system (Story 5.6 part A); its id. */
+    private UUID campaign(Gm gm, String name) throws Exception {
+        HttpResponse<String> created = send(gm, "POST", "/api/v1/campaigns", "{\"name\":\"" + name
+                + "\",\"systemId\":\"" + gm.system() + "\"}");
+        assertThat(created.statusCode()).as(created.body()).isEqualTo(201);
+        return UUID.fromString(json(created).path("id").asString());
+    }
+
+    /** The GM's sharing of the artifact at {@code path} with exactly these campaigns (Story 5.6 part A). */
+    private HttpResponse<String> share(Gm gm, String path, UUID... campaigns) throws Exception {
+        return send(gm, "PUT", path + "/sharing", JSON.writeValueAsString(Map.of("campaignIds",
+                Arrays.stream(campaigns).map(UUID::toString).toList())));
     }
 
     private static List<String> ids(JsonNode page) {

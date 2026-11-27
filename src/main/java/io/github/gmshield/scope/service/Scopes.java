@@ -156,6 +156,15 @@ import tools.jackson.databind.node.ObjectNode;
  *       record is in the scope's system tier, and a system-tier record names the artifact that overrides it
  *       ({@link ScopedRecordContent#overriddenBy}) when that artifact is one of the scope's (the campaign tier on). The
  *       scope stays the only decider; the worker copies these marks.</li>
+ *   <li>Story 5.6 part A (a shared artifact): when the system tier is on, {@link #resolve} also reads the ids of the live
+ *       artifacts of the owner's other campaigns shared into the campaign ({@link CampaignArtifacts#shared}) into
+ *       {@link ResolvedScope#shared}, never among its allowed sources. {@link #questionInput} alone lists them, after
+ *       the system tier's sources; {@link #recordContents} and {@link #citedRecords} read an id of that set through the
+ *       port ({@link CampaignArtifacts#readShared}) as a system-tier record of the scope, as an own artifact is read;
+ *       {@link #status} counts them as a source. Its overrides apply in its own campaign only: neither side of a mark
+ *       is set for a shared artifact, since the port answers the marks of the campaign's own artifacts alone.
+ *       {@link #removedArtifacts} counts an artifact shared into the campaign as live, whatever the tiers, until it is
+ *       unshared or deleting.</li>
  * </ul>
  *
  * Lines carry ids and counts, never a text, a section title or a question.
@@ -259,11 +268,14 @@ public class Scopes {
             }
             // Story 5.1 part B: the campaign's artifacts, with the campaign tier only; never an allowed source.
             Set<UUID> ofCampaign = settings.on(Tier.CAMPAIGN) ? artifacts.ids(campaign.id()) : Set.of();
+            // Story 5.6 part A: the artifacts shared into the campaign, with the system tier only; never one of its own.
+            Set<UUID> shared = settings.on(Tier.SYSTEM) ? sharedOnly(campaign.id(), ofCampaign) : Set.of();
             ResolvedScope scope = new ResolvedScope(owner, campaign.id(), settings, sources, pending, materialOf,
-                    recordTypeKeys.keysOf(campaign.system().id()), ofCampaign);
+                    recordTypeKeys.keysOf(campaign.system().id()), ofCampaign, shared);
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("campaignSources", sources.get(Tier.CAMPAIGN).size())
                     .addKeyValue("artifacts", ofCampaign.size())
+                    .addKeyValue("shared", shared.size())
                     .addKeyValue("systemSources", sources.get(Tier.SYSTEM).size())
                     .addKeyValue("otherSources", sources.get(Tier.OTHER).size())
                     .addKeyValue("materialsOff", settings.materialsOff().size())
@@ -296,9 +308,11 @@ public class Scopes {
                     .map(count -> new Indexing(count.remaining())).orElse(null);
             IndexingFailure failed = sources.isEmpty() ? null : reads.failed(sources)
                     .map(count -> new IndexingFailure(count.passages(), count.retrying())).orElse(null);
-            // Story 5.1 part B: a campaign whose only sources are its artifacts has sources too.
+            // Story 5.1 part B: a campaign whose only sources are its artifacts has sources too; from Story 5.6 part A
+            // one whose only sources are artifacts shared into it as well.
             boolean hasSources = !sources.isEmpty()
-                    || settings.on(Tier.CAMPAIGN) && !artifacts.ids(campaign.id()).isEmpty();
+                    || settings.on(Tier.CAMPAIGN) && !artifacts.ids(campaign.id()).isEmpty()
+                    || settings.on(Tier.SYSTEM) && !artifacts.shared(campaign.id()).isEmpty();
             log.atDebug().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaign.id())
                     .addKeyValue("sources", sources.size()).addKeyValue("hasSources", hasSources)
                     .addKeyValue("remaining", indexing == null ? 0 : indexing.remaining())
@@ -306,6 +320,16 @@ public class Scopes {
                     .addKeyValue("retrying", failed != null && failed.retrying()).log("scope.indexing");
             return new ScopeStatus(hasSources, indexing, failed);
         });
+    }
+
+    /**
+     * The ids of the live artifacts shared into the campaign (Story 5.6 part A), never one of {@code own}: an artifact
+     * is shared only into another campaign, so this only keeps a broken row out. Runs in the caller's transaction.
+     */
+    private Set<UUID> sharedOnly(UUID campaignId, Set<UUID> own) {
+        Set<UUID> shared = artifacts.shared(campaignId);
+        return own.isEmpty() ? shared : shared.stream().filter(id -> !own.contains(id))
+                .collect(Collectors.toUnmodifiableSet());
     }
 
     /** The owner's campaign with this id; {@code request.not_found} (404) for an unknown one or another owner's. */
@@ -581,7 +605,8 @@ public class Scopes {
         requireOwner(scope);
         List<UUID> wanted = ids.stream().filter(Objects::nonNull).distinct().toList();
         List<ScopedRecordContent> found = wanted.isEmpty()
-                || scope.allowedSources().isEmpty() && scope.artifacts().isEmpty() ? List.of()
+                || scope.allowedSources().isEmpty() && scope.artifacts().isEmpty() && scope.shared().isEmpty()
+                ? List.of()
                 : reading(() -> contents(scope, wanted, false)).orElseThrow();
         log.atInfo().addKeyValue("campaignId", scope.campaignId()).addKeyValue("cited", wanted.size())
                 .addKeyValue("kept", found.size()).addKeyValue("dropped", wanted.size() - found.size())
@@ -646,29 +671,34 @@ public class Scopes {
      * Runs in the caller's read transaction.
      */
     private Optional<List<ScopedRecordContent>> contents(ResolvedScope scope, List<UUID> wanted, boolean refuse) {
-        // Story 5.1 part B: an id of the campaign's artifacts is read through the port, never placed as a record.
+        // Story 5.1 part B: an id of the campaign's artifacts is read through the port, never placed as a record; from
+        // Story 5.6 part A so is an id of the artifacts shared into it, as a system-tier record.
         Set<UUID> ofCampaign = scope.artifacts();
+        Set<UUID> shared = scope.shared();
         List<UUID> artifactIds = wanted.stream().filter(ofCampaign::contains).toList();
-        List<UUID> extracted = wanted.stream().filter(id -> !ofCampaign.contains(id)).toList();
+        List<UUID> sharedIds = wanted.stream().filter(id -> !ofCampaign.contains(id) && shared.contains(id)).toList();
+        List<UUID> extracted = wanted.stream().filter(id -> !ofCampaign.contains(id) && !shared.contains(id))
+                .toList();
         ExtractedRecords.Reach reach = refuse ? ExtractedRecords.Reach.ALL : ExtractedRecords.Reach.LIVE;
         List<Placed> placed = extracted.isEmpty() ? List.of() : located(scope, records.located(extracted, reach));
         if (refuse && placed.size() != extracted.size() && !deletedArtifacts(extracted, placed)) {
             return Optional.empty();
         }
         Map<UUID, ScopedRecordContent> found = new HashMap<>();
-        if (!artifactIds.isEmpty()) {
-            Set<String> keys = scope.recordTypes();
-            // Story 5.2 part B: the port leaves out an artifact deleted since the scope was resolved (deleting or
-            // gone); it is left out of the answer, never refused. One it answers of a type the system lost is refused.
-            List<CampaignArtifacts.Artifact> live = artifacts.read(scope.campaignId(), artifactIds);
-            if (refuse && live.stream().anyMatch(artifact -> !keys.contains(artifact.recordType()))) {
-                return Optional.empty();
-            }
-            live.stream().filter(artifact -> keys.contains(artifact.recordType()))
-                    .forEach(artifact -> found.put(artifact.id(), new ScopedRecordContent(ScopedRecord.artifact(
-                            artifact.id(), artifact.recordType(), artifact.name(), artifact.version()),
-                            artifact.fields(), artifact.content())));
+        // Story 5.2 part B: the port leaves out an artifact deleted since the scope was resolved (deleting or gone;
+        // from Story 5.6 part A also one unshared since); it is left out of the answer, never refused. One it answers
+        // of a type the system lost is refused.
+        List<CampaignArtifacts.Artifact> own = artifactIds.isEmpty() ? List.of()
+                : artifacts.read(scope.campaignId(), artifactIds);
+        List<CampaignArtifacts.Artifact> brought = sharedIds.isEmpty() ? List.of()
+                : artifacts.readShared(scope.campaignId(), sharedIds);
+        Set<String> keys = scope.recordTypes();
+        if (refuse && (own.stream().anyMatch(artifact -> !keys.contains(artifact.recordType()))
+                || brought.stream().anyMatch(artifact -> !keys.contains(artifact.recordType())))) {
+            return Optional.empty();
         }
+        putArtifacts(found, own, keys, Tier.CAMPAIGN);
+        putArtifacts(found, brought, keys, Tier.SYSTEM);
         Map<UUID, ExtractedRecords.Content> contents = new HashMap<>();
         if (!placed.isEmpty()) {
             records.read(placed.stream().map(one -> one.record().id()).toList(), reach)
@@ -688,6 +718,15 @@ public class Scopes {
         return Optional.of(wanted.stream().map(found::get).filter(Objects::nonNull).toList());
     }
 
+    /** Puts these artifacts of a type key of the system as records of the tier {@code tier}, by id. */
+    private static void putArtifacts(Map<UUID, ScopedRecordContent> found, List<CampaignArtifacts.Artifact> read,
+                                     Set<String> keys, Tier tier) {
+        read.stream().filter(artifact -> keys.contains(artifact.recordType()))
+                .forEach(artifact -> found.put(artifact.id(), new ScopedRecordContent(ScopedRecord.artifact(
+                        artifact.id(), artifact.recordType(), artifact.name(), artifact.version(), tier),
+                        artifact.fields(), artifact.content())));
+    }
+
     /**
      * Sets the overrides of the records read (Story 5.5 part A), from the port, in place: an artifact's
      * {@code overrides} when the record it overrides is in the scope's system tier, and a system-tier record's
@@ -699,8 +738,10 @@ public class Scopes {
         if (ofCampaign.isEmpty() || found.isEmpty()) {
             return;
         }
-        List<UUID> artifactIds = found.values().stream().filter(content -> content.record().artifact())
-                .map(content -> content.record().recordId()).toList();
+        // Story 5.6 part A: an artifact shared into the campaign marks nothing here; its override is its own campaign's.
+        List<UUID> artifactIds = found.values().stream().filter(content -> content.record().artifact()
+                && ofCampaign.contains(content.record().recordId())).map(content -> content.record().recordId())
+                .toList();
         List<UUID> systemIds = found.values().stream().filter(content -> !content.record().artifact()
                 && content.record().tier() == Tier.SYSTEM).map(content -> content.record().recordId()).toList();
         Map<UUID, UUID> overrides = artifactIds.isEmpty() ? Map.of()
@@ -709,7 +750,7 @@ public class Scopes {
         Map<UUID, UUID> overriddenBy = systemIds.isEmpty() ? Map.of()
                 : overridesOf.overriddenBy(scope.campaignId(), systemIds);
         found.replaceAll((id, content) -> {
-            UUID target = content.record().artifact() ? overrides.get(id) : null;
+            UUID target = content.record().artifact() && ofCampaign.contains(id) ? overrides.get(id) : null;
             UUID artifact = content.record().artifact() || content.record().tier() != Tier.SYSTEM ? null
                     : overriddenBy.get(id);
             UUID kept = target != null && inSystemTier.contains(target) ? target : null;
@@ -796,7 +837,8 @@ public class Scopes {
     /**
      * Which of these artifact ids are removed for the owner (Story 5.2 part B): every one that is not a live artifact
      * of the owner's campaign {@code campaignId} (deleting, gone, or never one of its artifacts), so a stored reference
-     * to it reads as removed. Nothing is decrypted.
+     * to it reads as removed. From Story 5.6 part A a live artifact shared into the campaign is not removed, whatever
+     * the campaign's tiers; once it is unshared or deleting, it is. Nothing is decrypted.
      */
     public Set<UUID> removedArtifacts(UUID campaignId, Set<UUID> artifactIds) {
         Objects.requireNonNull(artifactIds, "artifactIds");
@@ -804,7 +846,15 @@ public class Scopes {
         if (artifactIds.isEmpty()) {
             return Set.of();
         }
-        Set<UUID> live = campaignId == null ? Set.of() : reading(() -> artifacts.live(campaignId, artifactIds));
+        Set<UUID> live = campaignId == null ? Set.of() : reading(() -> {
+            Set<UUID> own = artifacts.live(campaignId, artifactIds);
+            if (own.containsAll(artifactIds)) {
+                return own;
+            }
+            Set<UUID> kept = new HashSet<>(own);
+            artifacts.shared(campaignId).stream().filter(artifactIds::contains).forEach(kept::add);
+            return kept;
+        });
         return artifactIds.stream().filter(id -> !live.contains(id)).collect(Collectors.toUnmodifiableSet());
     }
 
@@ -961,7 +1011,7 @@ public class Scopes {
      * {@code {<field>: text, owner, modelKnowledge, tiers: [{tier, sources, pending}], tokenKey}} within {@code scope},
      * as {@link #questionInput} says; {@code line} names the log line, which carries counts only. With
      * {@code withArtifacts} (a question's input only, Story 5.1 part B), the campaign tier's sources end with the ids of
-     * the campaign's artifacts.
+     * the campaign's artifacts, and (Story 5.6 part A) the system tier's with the ids of the artifacts shared into it.
      */
     private ObjectNode textInput(ResolvedScope scope, String field, String text, String line, boolean withArtifacts) {
         Objects.requireNonNull(scope, "scope");
@@ -981,6 +1031,9 @@ public class Scopes {
             if (withArtifacts && tier == Tier.CAMPAIGN) {
                 scope.artifacts().stream().sorted().forEach(artifact -> sources.add(artifact.toString()));
             }
+            if (withArtifacts && tier == Tier.SYSTEM) {
+                scope.shared().stream().sorted().forEach(artifact -> sources.add(artifact.toString()));
+            }
             ArrayNode pending = entry.putArray("pending");
             scope.pending(tier).stream().limit(MAX_PENDING).forEach(id -> pending.add(id.toString()));
         }
@@ -999,6 +1052,7 @@ public class Scopes {
                 .addKeyValue("systemSources", scope.sources(Tier.SYSTEM).size())
                 .addKeyValue("otherSources", scope.sources(Tier.OTHER).size())
                 .addKeyValue("artifacts", withArtifacts ? scope.artifacts().size() : 0)
+                .addKeyValue("shared", withArtifacts ? scope.shared().size() : 0)
                 .addKeyValue("pending", scope.pending().size())
                 .addKeyValue("pendingListed", listed)
                 .addKeyValue("pendingLeftOut", scope.pending().size() - listed)
