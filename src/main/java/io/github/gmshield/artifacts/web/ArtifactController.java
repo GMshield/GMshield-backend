@@ -13,6 +13,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -169,8 +170,10 @@ class ArtifactController {
             List<FieldView> fields = cited == null ? null : cited.fields().stream()
                     .map(field -> new FieldView(field.name(), field.value())).toList();
             if (TurnReference.ARTIFACT.equals(reference.kind())) {
+                // An artifact's reference always names the artifact it cites (Sonar S2259 cannot see that).
+                TurnReference.Cited artifact = Objects.requireNonNull(cited, "artifacts.reference_without_artifact");
                 return new ReferenceView(reference.number(), reference.kind(), null, null, null, null, null,
-                        cited.id().toString(), cited.artifactVersion(), cited.type(), cited.name(), fields,
+                        artifact.id().toString(), artifact.artifactVersion(), artifact.type(), artifact.name(), fields,
                         reference.removed(), reference.tier());
             }
             return new ReferenceView(reference.number(), reference.kind(), reference.materialName(),

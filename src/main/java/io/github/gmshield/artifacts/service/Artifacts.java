@@ -614,8 +614,10 @@ public class Artifacts {
                 owner), fieldsJson(cited.fields().stream().map(field -> new Field(field.name(), field.value()))
                 .toList()));
         if (TurnReference.ARTIFACT.equals(reference.kind())) {
+            // An artifact's reference always names the artifact it cites (Sonar S2259 cannot see that).
+            TurnReference.Cited artifact = Objects.requireNonNull(cited, "artifacts.reference_without_artifact");
             return new ArtifactReferenceRow(id, owner, number, null, null, null, null, null, null, reference.tier(),
-                    null, cited.type(), recordName, recordFields, cited.id(), cited.artifactVersion(), at);
+                    null, artifact.type(), recordName, recordFields, artifact.id(), artifact.artifactVersion(), at);
         }
         ArrayNode path = JsonNodeFactory.instance.arrayNode();
         reference.sectionPath().forEach(path::add);
