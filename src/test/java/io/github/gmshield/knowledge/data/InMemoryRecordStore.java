@@ -300,8 +300,9 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit) {
-        return ofCampaign(campaignId, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
+    public List<ArtifactRow> artifacts(UUID campaignId, Collection<UUID> shared, String type, UUID before, int offset,
+                                       int limit) {
+        return ofCampaign(campaignId, shared, type).filter(row -> before == null || unsigned(row.id(), before) < 0)
                 .sorted(Comparator.comparing(ArtifactRow::id, InMemoryRecordStore::unsigned).reversed())
                 .skip(offset).limit(limit).toList();
     }
@@ -316,8 +317,8 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public long artifactCount(UUID campaignId, String type) {
-        return ofCampaign(campaignId, type).count();
+    public long artifactCount(UUID campaignId, Collection<UUID> shared, String type) {
+        return ofCampaign(campaignId, shared, type).count();
     }
 
     @Override
@@ -335,9 +336,9 @@ public class InMemoryRecordStore implements RecordStore {
     }
 
     @Override
-    public Map<String, Long> artifactTypes(UUID campaignId) {
+    public Map<String, Long> artifactTypes(UUID campaignId, Collection<UUID> shared) {
         Map<String, Long> counts = new TreeMap<>();
-        ofCampaign(campaignId, null).forEach(row -> counts.merge(row.type(), 1L, Long::sum));
+        ofCampaign(campaignId, shared, null).forEach(row -> counts.merge(row.type(), 1L, Long::sum));
         return counts;
     }
 
@@ -370,10 +371,12 @@ public class InMemoryRecordStore implements RecordStore {
         return deleted;
     }
 
-    private java.util.stream.Stream<ArtifactRow> ofCampaign(UUID campaignId, String type) {
+    /** The live artifacts of the campaign, and (Story 5.6 part B) those with an id in {@code shared}, of the type. */
+    private java.util.stream.Stream<ArtifactRow> ofCampaign(UUID campaignId, Collection<UUID> shared, String type) {
         UUID owner = OwnerContext.require();
         return artifacts.values().stream().filter(row -> row.ownerId().equals(owner)
-                && row.campaignId().equals(campaignId) && (type == null || row.type().equals(type)) && live(row));
+                && (row.campaignId().equals(campaignId) || shared.contains(row.id()))
+                && (type == null || row.type().equals(type)) && live(row));
     }
 
     /** Whether the artifact is not deleting (Story 5.2 part B). */

@@ -178,11 +178,13 @@ public interface RecordStore {
     List<ArtifactRow> findArtifacts(Collection<UUID> ids, Reach reach);
 
     /**
-     * The current owner's artifacts of the campaign {@code campaignId} (Story 5.1), newest first (by id, a UUIDv7):
-     * only those of the type key {@code type} when it is not null, only those older than {@code before} when it is not
-     * null, the first {@code offset} skipped, at most {@code limit}.
+     * The current owner's artifacts of the campaign {@code campaignId} (Story 5.1), and from Story 5.6 part B those of
+     * any campaign with an id in {@code shared} (the artifacts shared into it; empty for none), in one list newest
+     * first (by id, a UUIDv7): only those of the type key {@code type} when it is not null, only those older than
+     * {@code before} when it is not null, the first {@code offset} skipped, at most {@code limit}.
      */
-    List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit);
+    List<ArtifactRow> artifacts(UUID campaignId, Collection<UUID> shared, String type, UUID before, int offset,
+                                int limit);
 
     /**
      * The current owner's live artifacts saved from the conversation {@code conversationId} (Story 5.4 part B: its
@@ -190,8 +192,11 @@ public interface RecordStore {
      */
     List<ArtifactRow> artifactsOfConversation(UUID conversationId);
 
-    /** How many artifacts the current owner's campaign has (Story 5.1), of the type key {@code type} when not null. */
-    long artifactCount(UUID campaignId, String type);
+    /**
+     * How many artifacts the current owner's campaign has (Story 5.1), of the type key {@code type} when not null; from
+     * Story 5.6 part B those with an id in {@code shared} counted too, as {@link #artifacts} lists them.
+     */
+    long artifactCount(UUID campaignId, Collection<UUID> shared, String type);
 
     /** How many artifacts the current owner's campaigns with these ids hold (Story 5.1, their deletion's dialogs). */
     long artifactsIn(Collection<UUID> campaignIds);
@@ -202,8 +207,11 @@ public interface RecordStore {
      */
     long artifactsOfTypeIn(Collection<UUID> campaignIds, String type);
 
-    /** How many artifacts of each type key the current owner's campaign has (Story 5.1); a type with none is left out. */
-    Map<String, Long> artifactTypes(UUID campaignId);
+    /**
+     * How many artifacts of each type key the current owner's campaign has (Story 5.1), from Story 5.6 part B those
+     * with an id in {@code shared} counted too; a type with none is left out.
+     */
+    Map<String, Long> artifactTypes(UUID campaignId, Collection<UUID> shared);
 
     /**
      * The ids of every artifact of the current owner's campaigns with these ids (Story 5.1, their deletion; from Story

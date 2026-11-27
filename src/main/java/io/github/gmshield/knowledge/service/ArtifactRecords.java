@@ -217,14 +217,16 @@ public class ArtifactRecords {
     }
 
     /**
-     * The owner's artifacts of the campaign {@code campaignId}, newest first: of the type key {@code recordType} only
-     * when it is not null, only those older than {@code before} when it is not null, the first {@code offset} skipped,
-     * at most {@code limit}.
+     * The owner's artifacts of the campaign {@code campaignId}, and from Story 5.6 part B the live artifacts with an id
+     * in {@code shared} (those shared into it; empty for none), in one list newest first: of the type key
+     * {@code recordType} only when it is not null, only those older than {@code before} when it is not null, the first
+     * {@code offset} skipped, at most {@code limit}.
      */
-    public List<Identity> list(UUID campaignId, String recordType, UUID before, int offset, int limit) {
+    public List<Identity> list(UUID campaignId, Collection<UUID> shared, String recordType, UUID before, int offset,
+                               int limit) {
         OwnerContext.require();
-        return store.artifacts(campaignId, recordType, before, offset, limit).stream().map(ArtifactRecords::identity)
-                .toList();
+        return store.artifacts(campaignId, shared, recordType, before, offset, limit).stream()
+                .map(ArtifactRecords::identity).toList();
     }
 
     /**
@@ -237,16 +239,22 @@ public class ArtifactRecords {
                 .map(ArtifactRecords::identity).toList();
     }
 
-    /** How many artifacts the owner's campaign has, of the type key {@code recordType} when it is not null. */
-    public long count(UUID campaignId, String recordType) {
+    /**
+     * How many artifacts the owner's campaign has, of the type key {@code recordType} when it is not null; from Story
+     * 5.6 part B those with an id in {@code shared} counted too, as {@link #list} lists them.
+     */
+    public long count(UUID campaignId, Collection<UUID> shared, String recordType) {
         OwnerContext.require();
-        return store.artifactCount(campaignId, recordType);
+        return store.artifactCount(campaignId, shared, recordType);
     }
 
-    /** The type keys in use in the owner's campaign's artifacts, by key, each with how many artifacts have it. */
-    public List<TypeCount> types(UUID campaignId) {
+    /**
+     * The type keys in use in the owner's campaign's artifacts, by key, each with how many artifacts have it; from Story
+     * 5.6 part B those with an id in {@code shared} counted too.
+     */
+    public List<TypeCount> types(UUID campaignId, Collection<UUID> shared) {
         OwnerContext.require();
-        return store.artifactTypes(campaignId).entrySet().stream().sorted(Map.Entry.comparingByKey())
+        return store.artifactTypes(campaignId, shared).entrySet().stream().sorted(Map.Entry.comparingByKey())
                 .map(entry -> new TypeCount(entry.getKey(), entry.getValue())).toList();
     }
 

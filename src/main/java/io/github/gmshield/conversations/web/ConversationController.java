@@ -277,7 +277,7 @@ class ConversationController {
         static ConversationDeletionView of(Conversations.Deletion deletion) {
             return new ConversationDeletionView(deletion.questions(), deletion.artifacts().stream()
                     .map(artifact -> new ConversationDeletionArtifactView(artifact.id(), artifact.name(),
-                            artifact.recordType(), artifact.overrides())).toList());
+                            artifact.recordType(), artifact.overrides(), artifact.shared())).toList());
         }
 
         @Override
@@ -286,16 +286,19 @@ class ConversationController {
         }
     }
 
-    @Schema(name = "ConversationDeletionArtifact", requiredProperties = {"id", "name", "recordType", "overrides"},
-            description = "An artifact saved from a conversation, as its deletion's dialog lists it (contract 1.49.0;"
-                    + " overrides from 1.50.0)")
+    @Schema(name = "ConversationDeletionArtifact", requiredProperties = {"id", "name", "recordType", "overrides",
+        "shared"}, description = "An artifact saved from a conversation, as its deletion's dialog lists it (contract"
+                    + " 1.49.0; overrides from 1.50.0; shared from 1.53.0)")
     record ConversationDeletionArtifactView(
             @Schema(description = "The artifact's id", format = "uuid") UUID id,
             @Schema(description = "Its newest version's name", example = "Emboscada na Cripta") String name,
             @Schema(description = "Its record type's key", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "encounter")
             String recordType,
             @Schema(description = "Whether it overrides a record of its campaign's system (contract 1.50.0); deleting"
-                    + " it ends that override") boolean overrides) {
+                    + " it ends that override") boolean overrides,
+            @Schema(description = "Whether it is shared with at least one other campaign of the account (contract"
+                    + " 1.53.0), as the artifact's sharedWith lists them; deleting it takes it out of those campaigns"
+                    + " too") boolean shared) {
 
         @Override
         public String toString() {

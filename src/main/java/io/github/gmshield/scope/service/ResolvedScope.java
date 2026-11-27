@@ -19,8 +19,9 @@ import java.util.UUID;
  * makes one, so a scope cannot be forged by another module. From Story 5.1 part B it also holds the ids of the
  * campaign's artifacts when its campaign tier is on ({@link #artifacts}): they are no source of {@link #sources} or
  * {@link #allowedSources}, so no read of a material's passages or records ever reaches one, and only a question's input
- * lists them, among the campaign tier's sources ({@link Scopes#questionInput}). {@code toString} names ids and counts
- * only.
+ * lists them, among the campaign tier's sources ({@link Scopes#questionInput}). From Story 5.6 part A it holds, apart,
+ * the ids of the live artifacts shared into the campaign when its system tier is on ({@link #shared}): the same rules,
+ * among the system tier's sources. {@code toString} names ids and counts only.
  */
 public final class ResolvedScope {
 
@@ -32,15 +33,18 @@ public final class ResolvedScope {
     private final Map<UUID, UUID> materialOf;
     private final Set<String> recordTypes;
     private final Set<UUID> artifacts;
+    private final Set<UUID> shared;
 
     /**
      * {@code sources} and {@code pending} by tier (a missing tier has none); {@code materialOf} the material of each
      * allowed source; {@code recordTypes} the record type keys of the campaign's system (Story 4.4 part B);
-     * {@code artifacts} the ids of the campaign's artifacts, none when its campaign tier is off (Story 5.1 part B).
+     * {@code artifacts} the ids of the campaign's artifacts, none when its campaign tier is off (Story 5.1 part B);
+     * {@code shared} the ids of the artifacts shared into the campaign, none when its system tier is off (Story 5.6
+     * part A).
      */
     ResolvedScope(UUID ownerId, UUID campaignId, ScopeSettings settings, Map<Tier, List<UUID>> sources,
                   Map<Tier, List<UUID>> pending, Map<UUID, UUID> materialOf, Set<String> recordTypes,
-                  Set<UUID> artifacts) {
+                  Set<UUID> artifacts, Set<UUID> shared) {
         this.ownerId = Objects.requireNonNull(ownerId, "ownerId");
         this.campaignId = Objects.requireNonNull(campaignId, "campaignId");
         this.settings = Objects.requireNonNull(settings, "settings");
@@ -51,6 +55,7 @@ public final class ResolvedScope {
         this.materialOf = Map.copyOf(materialOf);
         this.recordTypes = Set.copyOf(recordTypes);
         this.artifacts = Set.copyOf(artifacts);
+        this.shared = Set.copyOf(shared);
     }
 
     /**
@@ -62,11 +67,20 @@ public final class ResolvedScope {
     }
 
     /**
+     * The ids of the live artifacts of the owner's other campaigns shared into the campaign (Story 5.6 part A),
+     * system-tier sources of a question only; none when the system tier is off.
+     */
+    public Set<UUID> shared() {
+        return shared;
+    }
+
+    /**
      * Whether a tier has a source a question may use (Story 5.1 part B): an allowed source, or for the campaign tier one
-     * of the campaign's artifacts too.
+     * of the campaign's artifacts too, and (Story 5.6 part A) for the system tier an artifact shared into the campaign.
      */
     public boolean hasSources(Tier tier) {
-        return !sources.get(tier).isEmpty() || tier == Tier.CAMPAIGN && !artifacts.isEmpty();
+        return !sources.get(tier).isEmpty() || tier == Tier.CAMPAIGN && !artifacts.isEmpty()
+                || tier == Tier.SYSTEM && !shared.isEmpty();
     }
 
     /**
@@ -143,6 +157,7 @@ public final class ResolvedScope {
         return "ResolvedScope[ownerId=" + ownerId + ", campaignId=" + campaignId + ", campaignSources="
                 + sources.get(Tier.CAMPAIGN).size() + ", systemSources=" + sources.get(Tier.SYSTEM).size()
                 + ", otherSources=" + sources.get(Tier.OTHER).size() + ", pending=" + pending().size()
-                + ", recordTypes=" + recordTypes.size() + ", artifacts=" + artifacts.size() + "]";
+                + ", recordTypes=" + recordTypes.size() + ", artifacts=" + artifacts.size() + ", shared=" + shared.size()
+                + "]";
     }
 }

@@ -37,6 +37,8 @@ import tools.jackson.databind.JsonNode;
  * another campaign's and another system's material (an archived campaign's too), and nothing of another owner. Then the
  * stored settings ({@link CampaignScopes}): the starting read at version 0, a change, a stale one, an unknown
  * material, another owner, and the deletion handler. The flow through the API is in {@code ConversationFlowTest}.
+ * Story 5.6 part A: an artifact shared into the campaign is a system-tier source only while that tier is on, whatever
+ * the campaign tier, and counts as a source of the scope's status.
  */
 class ScopeTiersTest {
 
@@ -357,6 +359,70 @@ class ScopeTiersTest {
             return null;
         });
         assertThat(store.rows).containsOnlyKeys(w.otherCampaign());
+    }
+
+    // --- Story 5.6 part A: an artifact shared into the campaign follows its system tier
+
+    @Test
+    void anArtifactSharedIntoTheCampaignIsASystemTierSourceOnlyWithThatTierOnWhateverTheCampaignTier() {
+        World w = world();
+        UUID kael = Ids.newId();
+        artifacts.put(w.gm().owner(), w.otherCampaign(), new CampaignArtifacts.Artifact(kael, "item",
+                "Espada de Kael", List.of(new ScopedRecordContent.Field("Dano", "1d8")), null, 2));
+        artifacts.share(kael, w.gm().campaign());
+
+        ResolvedScope on = resolve(w, new ScopeSettings(false, true, false, false));
+        ResolvedScope off = resolve(w, new ScopeSettings(true, false, false, false));
+
+        // The system tier on (the campaign tier off): a system-tier source of a question, after its materials, never an
+        // allowed source of a material read, and read as a system-tier record.
+        assertThat(on.shared()).containsExactly(kael);
+        assertThat(on.artifacts()).isEmpty();
+        assertThat(on.allowedSources()).doesNotContain(kael);
+        assertThat(on.hasSources(Tier.SYSTEM)).isTrue();
+        JsonNode question = as(w.gm().owner(), () -> scopes.questionInput(on, "Kael?"));
+        assertThat(question.path("tiers").get(1).path("sources")).extracting(JsonNode::asString)
+                .containsExactly(w.b().toString(), kael.toString());
+        assertThat(question.path("tiers").get(0).path("sources").toString()).doesNotContain(kael.toString());
+        assertThat(as(w.gm().owner(), () -> scopes.searchInput(on, "Kael")).toString())
+                .doesNotContain(kael.toString());
+        assertThat(as(w.gm().owner(), () -> scopes.recordContents(on, List.of(kael))))
+                .extracting(content -> content.record().tier(), content -> content.record().artifactVersion(),
+                        content -> content.overrides())
+                .containsExactly(tuple(Tier.SYSTEM, 2, null));
+        // Matrix row "System tier off": no source, whatever the campaign tier; its read is refused, its citation
+        // dropped; it still is no removed artifact there.
+        assertThat(off.shared()).isEmpty();
+        assertThat(as(w.gm().owner(), () -> scopes.questionInput(off, "Kael?")).toString())
+                .doesNotContain(kael.toString());
+        assertProblem(() -> as(w.gm().owner(), () -> scopes.recordContents(off, List.of(kael))), 403,
+                "scope.passage_refused");
+        assertThat(as(w.gm().owner(), () -> scopes.citedRecords(off, List.of(kael)))).isEmpty();
+        assertThat(as(w.gm().owner(), () -> scopes.removedArtifacts(w.gm().campaign(), Set.of(kael)))).isEmpty();
+        // In its own campaign it is a campaign-tier artifact, never a shared one.
+        ResolvedScope own = as(w.gm().owner(), () -> scopes.resolve(w.otherCampaign(), ScopeSettings.STARTING));
+        assertThat(own.artifacts()).containsExactly(kael);
+        assertThat(own.shared()).isEmpty();
+        // Another owner's campaign never sees it.
+        ScopeFixture.Starter them = fixture.starter();
+        assertThat(as(them.owner(), () -> scopes.resolve(them.campaign(), ScopeSettings.STARTING)).shared())
+                .isEmpty();
+    }
+
+    @Test
+    void aCampaignWhoseOnlySourceIsASharedArtifactHasSourcesWithItsSystemTierOn() {
+        ScopeFixture.Starter gm = fixture.starter();
+        UUID other = fixture.otherCampaign(gm);
+        UUID kael = Ids.newId();
+        artifacts.put(gm.owner(), other, new CampaignArtifacts.Artifact(kael, "item", "Espada de Kael", List.of(),
+                null, 1));
+        artifacts.share(kael, gm.campaign());
+
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), ScopeSettings.STARTING)).hasSources()).isTrue();
+        assertThat(as(gm.owner(), () -> scopes.status(gm.campaign(), new ScopeSettings(true, false, false, false)))
+                .hasSources()).isFalse();
+        assertThat(as(gm.owner(), () -> scopes.resolveSources(gm.campaign(), ScopeSettings.STARTING))
+                .hasSources(Tier.SYSTEM)).isTrue();
     }
 
     private void assertRefused(World w, ResolvedScope scope, List<UUID> ids) {

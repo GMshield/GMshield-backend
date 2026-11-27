@@ -1938,6 +1938,49 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     gains `related`. Deploy order: backend, then frontend (the 1.50.0 frontend behaves as before). Internal contract
     and worker unchanged.
 
+- **Share an artifact (`artifacts`, `scope`, Story 5.6 part A, FR-38, public contract 1.52.0).** An artifact is shared
+  with the owner's other campaigns of its system; it stays one artifact, so an edit shows everywhere.
+  - **V52** `artifact_share` (artifact, target campaign, owner, created), one row per pair. The artifact's key cascades
+    as `record_relation`'s; the campaign's has none, as every campaign key. No index job and no Qdrant point: sharing
+    lives in Postgres only. Additive; the migration's header has the way back.
+  - **The rule.** `artifacts.service.Artifacts#share` sets the whole set under the lock an edit takes on the newest
+    version. A target is another readable campaign of the owner's of the artifact's system (archived or not); its own
+    campaign, another system's, another owner's, a deleting one, unknown, malformed or null is 400
+    `artifact.share_target` and nothing is stored.
+  - **Scope.** The `scope` port `CampaignArtifacts` gains `shared` and `readShared` (kept apart from `ids`, `live` and
+    `read`, which overrides and relations use). When campaign B's system tier is on, `Scopes.resolve` puts the live
+    artifacts shared into B (their own campaign readable) into `ResolvedScope.shared`: the question input lists them
+    after the system tier's sources, the records read answers them with tier `system`, citations store that tier,
+    `status`/`hasSources(SYSTEM)` count them. With the tier off they are out, whatever the campaign tier. Their override
+    and relations apply in their own campaign only. `removedArtifacts` counts an artifact shared into the campaign as
+    live, whatever the tiers, until it is unshared or deleting, so B's stored citations then read as removed.
+  - **API.** `PUT /api/v1/campaigns/{campaignId}/artifacts/{artifactId}/sharing` `{campaignIds}` (the whole set, at
+    most 200; empty unshares all) answers the `Artifact`; from any campaign but the artifact's own it is 404. Every
+    `Artifact` gains `sharedWith: [{campaignId, name, archived}]` (by name, readable campaigns only; empty in a read
+    elsewhere) and `sharedFrom: {campaignId, name}` or null. `getArtifact` and `getArtifactVersion` in B also answer a
+    live artifact shared into B, whatever B's tiers, with `sharedFrom` set, no `overrides`, no `related`, and a null
+    `conversationId`; every other artifact route stays own-campaign only.
+  - **Deletion.** The artifacts' deletion part removes the shares of the artifacts going and, for a campaign's or a
+    system's deletion, the shares into the campaigns going, before `library` removes the campaign rows. From the mark
+    on, an artifact that is deleting, or whose own campaign is, is no source and no read in B.
+  - Log lines (ids and counts only): `artifacts.shared`, `artifacts.share_refused`; `artifacts.read` gains `shared`,
+    `artifacts.deletion_removed` gains `shares`, `scope.resolved` and the question input's line gain `shared`. Deploy
+    order: backend, then frontend (the 1.51.0 frontend behaves as before). Internal contract and worker unchanged.
+
+- **Shared artifacts in the other campaigns (`artifacts`, `conversations`, Story 5.6 part B, public contract
+  1.53.0).** What part A shared into campaign B is listed there and named where it is deleted.
+  - **List.** `listArtifacts` in B holds B's own artifacts and the live artifacts shared into B (their own campaign
+    readable, as part A's rule), whatever B's tiers: one list, newest first by id, with the same cursor and offset
+    paging, and `total` and `types` count both. The record store's `artifacts`, `artifactCount` and `artifactTypes`
+    take the shared ids (`campaign_id = :campaign or id in :shared`, ordered in SQL). Each `ArtifactSummary` gains
+    `sharedFrom: {campaignId, name}` (its own campaign) or null for B's own; the row opens part A's read-only read.
+  - **Dialog.** `ConversationDeletionArtifact` gains `shared`: true while the artifact is shared with at least one
+    readable campaign, as `sharedWith` counts them (one batch of shares, `ArtifactShareStore#ofAll`, and one of
+    campaigns).
+  - No migration, no index change. Log lines: `artifacts.listed` gains `sharedShown`. Deploy order: backend, then
+    frontend (the 1.52.0 frontend shows shared rows as plain rows that open the read-only page). Internal contract and
+    worker unchanged.
+
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
   provider's model id per tier (`GMSHIELD_MODEL_<AZURE_OPENAI|ANTHROPIC|OPENAI>_<FULL|LIGHTWEIGHT>`; Azure's are

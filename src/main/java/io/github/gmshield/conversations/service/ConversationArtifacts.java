@@ -31,10 +31,10 @@ public interface ConversationArtifacts {
 
     /**
      * An artifact saved from a conversation as its deletion's dialog lists it: its id, its newest version's name, its
-     * record type's key and (Story 5.5 part A) whether it overrides a record. {@code toString} names the id and the type
-     * only.
+     * record type's key, (Story 5.5 part A) whether it overrides a record and (Story 5.6 part B) whether it is shared
+     * with at least one readable campaign. {@code toString} names the id and the type only.
      */
-    record SavedArtifact(UUID id, String name, String recordType, boolean overrides) {
+    record SavedArtifact(UUID id, String name, String recordType, boolean overrides, boolean shared) {
 
         public SavedArtifact {
             Objects.requireNonNull(id, "id");
@@ -42,9 +42,9 @@ public interface ConversationArtifacts {
             Objects.requireNonNull(recordType, "recordType");
         }
 
-        /** An artifact that overrides nothing. */
+        /** An artifact that overrides nothing and is not shared. */
         public SavedArtifact(UUID id, String name, String recordType) {
-            this(id, name, recordType, false);
+            this(id, name, recordType, false, false);
         }
 
         @Override

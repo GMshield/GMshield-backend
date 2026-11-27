@@ -11,6 +11,7 @@ import io.github.gmshield.accounts.data.SessionStore;
 import io.github.gmshield.accounts.data.SignInAttemptStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactIndexStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactReferenceStore;
+import io.github.gmshield.artifacts.data.InMemoryArtifactShareStore;
 import io.github.gmshield.artifacts.data.InMemoryArtifactVersionStore;
 import io.github.gmshield.audit.data.AuditStore;
 import io.github.gmshield.audit.data.InMemoryAuditStore;
@@ -285,6 +286,9 @@ class CrossOwnerAuditFlowTest {
                     "campaign", "artifactId", "artifact", "recordId", "record").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relation-targets", "campaignId",
                     "campaign", "artifactId", "artifact").query("recordType=spell").own("campaignId"),
+            // an artifact's sharing with other campaigns of its system (Story 5.6 part A)
+            route("PUT", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/sharing", "campaignId", "campaign",
+                    "artifactId", "artifact").json("{\"campaignIds\":[]}").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}", "campaignId", "campaign",
                     "versionId", "version", "page", "1").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/sources/{versionId}/pages/{page}/picture", "campaignId",
@@ -412,6 +416,8 @@ class CrossOwnerAuditFlowTest {
     @Autowired
     private InMemoryArtifactReferenceStore artifactReferences;
     @Autowired
+    private InMemoryArtifactShareStore artifactShares;
+    @Autowired
     private InMemoryRecordRelationStore recordRelations;
     @Autowired
     private InMemoryMaterialStore materials;
@@ -484,7 +490,7 @@ class CrossOwnerAuditFlowTest {
         if (stores == null) {
             stores = new InMemoryCrossOwnerAuditStores(new InMemoryCrossOwnerAuditStores.Twins(accounts, jobs, stream,
                     library, deletions, scopes, knowledge, records, ontology, artifactVersions, artifactIndex,
-                    artifactReferences, recordRelations, materials,
+                    artifactReferences, recordRelations, artifactShares, materials,
                     uploads, index, conversations, references, searches, clock, vault), START);
         }
         stores.start();
@@ -619,7 +625,12 @@ class CrossOwnerAuditFlowTest {
                 new Probe("an artifact's recordId in POST /campaigns/{campaignId}/artifacts/{artifactId}/relations",
                         "artifact", 400, "artifact.relation_target", "otherArtifact", 200, false,
                         id -> json("POST", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
-                                + "/relations", "{\"recordId\":\"" + id + "\"}")));
+                                + "/relations", "{\"recordId\":\"" + id + "\"}")),
+                // Story 5.6 part A: sharing with another account's campaign is refused as an unknown campaign is.
+                new Probe("campaignIds in PUT /campaigns/{campaignId}/artifacts/{artifactId}/sharing", "campaign", 400,
+                        "artifact.share_target", "otherCampaign", 200, false,
+                        id -> json("PUT", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
+                                + "/sharing", "{\"campaignIds\":[\"" + id + "\"]}")));
     }
 
     @Test
@@ -773,6 +784,35 @@ class CrossOwnerAuditFlowTest {
         assertThat(get(b, "/api/v1/campaigns/" + b.campaign() + "/artifacts/" + own).statusCode()).isEqualTo(200);
     }
 
+    /**
+     * Story 5.6 part B: an artifact of A shared into A's other campaign is listed there, never in B's list, and B's
+     * read of A's campaign's list is not found as a random campaign's is.
+     */
+    @Test
+    void anotherAccountsSharedArtifactIsInNoListOfTheirs() throws Exception {
+        Gm a = signUp();
+        Gm b = signUp();
+        String theirs = artifact(a, "Espada de Kael");
+        String own = artifact(b, "Arco de Lia");
+        UUID quinta = UUID.fromString(json(send(a, "POST", "/api/v1/campaigns", "{\"name\":\"Mesa de quinta\","
+                + "\"systemId\":\"" + json(get(a, "/api/v1/campaigns/current")).path("system").path("id").asString()
+                + "\"}")).path("id").asString());
+        HttpResponse<String> shared = send(a, "PUT", "/api/v1/campaigns/" + a.campaign() + "/artifacts/" + theirs
+                + "/sharing", "{\"campaignIds\":[\"" + quinta + "\"]}");
+        assertThat(shared.statusCode()).as(shared.body()).isEqualTo(200);
+        assertThat(json(get(a, "/api/v1/campaigns/" + quinta + "/artifacts")).path("items").toString())
+                .contains(theirs);
+
+        JsonNode list = json(get(b, "/api/v1/campaigns/" + b.campaign() + "/artifacts"));
+        assertThat(list.path("total").asLong()).isOne();
+        assertThat(list.path("items").get(0).path("id").asString()).isEqualTo(own);
+        assertThat(list.toString()).doesNotContain(theirs).doesNotContain("Kael");
+        HttpResponse<String> foreign = get(b, "/api/v1/campaigns/" + quinta + "/artifacts");
+        HttpResponse<String> random = get(b, "/api/v1/campaigns/" + UUID.randomUUID() + "/artifacts");
+        assertThat(foreign.statusCode()).isEqualTo(random.statusCode()).isEqualTo(404);
+        assertThat(foreign.body()).doesNotContain("Kael");
+    }
+
     /** A worker call's response as the audit compares answers. */
     private static Answer answerOf(HttpResponse<String> response) {
         return new Answer(response.statusCode(), response.headers().firstValue("Content-Type").orElse(""),
@@ -916,8 +956,8 @@ class CrossOwnerAuditFlowTest {
     /**
      * Account B, with its own items for the probes' controls: two systems, a campaign, two materials of the campaign
      * (ingested and accepted), from Story 5.5 part A a material of its system and an artifact (from part B two), a
-     * conversation, and the versions its changes name. Its items stay writable: a control that changes a version
-     * writes the new one ({@link #refresh}).
+     * conversation, from Story 5.6 part A a second campaign of its system, and the versions its changes name. Its items
+     * stay writable: a control that changes a version writes the new one ({@link #refresh}).
      */
     private World mine() throws Exception {
         Gm gm = signUp();
@@ -946,6 +986,13 @@ class CrossOwnerAuditFlowTest {
         items.put("proposal", proposal(gm, UUID.fromString(items.get("system")), "record_type").path("id").asString());
         items.put("recordType", json(get(gm, "/api/v1/systems/" + items.get("system") + "/record-types"))
                 .path("items").get(1).path("id").asString());
+        // Story 5.6 part A: another campaign of B's system, for the sharing's control; the first stays current.
+        HttpResponse<String> other = send(gm, "POST", "/api/v1/campaigns", "{\"name\":\"Mesa de quinta\","
+                + "\"systemId\":\"" + items.get("system") + "\"}");
+        assertThat(other.statusCode()).as(other.body()).isEqualTo(201);
+        items.put("otherCampaign", json(other).path("id").asString());
+        assertThat(send(gm, "PUT", "/api/v1/campaigns/current", "{\"campaignId\":\"" + gm.campaign() + "\"}")
+                .statusCode()).isEqualTo(200);
         World world = new World(gm, items, Set.of());
         refresh(world);
         return world;

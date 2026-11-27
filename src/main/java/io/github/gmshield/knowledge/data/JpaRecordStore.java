@@ -75,6 +75,27 @@ class JpaRecordStore implements RecordStore {
             + " and r.id < :before" + LIVE + " order by r.id desc";
     private static final String ARTIFACTS_OF_TYPE_BEFORE = "select r from Record r where r.campaignId = :campaign"
             + " and r.recordType = :type and r.id < :before" + LIVE + " order by r.id desc";
+    /**
+     * Story 5.6 part B: a campaign's own artifacts and those with these ids (the artifacts shared into it, of other
+     * campaigns), one list newest first; one text per filter, as above.
+     */
+    private static final String OWN_OR_SHARED = "select r from Record r where (r.campaignId = :campaign"
+            + " or (r.id in :shared and r.campaignId is not null))";
+    private static final String ARTIFACTS_SHARED = OWN_OR_SHARED + LIVE + " order by r.id desc";
+    private static final String ARTIFACTS_SHARED_OF_TYPE = OWN_OR_SHARED + " and r.recordType = :type" + LIVE
+            + " order by r.id desc";
+    private static final String ARTIFACTS_SHARED_BEFORE = OWN_OR_SHARED + " and r.id < :before" + LIVE
+            + " order by r.id desc";
+    private static final String ARTIFACTS_SHARED_OF_TYPE_BEFORE = OWN_OR_SHARED + " and r.recordType = :type"
+            + " and r.id < :before" + LIVE + " order by r.id desc";
+    private static final String COUNT_OWN_OR_SHARED = "select count(r) from Record r where (r.campaignId = :campaign"
+            + " or (r.id in :shared and r.campaignId is not null))";
+    private static final String ARTIFACT_COUNT_SHARED = COUNT_OWN_OR_SHARED + LIVE;
+    private static final String ARTIFACT_COUNT_SHARED_OF_TYPE = COUNT_OWN_OR_SHARED + " and r.recordType = :type"
+            + LIVE;
+    private static final String ARTIFACT_TYPES_SHARED = "select r.recordType, count(r) from Record r"
+            + " where (r.campaignId = :campaign or (r.id in :shared and r.campaignId is not null))" + LIVE
+            + " group by r.recordType order by r.recordType";
     /** Story 5.4 part B: a conversation's live saved artifacts, oldest first (V49's record_owner_conversation). */
     private static final String ARTIFACTS_OF_CONVERSATION = "select r from Record r"
             + " where r.conversationId = :conversation and r.campaignId is not null" + LIVE
@@ -392,14 +413,25 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public List<ArtifactRow> artifacts(UUID campaignId, String type, UUID before, int offset, int limit) {
+    public List<ArtifactRow> artifacts(UUID campaignId, Collection<UUID> shared, String type, UUID before, int offset,
+                                       int limit) {
+        boolean withShared = !shared.isEmpty();
         String query;
         if (type == null) {
-            query = before == null ? ARTIFACTS : ARTIFACTS_BEFORE;
+            if (before == null) {
+                query = withShared ? ARTIFACTS_SHARED : ARTIFACTS;
+            } else {
+                query = withShared ? ARTIFACTS_SHARED_BEFORE : ARTIFACTS_BEFORE;
+            }
+        } else if (before == null) {
+            query = withShared ? ARTIFACTS_SHARED_OF_TYPE : ARTIFACTS_OF_TYPE;
         } else {
-            query = before == null ? ARTIFACTS_OF_TYPE : ARTIFACTS_OF_TYPE_BEFORE;
+            query = withShared ? ARTIFACTS_SHARED_OF_TYPE_BEFORE : ARTIFACTS_OF_TYPE_BEFORE;
         }
         TypedQuery<RecordEntity> read = em().createQuery(query, RecordEntity.class).setParameter("campaign", campaignId);
+        if (withShared) {
+            read.setParameter("shared", List.copyOf(shared));
+        }
         if (type != null) {
             read.setParameter("type", type);
         }
@@ -418,12 +450,22 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public long artifactCount(UUID campaignId, String type) {
+    public long artifactCount(UUID campaignId, Collection<UUID> shared, String type) {
+        boolean withShared = !shared.isEmpty();
+        String query;
         if (type == null) {
-            return em().createQuery(ARTIFACT_COUNT, Long.class).setParameter("campaign", campaignId).getSingleResult();
+            query = withShared ? ARTIFACT_COUNT_SHARED : ARTIFACT_COUNT;
+        } else {
+            query = withShared ? ARTIFACT_COUNT_SHARED_OF_TYPE : ARTIFACT_COUNT_OF_TYPE;
         }
-        return em().createQuery(ARTIFACT_COUNT_OF_TYPE, Long.class).setParameter("campaign", campaignId)
-                .setParameter("type", type).getSingleResult();
+        TypedQuery<Long> read = em().createQuery(query, Long.class).setParameter("campaign", campaignId);
+        if (withShared) {
+            read.setParameter("shared", List.copyOf(shared));
+        }
+        if (type != null) {
+            read.setParameter("type", type);
+        }
+        return read.getSingleResult();
     }
 
     @Override
@@ -444,10 +486,14 @@ class JpaRecordStore implements RecordStore {
     }
 
     @Override
-    public Map<String, Long> artifactTypes(UUID campaignId) {
+    public Map<String, Long> artifactTypes(UUID campaignId, Collection<UUID> shared) {
         Map<String, Long> counts = new LinkedHashMap<>();
-        em().createQuery(ARTIFACT_TYPES, Object[].class).setParameter("campaign", campaignId).getResultList()
-                .forEach(row -> counts.put((String) row[0], (Long) row[1]));
+        TypedQuery<Object[]> read = em().createQuery(shared.isEmpty() ? ARTIFACT_TYPES : ARTIFACT_TYPES_SHARED,
+                Object[].class).setParameter("campaign", campaignId);
+        if (!shared.isEmpty()) {
+            read.setParameter("shared", List.copyOf(shared));
+        }
+        read.getResultList().forEach(row -> counts.put((String) row[0], (Long) row[1]));
         return counts;
     }
 

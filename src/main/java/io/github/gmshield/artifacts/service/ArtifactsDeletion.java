@@ -2,6 +2,7 @@ package io.github.gmshield.artifacts.service;
 
 import io.github.gmshield.artifacts.data.ArtifactIndexStore;
 import io.github.gmshield.artifacts.data.ArtifactReferenceStore;
+import io.github.gmshield.artifacts.data.ArtifactShareStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.jobs.service.Jobs;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
@@ -39,6 +40,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p>Story 5.4 part A: the removal deletes a saved draft's copied references ({@code artifact_reference}) with its
  * versions, before its identity.
+ *
+ * <p>Story 5.6 part A: the removal deletes the shares of the artifacts going ({@code artifact_share}) before their
+ * identities, and, for a campaign's or a system's deletion, the shares into the campaigns going, whoever's artifact
+ * they share, before {@code library} removes the campaign rows (the share's key on (owner, campaign) needs them). From
+ * the mark on, an artifact shared into a campaign that is deleting, or whose own campaign is, is no source and no read
+ * there ({@link ArtifactSources}).
  */
 @Service
 class ArtifactsDeletion implements SystemDeletionHandler {
@@ -50,6 +57,7 @@ class ArtifactsDeletion implements SystemDeletionHandler {
     private final ArtifactRecords records;
     private final ArtifactVersionStore versions;
     private final ArtifactReferenceStore references;
+    private final ArtifactShareStore shares;
     private final ArtifactIndexStore index;
     private final ArtifactIndexing indexing;
     private final ArtifactIndexRemovals removals;
@@ -57,11 +65,13 @@ class ArtifactsDeletion implements SystemDeletionHandler {
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
     ArtifactsDeletion(ArtifactRecords records, ArtifactVersionStore versions, ArtifactReferenceStore references,
-                      ArtifactIndexStore index, ArtifactIndexing indexing, ArtifactIndexRemovals removals, Jobs jobs,
+                      ArtifactShareStore shares, ArtifactIndexStore index, ArtifactIndexing indexing,
+                      ArtifactIndexRemovals removals, Jobs jobs,
                       ObjectProvider<PlatformTransactionManager> transactions) {
         this.records = records;
         this.versions = versions;
         this.references = references;
+        this.shares = shares;
         this.index = index;
         this.indexing = indexing;
         this.removals = removals;
@@ -106,17 +116,21 @@ class ArtifactsDeletion implements SystemDeletionHandler {
         if (!going.ofOneArtifact() && (going.ofOneItem() || going.campaignIds().isEmpty())) {
             return;
         }
+        int[] unshared = {0};
         Integer removed = new TransactionTemplate(transactions.getObject()).execute(status -> {
             List<UUID> ids = going(going);
             // Story 5.1 part B: one removal of each artifact's points, then its index rows before its versions.
             ids.forEach(removals::start);
             index.deleteOf(ids);
             references.deleteOf(ids);
+            // Story 5.6 part A: the shares of the artifacts going, and the shares into the campaigns going.
+            unshared[0] = shares.deleteOf(ids)
+                    + (going.ofOneArtifact() ? 0 : shares.deleteInto(going.campaignIds()));
             versions.deleteOf(ids);
             return records.delete(ids);
         });
         going.about(log.atInfo().addKeyValue("ownerId", owner)).addKeyValue("artifacts", removed)
-                .log("artifacts.deletion_removed");
+                .addKeyValue("shares", unshared[0]).log("artifacts.deletion_removed");
     }
 
     /**

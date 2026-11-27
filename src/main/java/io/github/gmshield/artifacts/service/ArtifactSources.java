@@ -1,8 +1,11 @@
 package io.github.gmshield.artifacts.service;
 
+import io.github.gmshield.artifacts.data.ArtifactShareRow;
+import io.github.gmshield.artifacts.data.ArtifactShareStore;
 import io.github.gmshield.artifacts.data.ArtifactVersionRow;
 import io.github.gmshield.artifacts.data.ArtifactVersionStore;
 import io.github.gmshield.knowledge.service.ArtifactRecords;
+import io.github.gmshield.library.service.Library;
 import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.CampaignArtifacts;
 import io.github.gmshield.scope.service.ScopedRecordContent;
@@ -30,20 +33,29 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Story 5.2 part B a deleting artifact is left out of every answer, as one that is gone ({@link ArtifactRecords} reads
  * live artifacts only), and {@link #deleted} names the artifacts whose deletion is recorded
  * ({@link SystemDeletion#artifactDeletionsRecorded}), deleting or gone.
+ *
+ * <p>Story 5.6 part A: {@link #shared} and {@link #readShared} answer the artifacts shared into a campaign
+ * ({@code artifact_share}): a share applies while its artifact is live and its artifact's campaign is readable
+ * ({@link Library#places}: archived or not, never one being deleted), worked out when it is read.
  */
 @Service
 class ArtifactSources implements CampaignArtifacts {
 
     private final ArtifactRecords records;
     private final ArtifactVersionStore versions;
+    private final ArtifactShareStore shares;
+    private final Library library;
     private final Vault vault;
     private final ObjectProvider<SystemDeletion> deletions;
     private final ObjectProvider<PlatformTransactionManager> transactions;
 
-    ArtifactSources(ArtifactRecords records, ArtifactVersionStore versions, Vault vault,
-                    ObjectProvider<SystemDeletion> deletions, ObjectProvider<PlatformTransactionManager> transactions) {
+    ArtifactSources(ArtifactRecords records, ArtifactVersionStore versions, ArtifactShareStore shares, Library library,
+                    Vault vault, ObjectProvider<SystemDeletion> deletions,
+                    ObjectProvider<PlatformTransactionManager> transactions) {
         this.records = records;
         this.versions = versions;
+        this.shares = shares;
+        this.library = library;
         this.vault = vault;
         this.deletions = deletions;
         this.transactions = transactions;
@@ -77,24 +89,75 @@ class ArtifactSources implements CampaignArtifacts {
         if (campaignId == null || ids.isEmpty()) {
             return List.of();
         }
-        return reading(() -> {
-            List<ArtifactRecords.Identity> found = records.findAll(ids).stream()
-                    .filter(identity -> campaignId.equals(identity.campaignId())).toList();
-            Map<UUID, ArtifactVersionRow> latest = versions.latest(found.stream().map(ArtifactRecords.Identity::id)
-                    .toList());
-            List<Artifact> read = new ArrayList<>(found.size());
-            for (ArtifactRecords.Identity identity : found) {
-                ArtifactVersionRow version = latest.get(identity.id());
-                if (version == null) {
-                    continue;
-                }
-                Artifacts.Artifact artifact = Artifacts.open(vault, identity, version, owner);
-                read.add(new Artifact(artifact.id(), artifact.recordType(), artifact.name(), artifact.fields().stream()
-                        .map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList(),
-                        artifact.content(), artifact.version()));
+        return reading(() -> opened(records.findAll(ids).stream()
+                .filter(identity -> campaignId.equals(identity.campaignId())).toList(), owner));
+    }
+
+    @Override
+    public Set<UUID> shared(UUID campaignId) {
+        OwnerContext.require();
+        return campaignId == null ? Set.of() : reading(() -> sharedInto(campaignId, null).stream()
+                .map(ArtifactRecords.Identity::id).collect(Collectors.toUnmodifiableSet()));
+    }
+
+    @Override
+    public List<Artifact> readShared(UUID campaignId, Collection<UUID> ids) {
+        UUID owner = OwnerContext.require();
+        if (campaignId == null || ids.isEmpty()) {
+            return List.of();
+        }
+        return reading(() -> opened(sharedInto(campaignId, Set.copyOf(ids)), owner));
+    }
+
+    /**
+     * The owner's live artifacts shared into the campaign {@code campaignId}, among {@code among} when it is not null:
+     * each of another campaign that is still readable. Runs in the caller's transaction.
+     */
+    List<ArtifactRecords.Identity> sharedInto(UUID campaignId, Set<UUID> among) {
+        return origins(campaignId, among).stream().map(Origin::identity).toList();
+    }
+
+    /**
+     * {@link #sharedInto}, each with its own readable campaign (Story 5.6 part B: a list in the campaign it is shared
+     * into names it), in the order of the shares. Runs in the caller's transaction.
+     */
+    List<Origin> origins(UUID campaignId, Set<UUID> among) {
+        List<UUID> ids = shares.into(campaignId).stream().map(ArtifactShareRow::artifactId)
+                .filter(id -> among == null || among.contains(id)).distinct().toList();
+        if (ids.isEmpty()) {
+            return List.of();
+        }
+        List<ArtifactRecords.Identity> found = records.findAll(ids).stream()
+                .filter(identity -> !campaignId.equals(identity.campaignId())).toList();
+        if (found.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, Library.Campaign> readable = library.places(found.stream().map(ArtifactRecords.Identity::campaignId)
+                .collect(Collectors.toSet()), List.of()).campaigns();
+        return found.stream().filter(identity -> readable.containsKey(identity.campaignId()))
+                .map(identity -> new Origin(identity, readable.get(identity.campaignId()))).toList();
+    }
+
+    /** A live artifact shared into a campaign and its own campaign, readable (Story 5.6 part B). */
+    record Origin(ArtifactRecords.Identity identity, Library.Campaign from) {
+    }
+
+    /** These artifacts, each with its newest version, decrypted; one with no version is left out. */
+    private List<Artifact> opened(List<ArtifactRecords.Identity> found, UUID owner) {
+        Map<UUID, ArtifactVersionRow> latest = versions.latest(found.stream().map(ArtifactRecords.Identity::id)
+                .toList());
+        List<Artifact> read = new ArrayList<>(found.size());
+        for (ArtifactRecords.Identity identity : found) {
+            ArtifactVersionRow version = latest.get(identity.id());
+            if (version == null) {
+                continue;
             }
-            return List.copyOf(read);
-        });
+            Artifacts.Artifact artifact = Artifacts.open(vault, identity, version, owner);
+            read.add(new Artifact(artifact.id(), artifact.recordType(), artifact.name(), artifact.fields().stream()
+                    .map(field -> new ScopedRecordContent.Field(field.name(), field.value())).toList(),
+                    artifact.content(), artifact.version()));
+        }
+        return List.copyOf(read);
     }
 
     private <T> T reading(Supplier<T> read) {
