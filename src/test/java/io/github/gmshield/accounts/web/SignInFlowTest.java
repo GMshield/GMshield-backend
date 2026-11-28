@@ -225,10 +225,13 @@ class SignInFlowTest {
         assertThat(grant.path("expiresInSeconds").asLong()).isEqualTo(604800);
         assertThat(grant.path("renewAfterSeconds").asLong()).isEqualTo(900);
         assertThat(attempts.values).isEmpty();
-        assertThat(me(session).path("username").asString()).isEqualTo(username);
+        JsonNode me = me(session);
+        assertThat(me.path("username").asString()).isEqualTo(username);
         secrets.addAll(List.of(sub, "nova@example.test", username, session));
 
         AccountRow row = onlyAccountOf(sub);
+        // The account's id, which the browser keys its pending rolls with (Story 6.4 part B).
+        assertThat(me.path("id").asString()).isEqualTo(row.id().toString());
         assertThat(row.tier()).isEqualTo("ordinary");
         assertThat(row.state()).isEqualTo("active");
         assertThat(row.confirmed()).isTrue();
@@ -260,6 +263,7 @@ class SignInFlowTest {
         String second = again.path("session").path("sessionToken").asString();
         assertThat(second).isNotEqualTo(session);
         assertThat(me(second).path("username").asString()).isEqualTo(username);
+        assertThat(me(second).path("id").asString()).isEqualTo(row.id().toString());
         assertThat(accounts.rows.values().stream().filter(r -> r.id().equals(row.id()))).hasSize(1);
         secrets.add(second);
     }

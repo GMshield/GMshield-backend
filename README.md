@@ -129,7 +129,8 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - `GET /api/v1/me`, `POST /api/v1/session/renewal` and `DELETE /api/v1/session` read the session
     token from `X-Session-Token` (never a cookie). No session, an ended one or an account that is not
     active: `session.required` (401). Sign-out deletes the session and its entry in the account's set;
-    it answers 204 whether or not the session existed.
+    it answers 204 whether or not the session existed. `GET /api/v1/me` answers `Me{id, username}`: the
+    browser keys this account's pending rolls with the id (Story 6.4 part B, contract 1.60.0).
   - The table `account` (`V2__account.sql`) stores only the username, the email address and the
     Google id, each encrypted with `Binding("account", field, id, id)` and fingerprinted, plus tier
     (`ordinary`), state (`active`), `confirmed`, `terms_version`, `terms_accepted_at`,
@@ -2147,6 +2148,10 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     yet (Epic 8).
   - Log lines (ids and counts only): `library.roll_kept` (`created`), `library.rolls_cleared` (`count`). Deploy order:
     backend, then frontend (the 1.58.0 frontend stores no roll). Internal contract and worker unchanged.
+  - **Part B (public contract 1.60.0).** `GET /api/v1/me` adds the account's `id` (required), which the browser
+    keys its pending rolls with (`gmshield:rolls:{accountId}:{shieldId}` in its storage, AD-31). Nothing else changes
+    here: the roll routes, the migrations, the internal contract and the worker stay as they are. Deploy order:
+    backend, then frontend (the 1.59.0 frontend ignores the extra field).
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
