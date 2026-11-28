@@ -2170,6 +2170,29 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     1.28.0 ignores the unknown key.
   - Log lines: `library.campaign_party_changed` (`version`, and whether each value is set), and
     `conversation.turn_recorded` adds `partySize`/`partyLevel` (booleans). Deploy order: worker, backend, frontend.
+- **The item encyclopedia (`knowledge`, `artifacts`, Story 7.2, public contract 1.62.0).** `GET
+  /api/v1/campaigns/{campaignId}/items?q=&offset=&limit=` answers `{items, total}`: one list, sorted by name with the
+  root `Collator` at secondary strength (ties by id), a page at a time (limit 1 to 50, default 20; offset 0 to
+  100,000), of every `item` entry of the campaign's resolved scope (`Scopes.resolveSources` with its stored settings),
+  as answers see it. Each entry is `{kind: record|artifact, id, name, recordType, tier, materialName, page, sharedFrom,
+  overrides}`.
+  - Records: the live extracted records of core type `item` of every allowed source (a switched-off tier or material
+    lists none), with their tier, material name and first page. Artifacts: the campaign's live `item` artifacts while
+    its campaign tier is on (`ResolvedScope.artifacts`) and the live `item` artifacts shared into it while its system
+    tier is on (`ResolvedScope.shared`, each with `sharedFrom` naming its own campaign); an artifact has a null tier,
+    material and page. Model knowledge is never an entry.
+  - A system-tier record that a listed `item` artifact of the campaign overrides is not listed by itself: that
+    artifact's entry carries `overrides {recordId, name}`, and `q` matches that entry on the record's name too. A mark from an artifact of another type (a note), or one
+    the campaign tier off leaves without effect, hides nothing.
+  - `q` keeps the entries whose decrypted name contains it, case and accents folded (`RecordRelations.fold`), in
+    memory: nothing readable reaches SQL (AD-19). A `q` over 200 code points, a bad `limit` or `offset` is
+    `request.invalid` (400); another owner's, an unknown, a malformed or a deleting campaign `request.not_found`. The
+    route is a row of the cross-owner audit and of the deleted campaign's routes.
+  - Home: `ArtifactController` (route) over `Artifacts.items` (the `sharedFrom` names, from `ArtifactSources`) over
+    `RecordRelations.items` (the list), not `conversations` as the spine names it, since `conversations` may depend on
+    neither `knowledge` nor `artifacts`. Log line `knowledge.items_listed` (ids and counts: `filtered`, `offset`,
+    `limit`, `found`, `ownArtifacts`, `sharedArtifacts`, `overridden`, `shown`, `total`). No migration, no internal
+    contract or worker change. Deploy order: backend, then frontend.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each

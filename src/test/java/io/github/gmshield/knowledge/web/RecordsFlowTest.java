@@ -58,6 +58,7 @@ import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -3563,6 +3564,197 @@ class RecordsFlowTest {
         deletion.sweep();
         assertThat(shareStore.rows.values()).noneMatch(row -> row.artifactId().toString().equals(kael));
         assertThat(references(gm, cited).get(0).path("removed").asBoolean()).isTrue();
+    }
+
+    // --- Story 7.2: the item encyclopedia
+
+    private static Map<String, Object> item(String name) {
+        return Map.of("recordType", "item", "name", name, "fields", List.of());
+    }
+
+    private static List<String> values(JsonNode page, String field) {
+        List<String> found = new ArrayList<>();
+        page.path("items").forEach(item -> found.add(item.path(field).asString()));
+        return found;
+    }
+
+    @Test
+    void theItemEncyclopediaListsTheScopesItemRecordsAndTheCampaignsItemArtifactsInOneAlphabeticalList()
+            throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("item", "Corda", 3, List.of(new Field("Peso", "5"))), record("item", "Adaga", 2,
+                        List.of()), record("spell", "Bola de Fogo", 1, List.of())));
+        String dagger = recordOf(book.versionId(), "Adaga");
+        String rope = recordOf(book.versionId(), "Corda");
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/items";
+        assertThat(ok(get(path, gm.session())).path("items")).extracting(item -> item.path("name").asString())
+                .containsExactly("Adaga", "Corda");
+        // Matrix rows "Mixed list" and "Saved item": the GM's item is listed on the next open, a note never.
+        String compass = artifact(gm, gm.campaign(), item("Bússola"));
+        artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Bainha da adaga", "fields", List.of()));
+
+        JsonNode listed = ok(get(path, gm.session()));
+        assertThat(values(listed, "name")).containsExactly("Adaga", "Bússola", "Corda");
+        assertThat(values(listed, "id")).containsExactly(dagger, compass, rope);
+        assertThat(listed.path("total").asLong()).isEqualTo(3);
+        JsonNode first = listed.path("items").get(0);
+        assertThat(first.propertyNames()).containsExactlyInAnyOrder("kind", "id", "name", "recordType", "tier",
+                "materialName", "page", "sharedFrom", "overrides");
+        assertThat(first.path("kind").asString()).isEqualTo("record");
+        assertThat(first.path("recordType").asString()).isEqualTo("item");
+        assertThat(first.path("tier").asString()).isEqualTo("system");
+        assertThat(first.path("materialName").asString()).isEqualTo("Livro.pdf");
+        assertThat(first.path("page").asInt()).isEqualTo(2);
+        assertThat(first.path("sharedFrom").isNull()).isTrue();
+        assertThat(first.path("overrides").isNull()).isTrue();
+        assertThat(listed.path("items").get(2).path("page").asInt()).isEqualTo(3);
+        JsonNode custom = listed.path("items").get(1);
+        assertThat(custom.path("kind").asString()).isEqualTo("artifact");
+        assertThat(custom.path("recordType").asString()).isEqualTo("item");
+        assertThat(custom.path("tier").isNull()).isTrue();
+        assertThat(custom.path("materialName").isNull()).isTrue();
+        assertThat(custom.path("page").isNull()).isTrue();
+        assertThat(custom.path("sharedFrom").isNull()).isTrue();
+        assertThat(custom.path("overrides").isNull()).isTrue();
+
+        // The name filter folds case and accents, and pages with the total of the matches.
+        assertThat(values(ok(get(path + "?q=BUSSO", gm.session())), "id")).containsExactly(compass);
+        assertThat(values(ok(get(path + "?q=%20a%20", gm.session())), "id")).containsExactly(dagger, compass, rope);
+        JsonNode second = ok(get(path + "?limit=1&offset=1", gm.session()));
+        assertThat(values(second, "id")).containsExactly(compass);
+        assertThat(second.path("total").asLong()).isEqualTo(3);
+        assertThat(ok(get(path + "?q=nada", gm.session())).path("total").asLong()).isZero();
+        assertThat(ok(get(path + "?offset=9", gm.session())).path("items")).isEmpty();
+
+        // Matrix row "Material off": its items leave; the GM's own stays.
+        scope(gm, false, List.of(UUID.fromString(book.materialId())));
+        assertThat(values(ok(get(path, gm.session())), "id")).containsExactly(compass);
+        // The campaign tier off: the GM's own items leave too.
+        scope(gm, false, List.of());
+        scopeOf(gm, gm.campaign(), false, true);
+        assertThat(values(ok(get(path, gm.session())), "id")).containsExactly(dagger, rope);
+        assertThat(logged.list).anyMatch(event -> event.getFormattedMessage().equals("knowledge.items_listed")
+                && hasPair(event, "found", true) && hasPair(event, "total", 2L) && hasPair(event, "ownArtifacts", 0));
+        assertNoLineNames("Adaga", "Corda", "Bússola", "Bainha");
+    }
+
+    @Test
+    void anOverridingItemReplacesItsRecordASharedOneNamesItsCampaignAndTheOtherTierShowsAsOther() throws Exception {
+        Gm gm = signUp();
+        Ingested book = accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()),
+                List.of(record("item", "Adaga", 2, List.of()), record("item", "Corda", 3, List.of())));
+        UUID otherSystem = createSystem(gm, "Outro sistema");
+        Ingested foreign = accepted(gm, metadata("Outro.pdf", "system", otherSystem.toString()),
+                List.of(record("item", "Machado", 3, List.of())));
+        Ingested adventure = accepted(gm, metadata("Aventura.pdf", "campaign", gm.campaign().toString()),
+                List.of(record("item", "Coroa", 2, List.of())));
+        String dagger = recordOf(book.versionId(), "Adaga");
+        String rope = recordOf(book.versionId(), "Corda");
+        String axe = recordOf(foreign.versionId(), "Machado");
+        String crown = recordOf(adventure.versionId(), "Coroa");
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/items";
+
+        // Matrix row "Overridden": the GM's item takes the record's place and names it.
+        String house = artifact(gm, gm.campaign(), item("Punhal da casa"));
+        ok(send("PUT", artifactPath(gm, house) + "/override", gm.session(), Map.of("recordId", dagger)));
+        JsonNode listed = ok(get(path, gm.session()));
+        assertThat(values(listed, "id")).containsExactly(rope, crown, house);
+        assertThat(listed.path("items").get(0).path("tier").asString()).isEqualTo("system");
+        assertThat(listed.path("items").get(1).path("tier").asString()).isEqualTo("campaign");
+        assertThat(listed.path("items").get(1).path("materialName").asString()).isEqualTo("Aventura.pdf");
+        JsonNode replacing = listed.path("items").get(2);
+        assertThat(replacing.path("tier").isNull()).isTrue();
+        assertThat(replacing.path("overrides").propertyNames()).containsExactlyInAnyOrder("recordId", "name");
+        assertThat(replacing.path("overrides").path("recordId").asString()).isEqualTo(dagger);
+        assertThat(replacing.path("overrides").path("name").asString()).isEqualTo("Adaga");
+        // The record is no entry of its own; its name finds the item in its place, and it still opens in the campaign.
+        assertThat(values(ok(get(path + "?q=adaga", gm.session())), "id")).containsExactly(house);
+        ok(get("/api/v1/campaigns/" + gm.campaign() + "/records/" + dagger, gm.session()));
+        // A note marked as overriding an item record leaves it listed: the note is no entry to replace it.
+        String note = artifact(gm, gm.campaign(), Map.of("recordType", "note", "name", "Corda velha", "fields",
+                List.of()));
+        ok(send("PUT", artifactPath(gm, note) + "/override", gm.session(), Map.of("recordId", rope)));
+        assertThat(values(ok(get(path, gm.session())), "id")).containsExactly(rope, crown, house);
+
+        // Matrix row "Other tier on": another system's book, its items with the tier other.
+        scope(gm, true, List.of());
+        JsonNode other = ok(get(path + "?q=machado", gm.session()));
+        assertThat(values(other, "id")).containsExactly(axe);
+        assertThat(values(other, "tier")).containsExactly("other");
+        assertThat(other.path("items").get(0).path("materialName").asString()).isEqualTo("Outro.pdf");
+
+        // Matrix row "Shared in": an item of another campaign shared into this one names that campaign; with the
+        // system tier off it leaves, as answers see it.
+        UUID elsewhere = campaignOf(gm, "Outra mesa");
+        String lantern = artifact(gm, elsewhere, item("Lanterna"));
+        ok(send("PUT", "/api/v1/campaigns/" + elsewhere + "/artifacts/" + lantern + "/sharing", gm.session(),
+                Map.of("campaignIds", List.of(gm.campaign().toString()))));
+        JsonNode shared = ok(get(path + "?q=lanterna", gm.session())).path("items").get(0);
+        assertThat(shared.path("id").asString()).isEqualTo(lantern);
+        assertThat(shared.path("kind").asString()).isEqualTo("artifact");
+        assertThat(shared.path("sharedFrom").path("campaignId").asString()).isEqualTo(elsewhere.toString());
+        assertThat(shared.path("sharedFrom").path("name").asString()).isEqualTo("Outra mesa");
+        assertThat(shared.path("overrides").isNull()).isTrue();
+        // In its own campaign it is an own item, and the override of this campaign does not reach there.
+        JsonNode own = ok(get("/api/v1/campaigns/" + elsewhere + "/items", gm.session()));
+        assertThat(values(own, "id")).containsExactly(dagger, rope, lantern);
+        assertThat(own.path("items").get(2).path("sharedFrom").isNull()).isTrue();
+        scopeOf(gm, gm.campaign(), true, false);
+        JsonNode systemOff = ok(get(path, gm.session()));
+        assertThat(values(systemOff, "id")).containsExactly(crown, house);
+        // Its record out of the system tier, the mark has no effect: the entry names nothing.
+        assertThat(systemOff.path("items").get(1).path("overrides").isNull()).isTrue();
+        // The campaign tier off: the override has no effect, as in answers, and the record is listed again.
+        scopeOf(gm, gm.campaign(), false, true);
+        assertThat(values(ok(get(path, gm.session())), "id")).containsExactly(dagger, rope, lantern);
+        assertNoLineNames("Adaga", "Punhal", "Lanterna", "Outra mesa", "Machado");
+    }
+
+    @Test
+    void theItemEncyclopediaPagesItsEntriesAndRefusesAnotherOwnersCampaignAndBadInput() throws Exception {
+        Gm gm = signUp();
+        Gm them = signUp();
+        List<Extracted> sixty = new ArrayList<>();
+        for (int i = 1; i <= 58; i++) {
+            sixty.add(record("item", String.format(Locale.ROOT, "Item %02d", i), 1, List.of()));
+        }
+        accepted(gm, metadata("Livro.pdf", "system", gm.system().toString()), sixty);
+        artifact(gm, gm.campaign(), item("Item 59"));
+        artifact(gm, gm.campaign(), item("Item 60"));
+        String path = "/api/v1/campaigns/" + gm.campaign() + "/items";
+
+        // Matrix row "Paging": 60 entries, 20 a page by default, the last page at offset 40.
+        JsonNode firstPage = ok(get(path, gm.session()));
+        assertThat(firstPage.path("items")).hasSize(20);
+        assertThat(firstPage.path("total").asLong()).isEqualTo(60);
+        JsonNode last = ok(get(path + "?limit=20&offset=40", gm.session()));
+        List<String> expected = new ArrayList<>();
+        for (int i = 41; i <= 60; i++) {
+            expected.add(String.format(Locale.ROOT, "Item %02d", i));
+        }
+        assertThat(values(last, "name")).isEqualTo(expected);
+        assertThat(values(last, "kind").subList(18, 20)).containsExactly("artifact", "artifact");
+        assertThat(last.path("total").asLong()).isEqualTo(60);
+
+        // Matrix row "Cross-owner": another owner's, an unknown and a malformed campaign are one not found.
+        Map<String, Object> unknown = withoutTraceId(assertProblem(get("/api/v1/campaigns/" + UUID.randomUUID()
+                + "/items", gm.session()), 404, "request.not_found"));
+        for (String refused : List.of(path, "/api/v1/campaigns/not-an-id/items")) {
+            HttpResponse<String> answer = get(refused, them.session());
+            assertThat(withoutTraceId(assertProblem(answer, 404, "request.not_found"))).isEqualTo(unknown);
+            assertThat(answer.body()).doesNotContain("Item");
+        }
+        assertThat(get(path, null).statusCode()).isEqualTo(401);
+
+        // Matrix row "Bad query": a q over 200 code points, a limit or an offset out of range.
+        String wide = new String(Character.toChars(0x1D538));
+        String fits = URLEncoder.encode(wide.repeat(200), StandardCharsets.UTF_8);
+        String over = URLEncoder.encode(wide.repeat(201), StandardCharsets.UTF_8);
+        assertThat(ok(get(path + "?q=" + fits, gm.session())).path("total").asLong()).isZero();
+        for (String query : List.of("q=" + over, "limit=0", "limit=51", "limit=x", "offset=-1", "offset=100001")) {
+            assertProblem(get(path + "?" + query, gm.session()), 400, "request.invalid");
+        }
     }
 
     /** The GM's sharing of the artifact with exactly these campaigns (Story 5.6 part A). */

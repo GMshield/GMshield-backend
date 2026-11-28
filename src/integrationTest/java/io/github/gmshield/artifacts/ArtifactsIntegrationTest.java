@@ -35,6 +35,7 @@ import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.scope.service.CampaignArtifacts;
 import io.github.gmshield.scope.service.ScopeSettings;
 import io.github.gmshield.scope.service.Scopes;
+import io.github.gmshield.scope.service.Tier;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.MaterialSystemRow;
@@ -130,6 +131,9 @@ import tools.jackson.databind.json.JsonMapper;
  * one, and the check a held row of another type or without a campaign, so a retype is refused by the service and by the
  * table; the note is a source of the campaign tier on PostgreSQL; and a campaign's deletion removes its notes before its
  * Shields, which the key would otherwise refuse.
+ *
+ * <p>Story 7.2: the item encyclopedia on PostgreSQL's rows: item records and artifacts, own and shared in, in one list
+ * sorted by the collator, an overriding item in its record's place, and nothing for another owner.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application never reads a library table with
  * native SQL. The properties are {@code SystemDeletionIntegrationTest}'s, so the classes share one application context.
@@ -1217,6 +1221,57 @@ class ArtifactsIntegrationTest {
         freeTheIngestionLane();
     }
 
+    // --- Story 7.2
+
+    @Test
+    void theItemEncyclopediaSortsItemRecordsAndArtifactsTogetherAndAnOverridingItemTakesItsRecordsPlaceOnPostgres()
+            throws Exception {
+        freeTheIngestionLane();
+        Owner a = owner();
+        Owner b = owner();
+        SystemRecord dagger = systemRecord(a, "Adaga", "item");
+        SystemRecord rope = systemRecord(a, "Corda", "item");
+        systemRecord(a, "Bola de Fogo");
+        UUID compass = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("item", "Bússola",
+                List.of(), null))).orElseThrow().id();
+        UUID quinta = as(a.id(), () -> library.createCampaign(a.system(), "Mesa de quinta")).orElseThrow().id();
+        UUID lantern = as(a.id(), () -> artifacts.create(quinta, new Artifacts.Written("item", "lanterna", List.of(),
+                null))).orElseThrow().id();
+        as(a.id(), () -> artifacts.share(quinta, lantern, List.of(a.campaign()))).orElseThrow();
+
+        // One list on PostgreSQL's rows, the case folded by the collator: records, own and shared artifacts.
+        Artifacts.ItemEntryPage page = as(a.id(), () -> artifacts.items(a.campaign(), null, 0, 20)).orElseThrow();
+        assertThat(page.items()).extracting(entry -> entry.item().id())
+                .containsExactly(dagger.id(), compass, rope.id(), lantern);
+        assertThat(page.total()).isEqualTo(4);
+        RecordRelations.Item first = page.items().getFirst().item();
+        assertThat(first.artifact()).isFalse();
+        assertThat(first.tier()).isEqualTo(Tier.SYSTEM);
+        assertThat(first.materialName()).isEqualTo("Livro");
+        assertThat(first.page()).isEqualTo(1);
+        assertThat(page.items().get(1).item().artifact()).isTrue();
+        assertThat(page.items().get(1).sharedFrom()).isNull();
+        assertThat(page.items().get(3).sharedFrom().campaignId()).isEqualTo(quinta);
+        assertThat(page.items().get(3).sharedFrom().name()).isEqualTo("Mesa de quinta");
+
+        // An overriding item takes its record's place, naming it; the record's name finds the item, never the record.
+        UUID house = as(a.id(), () -> artifacts.create(a.campaign(), new Artifacts.Written("item", "Punhal",
+                List.of(), null))).orElseThrow().id();
+        as(a.id(), () -> artifacts.override(a.campaign(), house, dagger.id())).orElseThrow();
+        Artifacts.ItemEntryPage replaced = as(a.id(), () -> artifacts.items(a.campaign(), null, 0, 20))
+                .orElseThrow();
+        assertThat(replaced.items()).extracting(entry -> entry.item().id())
+                .containsExactly(compass, rope.id(), lantern, house);
+        assertThat(replaced.items().getLast().item().overridesId()).isEqualTo(dagger.id());
+        assertThat(replaced.items().getLast().item().overridesName()).isEqualTo("Adaga");
+        assertThat(as(a.id(), () -> artifacts.items(a.campaign(), "ADAGA", 0, 20)).orElseThrow().items())
+                .extracting(entry -> entry.item().id()).containsExactly(house);
+        assertThat(as(a.id(), () -> artifacts.items(a.campaign(), "punh", 1, 20)).orElseThrow().total()).isOne();
+        // Another owner reads nothing of it.
+        assertThat(as(b.id(), () -> artifacts.items(a.campaign(), null, 0, 20))).isEmpty();
+        freeTheIngestionLane();
+    }
+
     // --- Story 5.6 part B
 
     @Test
@@ -1537,6 +1592,11 @@ class ArtifactsIntegrationTest {
 
     /** A ready material of the owner's system with one spell record named {@code name}, stored directly. */
     private SystemRecord systemRecord(Owner owner, String name) throws Exception {
+        return systemRecord(owner, name, "spell");
+    }
+
+    /** A ready material of the owner's system with one record of the type {@code type}, stored directly. */
+    private SystemRecord systemRecord(Owner owner, String name, String type) throws Exception {
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
         UUID material = Ids.newId();
         UUID version = Ids.newId();
@@ -1551,7 +1611,7 @@ class ArtifactsIntegrationTest {
             materials.insertPassages(List.of(new PassageRow(passage, owner.id(), version, 0, 1,
                     vault.encryptText(new Binding("passage", "text", passage, owner.id()), name + "."),
                     vault.encrypt(new Binding("passage", "place", passage, owner.id()), place), now)));
-            return extracted.replaceRange(version, 1, 1, List.of(new ExtractedRecords.Extracted("spell", name,
+            return extracted.replaceRange(version, 1, 1, List.of(new ExtractedRecords.Extracted(type, name,
                     List.of(), List.of(passage), 1)));
         }));
         return new SystemRecord(jdbc.sql("select id from record where version_id = ?").param(version)
