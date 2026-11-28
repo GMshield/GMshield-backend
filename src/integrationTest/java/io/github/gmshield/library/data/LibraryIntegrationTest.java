@@ -8,6 +8,7 @@ import io.github.gmshield.conversations.data.ConversationRow;
 import io.github.gmshield.conversations.data.ConversationStore;
 import io.github.gmshield.library.service.CampaignFingerprints;
 import io.github.gmshield.library.service.Library;
+import io.github.gmshield.library.service.SystemDeletion;
 import io.github.gmshield.materials.data.MaterialRow;
 import io.github.gmshield.materials.data.MaterialStore;
 import io.github.gmshield.materials.data.MaterialSystemRow;
@@ -15,6 +16,7 @@ import io.github.gmshield.materials.data.VersionRow;
 import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
+import io.github.gmshield.vault.service.IntegrityException;
 import io.github.gmshield.vault.service.Vault;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
@@ -27,10 +29,13 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -62,7 +67,9 @@ import tools.jackson.databind.json.JsonMapper;
  * Story 6.1: Shields stored unnamed with each campaign, a named one only as ciphertext bound to its row, the store's
  * conflicts on PostgreSQL's keys and version, and one first Shield for a campaign without one, whatever the lists at once.
  * Part B: a Shield's deletion and the refusal of the last one, and two deletions at once, which the campaign's row lock
- * makes leave one Shield.
+ * makes leave one Shield. Story 6.4: a roll stored only as ciphertext, once per key whatever the repeats at once (the
+ * store's insert writes nothing for a key a concurrent insert committed), the log's order and pages, another owner's
+ * rolls not found, and the Shield's and the campaign's deletions removing the rolls.
  *
  * <p>The raw rows are read here with SQL to prove what is stored; the application itself never reads a library
  * table with native SQL.
@@ -302,6 +309,31 @@ class LibraryIntegrationTest {
         public boolean deleteDeletingShield(UUID id) {
             return real.deleteDeletingShield(id);
         }
+
+        @Override
+        public boolean insertRoll(RollRow row) {
+            return real.insertRoll(row);
+        }
+
+        @Override
+        public Optional<RollRow> findRollByKey(UUID rollKey) {
+            return real.findRollByKey(rollKey);
+        }
+
+        @Override
+        public List<RollRow> rolls(UUID shieldId, UUID before, int limit) {
+            return real.rolls(shieldId, before, limit);
+        }
+
+        @Override
+        public long rollCount(UUID shieldId) {
+            return real.rollCount(shieldId);
+        }
+
+        @Override
+        public int deleteRollsOf(UUID shieldId) {
+            return real.deleteRollsOf(shieldId);
+        }
     }
 
     @Value("${local.server.port}")
@@ -333,6 +365,9 @@ class LibraryIntegrationTest {
 
     @Autowired
     private ConversationStore conversations;
+
+    @Autowired
+    private SystemDeletion deletion;
 
     private final HttpClient client = HttpClient.newHttpClient();
 
@@ -1093,6 +1128,218 @@ class LibraryIntegrationTest {
         assertThat(count("select count(*) from shield where campaign_id = ? and deleting_at is null", gm.campaignId()))
                 .isEqualTo(1);
         assertThat(ok(get(path, gm.session())).path("total").asLong()).isEqualTo(1);
+    }
+
+    // --- Story 6.4: stored rolls ---
+
+    @Test
+    void aRollIsStoredOnceAsCiphertextAndRepeatsAtOnceLeaveOneRowOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        String shields = "/api/v1/campaigns/" + gm.campaignId() + "/shields";
+        UUID shield = UUID.fromString(ok(get(shields, gm.session())).path("items").get(0).path("id").asString());
+        String path = shields + "/" + shield + "/rolls";
+        UUID key = UUID.randomUUID();
+        Map<String, Object> roll = roll(key, "2d6+3", List.of(4, 5), "Iniciativa");
+
+        // Six sends of one key at once: one stores it, the others answer it, none fails.
+        List<CompletableFuture<HttpResponse<String>>> sends = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            sends.add(client.sendAsync(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path))
+                    .header("Authorization", "Bearer " + CREDENTIAL).header("X-Session-Token", gm.session())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(roll))).build(),
+                    HttpResponse.BodyHandlers.ofString()));
+        }
+        List<Integer> statuses = new ArrayList<>();
+        Set<String> ids = new HashSet<>();
+        for (CompletableFuture<HttpResponse<String>> send : sends) {
+            HttpResponse<String> response = send.get(30, TimeUnit.SECONDS);
+            statuses.add(response.statusCode());
+            ids.add(json(response).path("id").asString());
+        }
+        assertThat(statuses).containsOnly(200, 201).containsOnlyOnce(201);
+        assertThat(ids).hasSize(1);
+        UUID id = UUID.fromString(ids.iterator().next());
+        assertThat(count("select count(*) from roll where owner_id = ? and roll_key = ?", gm.id(), key)).isEqualTo(1);
+        Map<String, Object> row = jdbc.sql("select owner_id, shield_id, content, rolled_at from roll where id = ?")
+                .param(id).query().singleRow();
+        assertThat(row.get("owner_id")).isEqualTo(gm.id());
+        assertThat(row.get("shield_id")).isEqualTo(shield);
+        byte[] content = (byte[]) row.get("content");
+        assertThat(new String(content, StandardCharsets.ISO_8859_1)).doesNotContain("2d6").doesNotContain("Inicia");
+        assertThat(vault.decryptText(new Binding("roll", "content", id, gm.id()), content)).contains("Iniciativa");
+        assertThatThrownBy(() -> vault.decryptText(new Binding("roll", "content", id, Ids.newId()), content))
+                .isInstanceOf(IntegrityException.class);
+
+        // The same key in another Shield of the account is refused; the log reads newest first.
+        UUID combat = UUID.fromString(created(send("POST", shields, gm.session(), Map.of("name", "Combate")))
+                .path("id").asString());
+        HttpResponse<String> taken = send("POST", shields + "/" + combat + "/rolls", gm.session(), roll);
+        assertThat(taken.statusCode()).as(taken.body()).isEqualTo(409);
+        assertThat(json(taken).path("code").asString()).isEqualTo("request.roll_key_taken");
+        JsonNode newer = created(send("POST", path, gm.session(), roll(UUID.randomUUID(), "d20", List.of(20), null)));
+        JsonNode list = ok(get(path + "?limit=1", gm.session()));
+        assertThat(list.path("items").get(0)).isEqualTo(newer);
+        assertThat(list.path("total").asLong()).isEqualTo(2);
+        JsonNode rest = ok(get(path + "?limit=1&cursor=" + list.path("nextCursor").asString(), gm.session()));
+        assertThat(rest.path("items").get(0).path("id").asString()).isEqualTo(id.toString());
+        assertThat(rest.has("nextCursor")).isFalse();
+        // Another account's: not found, nothing written.
+        Gm other = signUp("en");
+        notFound(get(path, other.session()));
+        notFound(send("POST", path, other.session(), roll(UUID.randomUUID(), "d20", List.of(1), null)));
+        notFound(send("DELETE", path, other.session(), Map.of()));
+        assertThat(count("select count(*) from roll where shield_id = ?", shield)).isEqualTo(2);
+    }
+
+    @Test
+    void theLogPagesNewestFirstThroughATimeTieByIdDescAndAClearedCursorGivesAnEmptyPageOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        String path = "/api/v1/campaigns/" + gm.campaignId() + "/shields/"
+                + ok(get("/api/v1/campaigns/" + gm.campaignId() + "/shields", gm.session())).path("items").get(0)
+                .path("id").asString() + "/rolls";
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        List<String> ids = new ArrayList<>();
+        // The oldest, two of one time, the newest: in an order that is not the log's.
+        for (Instant at : List.of(now.minusSeconds(20), now.minusSeconds(30), now.minusSeconds(20), now.minusSeconds(10),
+                now.minusSeconds(20))) {
+            Map<String, Object> roll = roll(UUID.randomUUID(), "1d6", List.of(1), null);
+            roll.put("rolledAt", at.toString());
+            ids.add(created(send("POST", path, gm.session(), roll)).path("id").asString());
+        }
+        List<String> tied = new ArrayList<>(List.of(ids.get(0), ids.get(2), ids.get(4)));
+        // The tie is by id, descending: PostgreSQL orders uuid by its bytes, as lower-case hex text sorts.
+        tied.sort(Comparator.reverseOrder());
+        List<String> expected = new ArrayList<>(List.of(ids.get(3)));
+        expected.addAll(tied);
+        expected.add(ids.get(1));
+
+        for (int limit : List.of(1, 2)) {
+            List<String> read = new ArrayList<>();
+            String cursor = null;
+            do {
+                JsonNode page = ok(get(path + "?limit=" + limit + (cursor == null ? "" : "&cursor=" + cursor), gm.session()));
+                page.path("items").forEach(item -> read.add(item.path("id").asString()));
+                assertThat(page.path("total").asLong()).isEqualTo(5);
+                cursor = page.has("nextCursor") ? page.path("nextCursor").asString() : null;
+            } while (cursor != null);
+            assertThat(read).as("limit %d", limit).containsExactlyElementsOf(expected);
+        }
+        JsonNode first = ok(get(path + "?limit=2", gm.session()));
+        String old = first.path("nextCursor").asString();
+
+        assertThat(send("DELETE", path, gm.session(), Map.of()).statusCode()).isEqualTo(204);
+        JsonNode gone = ok(get(path + "?limit=2&cursor=" + old, gm.session()));
+        assertThat(gone.path("items")).isEmpty();
+        assertThat(gone.has("nextCursor")).isFalse();
+        assertThat(gone.path("total").asLong()).isZero();
+    }
+
+    @Test
+    void theStoresInsertOfAKeyACommittedRepeatHoldsWritesNothingAndFailsNothingOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        UUID shield = UUID.fromString(ok(get("/api/v1/campaigns/" + gm.campaignId() + "/shields", gm.session()))
+                .path("items").get(0).path("id").asString());
+        UUID key = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        CountDownLatch inserted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        // The first insert holds its row uncommitted while the second one waits on the key, then commits.
+        CompletableFuture<Boolean> first = CompletableFuture.supplyAsync(() -> OwnerContext.callAs(gm.id(), () ->
+                new TransactionTemplate(transactions).execute(status -> {
+                    boolean stored = store.insertRoll(new RollRow(Ids.newId(), gm.id(), shield, key, new byte[] {1}, now,
+                            now));
+                    inserted.countDown();
+                    try {
+                        assertThat(release.await(30, TimeUnit.SECONDS)).isTrue();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return stored;
+                })));
+        assertThat(inserted.await(30, TimeUnit.SECONDS)).isTrue();
+        long waitingBefore = waitingOnLocks();
+        UUID secondId = Ids.newId();
+        CompletableFuture<Optional<RollRow>> second = CompletableFuture.supplyAsync(() -> OwnerContext.callAs(gm.id(),
+                () -> new TransactionTemplate(transactions).execute(status -> {
+                    assertThat(store.insertRoll(new RollRow(secondId, gm.id(), shield, key, new byte[] {2}, now, now)))
+                            .isFalse();
+                    return store.findRollByKey(key);
+                })));
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (waitingOnLocks() < waitingBefore + 1 && System.nanoTime() < until) {
+            Thread.sleep(20);
+        }
+        release.countDown();
+
+        assertThat(first.get(30, TimeUnit.SECONDS)).isTrue();
+        Optional<RollRow> found = second.get(30, TimeUnit.SECONDS);
+        assertThat(found).hasValueSatisfying(row -> assertThat(row.content()).containsExactly(1));
+        assertThat(count("select count(*) from roll where roll_key = ?", key)).isEqualTo(1);
+        assertThat(count("select count(*) from roll where id = ?", secondId)).isZero();
+        // The same key is another owner's own (the key is unique per owner); that owner cannot read the first.
+        Gm other = signUp("en");
+        UUID otherShield = UUID.fromString(ok(get("/api/v1/campaigns/" + other.campaignId() + "/shields",
+                other.session())).path("items").get(0).path("id").asString());
+        Optional<RollRow> theirs = OwnerContext.callAs(other.id(), () -> new TransactionTemplate(transactions)
+                .execute(status -> store.findRollByKey(key)));
+        assertThat(theirs).isEmpty();
+        Boolean own = OwnerContext.callAs(other.id(), () -> new TransactionTemplate(transactions).execute(status ->
+                store.insertRoll(new RollRow(Ids.newId(), other.id(), otherShield, key, new byte[] {3}, now, now))));
+        assertThat(own).isTrue();
+        assertThat(count("select count(*) from roll where roll_key = ?", key)).isEqualTo(2);
+    }
+
+    @Test
+    void aShieldsAndACampaignsDeletionRemoveTheirRollsOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        String shields = "/api/v1/campaigns/" + gm.campaignId() + "/shields";
+        UUID first = UUID.fromString(ok(get(shields, gm.session())).path("items").get(0).path("id").asString());
+        UUID combat = UUID.fromString(created(send("POST", shields, gm.session(), Map.of("name", "Combate")))
+                .path("id").asString());
+        for (UUID shield : List.of(combat, combat, first)) {
+            created(send("POST", shields + "/" + shield + "/rolls", gm.session(),
+                    roll(UUID.randomUUID(), "1d6", List.of(6), null)));
+        }
+        assertThat(ok(get(shields + "/" + combat + "/deletion", gm.session())).path("rolls").asLong()).isEqualTo(2);
+
+        assertThat(send("DELETE", shields + "/" + combat, gm.session(), Map.of()).statusCode()).isEqualTo(202);
+        notFound(get(shields + "/" + combat + "/rolls", gm.session()));
+        UUID shieldDeletion = jdbc.sql("select id from deletion where owner_id = ? and kind = 'shield' and target_id = ?")
+                .param(gm.id()).param(combat).query(UUID.class).single();
+        assertThat(deletion.run(gm.id(), shieldDeletion)).isTrue();
+        assertThat(count("select count(*) from shield where id = ?", combat)).isZero();
+        assertThat(count("select count(*) from roll where shield_id = ?", combat)).isZero();
+        assertThat(count("select count(*) from roll where shield_id = ?", first)).isEqualTo(1);
+
+        // A campaign's deletion takes its Shields' rolls before its Shields.
+        JsonNode other = created(send("POST", "/api/v1/campaigns", gm.session(), Map.of("name", "Outra",
+                "systemId", gm.systemId().toString())));
+        UUID campaign = UUID.fromString(other.path("id").asString());
+        UUID itsShield = UUID.fromString(ok(get("/api/v1/campaigns/" + campaign + "/shields", gm.session()))
+                .path("items").get(0).path("id").asString());
+        created(send("POST", "/api/v1/campaigns/" + campaign + "/shields/" + itsShield + "/rolls", gm.session(),
+                roll(UUID.randomUUID(), "1d8", List.of(8), "Dano")));
+        assertThat(send("DELETE", "/api/v1/campaigns/" + campaign, gm.session(), Map.of()).statusCode()).isEqualTo(202);
+        UUID campaignDeletion = jdbc.sql("select id from deletion where owner_id = ? and kind = 'campaign'"
+                + " and target_id = ?").param(gm.id()).param(campaign).query(UUID.class).single();
+        assertThat(deletion.run(gm.id(), campaignDeletion)).isTrue();
+        assertThat(count("select count(*) from shield where id = ?", itsShield)).isZero();
+        assertThat(count("select count(*) from roll where shield_id = ?", itsShield)).isZero();
+        assertThat(count("select count(*) from roll where shield_id = ?", first)).isEqualTo(1);
+    }
+
+    /** A roll's body, made a moment ago. */
+    private static Map<String, Object> roll(UUID key, String formula, List<Integer> results, String label) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("key", key.toString());
+        body.put("formula", formula);
+        body.put("results", results);
+        if (label != null) {
+            body.put("label", label);
+        }
+        body.put("rolledAt", Instant.now().minusSeconds(1).toString());
+        return body;
     }
 
     /** How many sessions of this database wait for a lock now. */

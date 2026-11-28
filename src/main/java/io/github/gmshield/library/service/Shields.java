@@ -48,8 +48,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * ({@link SystemDeletion#deleteShield}). Under the campaign's lock the Shield is found live and not the last, becomes
  * deleting (its name free at once) and the deletion is recorded, in one transaction that also marks its live notes
  * deleting; from the commit it is "not found" to every read and count here. The preview counts its live notes
- * ({@link SystemDeletion#previewShield}); rolls stay 0 until Story 6.4. {@link #lockedShield} gives the {@code artifacts}
- * module the live Shield under the same lock, so a note is never created in, or moved into, a Shield being deleted.
+ * ({@link SystemDeletion#previewShield}) and, from Story 6.4, its stored rolls. {@link #lockedShield} gives the
+ * {@code artifacts} module ({@link Rolls} too) the live Shield under the same lock, so a note or a roll is never created
+ * in, or moved into, a Shield being deleted.
  */
 @Service
 public class Shields {
@@ -193,8 +194,8 @@ public class Shields {
     }
 
     /**
-     * What goes with a Shield if it is deleted: how many live notes (Story 6.2 part B) and rolls (none until Story 6.4
-     * stores them), and whether it is its campaign's only live Shield, which cannot be deleted.
+     * What goes with a Shield if it is deleted: how many live notes (Story 6.2 part B) and stored rolls (Story 6.4), and
+     * whether it is its campaign's only live Shield, which cannot be deleted.
      */
     public record ShieldDeletion(long notes, long rolls, boolean last) {
     }
@@ -206,7 +207,7 @@ public class Shields {
     public Optional<ShieldDeletion> shieldDeletion(UUID campaignId, UUID shieldId) {
         return reading(() -> store.findCampaign(campaignId)
                 .flatMap(campaign -> store.findShield(campaign.id(), shieldId))
-                .map(row -> new ShieldDeletion(deletion.getObject().previewShield(row.id()), 0,
+                .map(row -> new ShieldDeletion(deletion.getObject().previewShield(row.id()), store.rollCount(row.id()),
                         store.shieldCount(row.campaignId()) <= 1L)));
     }
 

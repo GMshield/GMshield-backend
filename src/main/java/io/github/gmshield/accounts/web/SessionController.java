@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import java.util.UUID;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -34,8 +35,11 @@ class SessionController {
         this.sessions = sessions;
     }
 
-    @Schema(name = "Me", requiredProperties = "username")
-    record Me(@Schema(description = "The username, as typed", example = "mestre_ana") String username) {
+    @Schema(name = "Me", requiredProperties = {"id", "username"})
+    record Me(
+            @Schema(description = "The account's id: the browser keys this account's pending rolls with it (Story 6.4)",
+                    example = "01890a5d-ac96-774b-bcce-b302099a8057") UUID id,
+            @Schema(description = "The username, as typed", example = "mestre_ana") String username) {
     }
 
     @GetMapping(path = ME, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -43,7 +47,7 @@ class SessionController {
             + " session.renewal_required (401) when the token must be renewed first")
     ResponseEntity<Me> me(@RequestHeader(name = HEADER, required = false) String sessionToken) {
         Account account = sessions.account(sessionToken);
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new Me(account.username()));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new Me(account.id(), account.username()));
     }
 
     @PostMapping(path = RENEWAL, produces = MediaType.APPLICATION_JSON_VALUE)

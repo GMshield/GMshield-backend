@@ -4,7 +4,7 @@ import io.github.gmshield.shared.service.ApiProblem;
 import java.util.Map;
 
 /**
- * The problems of the GM's edits of the library (Stories 3.1, 3.2 and 6.1). None carries content: the params are a field's limits
+ * The problems of the GM's edits of the library (Stories 3.1, 3.2, 6.1 and 6.4). None carries content: the params are a field's limits
  * only. Each invalid field has its own code, so the form shows the text under that field.
  */
 final class LibraryProblems {
@@ -38,6 +38,16 @@ final class LibraryProblems {
     /** The Shield is its campaign's only one, which cannot be deleted (Story 6.1 part B). */
     static final ApiProblem LAST_SHIELD =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "last_shield", "Last shield");
+    /**
+     * A roll the browser could not have made (Story 6.4): its formula does not read, its results do not match its dice,
+     * its label is too long or its time is too far ahead.
+     */
+    static final ApiProblem ROLL_INVALID =
+            ApiProblem.of(400, ApiProblem.CATEGORY_REQUEST, "roll_invalid", "Roll invalid")
+                    .withParams(Map.<String, Object>of("labelMax", Rolls.LABEL_MAX));
+    /** The roll's key is one the owner already holds in another Shield (Story 6.4). */
+    static final ApiProblem ROLL_KEY_TAKEN =
+            ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "roll_key_taken", "Roll key taken");
     /** The edit names a version the item has left: someone changed it elsewhere. */
     static final ApiProblem STALE_VERSION =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "stale_version", "Stale version");

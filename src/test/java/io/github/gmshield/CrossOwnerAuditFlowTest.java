@@ -89,7 +89,7 @@ import tools.jackson.databind.node.ObjectNode;
  * record, which becomes a reference of its own), a done, dismissed turn, a search, and a turn still waiting in a second
  * conversation; from Story 5.1 an artifact of the campaign (from part B indexed, and cited by the bookmarked turn too);
  * from Story 5.3 part A a finished draft (a turn of kind draft); from Story 6.1 a renamed Shield of the campaign beside its
- * unnamed first one. From Story 5.4 part B, A's artifact named in the deletion
+ * unnamed first one, and from Story 6.4 a stored roll of that Shield. From Story 5.4 part B, A's artifact named in the deletion
  * of B's own conversation is ignored as a random id is, and stays. Account B then walks {@link #ROUTES}, every public
  * route that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same
  * body as a random id on that route (the trace id aside), and a route with a container and an item ({@code own})
@@ -119,8 +119,14 @@ class CrossOwnerAuditFlowTest {
             Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
     private static final Pattern DIGITS = Pattern.compile("[0-9]+");
     private static final int TIMEOUT_SECONDS = 15;
-    /** A row added to the job or the search table, as {@link #differences} writes it. */
-    private static final Pattern ADDED_SEARCH_OR_JOB = Pattern.compile("(job|search) [0-9a-f-]{36} added");
+    /**
+     * A row added to the job or the search table, as {@link #differences} writes it; from Story 6.4 to the roll table
+     * too (B's own rolls, which a key of A's or a random one stores in B's Shield).
+     */
+    private static final Pattern ADDED_SEARCH_JOB_OR_ROLL = Pattern.compile("(job|search|roll) [0-9a-f-]{36} added");
+    /** A roll (Story 6.4): valid, in the past of the unit clock and the real one, so only the Shield decides. */
+    private static final String ROLL = "{\"key\":\"%s\",\"formula\":\"2d6+3\",\"results\":[4,5],"
+            + "\"label\":\"Iniciativa\",\"rolledAt\":\"2026-11-22T11:00:00Z\"}";
     private static final byte[] PART = jpeg(9000);
     private static final String QUESTION = "Quanto dano causa Fire Bolt?";
     private static final String SCOPE_CHANGE = "{\"version\":{scopeVersion},\"campaignTier\":false,\"systemTier\":false,"
@@ -309,6 +315,13 @@ class CrossOwnerAuditFlowTest {
                     .own("id"),
             route("POST", "/api/v1/campaigns/{id}/shields/{shieldId}/notes", "id", "campaign", "shieldId", "shield")
                     .json("{\"name\":\"Tomado\",\"content\":\"Tomado\"}").own("id"),
+            // a Shield's stored rolls, a new roll and their clearing (Story 6.4 part A)
+            route("GET", "/api/v1/campaigns/{id}/shields/{shieldId}/rolls", "id", "campaign", "shieldId", "shield")
+                    .own("id"),
+            route("POST", "/api/v1/campaigns/{id}/shields/{shieldId}/rolls", "id", "campaign", "shieldId", "shield")
+                    .json(ROLL.formatted("{rollKey}")).own("id"),
+            route("DELETE", "/api/v1/campaigns/{id}/shields/{shieldId}/rolls", "id", "campaign", "shieldId", "shield")
+                    .own("id"),
             // a note moved to another Shield of its campaign (Story 6.2 part B): the Shield is named in the body
             route("PUT", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/shield", "campaignId", "campaign",
                     "artifactId", "artifact").json("{\"shieldId\":\"{shield}\"}").own("campaignId"),
@@ -654,6 +667,11 @@ class CrossOwnerAuditFlowTest {
                         "artifact.share_target", "otherCampaign", 200, false,
                         id -> json("PUT", "/api/v1/campaigns/" + campaign + "/artifacts/" + b.get("artifact")
                                 + "/sharing", "{\"campaignIds\":[\"" + id + "\"]}")),
+                // Story 6.4: another account's roll key is a new roll of B's own, as a random key is; B's own key
+                // answers B's stored roll (200).
+                probe("key in POST /campaigns/{id}/shields/{shieldId}/rolls", "rollKey", 201, null, 200,
+                        id -> json("POST", "/api/v1/campaigns/" + campaign + "/shields/" + b.get("shield") + "/rolls",
+                                ROLL.formatted(id))),
                 // Story 5.7 part A: exporting another account's artifact is refused as an unknown artifact is.
                 probe("ids in GET /campaigns/{campaignId}/artifacts/export", "artifact", 404, "request.not_found", 200,
                         id -> new Request("GET", "/api/v1/campaigns/" + campaign + "/artifacts/export?format=txt&ids="
@@ -703,7 +721,7 @@ class CrossOwnerAuditFlowTest {
         // Only B's searches were recorded, each with its job; nothing else was added, changed or removed.
         List<String> changed = differences(before, stores.tables(owners(a, b)));
         assertThat(changed).as("tables changed by B's requests")
-                .allMatch(line -> ADDED_SEARCH_OR_JOB.matcher(line).matches());
+                .allMatch(line -> ADDED_SEARCH_JOB_OR_ROLL.matcher(line).matches());
         List<CrossOwnerAuditStores.Job> made = stores.jobs(owners(a, b)).stream()
                 .filter(row -> !before.get("job").containsKey(row.id())).toList();
         assertThat(made).hasSize(searchesMade).allSatisfy(job -> {
@@ -931,6 +949,12 @@ class CrossOwnerAuditFlowTest {
         assertThat(shieldRenamed.statusCode()).as(shieldRenamed.body()).isEqualTo(200);
         items.put("firstShield", json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/shields")).path("items").get(0)
                 .path("id").asString());
+        // Story 6.4: a stored roll of that Shield, and the key the browser made for it.
+        items.put("rollKey", UUID.randomUUID().toString());
+        HttpResponse<String> roll = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/shields/"
+                + items.get("shield") + "/rolls", ROLL.formatted(items.get("rollKey")));
+        assertThat(roll.statusCode()).as(roll.body()).isEqualTo(201);
+        items.put("roll", json(roll).path("id").asString());
 
         HttpResponse<String> scoped = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/scope", "{\"version\":0,"
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
@@ -1033,6 +1057,13 @@ class CrossOwnerAuditFlowTest {
         items.put("otherCampaign", json(other).path("id").asString());
         assertThat(send(gm, "PUT", "/api/v1/campaigns/current", "{\"campaignId\":\"" + gm.campaign() + "\"}")
                 .statusCode()).isEqualTo(200);
+        // Story 6.4: B's first Shield with a stored roll, for the roll key's control.
+        items.put("shield", json(get(gm, "/api/v1/campaigns/" + gm.campaign() + "/shields")).path("items").get(0)
+                .path("id").asString());
+        items.put("rollKey", UUID.randomUUID().toString());
+        HttpResponse<String> roll = send(gm, "POST", "/api/v1/campaigns/" + gm.campaign() + "/shields/"
+                + items.get("shield") + "/rolls", ROLL.formatted(items.get("rollKey")));
+        assertThat(roll.statusCode()).as(roll.body()).isEqualTo(201);
         World world = new World(gm, items, Set.of());
         refresh(world);
         return world;

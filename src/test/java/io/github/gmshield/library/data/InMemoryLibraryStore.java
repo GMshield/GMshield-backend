@@ -27,8 +27,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * and the (owner, campaign) reference, which refuses to delete a campaign that still has Shields; from Story 6.1 part B
  * a per-campaign lock that {@link #lockCampaign} holds until its transaction ends, so that Shield deletions of one
  * campaign run one after the other (the campaign's own deletion does not take it); from Story 6.2 part B a Shield's
- * deleting state (every Shield read and count skips a deleting one, and its name is freed). A write undoes itself when
- * its transaction rolls back.
+ * deleting state (every Shield read and count skips a deleting one, and its name is freed); from Story 6.4 a Shield's
+ * stored rolls, with the (owner, key) key (a held key inserts nothing) and the (owner, shield) reference, which refuses a
+ * roll of a missing Shield (a Shield's deletions remove its rolls before its row, as {@code roll_shield_fkey} needs). A
+ * write undoes itself when its transaction rolls back.
  */
 public class InMemoryLibraryStore implements LibraryStore {
 
@@ -43,6 +45,8 @@ public class InMemoryLibraryStore implements LibraryStore {
     public final Set<UUID> deletingCampaigns = ConcurrentHashMap.newKeySet();
     /** The Shields (Story 6.1, V53). */
     public final Map<UUID, ShieldRow> shields = new ConcurrentHashMap<>();
+    /** The stored rolls (Story 6.4, V56). */
+    public final Map<UUID, RollRow> rolls = new ConcurrentHashMap<>();
     /** Per-campaign locks for Shield deletions (Story 6.1 part B), each held from {@link #lockCampaign} until its transaction ends. */
     private final Map<UUID, ReentrantLock> campaignLocks = new ConcurrentHashMap<>();
     /**
@@ -459,6 +463,7 @@ public class InMemoryLibraryStore implements LibraryStore {
         for (ShieldRow row : List.copyOf(shields.values())) {
             if (row.ownerId().equals(owner) && campaignIds.contains(row.campaignId())) {
                 ownerFor(row.ownerId());
+                removeRollsOf(row.id());
                 shields.remove(row.id());
                 RollbackUndo.onRollback(() -> shields.put(row.id(), row));
                 deleted++;
@@ -521,9 +526,77 @@ public class InMemoryLibraryStore implements LibraryStore {
         if (shieldHasNotes != null && shieldHasNotes.test(id)) {
             throw new IllegalStateException("record_shield_fkey");
         }
+        removeRollsOf(id);
         shields.remove(id);
         RollbackUndo.onRollback(() -> shields.put(id, row));
         return true;
+    }
+
+    @Override
+    public synchronized boolean insertRoll(RollRow row) {
+        UUID owner = ownerFor(row.ownerId());
+        ShieldRow shield = shields.get(row.shieldId());
+        if (rolls.containsKey(row.id()) || shield == null || !shield.ownerId().equals(owner)) {
+            throw new IllegalStateException("key or reference refused");
+        }
+        if (rolls.values().stream().anyMatch(other -> other.ownerId().equals(owner)
+                && other.rollKey().equals(row.rollKey()))) {
+            return false;
+        }
+        rolls.put(row.id(), row);
+        RollbackUndo.onRollback(() -> rolls.remove(row.id()));
+        return true;
+    }
+
+    @Override
+    public Optional<RollRow> findRollByKey(UUID rollKey) {
+        UUID owner = OwnerContext.require();
+        return rolls.values().stream().filter(row -> row.ownerId().equals(owner) && row.rollKey().equals(rollKey))
+                .findFirst();
+    }
+
+    @Override
+    public List<RollRow> rolls(UUID shieldId, UUID before, int limit) {
+        UUID owner = OwnerContext.require();
+        Comparator<RollRow> newestFirst = Comparator.comparing(RollRow::rolledAt).thenComparing(RollRow::id).reversed();
+        List<RollRow> all = rolls.values().stream()
+                .filter(row -> row.ownerId().equals(owner) && row.shieldId().equals(shieldId))
+                .sorted(newestFirst).toList();
+        if (before == null) {
+            return all.stream().limit(Math.max(limit, 0)).toList();
+        }
+        Optional<RollRow> cursor = all.stream().filter(row -> row.id().equals(before)).findFirst();
+        if (cursor.isEmpty()) {
+            return List.of();
+        }
+        return all.stream().filter(row -> newestFirst.compare(row, cursor.get()) > 0).limit(Math.max(limit, 0))
+                .toList();
+    }
+
+    @Override
+    public long rollCount(UUID shieldId) {
+        return rolls(shieldId, null, Integer.MAX_VALUE).size();
+    }
+
+    @Override
+    public synchronized int deleteRollsOf(UUID shieldId) {
+        OwnerContext.require();
+        return removeRollsOf(shieldId);
+    }
+
+    /** Removes the current owner's rolls of the Shield, each undone on a rollback. */
+    private int removeRollsOf(UUID shieldId) {
+        UUID owner = OwnerContext.require();
+        int removed = 0;
+        for (RollRow row : List.copyOf(rolls.values())) {
+            if (row.ownerId().equals(owner) && row.shieldId().equals(shieldId)) {
+                ownerFor(row.ownerId());
+                rolls.remove(row.id());
+                RollbackUndo.onRollback(() -> rolls.put(row.id(), row));
+                removed++;
+            }
+        }
+        return removed;
     }
 
     /** Like the key on (campaign, name fingerprint), which ignores a null fingerprint. */

@@ -129,7 +129,8 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
   - `GET /api/v1/me`, `POST /api/v1/session/renewal` and `DELETE /api/v1/session` read the session
     token from `X-Session-Token` (never a cookie). No session, an ended one or an account that is not
     active: `session.required` (401). Sign-out deletes the session and its entry in the account's set;
-    it answers 204 whether or not the session existed.
+    it answers 204 whether or not the session existed. `GET /api/v1/me` answers `Me{id, username}`: the
+    browser keys this account's pending rolls with the id (Story 6.4 part B, contract 1.60.0).
   - The table `account` (`V2__account.sql`) stores only the username, the email address and the
     Google id, each encrypted with `Binding("account", field, id, id)` and fingerprinted, plus tier
     (`ordinary`), state (`active`), `confirmed`, `terms_version`, `terms_accepted_at`,
@@ -170,7 +171,8 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
 - **Library and its owner (`library`, Story 1.11, AD-11).** The library tables `system` and `campaign`
   (`V4__library.sql`) each carry `owner_id`, mapped with Hibernate `@TenantId`: Hibernate fills it on insert
   and filters every query by it, so another owner's row is never read. They are read and written only through
-  JPA entities and JPQL (also by id), never native SQL or `JdbcClient`.
+  JPA entities and JPQL (also by id), never native SQL or `JdbcClient` (one exception from Story 6.4: a stored roll's
+  insert, `on conflict do nothing` on the owner's key, which names the row's owner; every read stays JPQL).
   - The owner comes from `shared.service.OwnerContext`, a `ScopedValue` bound for one piece of work and
     gone afterwards. Two places bind it: `accounts.web.LibraryOwnerFilter`, for every request to
     `/api/v1/systems/**`, `/api/v1/campaigns/**`, `/api/v1/uploads/**` and `/api/v1/materials/**`, from the session's account (`X-Session-Token`; no
@@ -2109,12 +2111,47 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     the record (`library.shield_deleted`, `removed`). A failed pass is retried by the sweep; a campaign's or a system's
     deletion that overtakes it removes everything, and the Shield's pass then ends without work.
   - **Preview.** `ShieldDeletion.notes` is the Shield's live notes, counted by the handlers
-    (`SystemDeletion#previewShield`); `rolls` stays 0 until Story 6.4. `library` still depends only on `shared` and
+    (`SystemDeletion#previewShield`); `rolls` stayed 0 until Story 6.4 (below). `library` still depends only on `shared` and
     `vault`.
   - Log lines (ids and counts only): `artifacts.note_moved` (`found`, `moved`), `library.shield_delete` (`recorded`),
     `library.shield_deleting`, `library.shield_deleted` (`removed`), `artifacts.deletion_prepared` (`marked`). Deploy
     order: backend, then frontend (the 1.57.0 frontend reads the 202 as a success too). Internal contract and worker
     unchanged.
+
+- **Keep the rolls (`library`, Story 6.4 part A, AD-31, public contract 1.59.0, migration V56).** The browser draws the
+  dice (Story 6.3) and sends every roll; the backend checks it, keeps it once by the browser's key and lists it on
+  every device. It never rolls and never edits a roll.
+  - **V56** `roll` (id, owner, Shield, `roll_key`, `content`, `rolled_at`, created). Keys: (owner, id); unique (owner,
+    `roll_key`); (owner, Shield) to `shield` with no cascade (as V54's note key). The index (owner, Shield, `rolled_at`
+    desc, id desc) serves the log. The migration's header has the way back (drop the table; it deletes every stored
+    roll for good).
+  - **Rules** (`library.service.Rolls`, `DiceFormula`). A roll is stored only when its formula reads under the
+    frontend's `src/dice.ts` grammar (`DiceFormula`, a Java copy with JavaScript's `\s` as white space), its results are
+    its dice in order (one per die, each from 1 to its sides: `2d6-1d4` takes three), its label is at most 80 code
+    points after trimming (blank for none) and `rolledAt` is at most 5 minutes ahead of the server clock; otherwise
+    `request.roll_invalid` (400, `params.labelMax`). The total is computed here. The formula, the results and the label
+    are one vault ciphertext (`Binding("roll", "content", id, owner)`); `rolled_at` stays plain.
+  - **Exactly once.** A key the owner holds in that Shield answers 200 with the stored roll; in another of the owner's
+    Shields, `request.roll_key_taken` (409). The insert is the library's one native statement
+    (`insert ... on conflict (owner_id, roll_key) do nothing`, as `JdbcDeletionStore.insertIfAbsent`), then the row is
+    read back, so a concurrent repeat is never a 500. Writes find the Shield through `Shields#lockedShield` (the
+    campaign's row lock that a Shield's deletion takes).
+  - **API** (`RollController`, all `no-store`, every route a row of the cross-owner audit):
+    `POST /api/v1/campaigns/{id}/shields/{shieldId}/rolls` `{key, formula, results, label?, rolledAt}` (201 or 200,
+    `Roll{id, key, formula, results, total, label, rolledAt}`), `GET` on the same path (newest first by `rolledAt`, then
+    id; `limit`, `cursor`; `RollPage{items, nextCursor, total}`; a cleared cursor gives an empty page) and `DELETE`
+    (clears the Shield's rolls, 204). A malformed body (not an object, a key missing or not a UUID) is
+    `request.invalid`. Another owner's, a deleting Shield and a campaign being deleted are `request.not_found`.
+  - **Deletion.** `ShieldDeletion.rolls` counts the Shield's stored rolls. `LibraryStore.deleteDeletingShield` and
+    `deleteShieldsOf` remove the rolls before the Shield rows, so a Shield's, a campaign's and a system's deletion
+    remove them. A roll never goes to the worker, the index, search, answers or a scope, and is not in a data export
+    yet (Epic 8).
+  - Log lines (ids and counts only): `library.roll_kept` (`created`), `library.rolls_cleared` (`count`). Deploy order:
+    backend, then frontend (the 1.58.0 frontend stores no roll). Internal contract and worker unchanged.
+  - **Part B (public contract 1.60.0).** `GET /api/v1/me` adds the account's `id` (required), which the browser
+    keys its pending rolls with (`gmshield:rolls:{accountId}:{shieldId}` in its storage, AD-31). Nothing else changes
+    here: the roll routes, the migrations, the internal contract and the worker stay as they are. Deploy order:
+    backend, then frontend (the 1.59.0 frontend ignores the extra field).
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
