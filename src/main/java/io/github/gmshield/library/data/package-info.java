@@ -9,5 +9,7 @@
  * the owner named in every write and read by id; the removal sweep's list alone reads across owners. From Story 3.2
  * (V23) a campaign has a version, an archive time, a choice time and a name fingerprint unique per owner and system;
  * {@code campaign_fingerprint_backfill} is not a library table either (owner ids only, {@link FingerprintBackfill}).
+ * From Story 6.4 (V56) {@code roll} holds a Shield's stored rolls (one ciphertext each); its insert alone is a native
+ * statement ({@code on conflict do nothing} on the owner's key, naming the row's owner), and every roll read is JPQL.
  */
 package io.github.gmshield.library.data;

@@ -62,6 +62,10 @@ class ShieldEntity {
         this.deletingAt = row.deletingAt();
     }
 
+    UUID id() {
+        return id;
+    }
+
     long version() {
         return version;
     }

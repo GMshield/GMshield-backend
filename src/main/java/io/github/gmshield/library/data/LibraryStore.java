@@ -223,7 +223,8 @@ public interface LibraryStore {
 
     /**
      * Deletes every Shield of the current owner's campaigns {@code campaignIds}, whatever their state (a campaign's or a
-     * system's deletion, before the campaign rows go); answers how many went. Joins the caller's transaction, which must
+     * system's deletion, before the campaign rows go), their stored rolls first (Story 6.4); answers how many Shields
+     * went. Joins the caller's transaction, which must
      * exist.
      */
     int deleteShieldsOf(Collection<UUID> campaignIds);
@@ -251,9 +252,37 @@ public interface LibraryStore {
     boolean shieldDeleting(UUID id);
 
     /**
-     * Deletes the current owner's deleting Shield {@code id}, which no note may name any more; false when there is no
-     * such Shield (a campaign's or a system's deletion may have taken it). Joins the caller's transaction, which must
-     * exist.
+     * Deletes the current owner's deleting Shield {@code id}, which no note may name any more, its stored rolls first
+     * (Story 6.4); false when there is no such Shield (a campaign's or a system's deletion may have taken it). Joins the
+     * caller's transaction, which must exist.
      */
     boolean deleteDeletingShield(UUID id);
+
+    // --- stored rolls (Story 6.4, V56)
+
+    /**
+     * Stores a roll of the current owner's Shield unless the owner already holds a roll with its key, in any Shield:
+     * true when it was stored, false when the key was held (nothing is written; a roll with that key committed by a
+     * concurrent request counts as held, never as a failure). Joins the caller's transaction, which must exist.
+     */
+    boolean insertRoll(RollRow row);
+
+    /** The current owner's roll with the key {@code rollKey}, whatever its Shield; empty for any other key. */
+    Optional<RollRow> findRollByKey(UUID rollKey);
+
+    /**
+     * The current owner's rolls of the Shield {@code shieldId}, newest first (by {@code rolledAt}, then by id), only
+     * those after the roll {@code before} of that Shield in that order when it is given (none when that roll is not
+     * there any more), at most {@code limit}.
+     */
+    List<RollRow> rolls(UUID shieldId, UUID before, int limit);
+
+    /** How many rolls the current owner's Shield {@code shieldId} holds. */
+    long rollCount(UUID shieldId);
+
+    /**
+     * Deletes every roll of the current owner's Shield {@code shieldId}; answers how many went. Joins the caller's
+     * transaction, which must exist.
+     */
+    int deleteRollsOf(UUID shieldId);
 }

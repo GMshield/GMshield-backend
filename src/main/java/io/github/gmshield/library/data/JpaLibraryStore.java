@@ -35,6 +35,12 @@ import org.springframework.stereotype.Repository;
  *
  * <p>Story 6.2 part B: every Shield read and count takes live Shields only ({@code deleting_at} null, V55); a deleting
  * Shield is reached by its deletion's methods and by the campaigns' deletions ({@link #deleteShieldsOf}).
+ *
+ * <p>Story 6.4: a Shield's stored rolls ({@code roll}, V56), read by Shield newest first and by key. A roll's insert is
+ * the one native statement here ({@code on conflict do nothing} on the owner's key, as
+ * {@code JdbcDeletionStore.insertIfAbsent}), so a concurrent repeat of a key waits for the other insert and then finds
+ * its row instead of failing the transaction; it names the owner of the row, which the service set from the owner of the
+ * work. Every roll read is JPQL. The Shields' deletions remove their rolls first, which {@code roll_shield_fkey} needs.
  */
 @Repository
 class JpaLibraryStore implements LibraryStore {
@@ -107,6 +113,20 @@ class JpaLibraryStore implements LibraryStore {
     private static final String SHIELDS_OF = "select s from LibraryShield s where s.campaignId in :campaigns";
     private static final String DELETING_SHIELD = "select s from LibraryShield s where s.id = :id"
             + " and s.deletingAt is not null";
+
+    /** Story 6.4: a roll is stored once per owner and key (V56's roll_owner_key_key); a held key writes nothing. */
+    private static final String INSERT_ROLL = "insert into roll (id, owner_id, shield_id, roll_key, content, rolled_at,"
+            + " created_at) values (:id, :owner, :shield, :rollKey, :content, :rolledAt, :createdAt)"
+            + " on conflict (owner_id, roll_key) do nothing";
+    private static final String ROLL_BY_KEY = "select r from LibraryRoll r where r.rollKey = :rollKey";
+    private static final String ROLLS = "select r from LibraryRoll r where r.shieldId = :shield"
+            + " order by r.rolledAt desc, r.id desc";
+    private static final String ROLLS_BEFORE = "select r from LibraryRoll r where r.shieldId = :shield"
+            + " and (r.rolledAt < :at or (r.rolledAt = :at and r.id < :before)) order by r.rolledAt desc, r.id desc";
+    private static final String ROLL_TIME = "select r.rolledAt from LibraryRoll r where r.id = :id"
+            + " and r.shieldId = :shield";
+    private static final String ROLL_COUNT = "select count(r) from LibraryRoll r where r.shieldId = :shield";
+    private static final String ROLLS_OF = "select r from LibraryRoll r where r.shieldId in :shields";
 
     private final ObjectProvider<EntityManagerFactory> factory;
     private volatile EntityManager shared;
@@ -463,6 +483,11 @@ class JpaLibraryStore implements LibraryStore {
         EntityManager em = em();
         List<ShieldEntity> going = em.createQuery(SHIELDS_OF, ShieldEntity.class).setParameter("campaigns", campaignIds)
                 .getResultList();
+        if (going.isEmpty()) {
+            return 0;
+        }
+        // Story 6.4: their rolls first, which roll_shield_fkey would otherwise refuse.
+        removeRollsOf(going.stream().map(ShieldEntity::id).toList());
         going.forEach(em::remove);
         em.flush();
         return going.size();
@@ -495,10 +520,68 @@ class JpaLibraryStore implements LibraryStore {
         Optional<ShieldEntity> found = deletingShield(id);
         found.ifPresent(entity -> {
             EntityManager em = em();
+            // Story 6.4: its rolls first, which roll_shield_fkey would otherwise refuse.
+            removeRollsOf(List.of(id));
             em.remove(entity);
             em.flush();
         });
         return found.isPresent();
+    }
+
+    @Override
+    public boolean insertRoll(RollRow row) {
+        return em().createNativeQuery(INSERT_ROLL).setParameter("id", row.id()).setParameter("owner", row.ownerId())
+                .setParameter("shield", row.shieldId()).setParameter("rollKey", row.rollKey())
+                .setParameter("content", row.content()).setParameter("rolledAt", row.rolledAt())
+                .setParameter("createdAt", row.createdAt()).executeUpdate() == 1;
+    }
+
+    @Override
+    public Optional<RollRow> findRollByKey(UUID rollKey) {
+        return em().createQuery(ROLL_BY_KEY, RollEntity.class).setParameter("rollKey", rollKey).getResultList().stream()
+                .findFirst().map(RollEntity::row);
+    }
+
+    @Override
+    public List<RollRow> rolls(UUID shieldId, UUID before, int limit) {
+        if (limit < 1) {
+            return List.of();
+        }
+        EntityManager em = em();
+        TypedQuery<RollEntity> query;
+        if (before == null) {
+            query = em.createQuery(ROLLS, RollEntity.class);
+        } else {
+            Optional<Instant> at = em.createQuery(ROLL_TIME, Instant.class).setParameter("id", before)
+                    .setParameter("shield", shieldId).getResultList().stream().findFirst();
+            if (at.isEmpty()) {
+                return List.of();
+            }
+            query = em.createQuery(ROLLS_BEFORE, RollEntity.class).setParameter("at", at.get())
+                    .setParameter("before", before);
+        }
+        return query.setParameter("shield", shieldId).setMaxResults(limit).getResultList().stream()
+                .map(RollEntity::row).toList();
+    }
+
+    @Override
+    public long rollCount(UUID shieldId) {
+        return em().createQuery(ROLL_COUNT, Long.class).setParameter("shield", shieldId).getSingleResult();
+    }
+
+    @Override
+    public int deleteRollsOf(UUID shieldId) {
+        return removeRollsOf(List.of(shieldId));
+    }
+
+    /** Removes the owner's rolls of these Shields (each read first, so only the owner's rows are reached). */
+    private int removeRollsOf(Collection<UUID> shieldIds) {
+        EntityManager em = em();
+        List<RollEntity> going = em.createQuery(ROLLS_OF, RollEntity.class).setParameter("shields", shieldIds)
+                .getResultList();
+        going.forEach(em::remove);
+        em.flush();
+        return going.size();
     }
 
     private Optional<ShieldEntity> deletingShield(UUID id) {

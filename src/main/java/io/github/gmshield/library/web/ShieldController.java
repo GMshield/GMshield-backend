@@ -40,6 +40,9 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 6.2 part B (contract 1.58.0): the preview counts the Shield's live notes, and its deletion is the recorded,
  * resumable process (202, no body, as a campaign's): from then on the Shield and its notes are not found, and the notes
  * are removed in the background with their index points.
+ *
+ * <p>Story 6.4 (contract 1.59.0): the preview counts the Shield's stored rolls ({@link RollController}), and its deletion
+ * removes them with it.
  */
 @RestController
 @Tag(name = "library")
@@ -116,7 +119,7 @@ class ShieldController {
     record ShieldDeletionView(
             @Schema(description = "How many live notes of the Shield go with it (contract 1.58.0)", format = "int64",
                     minimum = "0", example = "0") long notes,
-            @Schema(description = "How many stored rolls of the Shield go with it (0 until rolls are stored)",
+            @Schema(description = "How many stored rolls of the Shield go with it (contract 1.59.0)",
                     format = "int64", minimum = "0", example = "0") long rolls,
             @Schema(description = "Whether it is the campaign's only Shield, which cannot be deleted", example = "false")
             boolean last) {
@@ -227,7 +230,7 @@ class ShieldController {
 
     @GetMapping(path = SHIELD_DELETION, produces = MediaType.APPLICATION_JSON_VALUE)
     @Operation(operationId = "getShieldDeletion", summary = "What goes with one Shield of one of the account's campaigns"
-            + " if it is deleted: how many live notes (contract 1.58.0) and stored rolls (0 until they exist), and"
+            + " if it is deleted: how many live notes (contract 1.58.0) and stored rolls (contract 1.59.0), and"
             + " whether it is the campaign's only Shield (last), which cannot be deleted. request.not_found (404) for"
             + " any other id (unknown, another account's, malformed, already deleted, a Shield of another campaign or"
             + " of a campaign being deleted);"

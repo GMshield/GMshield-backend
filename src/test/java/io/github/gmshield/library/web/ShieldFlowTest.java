@@ -61,7 +61,8 @@ import tools.jackson.databind.json.JsonMapper;
  * deletion (from Story 6.2 part B the recorded process: 202, the list one shorter at once, its name free at once, its
  * row gone after the pass), the refusal of the last Shield ({@code request.last_shield}, 409, the row kept), an already
  * deleted Shield (404), and the same not found on both routes. The deletion of a Shield holding notes is
- * {@code ShieldNoteFlowTest}'s.
+ * {@code ShieldNoteFlowTest}'s. Story 6.4: the preview counts the Shield's stored rolls, and the deletion removes them
+ * (the rolls' own rows are {@link RollFlowTest}'s).
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "GMSHIELD_MODE=test")
 @ActiveProfiles({"test-mode", "unit"})
@@ -410,6 +411,32 @@ class ShieldFlowTest {
         assertThat(ok(get(gm, shields(gm.campaign()))).path("items")).extracting(item -> item.path("id").asString())
                 .containsExactly(next.toString());
         assertThat(ok(get(gm, shields(gm.campaign()) + "/" + next + "/deletion")).path("last").asBoolean()).isTrue();
+    }
+
+    @Test
+    void thePreviewCountsTheShieldsStoredRollsAndItsDeletionRemovesThem() throws Exception {
+        Gm gm = signUp();
+        UUID first = firstShield(gm);
+        UUID combat = UUID.fromString(json(send(gm, "POST", shields(gm.campaign()), "{\"name\":\"Combate\"}"))
+                .path("id").asString());
+        for (UUID shield : List.of(combat, combat, first)) {
+            HttpResponse<String> kept = send(gm, "POST", shields(gm.campaign()) + "/" + shield + "/rolls",
+                    "{\"key\":\"" + UUID.randomUUID() + "\",\"formula\":\"1d20\",\"results\":[7],"
+                            + "\"rolledAt\":\"2026-11-27T11:00:00Z\"}");
+            assertThat(kept.statusCode()).as(kept.body()).isEqualTo(201);
+        }
+
+        JsonNode preview = ok(get(gm, shields(gm.campaign()) + "/" + combat + "/deletion"));
+        assertThat(preview.path("rolls").asLong()).isEqualTo(2);
+        assertThat(preview.path("notes").asLong()).isZero();
+        assertThat(ok(get(gm, shields(gm.campaign()) + "/" + first + "/deletion")).path("rolls").asLong()).isEqualTo(1);
+
+        assertThat(send(gm, "DELETE", shields(gm.campaign()) + "/" + combat, "").statusCode()).isEqualTo(202);
+        deletion.sweep();
+        assertThat(library.shields).doesNotContainKey(combat);
+        assertThat(library.rolls.values()).noneMatch(row -> row.shieldId().equals(combat));
+        assertThat(library.rolls.values()).filteredOn(row -> row.ownerId().equals(gm.id())).singleElement()
+                .satisfies(row -> assertThat(row.shieldId()).isEqualTo(first));
     }
 
     // --- helpers
