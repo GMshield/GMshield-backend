@@ -289,6 +289,8 @@ class CrossOwnerAuditFlowTest {
                     "campaign", "artifactId", "artifact").own("campaignId"),
             route("GET", "/api/v1/campaigns/{campaignId}/override-targets", "campaignId", "campaign")
                     .query("recordType=spell"),
+            // the campaign's item encyclopedia (Story 7.2)
+            route("GET", "/api/v1/campaigns/{campaignId}/items", "campaignId", "campaign").query("q=a"),
             // an artifact's relations, their removal and the records it can be related to (Story 5.5 part B)
             route("POST", "/api/v1/campaigns/{campaignId}/artifacts/{artifactId}/relations", "campaignId", "campaign",
                     "artifactId", "artifact").json("{\"recordId\":\"{record}\"}").own("campaignId"),

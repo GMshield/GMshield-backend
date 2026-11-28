@@ -139,6 +139,10 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * no index job. Both it and {@link #createNote} find the Shield under its campaign's row lock
  * ({@link Shields#lockedShield}), which a Shield's deletion takes too, so a note never lands in a Shield being deleted.
  *
+ * <p>Story 7.2: {@link #items} answers the campaign's item encyclopedia ({@link RecordRelations#items}: the item records
+ * of its resolved scope with their tier, and its item artifacts as answers see them, an overriding one in its record's
+ * place), each artifact shared in naming its own campaign, from the same read.
+ *
  * Names, fields and content leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -888,6 +892,53 @@ public class Artifacts {
             throw new IllegalArgumentException("artifacts.offset_invalid");
         }
         return relations.relationTargets(campaignId, artifactId, recordType, query, offset, limit);
+    }
+
+    /**
+     * An entry of a campaign's item encyclopedia (Story 7.2), as {@link RecordRelations.Item}, an artifact shared into
+     * the campaign naming its own campaign ({@code sharedFrom}; null otherwise). {@code toString} names ids only.
+     */
+    public record ItemEntry(RecordRelations.Item item, SharedFrom sharedFrom) {
+        @Override
+        public String toString() {
+            return "ItemEntry[item=" + item + ", shared=" + (sharedFrom != null) + "]";
+        }
+    }
+
+    /** One page of a campaign's item encyclopedia, alphabetical, with how many entries match in all (Story 7.2). */
+    public record ItemEntryPage(List<ItemEntry> items, long total) {
+        public ItemEntryPage {
+            items = List.copyOf(items);
+        }
+    }
+
+    /**
+     * The item encyclopedia of the owner's campaign {@code campaignId} (Story 7.2, {@link RecordRelations#items}): the
+     * item records of its resolved scope and its item artifacts, own and shared in, whose name contains {@code query}
+     * (case and accents ignored; null or blank for all), the {@code offset} first skipped (0 to {@value #MAX_OFFSET}),
+     * at most {@code limit} (1 to {@value #MAX_LIMIT}), each artifact shared in naming its own campaign. Empty when the
+     * campaign is not the owner's or not readable.
+     */
+    public Optional<ItemEntryPage> items(UUID campaignId, String query, int offset, int limit) {
+        if (limit < 1 || limit > MAX_LIMIT) {
+            throw new IllegalArgumentException("artifacts.limit_invalid");
+        }
+        if (offset < 0 || offset > MAX_OFFSET) {
+            throw new IllegalArgumentException("artifacts.offset_invalid");
+        }
+        OwnerContext.require();
+        return reading(() -> relations.items(campaignId, query, offset, limit).map(page -> {
+            Set<UUID> shared = page.items().stream().filter(RecordRelations.Item::shared)
+                    .map(RecordRelations.Item::id).collect(Collectors.toSet());
+            Map<UUID, SharedFrom> from = new HashMap<>();
+            if (!shared.isEmpty()) {
+                for (ArtifactSources.Origin origin : sources.origins(campaignId, shared)) {
+                    from.put(origin.identity().id(), new SharedFrom(origin.from().id(), origin.from().name()));
+                }
+            }
+            return new ItemEntryPage(page.items().stream().map(item -> new ItemEntry(item, item.shared()
+                    ? from.get(item.id()) : null)).toList(), page.total());
+        }));
     }
 
     /**

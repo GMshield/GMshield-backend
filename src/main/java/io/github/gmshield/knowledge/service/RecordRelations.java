@@ -92,6 +92,14 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>A relation changes no answer: no read of a question's scope looks at it.</li>
  * </ul>
  *
+ * <p>Story 7.2: the campaign's item encyclopedia ({@link #items}): every entry of the core type
+ * {@value #ITEM_TYPE} the campaign's resolved scope holds, as answers see it. The live extracted records of that type of
+ * every allowed source, with their tier, and the live artifacts of that type of {@link ResolvedScope#artifacts} (its
+ * own, none with the campaign tier off) and of {@link ResolvedScope#shared} (shared in, none with the system tier off).
+ * A system-tier record a listed artifact of the campaign's own overrides is not listed by itself: that artifact's entry
+ * names it, and the record's name finds that entry in the filter. One alphabetical list, sorted and filtered as
+ * {@link #targets}, a page at a time. Model knowledge is never an entry.
+ *
  * Names leave only in these answers; logs carry ids and counts only.
  */
 @Service
@@ -117,6 +125,8 @@ public class RecordRelations implements CampaignOverrides {
     public static final int MAX_RELATIONS = 50;
     /** A name filter: at most this many code points after trimming. */
     public static final int MAX_QUERY = 200;
+    /** The core record type key the item encyclopedia lists (Story 7.2). */
+    public static final String ITEM_TYPE = "item";
     private static final Logger log = LoggerFactory.getLogger(RecordRelations.class);
 
     private final RecordStore records;
@@ -218,6 +228,29 @@ public class RecordRelations implements CampaignOverrides {
     }
 
     /**
+     * An entry of the item encyclopedia (Story 7.2): an extracted record ({@code artifact} false) with its tier, its
+     * material's name (null when it cannot be read) and its first page, or an artifact ({@code artifact} true, no tier, material or page) of the
+     * campaign's own ({@code shared} false) or shared into it ({@code shared} true). An own artifact that overrides a
+     * system-tier record of the scope names it ({@code overridesId}, {@code overridesName}; null otherwise).
+     * {@code toString} names ids and the type only.
+     */
+    public record Item(UUID id, String name, String recordType, boolean artifact, Tier tier, String materialName,
+                       Integer page, boolean shared, UUID overridesId, String overridesName) {
+        @Override
+        public String toString() {
+            return "Item[id=" + id + ", recordType=" + recordType + ", artifact=" + artifact + ", tier=" + tier
+                    + ", shared=" + shared + ", overridesId=" + overridesId + "]";
+        }
+    }
+
+    /** One page of the item encyclopedia, alphabetical, with how many entries match in all (Story 7.2). */
+    public record ItemPage(List<Item> items, long total) {
+        public ItemPage {
+            items = List.copyOf(items);
+        }
+    }
+
+    /**
      * The targets of the owner's campaign {@code campaignId} of the type key {@code recordType}, as the class says:
      * whose folded name contains the folded {@code query} (null or blank: all), the {@code offset} first skipped, at
      * most {@code limit}. Empty when the campaign is not the owner's or not readable; no item for a key that is not one
@@ -254,6 +287,103 @@ public class RecordRelations implements CampaignOverrides {
                 .addKeyValue("shown", found.map(page -> page.items().size()).orElse(0))
                 .addKeyValue("total", found.map(TargetPage::total).orElse(0L)).log("knowledge.override_targets_listed");
         return found;
+    }
+
+    /**
+     * The item encyclopedia of the owner's campaign {@code campaignId} (Story 7.2), as the class says: the entries
+     * whose folded name contains the folded {@code query} (null or blank: all), the {@code offset} first skipped, at
+     * most {@code limit}, in the caller's read transaction (or one of its own). Empty when the campaign is not the
+     * owner's or not readable.
+     */
+    public Optional<ItemPage> items(UUID campaignId, String query, int offset, int limit) {
+        UUID owner = OwnerContext.require();
+        String folded = query == null ? "" : fold(query.strip());
+        int[] counts = {0, 0, 0};
+        Optional<ItemPage> found = reading(() -> library.campaign(campaignId).map(campaign -> {
+            ResolvedScope scope = scopeOf(campaign.id());
+            List<Entry> named = new ArrayList<>();
+            // The campaign's own artifacts of the type (none with the campaign tier off), then those shared in (none
+            // with the system tier off): an artifact shared in overrides nothing here, its mark being its own campaign's.
+            List<CampaignArtifacts.Artifact> own = scope.artifacts().isEmpty() ? List.of()
+                    : campaignArtifacts.getObject().read(campaign.id(), scope.artifacts()).stream()
+                    .filter(artifact -> ITEM_TYPE.equals(artifact.recordType())).toList();
+            List<CampaignArtifacts.Artifact> shared = scope.shared().isEmpty() ? List.of()
+                    : campaignArtifacts.getObject().readShared(campaign.id(), scope.shared()).stream()
+                    .filter(artifact -> ITEM_TYPE.equals(artifact.recordType())).toList();
+            Map<UUID, UUID> overrides = own.isEmpty() ? Map.of()
+                    : overrides(campaign.id(), own.stream().map(CampaignArtifacts.Artifact::id).toList());
+            // A mark counts only when its record is a live system-tier record of the scope, as answers read it.
+            Map<UUID, RecordRow> overridden = new HashMap<>();
+            if (!overrides.isEmpty()) {
+                records.findAll(Set.copyOf(overrides.values()), RecordStore.Reach.LIVE).stream()
+                        .filter(row -> target(scope, row)).forEach(row -> overridden.put(row.id(), row));
+            }
+            Set<UUID> replaced = new HashSet<>();
+            for (CampaignArtifacts.Artifact artifact : own) {
+                UUID target = overrides.get(artifact.id());
+                RecordRow row = target == null ? null : overridden.get(target);
+                if (row != null) {
+                    replaced.add(row.id());
+                }
+                // The entry stands in the record's place, so the record's name finds it too.
+                if (folded.isEmpty() || fold(artifact.name()).contains(folded) || row != null
+                        && fold(vault.decryptText(ExtractedRecordStore.name(row.id(), owner), row.name()))
+                        .contains(folded)) {
+                    named.add(new Entry(artifact.id(), artifact.name(), artifact.recordType(), null, null, false,
+                            row));
+                }
+            }
+            Set<UUID> ownIds = own.stream().map(CampaignArtifacts.Artifact::id).collect(Collectors.toSet());
+            for (CampaignArtifacts.Artifact artifact : shared) {
+                if (!ownIds.contains(artifact.id()) && (folded.isEmpty() || fold(artifact.name()).contains(folded))) {
+                    named.add(new Entry(artifact.id(), artifact.name(), artifact.recordType(), null, null, true,
+                            null));
+                }
+            }
+            List<UUID> allowed = List.copyOf(scope.allowedSources());
+            if (!allowed.isEmpty() && scope.recordTypes().contains(ITEM_TYPE)) {
+                for (RecordRow row : records.ofTypeIn(allowed, ITEM_TYPE)) {
+                    Optional<Tier> tier = scope.tierOf(row.versionId());
+                    if (tier.isEmpty() || replaced.contains(row.id())) {
+                        continue;
+                    }
+                    String name = vault.decryptText(ExtractedRecordStore.name(row.id(), owner), row.name());
+                    if (folded.isEmpty() || fold(name).contains(folded)) {
+                        named.add(new Entry(row.id(), name, row.type(), tier.get(), row, false, null));
+                    }
+                }
+            }
+            counts[0] = own.size();
+            counts[1] = shared.size();
+            counts[2] = replaced.size();
+            Collator collator = Collator.getInstance(Locale.ROOT);
+            collator.setStrength(Collator.SECONDARY);
+            named.sort(Comparator.comparing(Entry::name, collator).thenComparing(Entry::id));
+            List<Entry> shown = named.subList(Math.min(offset, named.size()),
+                    Math.min(offset + limit, named.size()));
+            Map<UUID, String> materials = sources.materialNames(shown.stream().map(Entry::versionId)
+                    .filter(Objects::nonNull).toList());
+            return new ItemPage(shown.stream().map(one -> item(one, materials, owner)).toList(), named.size());
+        }));
+        log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
+                .addKeyValue("filtered", !folded.isEmpty()).addKeyValue("offset", offset).addKeyValue("limit", limit)
+                .addKeyValue("found", found.isPresent()).addKeyValue("ownArtifacts", counts[0])
+                .addKeyValue("sharedArtifacts", counts[1]).addKeyValue("overridden", counts[2])
+                .addKeyValue("shown", found.map(page -> page.items().size()).orElse(0))
+                .addKeyValue("total", found.map(ItemPage::total).orElse(0L)).log("knowledge.items_listed");
+        return found;
+    }
+
+    /** An encyclopedia entry from its candidate, the overridden record's name decrypted (Story 7.2). */
+    private Item item(Entry one, Map<UUID, String> materials, UUID owner) {
+        if (one.record() != null) {
+            return new Item(one.id(), one.name(), one.recordType(), false, one.tier(),
+                    materials.get(one.versionId()), one.record().firstPage(), false, null, null);
+        }
+        RecordRow target = one.overridden();
+        return new Item(one.id(), one.name(), one.recordType(), true, null, null, null, one.shared(),
+                target == null ? null : target.id(), target == null ? null
+                : vault.decryptText(ExtractedRecordStore.name(target.id(), owner), target.name()));
     }
 
     /**
@@ -711,6 +841,18 @@ public class RecordRelations implements CampaignOverrides {
 
     /** A relation target before it is paged: an extracted record with its version, or an artifact (no version). */
     private record Candidate(UUID id, String name, String recordType, Tier tier, UUID versionId) {
+    }
+
+    /**
+     * An encyclopedia entry before it is paged (Story 7.2): an extracted record ({@code record} set, with its tier), or
+     * an artifact, shared in or not, with the system-tier record it overrides ({@code overridden}, null for none).
+     */
+    private record Entry(UUID id, String name, String recordType, Tier tier, RecordRow record, boolean shared,
+                         RecordRow overridden) {
+
+        UUID versionId() {
+            return record == null ? null : record.versionId();
+        }
     }
 
     private static UUID requireTransaction() {

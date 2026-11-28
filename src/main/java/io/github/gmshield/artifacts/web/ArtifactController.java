@@ -115,6 +115,13 @@ import org.springframework.web.bind.annotation.RestController;
  * Shield of the same campaign, keeping its versions (no new version, no index job, no change to its content); its own
  * Shield answers it unchanged. A note no Shield holds, a Shield of another campaign, a deleting or unknown Shield and
  * another account's ids are {@code request.not_found} (404).
+ *
+ * <p>Story 7.2 (contract 1.62.0): {@code GET /api/v1/campaigns/{campaignId}/items?q=&offset=&limit=} answers the
+ * campaign's item encyclopedia ({@link Artifacts#items}): the item records of its resolved scope with their tier,
+ * material and page, and its item artifacts as answers see them (own with the campaign tier on, shared in with the
+ * system tier on, naming their own campaign), an overriding artifact in its record's place, one alphabetical list a
+ * page at a time with the total. The route lives here, beside the override targets, because {@code conversations},
+ * which the spine names, may depend on neither {@code knowledge} nor {@code artifacts}.
  */
 @RestController
 @Tag(name = "artifacts")
@@ -135,6 +142,8 @@ class ArtifactController {
     static final String SHARING = ARTIFACT + "/sharing";
     /** Story 6.2 part B: the Shield holding a note. */
     static final String SHIELD = ARTIFACT + "/shield";
+    /** Story 7.2: the campaign's item encyclopedia. */
+    static final String ITEMS = "/api/v1/campaigns/{campaignId}/items";
     /** A version's number: 1 to 999,999,999, no leading zero. */
     private static final Pattern NUMBER = Pattern.compile("[1-9][0-9]{0,8}");
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
@@ -1166,6 +1175,108 @@ class ArtifactController {
                 from, size).orElseThrow(ArtifactController::notFound);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new RelationTargetPageView(page.items()
                 .stream().map(RelationTargetView::of).toList(), page.total()));
+    }
+
+    @Schema(name = "CampaignItemOverride", requiredProperties = {"recordId", "name"},
+            description = "The system record an artifact of the campaign overrides, which its encyclopedia entry"
+            + " replaces (contract 1.62.0)")
+    record ItemOverrideView(
+            @Schema(description = "The record's id; getCampaignRecord opens it in the campaign", format = "uuid")
+            String recordId,
+            @Schema(description = "The record's name, as extracted or corrected", example = "Espada longa")
+            String name) {
+
+        @Override
+        public String toString() {
+            return "ItemOverrideView[recordId=" + recordId + "]";
+        }
+    }
+
+    @Schema(name = "CampaignItem", requiredProperties = {"kind", "id", "name", "recordType", "tier", "materialName",
+        "page", "sharedFrom", "overrides"}, description = "An entry of a campaign's item encyclopedia (contract 1.62.0):"
+            + " an extracted item record of the campaign's scope, or an item artifact of the campaign or shared into it")
+    record ItemView(
+            @Schema(description = "record for an extracted record (getCampaignRecord opens it), artifact for an artifact"
+                    + " (getArtifact opens it in the campaign)", allowableValues = {"record", "artifact"}) String kind,
+            @Schema(description = "The record's or the artifact's id", format = "uuid") String id,
+            @Schema(description = "Its name: a record's as extracted or corrected, an artifact's newest version's",
+                    example = "Espada longa") String name,
+            @Schema(description = "The key of its record type", pattern = "^[a-z][a-z0-9_]{0,31}$", example = "item")
+            String recordType,
+            @Schema(description = "A record's tier in the campaign's scope; null for an artifact",
+                    types = {"string", "null"}, allowableValues = {"campaign", "system", "other"}) String tier,
+            @Schema(description = "The name of the material a record was extracted from; null for an artifact",
+                    types = {"string", "null"}, example = "Livro do Jogador") String materialName,
+            @Schema(description = "A record's first page in its material; null for an artifact",
+                    types = {"integer", "null"}, format = "int32", minimum = "1", example = "150") Integer page,
+            @Schema(description = "For an artifact shared into the campaign, its own campaign; null otherwise",
+                    types = {"object", "null"}, implementation = SharedFromView.class) SharedFromView sharedFrom,
+            @Schema(description = "For an artifact of the campaign that overrides a system record of its scope, that"
+                    + " record (not listed by itself); null otherwise", types = {"object", "null"},
+                    implementation = ItemOverrideView.class) ItemOverrideView overrides) {
+
+        static ItemView of(Artifacts.ItemEntry entry) {
+            RecordRelations.Item item = entry.item();
+            return new ItemView(item.artifact() ? "artifact" : "record", item.id().toString(), item.name(),
+                    item.recordType(), item.tier() == null ? null : item.tier().word(), item.materialName(),
+                    item.page(), SharedFromView.of(entry.sharedFrom()), item.overridesId() == null ? null
+                    : new ItemOverrideView(item.overridesId().toString(), item.overridesName()));
+        }
+
+        @Override
+        public String toString() {
+            return "ItemView[kind=" + kind + ", id=" + id + ", tier=" + tier + "]";
+        }
+    }
+
+    @Schema(name = "CampaignItemPage", requiredProperties = {"items", "total"},
+            description = "A page of a campaign's item encyclopedia (contract 1.62.0)")
+    record ItemPageView(
+            @ArraySchema(schema = @Schema(implementation = ItemView.class)) List<ItemView> items,
+            @Schema(description = "How many entries match in all, whatever the page", format = "int64", minimum = "0",
+                    example = "12") long total) {
+    }
+
+    @GetMapping(path = ITEMS, produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "listCampaignItems", summary = "The item encyclopedia of one of the account's campaigns"
+            + " (contract 1.62.0): every entry of the record type item its scope (its stored settings) holds, as"
+            + " answers see them, in one list alphabetical by name (ties by id), a page at a time with the total. The"
+            + " live extracted item records of every allowed source, each with its tier, material and first page (a"
+            + " switched-off tier or material lists none); the campaign's live item artifacts while its campaign tier"
+            + " is on; and the live item artifacts shared into it while its system tier is on, each naming its own"
+            + " campaign. A system record an artifact of the campaign overrides is not listed by itself: that"
+            + " artifact's entry names it in overrides. Model knowledge is never an entry. q keeps the entries whose"
+            + " name contains it, case and accents ignored. request.not_found (404) for a campaign that is not the"
+            + " account's (unknown, another account's, malformed or being deleted); request.invalid (400) for a q"
+            + " over 200 characters, a limit outside 1 to 50 or an offset outside 0 to 100000;" + SESSION_SUMMARY,
+            parameters = {
+                @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                        schema = @Schema(type = "string")),
+                @Parameter(name = "q", in = ParameterIn.QUERY, description = "Only the entries whose name contains"
+                        + " this, case and accents ignored; at most 200 characters, blank for all",
+                        schema = @Schema(type = "string", maxLength = 200)),
+                @Parameter(name = "limit", in = ParameterIn.QUERY, description = "At most this many, 1 to 50",
+                        schema = @Schema(type = "integer", format = "int32", minimum = "1", maximum = "50",
+                                defaultValue = "20")),
+                @Parameter(name = "offset", in = ParameterIn.QUERY, description = "How many of the first to skip, 0 to"
+                        + " 100000, for a numbered page", schema = @Schema(type = "integer", format = "int32",
+                        minimum = "0", maximum = "100000", defaultValue = "0"))})
+    ResponseEntity<ItemPageView> listCampaignItems(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("campaignId") String campaignId,
+            @Parameter(hidden = true) @RequestParam(value = "q", required = false) String query,
+            @Parameter(hidden = true) @RequestParam(value = "limit", required = false) String limit,
+            @Parameter(hidden = true) @RequestParam(value = "offset", required = false) String offset) {
+        UUID campaign = parse(campaignId).orElseThrow(ArtifactController::notFound);
+        if (query != null && query.strip().codePointCount(0, query.strip().length()) > RecordRelations.MAX_QUERY) {
+            throw invalid();
+        }
+        int size = limit(limit);
+        int from = offset(offset, null);
+        Artifacts.ItemEntryPage page = artifacts.items(campaign, query, from, size)
+                .orElseThrow(ArtifactController::notFound);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new ItemPageView(page.items().stream()
+                .map(ItemView::of).toList(), page.total()));
     }
 
     @Schema(name = "ArtifactSharing", requiredProperties = "campaignIds",

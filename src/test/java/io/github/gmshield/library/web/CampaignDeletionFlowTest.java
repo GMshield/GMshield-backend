@@ -248,6 +248,7 @@ class CampaignDeletionFlowTest {
         assertNotFound(send(gm, "PUT", "/api/v1/campaigns/current", "{\"campaignId\":\"" + target + "\"}"));
         assertNotFound(send(gm, "DELETE", "/api/v1/campaigns/" + target));
         assertNotFound(get(gm, "/api/v1/campaigns/" + target + "/conversation"));
+        assertNotFound(get(gm, "/api/v1/campaigns/" + target + "/items"));
         assertNotFound(ask(gm, target));
         for (String list : List.of("/api/v1/campaigns", "/api/v1/campaigns?archived=true",
                 "/api/v1/campaigns?system=" + gm.system())) {
