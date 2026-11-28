@@ -165,6 +165,8 @@ public class Conversations {
     static final String TURN = "turn";
     static final String FIELD_QUESTION = "question";
     static final String FIELD_PROPOSAL_NAME = "proposal_name";
+    static final String FIELD_PARTY_SIZE = "party_size";
+    static final String FIELD_PARTY_LEVEL = "party_level";
     static final String BATCH = "turn_event_batch";
     static final String FIELD_PAYLOAD = "payload";
     private static final Logger log = LoggerFactory.getLogger(Conversations.class);
@@ -456,24 +458,29 @@ public class Conversations {
         UUID owner = OwnerContext.require();
         String language = Languages.detect(question);
         return writing(() -> {
-            if (campaignId == null || library.campaign(campaignId).isEmpty()) {
+            Library.Campaign campaign = campaignId == null ? null : library.campaign(campaignId).orElse(null);
+            if (campaign == null) {
                 throw ConversationProblems.notFound();
             }
             Instant now = now();
             ConversationRow conversation = conversationFor(owner, campaignId, conversationId, area, asked, now);
             UUID turnId = Ids.newId();
             ScopeSettings settings = campaignScopes.settings(campaignId);
+            // Story 7.1: the campaign's party, frozen with the turn, so a change applies from the next question.
+            byte[] partySize = encryptParty(FIELD_PARTY_SIZE, turnId, owner, campaign.partySize());
+            byte[] partyLevel = encryptParty(FIELD_PARTY_LEVEL, turnId, owner, campaign.partyLevel());
             JobRef job = jobs.create(asked.jobKind(), Lane.INTERACTIVE, created -> store.insertTurn(new TurnRow(turnId,
                     owner, conversation.id(), created.id(), vault.encryptText(question(turnId, owner), question),
                     language, settings.campaignTier(), settings.systemTier(), settings.otherTier(),
                     settings.modelKnowledge(), settings.materialsOff(), now, null, null, null, asked.word(), null,
-                    null, null, null)));
+                    null, null, null, partySize, partyLevel)));
             log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", campaignId)
                     .addKeyValue("conversationId", conversation.id()).addKeyValue("area", conversation.area())
                     .addKeyValue("turnId", turnId).addKeyValue("kind", asked.word())
                     .addKeyValue("jobId", job.id()).addKeyValue("language", language == null ? "unsure" : language)
                     .addKeyValue("otherTier", settings.otherTier())
                     .addKeyValue("materialsOff", settings.materialsOff().size())
+                    .addKeyValue("partySize", partySize != null).addKeyValue("partyLevel", partyLevel != null)
                     .addKeyValue("questionLength", question.codePointCount(0, question.length()))
                     .log("conversation.turn_recorded");
             return new Asked(turnId, conversation.id(), language);
@@ -1183,6 +1190,19 @@ public class Conversations {
                         // Story 5.1 part B: an artifact's reference has no page or picture.
                         .filter(row -> row.number() == number && !row.artifact()).findFirst()
                         .map(row -> new Cited(conversation.campaignId(), row.materialId(), row.versionId())));
+    }
+
+    /** A frozen party value (Story 7.1), encrypted as its decimal text under its turn binding; null stays null. */
+    private byte[] encryptParty(String field, UUID turnId, UUID owner, Integer value) {
+        return value == null ? null : vault.encryptText(party(field, turnId, owner), value.toString());
+    }
+
+    /**
+     * The binding of a party value frozen on a turn (Story 7.1, {@code turn.party_size} or {@code turn.party_level}):
+     * {@code field} is {@value #FIELD_PARTY_SIZE} or {@value #FIELD_PARTY_LEVEL}.
+     */
+    static Binding party(String field, UUID turnId, UUID owner) {
+        return new Binding(TURN, field, turnId, owner);
     }
 
     static Binding question(UUID turnId, UUID owner) {

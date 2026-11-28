@@ -30,6 +30,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.JsonNode;
 
 /**
  * The owner's systems and campaigns (Story 1.11). The owner is the session's account, set by the request edge
@@ -57,6 +58,11 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Story 3.2 part B: what goes with a campaign ({@code GET .../deletion}), and its deletion ({@code DELETE}, 202 with
  * no body; {@link SystemDeletion#deleteCampaign}). A campaign being deleted is {@code request.not_found} on every
  * route, as another owner's is.
+ *
+ * <p>Story 7.1: a campaign carries its party size and level (each null while not set), and
+ * {@code PUT .../party} replaces both on the campaign's version (null clears). A value that is not a whole number in its
+ * range is {@code request.party_size_invalid} or {@code request.party_level_invalid} (400, params {@code min} and
+ * {@code max}).
  */
 @RestController
 @Tag(name = "library")
@@ -69,6 +75,7 @@ class LibraryController {
     static final String SYSTEM = "/api/v1/systems/{id}";
     static final String SYSTEM_DELETION = "/api/v1/systems/{id}/deletion";
     static final String CAMPAIGN_DELETION = "/api/v1/campaigns/{id}/deletion";
+    static final String CAMPAIGN_PARTY = "/api/v1/campaigns/{id}/party";
     /** A UUID in its canonical text form; anything else is an id that exists nowhere. */
     private static final Pattern UUID_TEXT = Pattern.compile("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}");
     private static final Pattern LIMIT = Pattern.compile("[1-9][0-9]?");
@@ -130,20 +137,28 @@ class LibraryController {
         }
     }
 
-    @Schema(name = "Campaign", requiredProperties = {"id", "name", "system", "archived", "version"})
+    @Schema(name = "Campaign", requiredProperties = {"id", "name", "system", "archived", "version", "partySize",
+        "partyLevel"})
     record CampaignView(
             @Schema(description = "The campaign's id", format = "uuid", example = "0190a0b0-0000-7000-8000-000000000002")
             String id,
             @Schema(description = "The campaign's name", example = "Primeira campanha") String name,
             @Schema(description = "The campaign's system") SystemView system,
             @Schema(description = "Whether the GM archived it (contract 1.19.0)") boolean archived,
-            @Schema(description = "The campaign's version: a rename, an archive or a restore names it and raises it by"
-                    + " one; choosing the campaign does not (contract 1.19.0)", format = "int64", example = "0")
-            long version) {
+            @Schema(description = "The campaign's version: a rename, an archive, a restore or a change of its party"
+                    + " (contract 1.61.0) names it and raises it by one; choosing the campaign does not (contract"
+                    + " 1.19.0)", format = "int64", example = "0")
+            long version,
+            @Schema(description = "How many players the GM's party has, 1 to 20; null while not set (contract 1.61.0)",
+                    types = {"integer", "null"}, format = "int32", minimum = "1", maximum = "20", example = "4")
+            Integer partySize,
+            @Schema(description = "The party's level, 1 to 999; null while not set (contract 1.61.0)",
+                    types = {"integer", "null"}, format = "int32", minimum = "1", maximum = "999", example = "5")
+            Integer partyLevel) {
 
         static CampaignView of(Library.Campaign campaign) {
             return new CampaignView(campaign.id().toString(), campaign.name(), SystemView.of(campaign.system()),
-                    campaign.archived(), campaign.version());
+                    campaign.archived(), campaign.version(), campaign.partySize(), campaign.partyLevel());
         }
 
         @Override
@@ -280,6 +295,24 @@ class LibraryController {
         }
     }
 
+    @Schema(name = "CampaignPartyChange", requiredProperties = {"version"})
+    record CampaignPartyBody(
+            @Schema(description = "The version the change was made on, as the campaign was read", format = "int64",
+                    minimum = "0", example = "3") Long version,
+            @Schema(description = "How many players, a whole number from 1 to 20; absent or null: not set",
+                    implementation = Integer.class, types = {"integer", "null"}, format = "int32", minimum = "1",
+                    maximum = "20", example = "4") JsonNode size,
+            @Schema(description = "The party's level, a whole number from 1 to 999 (most systems go from 1 to 20;"
+                    + " supplements may go beyond); absent or null: not set", implementation = Integer.class,
+                    types = {"integer", "null"}, format = "int32", minimum = "1", maximum = "999", example = "5")
+            JsonNode level) {
+
+        @Override
+        public String toString() {
+            return "CampaignPartyBody[version=" + version + "]";
+        }
+    }
+
     @Schema(name = "CurrentCampaignChoice", requiredProperties = "campaignId")
     record CurrentCampaignBody(
             @Schema(description = "The account's campaign to make current; not an archived one", format = "uuid",
@@ -392,6 +425,42 @@ class LibraryController {
         }
         return found(library.changeCampaign(campaignId, body.version(), body.name(), body.archived())
                 .map(CampaignView::of));
+    }
+
+    @PutMapping(path = CAMPAIGN_PARTY, consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(operationId = "changeCampaignParty", summary = "Replaces the party size and level of one of the"
+            + " account's campaigns on the version it names (null or absent clears a value): the campaign as stored,"
+            + " its version raised by one. A question asked before keeps the values it was asked with; the change"
+            + " applies from the next question. request.party_size_invalid (400) for a size that is not a whole number"
+            + " from 1 to 20, request.party_level_invalid (400) for a level that is not a whole number from 1 to 999"
+            + " (params min and max), request.stale_version (409) when the campaign has left that version,"
+            + " request.invalid (400) without a version or for a malformed body, request.not_found (404) for any other"
+            + " id; nothing changes then;" + SESSION_SUMMARY,
+            parameters = @Parameter(name = SESSION, in = ParameterIn.HEADER, description = "The session token",
+                    schema = @Schema(type = "string")))
+    ResponseEntity<CampaignView> changeCampaignParty(
+            @Parameter(description = "The campaign's id", schema = @Schema(type = "string", format = "uuid"))
+            @PathVariable("id") String id,
+            @RequestBody CampaignPartyBody body) {
+        UUID campaignId = parse(id).orElseThrow(LibraryController::notFound);
+        if (body == null || body.version() == null || body.version() < 0) {
+            throw invalid();
+        }
+        return found(library.changeParty(campaignId, body.version(), partyNumber(body.size()), partyNumber(body.level()))
+                .map(CampaignView::of));
+    }
+
+    /**
+     * A party value as sent (Story 7.1): absent or null is null; a JSON number is its number, whole or not; anything
+     * else (a string, a boolean...) is {@link Double#NaN}, a number that is never whole, so the library refuses it with
+     * the field's own problem.
+     */
+    private static Number partyNumber(JsonNode value) {
+        if (value == null || value.isNull() || value.isMissingNode()) {
+            return null;
+        }
+        return value.isNumber() ? value.numberValue() : Double.valueOf(Double.NaN);
     }
 
     @GetMapping(path = CAMPAIGN, produces = MediaType.APPLICATION_JSON_VALUE)

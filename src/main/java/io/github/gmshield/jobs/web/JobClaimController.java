@@ -81,7 +81,10 @@ class JobClaimController {
                     + " terms within its turn's scope as question.answer does, posts its draft as answer events and"
                     + " calls a model; it writes nothing to the library. From contract 1.26.0 a content.draft input"
                     + " also carries recordTypeNames: each recordTypes key with the name of the campaign system's record"
-                    + " type (data for the model that proposes the draft's type)")
+                    + " type (data for the model that proposes the draft's type). From contract 1.28.0 a question.answer"
+                    + " or content.draft input may carry party {size?, level?}: the campaign's party size (1 to 20) and"
+                    + " level (1 to 999) frozen on the turn, each only when the GM set it, the key absent when neither"
+                    + " is; campaign data for the model, never instructions and never account data")
             Map<String, Object> input,
             @Schema(requiredMode = Schema.RequiredMode.REQUIRED,
                     description = "W3C traceparent of the job's trace: log under it and send it on every call")

@@ -89,7 +89,7 @@ import tools.jackson.databind.node.ObjectNode;
  * record, which becomes a reference of its own), a done, dismissed turn, a search, and a turn still waiting in a second
  * conversation; from Story 5.1 an artifact of the campaign (from part B indexed, and cited by the bookmarked turn too);
  * from Story 5.3 part A a finished draft (a turn of kind draft); from Story 6.1 a renamed Shield of the campaign beside its
- * unnamed first one, and from Story 6.4 a stored roll of that Shield. From Story 5.4 part B, A's artifact named in the deletion
+ * unnamed first one, and from Story 6.4 a stored roll of that Shield; from Story 7.1 the campaign's party is set. From Story 5.4 part B, A's artifact named in the deletion
  * of B's own conversation is ignored as a random id is, and stays. Account B then walks {@link #ROUTES}, every public
  * route that names a library item by id, with A's ids: each answer is {@code request.not_found} (404) with the same
  * body as a random id on that route (the trace id aside), and a route with a container and an item ({@code own})
@@ -237,6 +237,9 @@ class CrossOwnerAuditFlowTest {
                     .json("{\"version\":{campaignVersion},\"name\":\"Tomada\",\"archived\":true}"),
             route("GET", "/api/v1/campaigns/{id}/deletion", "id", "campaign"),
             route("DELETE", "/api/v1/campaigns/{id}", "id", "campaign"),
+            // Story 7.1: the party's size and level
+            route("PUT", "/api/v1/campaigns/{id}/party", "id", "campaign")
+                    .json("{\"version\":{campaignVersion},\"size\":3,\"level\":2}"),
             // scope settings
             route("GET", "/api/v1/campaigns/{id}/scope", "id", "campaign"),
             route("PUT", "/api/v1/campaigns/{id}/scope", "id", "campaign").json(SCOPE_CHANGE),
@@ -960,6 +963,10 @@ class CrossOwnerAuditFlowTest {
                 + "\"campaignTier\":true,\"systemTier\":true,\"otherTier\":true,\"modelKnowledge\":false,"
                 + "\"materialsOff\":[]}");
         assertThat(scoped.statusCode()).as(scoped.body()).isEqualTo(200);
+        // Story 7.1: the campaign's party, which the turns asked next freeze.
+        HttpResponse<String> party = send(gm, "PUT", "/api/v1/campaigns/" + gm.campaign() + "/party", "{\"version\":"
+                + version(gm, "/api/v1/campaigns/" + gm.campaign()) + ",\"size\":4,\"level\":5}");
+        assertThat(party.statusCode()).as(party.body()).isEqualTo(200);
 
         HttpResponse<String> set = send(gm, "POST", "/api/v1/image-sets", "{\"name\":\"Ficha\",\"kind\":\"other\","
                 + "\"language\":\"detect\",\"campaign\":\"" + gm.campaign() + "\",\"images\":[{\"name\":\"a.jpg\","

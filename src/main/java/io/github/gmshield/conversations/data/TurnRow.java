@@ -20,13 +20,15 @@ import java.util.UUID;
  * From Story 5.4 part A (V49), a draft's save state: the artifact it was saved as ({@code saved_record_id}; null when
  * never saved, or once that artifact is gone) and when its save card was closed ({@code save_declined_at}: by "Agora
  * não", or by a save; null while it is offered).
+ * From Story 7.1 (V57), the campaign's party size and level frozen when it was asked ({@code party_size},
+ * {@code party_level}), each a vault ciphertext of its decimal text, null when not set (and on a turn from before V57).
  * {@code toString} names ids only.
  */
 public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, byte[] question, String language,
                       boolean campaignTier, boolean systemTier, boolean otherTier, boolean modelKnowledge,
                       Set<UUID> materialsOff, Instant createdAt, Instant stoppedAt, Instant dismissedAt,
                       Instant bookmarkedAt, String kind, byte[] proposalName, String proposalType,
-                      UUID savedRecordId, Instant saveDeclinedAt) {
+                      UUID savedRecordId, Instant saveDeclinedAt, byte[] partySize, byte[] partyLevel) {
 
     /** The kind of a turn the GM asked as a question (Story 5.3 part A): the default. */
     public static final String QUESTION = "question";
@@ -36,6 +38,8 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
     public TurnRow {
         question = question.clone();
         proposalName = proposalName == null ? null : proposalName.clone();
+        partySize = partySize == null ? null : partySize.clone();
+        partyLevel = partyLevel == null ? null : partyLevel.clone();
         proposalType = proposalName == null ? null : proposalType;
         kind = kind == null ? QUESTION : kind;
         materialsOff = materialsOff == null ? Set.of() : Set.copyOf(materialsOff);
@@ -50,6 +54,18 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
     @Override
     public byte[] proposalName() {
         return proposalName == null ? null : proposalName.clone();
+    }
+
+    /** The frozen party size, a vault ciphertext; null when not set (Story 7.1). */
+    @Override
+    public byte[] partySize() {
+        return partySize == null ? null : partySize.clone();
+    }
+
+    /** The frozen party level, a vault ciphertext; null when not set (Story 7.1). */
+    @Override
+    public byte[] partyLevel() {
+        return partyLevel == null ? null : partyLevel.clone();
     }
 
     /** Whether the turn has a proposal (Story 5.3 part B). */
@@ -69,35 +85,37 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
                 && Objects.equals(bookmarkedAt, that.bookmarkedAt) && Objects.equals(kind, that.kind)
                 && Arrays.equals(proposalName, that.proposalName) && Objects.equals(proposalType, that.proposalType)
                 && Objects.equals(savedRecordId, that.savedRecordId)
-                && Objects.equals(saveDeclinedAt, that.saveDeclinedAt);
+                && Objects.equals(saveDeclinedAt, that.saveDeclinedAt) && Arrays.equals(partySize, that.partySize)
+                && Arrays.equals(partyLevel, that.partyLevel);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(id, ownerId, conversationId, jobId, Arrays.hashCode(question), language, campaignTier,
                 systemTier, otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt,
-                kind, Arrays.hashCode(proposalName), proposalType, savedRecordId, saveDeclinedAt);
+                kind, Arrays.hashCode(proposalName), proposalType, savedRecordId, saveDeclinedAt,
+                Arrays.hashCode(partySize), Arrays.hashCode(partyLevel));
     }
 
     /** This row, stopped at {@code at}. */
     public TurnRow stopped(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, at, dismissedAt, bookmarkedAt, kind,
-                proposalName, proposalType, savedRecordId, saveDeclinedAt);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt, partySize, partyLevel);
     }
 
     /** This row, dismissed at {@code at} (Story 3.11; null: shown again). */
     public TurnRow dismissed(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, at, bookmarkedAt, kind,
-                proposalName, proposalType, savedRecordId, saveDeclinedAt);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt, partySize, partyLevel);
     }
 
     /** This row, bookmarked at {@code at} (Story 3.12; null: not saved). */
     public TurnRow bookmarked(Instant at) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, at, kind,
-                proposalName, proposalType, savedRecordId, saveDeclinedAt);
+                proposalName, proposalType, savedRecordId, saveDeclinedAt, partySize, partyLevel);
     }
 
     /**
@@ -107,7 +125,7 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
     public TurnRow proposed(byte[] name, String type) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind, name,
-                type, savedRecordId, saveDeclinedAt);
+                type, savedRecordId, saveDeclinedAt, partySize, partyLevel);
     }
 
     /**
@@ -117,7 +135,7 @@ public record TurnRow(UUID id, UUID ownerId, UUID conversationId, UUID jobId, by
     public TurnRow saving(UUID savedRecord, Instant declinedAt) {
         return new TurnRow(id, ownerId, conversationId, jobId, question, language, campaignTier, systemTier,
                 otherTier, modelKnowledge, materialsOff, createdAt, stoppedAt, dismissedAt, bookmarkedAt, kind,
-                proposalName, proposalType, savedRecord, declinedAt);
+                proposalName, proposalType, savedRecord, declinedAt, partySize, partyLevel);
     }
 
     @Override

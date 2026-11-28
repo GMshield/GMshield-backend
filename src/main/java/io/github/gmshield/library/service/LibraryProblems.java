@@ -4,7 +4,7 @@ import io.github.gmshield.shared.service.ApiProblem;
 import java.util.Map;
 
 /**
- * The problems of the GM's edits of the library (Stories 3.1, 3.2, 6.1 and 6.4). None carries content: the params are a field's limits
+ * The problems of the GM's edits of the library (Stories 3.1, 3.2, 6.1, 6.4 and 7.1). None carries content: the params are a field's limits
  * only. Each invalid field has its own code, so the form shows the text under that field.
  */
 final class LibraryProblems {
@@ -28,6 +28,14 @@ final class LibraryProblems {
     /** Another campaign of the system has the same name (its unique form, Story 3.2). */
     static final ApiProblem CAMPAIGN_NAME_TAKEN =
             ApiProblem.of(409, ApiProblem.CATEGORY_REQUEST, "campaign_name_taken", "Campaign name taken");
+    /** A party size that is not a whole number from 1 to {@value Library#PARTY_SIZE_MAX} (Story 7.1). */
+    static final ApiProblem PARTY_SIZE_INVALID =
+            ApiProblem.of(400, ApiProblem.CATEGORY_REQUEST, "party_size_invalid", "Party size invalid")
+                    .withParams(Map.<String, Object>of("min", 1, "max", Library.PARTY_SIZE_MAX));
+    /** A party level that is not a whole number from 1 to {@value Library#PARTY_LEVEL_MAX} (Story 7.1). */
+    static final ApiProblem PARTY_LEVEL_INVALID =
+            ApiProblem.of(400, ApiProblem.CATEGORY_REQUEST, "party_level_invalid", "Party level invalid")
+                    .withParams(Map.<String, Object>of("min", 1, "max", Library.PARTY_LEVEL_MAX));
     /** A Shield's name outside its limits (Story 6.1). */
     static final ApiProblem SHIELD_NAME_INVALID =
             ApiProblem.of(400, ApiProblem.CATEGORY_REQUEST, "shield_name_invalid", "Shield name invalid")
