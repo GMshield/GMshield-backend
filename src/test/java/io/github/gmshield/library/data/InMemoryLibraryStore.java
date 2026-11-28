@@ -189,7 +189,26 @@ public class InMemoryLibraryStore implements LibraryStore {
             archivedAt = change.archived() ? before.archivedAt() : null;
         }
         CampaignRow after = new CampaignRow(before.id(), owner, before.systemId(), change.name(), change.nameFingerprint(),
-                archivedAt, chosenAt, before.version() + 1, before.createdAt());
+                archivedAt, chosenAt, before.version() + 1, before.createdAt(), before.partySize(), before.partyLevel());
+        campaigns.put(after.id(), after);
+        RollbackUndo.onRollback(() -> campaigns.put(before.id(), before));
+        return Optional.of(after);
+    }
+
+    @Override
+    public synchronized Optional<CampaignRow> updateCampaignParty(CampaignPartyChange change) {
+        Optional<CampaignRow> found = findCampaign(change.id());
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        CampaignRow before = found.get();
+        ownerFor(before.ownerId());
+        if (before.version() != change.version()) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        CampaignRow after = new CampaignRow(before.id(), before.ownerId(), before.systemId(), before.name(),
+                before.nameFingerprint(), before.archivedAt(), before.chosenAt(), before.version() + 1,
+                before.createdAt(), change.size(), change.level());
         campaigns.put(after.id(), after);
         RollbackUndo.onRollback(() -> campaigns.put(before.id(), before));
         return Optional.of(after);
@@ -201,7 +220,8 @@ public class InMemoryLibraryStore implements LibraryStore {
         found.ifPresent(before -> {
             ownerFor(before.ownerId());
             campaigns.put(id, new CampaignRow(id, before.ownerId(), before.systemId(), before.name(),
-                    before.nameFingerprint(), null, at, before.version(), before.createdAt()));
+                    before.nameFingerprint(), null, at, before.version(), before.createdAt(), before.partySize(),
+                    before.partyLevel()));
             RollbackUndo.onRollback(() -> campaigns.put(id, before));
         });
         return found.isPresent();
@@ -230,7 +250,8 @@ public class InMemoryLibraryStore implements LibraryStore {
                 throw new LibraryConflict(LibraryConflict.Reason.CAMPAIGN_NAME_TAKEN);
             }
             campaigns.put(id, new CampaignRow(id, owner, before.systemId(), before.name(), nameFingerprint,
-                    before.archivedAt(), before.chosenAt(), before.version(), before.createdAt()));
+                    before.archivedAt(), before.chosenAt(), before.version(), before.createdAt(), before.partySize(),
+                    before.partyLevel()));
             RollbackUndo.onRollback(() -> campaigns.put(id, before));
         });
         return found.isPresent();
@@ -349,7 +370,8 @@ public class InMemoryLibraryStore implements LibraryStore {
             ByteBuffer id16 = ByteBuffer.allocate(16).putLong(id.getMostSignificantBits())
                     .putLong(id.getLeastSignificantBits());
             campaigns.put(id, new CampaignRow(id, before.ownerId(), before.systemId(), before.name(), id16.array(),
-                    before.archivedAt(), before.chosenAt(), before.version() + 1, before.createdAt()));
+                    before.archivedAt(), before.chosenAt(), before.version() + 1, before.createdAt(),
+                    before.partySize(), before.partyLevel()));
             deletingCampaigns.add(id);
             RollbackUndo.onRollback(() -> {
                 deletingCampaigns.remove(id);

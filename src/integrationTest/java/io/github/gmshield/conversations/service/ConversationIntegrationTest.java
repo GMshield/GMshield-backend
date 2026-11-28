@@ -927,6 +927,34 @@ class ConversationIntegrationTest {
     }
 
     @Test
+    void aTurnFreezesTheCampaignsPartyEncryptedOnPostgresAndAQuestionsAndADraftsClaimCarryIt() {
+        UUID owner = Ids.newId();
+        UUID campaign = as(owner, () -> {
+            library.createStarter(Language.PT_BR);
+            Library.Campaign current = library.currentCampaign().orElseThrow();
+            library.changeParty(current.id(), current.version(), 4, 5).orElseThrow();
+            return current.id();
+        });
+        citedPassage(owner, campaign);
+        Conversations.Asked question = OwnerContext.callAs(owner, () -> conversations.ask(campaign, QUESTION));
+        Conversations.Asked draft = OwnerContext.callAs(owner, () -> conversations.ask(campaign,
+                "Um encontro para a cripta", null, null, TurnKind.DRAFT));
+
+        for (Conversations.Asked asked : List.of(question, draft)) {
+            // Story 7.1: turn.party_size and turn.party_level, each a ciphertext of its own turn binding.
+            Map<String, Object> row = jdbc.sql("select job_id, party_size, party_level from turn where id = :id")
+                    .param("id", asked.turnId()).query().singleRow();
+            assertThat(vault.decryptText(new Binding("turn", "party_size", asked.turnId(), owner),
+                    (byte[]) row.get("party_size"))).isEqualTo("4");
+            assertThat(vault.decryptText(new Binding("turn", "party_level", asked.turnId(), owner),
+                    (byte[]) row.get("party_level"))).isEqualTo("5");
+            // Read back through TurnEntity: the claim's input carries the frozen party.
+            JobClaims.Claim claim = claims.claim((UUID) row.get("job_id"), null, List.of("azure-openai"));
+            assertThat(claim.input().path("party").toString()).isEqualTo("{\"size\":4,\"level\":5}");
+        }
+    }
+
+    @Test
     void aDraftsProposalIsStoredWithItsDoneEventTheNameEncryptedAtRestAndReadBackOnPostgres() {
         UUID owner = Ids.newId();
         UUID campaign = as(owner, () -> {
@@ -1285,7 +1313,8 @@ class ConversationIntegrationTest {
                 UUID turnId = Ids.newId();
                 store.insertTurn(new TurnRow(turnId, owner, conversation, Ids.newId(), vault.encryptText(
                         Conversations.question(turnId, owner), "Pergunta " + number), "pt-BR", true, true, false, false,
-                        java.util.Set.of(), start.plusSeconds(number), null, null, null, null, null, null, null, null));
+                        java.util.Set.of(), start.plusSeconds(number), null, null, null, null, null, null, null, null,
+                        null, null));
                 ids.add(turnId);
             }
             return ids;

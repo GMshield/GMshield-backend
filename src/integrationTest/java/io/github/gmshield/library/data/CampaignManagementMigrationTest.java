@@ -19,6 +19,10 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
  * application started. Migrated to V22, given two owners' systems and campaigns (and a third owner with a system but no
  * campaign), then migrated to the latest: both owners with campaigns are listed in {@code campaign_fingerprint_backfill},
  * and every existing campaign has the new columns' defaults.
+ *
+ * <p>Story 7.1: V57 on a campaign that exists before it: migrated to V56, given a campaign, then migrated to the latest:
+ * the campaign reads as no party (both columns null, its version unchanged), and the turn's two new columns are
+ * nullable bytea, so every turn from before reads as not set.
  */
 class CampaignManagementMigrationTest {
 
@@ -59,6 +63,27 @@ class CampaignManagementMigrationTest {
                     + ".campaign where id = ?").param(campaign).query().singleRow();
             assertThat(row).containsEntry("version", 0L).containsEntry("archived_at", null).containsEntry("chosen_at", null)
                     .containsEntry("name_fingerprint", null);
+        }
+    }
+
+    @Test
+    void v57LeavesEveryExistingCampaignAndTurnWithoutAParty() {
+        flyway().target("56").load().migrate();
+        UUID campaign = campaign(OWNER_A, system(OWNER_A));
+
+        flyway().load().migrate();
+
+        Map<String, Object> row = jdbc.sql("select version, party_size, party_level from " + SCHEMA
+                + ".campaign where id = ?").param(campaign).query().singleRow();
+        assertThat(row).containsEntry("version", 0L).containsEntry("party_size", null)
+                .containsEntry("party_level", null);
+        for (String table : List.of("campaign", "turn")) {
+            assertThat(jdbc.sql("select column_name, data_type, is_nullable from information_schema.columns"
+                            + " where table_schema = ? and table_name = ? and column_name like 'party_%'"
+                            + " order by column_name")
+                    .params(SCHEMA, table).query((result, number) -> result.getString(1) + " " + result.getString(2)
+                            + " " + result.getString(3)).list())
+                    .as(table).containsExactly("party_level bytea YES", "party_size bytea YES");
         }
     }
 

@@ -56,7 +56,10 @@ import tools.jackson.databind.node.ObjectNode;
  *       Story 3.10 (internal contract 1.16.0) it adds {@code history: [{question, answer}]}, the conversation's earlier
  *       turns oldest first ({@link Conversations#history}; from Story 3.11 a dismissed turn is never among them, nor a
  *       stopped or failed one), built for each claim, so a claim already made keeps the history it was given: data for
- *       the model, never a source and never searched with; the line carries its count only.</li>
+ *       the model, never a source and never searched with; the line carries its count only. From Story 7.1
+ *       (internal contract 1.28.0) it adds {@code party: {size?, level?}}, the campaign's party frozen on the turn
+ *       (each value only when set, the key only when either is): campaign data for the model, never account data. A
+ *       turn from before V57 has none.</li>
  *   <li>Each numbered batch of events the worker posts is stored once per claim, encrypted with the turn, its events
  *       taking the turn's next sequences; a number past the next one of its claim is
  *       {@code job.batch_out_of_order}. Once the turn has a batch, the job has delivered (no splice: it is never
@@ -151,7 +154,25 @@ public class AnswerJobs implements JobHandler {
         log.atInfo().addKeyValue("jobId", job.id()).addKeyValue("turnId", turn.id())
                 .addKeyValue("conversationId", turn.conversationId()).addKeyValue("history", earlier.size())
                 .log("conversation.history_read");
+        // Story 7.1: the party frozen on the turn, only what is set.
+        Integer size = partyValue(Conversations.FIELD_PARTY_SIZE, turn, turn.partySize());
+        Integer level = partyValue(Conversations.FIELD_PARTY_LEVEL, turn, turn.partyLevel());
+        if (size != null || level != null) {
+            ObjectNode party = input.putObject("party");
+            if (size != null) {
+                party.put("size", size.intValue());
+            }
+            if (level != null) {
+                party.put("level", level.intValue());
+            }
+        }
         return input;
+    }
+
+    /** A party value frozen on the turn (Story 7.1), decrypted; null when not set. */
+    private Integer partyValue(String field, TurnRow turn, byte[] stored) {
+        return stored == null ? null
+                : Integer.valueOf(vault.decryptText(Conversations.party(field, turn.id(), turn.ownerId()), stored));
     }
 
     @Override

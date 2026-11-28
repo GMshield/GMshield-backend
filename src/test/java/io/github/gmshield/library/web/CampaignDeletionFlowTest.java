@@ -244,6 +244,7 @@ class CampaignDeletionFlowTest {
         assertNotFound(get(gm, "/api/v1/campaigns/" + target + "/deletion"));
         assertNotFound(send(gm, "PATCH", "/api/v1/campaigns/" + target, "{\"version\":0,\"name\":\"X\"}"));
         assertNotFound(send(gm, "PATCH", "/api/v1/campaigns/" + target, "{\"version\":0,\"archived\":true}"));
+        assertNotFound(send(gm, "PUT", "/api/v1/campaigns/" + target + "/party", "{\"version\":0,\"size\":4,\"level\":5}"));
         assertNotFound(send(gm, "PUT", "/api/v1/campaigns/current", "{\"campaignId\":\"" + target + "\"}"));
         assertNotFound(send(gm, "DELETE", "/api/v1/campaigns/" + target));
         assertNotFound(get(gm, "/api/v1/campaigns/" + target + "/conversation"));

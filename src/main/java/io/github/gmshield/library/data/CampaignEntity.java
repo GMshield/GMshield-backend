@@ -21,6 +21,9 @@ import org.hibernate.annotations.TenantId;
  *
  * <p>Story 3.2 part B (V24): it has a {@code state}: every read of the store but the deletion's own takes
  * {@code ready} rows only.
+ *
+ * <p>Story 7.1 (V57): its party size and level, each a vault ciphertext or null; a change of them raises the version,
+ * as a rename does.
  */
 @Entity(name = "LibraryCampaign")
 @Table(name = "campaign")
@@ -58,6 +61,12 @@ class CampaignEntity {
     @Column(name = "state", nullable = false)
     private String state = READY;
 
+    @Column(name = "party_size")
+    private byte[] partySize;
+
+    @Column(name = "party_level")
+    private byte[] partyLevel;
+
     @Version
     @Column(name = "version", nullable = false)
     private long version;
@@ -80,6 +89,8 @@ class CampaignEntity {
         this.nameFingerprint = SystemRow.copy(row.nameFingerprint());
         this.archivedAt = row.archivedAt();
         this.chosenAt = row.chosenAt();
+        this.partySize = SystemRow.copy(row.partySize());
+        this.partyLevel = SystemRow.copy(row.partyLevel());
         this.createdAt = row.createdAt();
         this.updatedAt = row.createdAt();
     }
@@ -112,6 +123,13 @@ class CampaignEntity {
         this.updatedAt = change.at();
     }
 
+    /** Replaces the party size and level (Story 7.1); Hibernate raises the version when it writes them. */
+    void changeParty(CampaignPartyChange change) {
+        this.partySize = SystemRow.copy(change.size());
+        this.partyLevel = SystemRow.copy(change.level());
+        this.updatedAt = change.at();
+    }
+
     /** The GM made it the current campaign at {@code at}; the version stays. */
     void choose(Instant at) {
         this.chosenAt = at;
@@ -136,6 +154,6 @@ class CampaignEntity {
 
     CampaignRow row() {
         return new CampaignRow(id, ownerId, systemId, name.clone(), SystemRow.copy(nameFingerprint), archivedAt, chosenAt,
-                version, createdAt);
+                version, createdAt, SystemRow.copy(partySize), SystemRow.copy(partyLevel));
     }
 }

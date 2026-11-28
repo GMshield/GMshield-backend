@@ -273,6 +273,21 @@ class JpaLibraryStore implements LibraryStore {
     }
 
     @Override
+    public Optional<CampaignRow> updateCampaignParty(CampaignPartyChange change) {
+        Optional<CampaignEntity> found = campaign(change.id());
+        if (found.isEmpty()) {
+            return Optional.empty();
+        }
+        CampaignEntity entity = found.get();
+        if (entity.version() != change.version()) {
+            throw new LibraryConflict(LibraryConflict.Reason.STALE_VERSION);
+        }
+        entity.changeParty(change);
+        flushChecked(em());
+        return Optional.of(entity.row());
+    }
+
+    @Override
     public boolean chooseCampaign(UUID id, Instant at) {
         Optional<CampaignEntity> found = campaign(id).filter(entity -> !entity.archived());
         found.ifPresent(entity -> {

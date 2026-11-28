@@ -1,6 +1,7 @@
 package io.github.gmshield.library.service;
 
 import io.github.gmshield.library.data.CampaignChange;
+import io.github.gmshield.library.data.CampaignPartyChange;
 import io.github.gmshield.library.data.CampaignRow;
 import io.github.gmshield.library.data.LibraryConflict;
 import io.github.gmshield.library.data.LibraryStore;
@@ -13,6 +14,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.Vault;
+import java.math.BigInteger;
 import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
@@ -84,10 +86,19 @@ public class Library {
     static final String FIELD_NAME = "name";
     static final String FIELD_EDITION = "edition";
     static final String FIELD_DESCRIPTION = "description";
+    static final String FIELD_PARTY_SIZE = "party_size";
+    static final String FIELD_PARTY_LEVEL = "party_level";
     /** A system's limits, in code points after trimming (Story 3.1). */
     public static final int NAME_MAX = 120;
     public static final int EDITION_MAX = 60;
     public static final int DESCRIPTION_MAX = 2000;
+    /** The largest party size (Story 7.1): players at one table. */
+    public static final int PARTY_SIZE_MAX = 20;
+    /**
+     * The largest party level (Story 7.1). No system-shaped cap: GMshield serves many systems and homebrew (a supplement
+     * may go to level 40), so this only catches garbage.
+     */
+    public static final int PARTY_LEVEL_MAX = 999;
     /** A list page's size: {@value #DEFAULT_LIMIT} unless asked, at most {@value #MAX_LIMIT}. */
     public static final int DEFAULT_LIMIT = 20;
     public static final int MAX_LIMIT = 50;
@@ -122,8 +133,12 @@ public class Library {
         }
     }
 
-    /** A campaign with its system, whether it is archived, and its version (Story 3.2). */
-    public record Campaign(UUID id, String name, GameSystem system, boolean archived, long version) {
+    /**
+     * A campaign with its system, whether it is archived, and its version (Story 3.2); from Story 7.1 its party size and
+     * level, each null while not set.
+     */
+    public record Campaign(UUID id, String name, GameSystem system, boolean archived, long version, Integer partySize,
+                           Integer partyLevel) {
         @Override
         public String toString() {
             return "Campaign[id=" + id + ", system=" + system + ", archived=" + archived + ", version=" + version + "]";
@@ -393,7 +408,7 @@ public class Library {
                 return row;
             });
             store.insertShield(ShieldRow.unnamed(Ids.newId(), owner, id, now));
-            return new Campaign(id, name, open(system), false, row.version());
+            return new Campaign(id, name, open(system), false, row.version(), null, null);
         }));
         created.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", owner).addKeyValue("campaignId", id)
                 .addKeyValue("systemId", systemId).log("library.campaign_created"));
@@ -436,6 +451,56 @@ public class Library {
                 .addKeyValue("version", campaign.version()).addKeyValue("archived", campaign.archived())
                 .log("library.campaign_changed"));
         return changed;
+    }
+
+    /**
+     * Replaces the party size and level of the owner's campaign {@code id} (Story 7.1) on the version {@code version}:
+     * each is a whole number (size 1 to {@value #PARTY_SIZE_MAX}, level 1 to {@value #PARTY_LEVEL_MAX}), or null, which
+     * clears it. Each is stored encrypted under its own binding. Answers the campaign as stored, its version raised by
+     * one; empty for an unknown campaign, another owner's or one being deleted. Throws
+     * {@code request.party_size_invalid} or {@code request.party_level_invalid} (400) for a value that is not a whole
+     * number in its range (a fraction, or {@link Double#NaN} for a value that is not a number at all), and
+     * {@code request.stale_version} (409) when the campaign is no longer at {@code version}; nothing changes then. A
+     * question asked before the change keeps the values frozen on its turn.
+     */
+    public Optional<Campaign> changeParty(UUID id, long version, Number size, Number level) {
+        Integer newSize = partyNumber(size, PARTY_SIZE_MAX, LibraryProblems.PARTY_SIZE_INVALID);
+        Integer newLevel = partyNumber(level, PARTY_LEVEL_MAX, LibraryProblems.PARTY_LEVEL_INVALID);
+        Optional<Campaign> changed = writing(() -> store.findCampaign(id).map(row -> {
+            if (row.version() != version) {
+                throw new ApiException(LibraryProblems.STALE_VERSION);
+            }
+            UUID owner = row.ownerId();
+            CampaignPartyChange change = new CampaignPartyChange(id, version,
+                    encryptParty(FIELD_PARTY_SIZE, id, owner, newSize), encryptParty(FIELD_PARTY_LEVEL, id, owner, newLevel),
+                    now());
+            CampaignRow stored = conflicts(() -> store.updateCampaignParty(change))
+                    .orElseThrow(() -> new IllegalStateException("library.campaign_vanished"));
+            return open(stored, systemOf(stored.systemId()));
+        }));
+        changed.ifPresent(campaign -> log.atInfo().addKeyValue("ownerId", OwnerContext.require()).addKeyValue("campaignId", id)
+                .addKeyValue("version", campaign.version()).addKeyValue("partySize", newSize != null)
+                .addKeyValue("partyLevel", newLevel != null).log("library.campaign_party_changed"));
+        return changed;
+    }
+
+    /** A party value as typed: null stays null; a whole number from 1 to {@code max}, else {@code invalid}. */
+    private static Integer partyNumber(Number value, int max, ApiProblem invalid) {
+        if (value == null) {
+            return null;
+        }
+        long whole;
+        if (value instanceof Integer || value instanceof Long || value instanceof Short || value instanceof Byte) {
+            whole = value.longValue();
+        } else if (value instanceof BigInteger big && big.bitLength() < Long.SIZE) {
+            whole = big.longValue();
+        } else {
+            throw new ApiException(invalid);
+        }
+        if (whole < 1 || whole > max) {
+            throw new ApiException(invalid);
+        }
+        return (int) whole;
     }
 
     /**
@@ -548,12 +613,24 @@ public class Library {
         return stored == null ? null : vault.decryptText(binding(SYSTEM, field, row.id(), row.ownerId()), stored);
     }
 
+    /** A party value, encrypted as its decimal text under its campaign binding (Story 7.1); null stays null. */
+    private byte[] encryptParty(String field, UUID id, UUID owner, Integer value) {
+        return value == null ? null : vault.encryptText(binding(CAMPAIGN, field, id, owner), value.toString());
+    }
+
+    /** A stored party value, decrypted (Story 7.1); null while not set. */
+    private Integer partyValue(String field, CampaignRow row, byte[] stored) {
+        return stored == null ? null
+                : Integer.valueOf(vault.decryptText(binding(CAMPAIGN, field, row.id(), row.ownerId()), stored));
+    }
+
     private Campaign open(CampaignRow row) {
         return open(row, systemOf(row.systemId()));
     }
 
     private Campaign open(CampaignRow row, GameSystem system) {
-        return new Campaign(row.id(), campaignName(row), system, row.archived(), row.version());
+        return new Campaign(row.id(), campaignName(row), system, row.archived(), row.version(),
+                partyValue(FIELD_PARTY_SIZE, row, row.partySize()), partyValue(FIELD_PARTY_LEVEL, row, row.partyLevel()));
     }
 
     /** A campaign's system: the database keeps it within its owner, so a missing one is a broken row, not a 404. */

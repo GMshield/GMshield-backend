@@ -55,6 +55,7 @@ import io.github.gmshield.shared.service.Ids;
 import io.github.gmshield.shared.service.OwnerContext;
 import io.github.gmshield.vault.data.DataKeyStore;
 import io.github.gmshield.vault.data.InMemoryDataKeyStore;
+import io.github.gmshield.vault.service.Binding;
 import io.github.gmshield.vault.service.FileStore;
 import io.github.gmshield.vault.service.Vault;
 import java.io.BufferedReader;
@@ -1646,6 +1647,51 @@ class ConversationFlowTest {
                 .containsExactly(ofSibling.versionId().toString());
         assertProblem(sendAsWorker("POST", next.path("passages"), "{\"ids\":[\"" + own.passages().getFirst()
                 + "\"]}", next.grant()), 403, "scope.passage_refused");
+    }
+
+    @Test
+    void aPartyIsFrozenOnItsTurnSentAsDataWithoutAccountDataAndAChangeAppliesFromTheNextQuestion() throws Exception {
+        Gm gm = signUp();
+        source(gm, gm.campaign(), List.of(1));
+        String campaignPath = "/api/v1/campaigns/" + gm.campaign();
+        // Matrix row "Not set": the input has no party, and the turn froze none.
+        UUID unset = turnId(ask(gm, gm.campaign(), QUESTION));
+        assertThat(claim(jobOf(unset)).input().has("party")).isFalse();
+        assertThat(conversations.turns.get(unset).partySize()).isNull();
+        assertThat(conversations.turns.get(unset).partyLevel()).isNull();
+
+        long version = json(get(gm, campaignPath)).path("version").asLong();
+        assertThat(send(gm, "PUT", campaignPath + "/party", "{\"version\":" + version + ",\"size\":4,\"level\":5}")
+                .statusCode()).isEqualTo(200);
+        UUID first = turnId(ask(gm, gm.campaign(), QUESTION));
+        Claim firstClaim = claim(jobOf(first));
+        // Acceptance: the claimed input carries party {size: 4, level: 5} and no account data.
+        assertThat(firstClaim.input().path("party")).isEqualTo(JSON.readTree("{\"size\":4,\"level\":5}"));
+        String text = firstClaim.input().toString();
+        assertThat(text).doesNotContain("example.test").doesNotContain("\"email\"").doesNotContain("\"username\"")
+                .doesNotContain("\"displayName\"");
+        // Frozen on the turn, only encrypted, each under its own turn binding.
+        TurnRow frozen = conversations.turns.get(first);
+        assertThat(vault.decryptText(new Binding("turn", "party_size", first, gm.id()), frozen.partySize()))
+                .isEqualTo("4");
+        assertThat(vault.decryptText(new Binding("turn", "party_level", first, gm.id()), frozen.partyLevel()))
+                .isEqualTo("5");
+
+        // Matrix row "Mid-answer change": the size changes and the level is cleared while the turn is answered.
+        assertThat(send(gm, "PUT", campaignPath + "/party", "{\"version\":" + (version + 1) + ",\"size\":6}")
+                .statusCode()).isEqualTo(200);
+        TurnRow kept = conversations.turns.get(first);
+        assertThat(vault.decryptText(new Binding("turn", "party_size", first, gm.id()), kept.partySize())).isEqualTo("4");
+        assertThat(vault.decryptText(new Binding("turn", "party_level", first, gm.id()), kept.partyLevel()))
+                .isEqualTo("5");
+        postEvents(firstClaim, 1, List.of(delta("Um.")), List.of());
+        report(firstClaim, "{\"outcome\":\"done\"}");
+        // The next question, and a draft, use the new values: only what is set.
+        Claim next = claim(jobOf(turnId(ask(gm, gm.campaign(), QUESTION))));
+        assertThat(next.input().path("party")).isEqualTo(JSON.readTree("{\"size\":6}"));
+        HttpResponse<String> drafted = askKind(gm, DRAFT, null, null, "draft");
+        assertThat(drafted.statusCode()).as(drafted.body()).isEqualTo(201);
+        assertThat(claim(jobOf(turnId(drafted))).input().path("party")).isEqualTo(JSON.readTree("{\"size\":6}"));
     }
 
     @Test

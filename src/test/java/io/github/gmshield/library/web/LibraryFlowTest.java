@@ -819,6 +819,92 @@ class LibraryFlowTest {
     }
 
     @Test
+    void aPartyIsSetChangedAndClearedOnItsVersionStoredOnlyEncrypted() throws Exception {
+        Gm gm = signUp("pt-BR");
+        UUID campaign = onlyCampaignOf(gm.id()).id();
+        String party = "/api/v1/campaigns/" + campaign + "/party";
+
+        // Matrix row "Not set": a campaign reads both values as null.
+        JsonNode read = ok(get("/api/v1/campaigns/" + campaign, gm.session()));
+        assertThat(read.has("partySize")).isTrue();
+        assertThat(read.path("partySize").isNull()).isTrue();
+        assertThat(read.path("partyLevel").isNull()).isTrue();
+        assertThat(current(gm.session(), 200).path("partySize").isNull()).isTrue();
+
+        // Matrix row "Set": both values, the version raised by one.
+        JsonNode set = ok(send("PUT", party, gm.session(), Map.of("version", 0, "size", 4, "level", 5)));
+        assertThat(set.path("partySize").asInt()).isEqualTo(4);
+        assertThat(set.path("partyLevel").asInt()).isEqualTo(5);
+        assertThat(set.path("version").asLong()).isEqualTo(1);
+        assertThat(ok(get("/api/v1/campaigns/" + campaign, gm.session())).path("partyLevel").asInt()).isEqualTo(5);
+        assertThat(current(gm.session(), 200).path("partySize").asInt()).isEqualTo(4);
+        // Stored only encrypted, each under its own binding.
+        CampaignRow row = library.campaigns.get(campaign);
+        assertThat(vault.decryptText(new Binding("campaign", "party_size", campaign, gm.id()), row.partySize()))
+                .isEqualTo("4");
+        assertThat(vault.decryptText(new Binding("campaign", "party_level", campaign, gm.id()), row.partyLevel()))
+                .isEqualTo("5");
+        assertThatThrownBy(() -> vault.decryptText(new Binding("campaign", "party_level", campaign, gm.id()),
+                row.partySize())).isNotNull();
+        assertThat(row.toString()).contains("partySize=" + row.partySize().length + " bytes");
+
+        // Matrix row "Clear one": null clears the level, the size stays; an absent value clears too.
+        JsonNode cleared = ok(sendText("PUT", party, gm.session(), "{\"version\":1,\"size\":4,\"level\":null}"));
+        assertThat(cleared.path("partySize").asInt()).isEqualTo(4);
+        assertThat(cleared.path("partyLevel").isNull()).isTrue();
+        assertThat(library.campaigns.get(campaign).partyLevel()).isNull();
+        // Matrix row "High level": 40 is stored, with no warning.
+        JsonNode high = ok(sendText("PUT", party, gm.session(), "{\"version\":2,\"level\":40}"));
+        assertThat(high.path("partySize").isNull()).isTrue();
+        assertThat(high.path("partyLevel").asInt()).isEqualTo(40);
+        assertThat(ok(send("PUT", party, gm.session(), Map.of("version", 3, "size", 20, "level", 999)))
+                .path("version").asLong()).isEqualTo(4);
+
+        // Matrix row "Invalid": each refused with its own code and limits, nothing stored.
+        for (String size : List.of("0", "21", "2.5", "4.0", "\"x\"", "\"4\"", "true", "[4]", "{}", "-1",
+                "99999999999999999999")) {
+            HttpResponse<String> refused = sendText("PUT", party, gm.session(), "{\"version\":4,\"size\":" + size + "}");
+            assertThat(refused.statusCode()).as(size).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).as(size).isEqualTo("request.party_size_invalid");
+            assertThat(json(refused).path("params").path("min").asInt()).isEqualTo(1);
+            assertThat(json(refused).path("params").path("max").asInt()).isEqualTo(Library.PARTY_SIZE_MAX);
+        }
+        for (String level : List.of("0", "1000", "2.5", "\"x\"")) {
+            HttpResponse<String> refused = sendText("PUT", party, gm.session(), "{\"version\":4,\"level\":" + level + "}");
+            assertThat(refused.statusCode()).as(level).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).as(level).isEqualTo("request.party_level_invalid");
+            assertThat(json(refused).path("params").path("max").asInt()).isEqualTo(Library.PARTY_LEVEL_MAX);
+        }
+        // A missing or negative version, or a malformed body, is request.invalid.
+        for (String body : List.of("{\"size\":4}", "{\"version\":-1,\"size\":4}", "{\"version\":")) {
+            HttpResponse<String> refused = sendText("PUT", party, gm.session(), body);
+            assertThat(refused.statusCode()).as(body).isEqualTo(400);
+            assertThat(json(refused).path("code").asString()).as(body).isEqualTo("request.invalid");
+        }
+        assertThat(library.campaigns.get(campaign).version()).isEqualTo(4);
+
+        // Matrix row "Stale": an older version changes nothing.
+        HttpResponse<String> stale = send("PUT", party, gm.session(), Map.of("version", 3, "size", 2));
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        JsonNode after = ok(get("/api/v1/campaigns/" + campaign, gm.session()));
+        assertThat(after.path("partySize").asInt()).isEqualTo(20);
+        assertThat(after.path("version").asLong()).isEqualTo(4);
+        // A rename keeps the party; the party change made the rename's version move.
+        JsonNode renamed = ok(send("PATCH", "/api/v1/campaigns/" + campaign, gm.session(),
+                Map.of("version", 4, "name", "Mesa de sexta")));
+        assertThat(renamed.path("partySize").asInt()).isEqualTo(20);
+        assertThat(renamed.path("partyLevel").asInt()).isEqualTo(999);
+
+        // Matrix row "Cross-owner": another owner's campaign, an unknown or a malformed id is request.not_found.
+        Gm other = signUp("en");
+        notFound(send("PUT", party, other.session(), Map.of("version", 5, "size", 3)));
+        notFound(send("PUT", "/api/v1/campaigns/" + Ids.newId() + "/party", gm.session(), Map.of("version", 0)));
+        notFound(send("PUT", "/api/v1/campaigns/nope/party", gm.session(), Map.of("version", 0)));
+        assertThat(library.campaigns.get(campaign).version()).isEqualTo(5);
+    }
+
+    @Test
     void allCampaignsComeInPagesNewestFirst() throws Exception {
         Gm gm = signUp("en");
         UUID system = onlySystemOf(gm.id()).id();

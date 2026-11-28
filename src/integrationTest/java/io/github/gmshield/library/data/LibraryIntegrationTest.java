@@ -170,6 +170,11 @@ class LibraryIntegrationTest {
         }
 
         @Override
+        public Optional<CampaignRow> updateCampaignParty(CampaignPartyChange change) {
+            return real.updateCampaignParty(change);
+        }
+
+        @Override
         public boolean chooseCampaign(UUID id, Instant at) {
             return real.chooseCampaign(id, at);
         }
@@ -756,6 +761,48 @@ class LibraryIntegrationTest {
         assertThat(ok(get("/api/v1/materials?state=ready&limit=2&offset=2", gm.session())).path("items")).hasSize(2);
         assertThat(ok(get("/api/v1/materials?state=failed&system=" + gm.systemId(), gm.session())).path("total").asLong())
                 .isZero();
+    }
+
+    // --- Story 7.1: the party's size and level ---
+
+    @Test
+    void aCampaignsPartyIsStoredOnlyEncryptedUnderItsOwnBindingAndReplacedByVersionOnPostgresql() throws Exception {
+        Gm gm = signUp("pt-BR");
+        String party = "/api/v1/campaigns/" + gm.campaignId() + "/party";
+        Map<String, Object> unset = jdbc.sql("select party_size, party_level from campaign where id = ?")
+                .param(gm.campaignId()).query().singleRow();
+        assertThat(unset).containsEntry("party_size", null).containsEntry("party_level", null);
+
+        JsonNode set = ok(send("PUT", party, gm.session(), Map.of("version", 0, "size", 4, "level", 5)));
+        assertThat(set.path("version").asLong()).isEqualTo(1);
+
+        // Acceptance: ciphertext that decrypts only under its own binding.
+        Map<String, Object> row = jdbc.sql("select party_size, party_level, version from campaign where id = ?")
+                .param(gm.campaignId()).query().singleRow();
+        byte[] size = (byte[]) row.get("party_size");
+        byte[] level = (byte[]) row.get("party_level");
+        assertThat(row).containsEntry("version", 1L);
+        assertThat(size).isNotEqualTo("4".getBytes(StandardCharsets.UTF_8));
+        assertThat(vault.decryptText(new Binding("campaign", "party_size", gm.campaignId(), gm.id()), size))
+                .isEqualTo("4");
+        assertThat(vault.decryptText(new Binding("campaign", "party_level", gm.campaignId(), gm.id()), level))
+                .isEqualTo("5");
+        assertThatThrownBy(() -> vault.decryptText(new Binding("campaign", "party_level", gm.campaignId(), gm.id()),
+                size)).isNotNull();
+        assertThatThrownBy(() -> vault.decryptText(new Binding("campaign", "name", gm.campaignId(), gm.id()), size))
+                .isNotNull();
+
+        // Clearing one writes null; a stale version writes nothing.
+        Map<String, Object> clearLevel = new java.util.HashMap<>(Map.of("version", 1, "size", 4));
+        clearLevel.put("level", null);
+        ok(send("PUT", party, gm.session(), clearLevel));
+        assertThat(count("select count(*) from campaign where id = ? and party_level is null and party_size is not null",
+                gm.campaignId())).isEqualTo(1);
+        HttpResponse<String> stale = send("PUT", party, gm.session(), Map.of("version", 1, "size", 2));
+        assertThat(stale.statusCode()).isEqualTo(409);
+        assertThat(json(stale).path("code").asString()).isEqualTo("request.stale_version");
+        assertThat(ok(get("/api/v1/campaigns/" + gm.campaignId(), gm.session())).path("partySize").asInt()).isEqualTo(4);
+        assertThat(count("select count(*) from campaign where id = ? and version = 2", gm.campaignId())).isEqualTo(1);
     }
 
     // --- Story 3.2: campaigns ---

@@ -99,6 +99,14 @@ public interface LibraryStore {
     Optional<CampaignRow> updateCampaign(CampaignChange change);
 
     /**
+     * Writes a change of the current owner's campaign's party (Story 7.1) and answers the row as stored, its version
+     * raised by one; empty for an unknown id, another owner's or a deleting campaign. Throws {@link LibraryConflict}
+     * ({@code STALE_VERSION}) when the row is not at {@code change.version()}; nothing is written then. Joins the
+     * caller's transaction, which must exist.
+     */
+    Optional<CampaignRow> updateCampaignParty(CampaignPartyChange change);
+
+    /**
      * The current owner's campaign {@code id}, of a ready system and not archived, was chosen at {@code at} (Story 3.2):
      * its version stays. False, and nothing changes, for any other id. Joins the caller's transaction, which must exist.
      */

@@ -2152,6 +2152,24 @@ use `shared`, `vault`, `library` and, from Story 4.2, `materials`, and neither `
     keys its pending rolls with (`gmshield:rolls:{accountId}:{shieldId}` in its storage, AD-31). Nothing else changes
     here: the roll routes, the migrations, the internal contract and the worker stay as they are. Deploy order:
     backend, then frontend (the 1.59.0 frontend ignores the extra field).
+- **The party's size and level (`library`, `conversations`, Story 7.1, public contract 1.61.0, internal contract
+  1.28.0, migration V57).** A campaign stores an optional party size (1 to `Library.PARTY_SIZE_MAX` = 20) and party
+  level (1 to `Library.PARTY_LEVEL_MAX` = 999: no system-shaped cap, since homebrew goes past 20; the ceiling only
+  catches garbage), each a vault ciphertext of its decimal text (`Binding("campaign", "party_size"|"party_level", id,
+  owner)`), null while not set. `Campaign` (read, PATCH, current, create) gains nullable `partySize` and `partyLevel`.
+  - `PUT /api/v1/campaigns/{id}/party` `{version, size|null, level|null}` replaces both (null or absent clears) and
+    answers the `Campaign`, its version raised by one (a party change makes an open rename stale, as a rename does). A
+    value that is not a whole number in its range (a fraction, a string, a boolean...) is `request.party_size_invalid`
+    or `request.party_level_invalid` (400, params `min` and `max`); a stale version `request.stale_version` (409);
+    another owner's, an unknown or a deleting campaign `request.not_found`. Nothing changes then. The route is a row of
+    the cross-owner audit.
+  - A new turn freezes the campaign's values in `turn.party_size` and `turn.party_level` (`Binding("turn", same field,
+    turnId, owner)`), as V17/V27 froze the scope switches, so a change applies from the next question; a turn from
+    before V57 reads as not set. `AnswerJobs.input` (and so `DraftJobs.input`) adds `party: {size?, level?}`, each value
+    only when set and the key only when either is: campaign data for the model, never account data. A worker before
+    1.28.0 ignores the unknown key.
+  - Log lines: `library.campaign_party_changed` (`version`, and whether each value is set), and
+    `conversation.turn_recorded` adds `partySize`/`partyLevel` (booleans). Deploy order: worker, backend, frontend.
 
 - **The model setting (`limits`, Story 2.10, AD-18).** The one owner of the provider setting. `ModelSettings` reads
   the active provider (`GMSHIELD_MODEL_PROVIDER`: `azure-openai`, the default, `anthropic` or `openai`) and each
