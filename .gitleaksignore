@@ -7,3 +7,5 @@ f143256ac969b27af88abe69259ae115005f7c8f:src/test/java/io/github/gmshield/vault/
 4f1c855b7da6a0a9a7ffbe0e92cb730b551ee063:dev/README.md:curl-auth-header:61
 # Story 1.12: the development setup's throwaway worker credential in a curl example (dev/compose.yaml), not a secret.
 897af0f5de12b7b93e8a13ed513afcef92140248:dev/README.md:curl-auth-header:69
+# Story 6.4: the OpenAPI example of a roll's key (a random UUID the browser makes), not a secret.
+2823715a787ee3781f44ec7e9776883c7d584496:src/main/java/io/github/gmshield/library/web/RollController.java:generic-api-key:55
